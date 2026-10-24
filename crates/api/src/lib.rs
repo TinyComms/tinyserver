@@ -1,5 +1,6 @@
-//! HTTP surface. Health, session, rooms, people, and invites. Media does not enter this crate.
+//! HTTP surface. Health, session, account, rooms, people, and invites. Media does not enter this crate.
 
+mod account;
 mod community;
 mod health;
 mod limit;
@@ -16,6 +17,7 @@ pub fn router(pool: PgPool) -> Router {
     Router::new()
         .merge(health::routes())
         .merge(session::routes())
+        .merge(account::routes())
         .merge(community::routes())
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(middleware::from_fn(limit::guard))

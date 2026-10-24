@@ -13,7 +13,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
-use crate::bootstrap::{hash_password, normalize_email, normalize_name};
+use crate::bootstrap::{check_password, hash_password, normalize_email, normalize_name};
 use crate::session::{new_token, password_matches, token_digest};
 use crate::DbError;
 
@@ -267,6 +267,7 @@ pub async fn set_member_role(
     Ok(stored)
 }
 
+/// Also ends the person's sessions, so an invite back does not revive an old token.
 pub async fn remove_member(
     pool: &PgPool,
     caller: &Caller,
@@ -275,6 +276,11 @@ pub async fn remove_member(
     managers(caller)?;
     let mut tx = scope(pool, caller).await?;
     sqlx::query("SELECT app_remove_member($1::uuid)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(from_sql)?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1::uuid")
         .bind(user_id)
         .execute(&mut *tx)
         .await
@@ -357,6 +363,34 @@ pub async fn create_invite(
     Ok(Wrote::Fresh(issued))
 }
 
+/// Deletes an invite nobody has accepted. An accepted invite stays as the record of who joined.
+pub async fn revoke_invite(pool: &PgPool, caller: &Caller, id: &str) -> Result<(), CommunityError> {
+    managers(caller)?;
+    let mut tx = scope(pool, caller).await?;
+    let gone: Option<(String, String)> = sqlx::query_as(
+        "DELETE FROM invites
+         WHERE id = $1::uuid
+           AND accepted_at IS NULL
+         RETURNING id::text, role",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(from_sql)?;
+    let Some((id, role)) = gone else {
+        return Err(CommunityError::NotFound);
+    };
+    audit(
+        &mut tx,
+        "invite.revoke",
+        "invite",
+        serde_json::json!({"id": id, "role": role}),
+    )
+    .await?;
+    tx.commit().await.map_err(from_sql)?;
+    Ok(())
+}
+
 pub async fn accept_invite(
     pool: &PgPool,
     token: &str,
@@ -364,9 +398,7 @@ pub async fn accept_invite(
     password: &str,
     display_name: &str,
 ) -> Result<Accepted, CommunityError> {
-    if !(12..=128).contains(&password.len()) {
-        return Err(CommunityError::Invalid);
-    }
+    check_password(password).map_err(|_| CommunityError::Invalid)?;
     let email = normalize_email(email).map_err(|_| CommunityError::Invalid)?;
     let display_name = normalize_name(display_name).map_err(|_| CommunityError::Invalid)?;
     let digest = token_digest(token);
@@ -478,7 +510,7 @@ fn invite_role(role: &str) -> Result<&str, CommunityError> {
     }
 }
 
-async fn scope<'a>(
+pub(crate) async fn scope<'a>(
     pool: &'a PgPool,
     caller: &Caller,
 ) -> Result<Transaction<'a, Postgres>, CommunityError> {
@@ -496,7 +528,7 @@ async fn scope<'a>(
     Ok(tx)
 }
 
-async fn audit(
+pub(crate) async fn audit(
     tx: &mut Transaction<'_, Postgres>,
     action: &str,
     subject: &str,
@@ -639,7 +671,7 @@ fn audit_from(row: &PgRow) -> Result<AuditRow, CommunityError> {
     })
 }
 
-fn from_sql(error: sqlx::Error) -> CommunityError {
+pub(crate) fn from_sql(error: sqlx::Error) -> CommunityError {
     if let Some(kind) = classify(&error) {
         return kind;
     }

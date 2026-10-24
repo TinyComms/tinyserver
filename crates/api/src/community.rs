@@ -5,8 +5,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use db::{
     accept_invite, create_invite, create_room, delete_room, list_audit, list_invites, list_members,
-    list_rooms, remove_member, rename_room, set_member_role, Caller, CommunityError, PgPool,
-    SessionError, Wrote,
+    list_rooms, remove_member, rename_room, revoke_invite, set_member_role, Caller, CommunityError,
+    PgPool, SessionError, Wrote,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,6 +27,7 @@ pub fn routes() -> Router<PgPool> {
             axum::routing::patch(role).delete(remove_member_route),
         )
         .route("/v1/invites", get(invites).post(add_invite))
+        .route("/v1/invites/{id}", axum::routing::delete(revoke))
         .route("/v1/invites/accept", axum::routing::post(accept))
         .route("/v1/audit", get(audit))
 }
@@ -59,7 +60,7 @@ struct ErrorBody {
     error: &'static str,
 }
 
-enum ApiError {
+pub(crate) enum ApiError {
     Unauthorized,
     Forbidden,
     NotFound,
@@ -90,7 +91,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn lift(error: CommunityError) -> ApiError {
+pub(crate) fn lift(error: CommunityError) -> ApiError {
     match error {
         CommunityError::Forbidden => ApiError::Forbidden,
         CommunityError::NotFound => ApiError::NotFound,
@@ -118,7 +119,7 @@ fn session_failure(error: SessionError) -> ApiError {
     }
 }
 
-async fn caller(pool: &PgPool, headers: &HeaderMap) -> Result<Caller, ApiError> {
+pub(crate) async fn caller(pool: &PgPool, headers: &HeaderMap) -> Result<Caller, ApiError> {
     let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
     let identity = db::current_session(pool, token)
         .await
@@ -247,6 +248,17 @@ async fn add_invite(
         tracing::info!(user_id = %caller.user_id, "invite created");
     }
     created(wrote)
+}
+
+async fn revoke(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let caller = caller(&pool, &headers).await?;
+    revoke_invite(&pool, &caller, &id).await.map_err(lift)?;
+    tracing::info!(user_id = %caller.user_id, invite = %id, "invite revoked");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn accept(

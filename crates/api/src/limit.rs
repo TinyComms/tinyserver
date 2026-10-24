@@ -1,4 +1,4 @@
-//! Caps the unauthenticated posts a scanner can force through password hashing.
+//! Caps the posts a scanner can force through password hashing.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -18,6 +18,7 @@ const WINDOW: Duration = Duration::from_secs(60);
 
 static SESSION: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
 static ACCEPT: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
+static PASSWORD: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
 
 struct Gate {
     per_key: usize,
@@ -64,14 +65,13 @@ struct SlowDown {
 }
 
 pub async fn guard(request: Request<Body>, next: Next) -> Response {
-    let limited = request.method() == Method::POST
-        && matches!(request.uri().path(), "/v1/session" | "/v1/invites/accept");
-    if limited {
-        let gate = if request.uri().path() == "/v1/session" {
-            &*SESSION
-        } else {
-            &*ACCEPT
-        };
+    let gate = match (request.method(), request.uri().path()) {
+        (&Method::POST, "/v1/session") => Some(&*SESSION),
+        (&Method::POST, "/v1/invites/accept") => Some(&*ACCEPT),
+        (&Method::POST, "/v1/me/password") => Some(&*PASSWORD),
+        _ => None,
+    };
+    if let Some(gate) = gate {
         if !gate.allow(&client_key(request.headers())) {
             return (
                 StatusCode::TOO_MANY_REQUESTS,

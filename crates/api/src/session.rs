@@ -28,11 +28,22 @@ struct Opened {
 }
 
 #[derive(Serialize)]
-struct Current {
+pub(crate) struct Current {
     user_id: String,
     email: String,
     display_name: String,
     role: String,
+}
+
+impl From<db::Identity> for Current {
+    fn from(identity: db::Identity) -> Self {
+        Self {
+            user_id: identity.user_id,
+            email: identity.email,
+            display_name: identity.display_name,
+            role: identity.role,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -93,12 +104,7 @@ async fn current(
         .await
         .map_err(|error| failure(error, ApiError::Unauthorized))?;
     tracing::info!(user_id = %identity.user_id, "session read");
-    Ok(Json(Current {
-        user_id: identity.user_id,
-        email: identity.email,
-        display_name: identity.display_name,
-        role: identity.role,
-    }))
+    Ok(Json(Current::from(identity)))
 }
 
 async fn close(State(pool): State<PgPool>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
