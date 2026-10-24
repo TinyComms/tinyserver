@@ -1,4 +1,4 @@
-# Development database on Zen. The app connects as app_runtime.
+# Local Postgres for development. The server connects as app_runtime.
 # app_owner is migrations and the first-owner bootstrap only.
 
 name: tinyserver

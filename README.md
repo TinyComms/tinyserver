@@ -1,49 +1,38 @@
 # tinyserver
 
-Self-hosted voice and video for tinyclient. One VPS, one community. People, rooms, and invites live in Postgres. Media is not in this build.
+Self-hosted voice and video for [tinyclient](https://github.com/itz4blitz/tinyclient). One server, one community. It is written in Rust. [MIT licensed](LICENSE).
 
-The database roles follow the Premier Studio Postgres starter. `app_owner` migrates and creates the first owner. `app_runtime` serves, with row level security forced on. Identity (`users`, `sessions`) is not authorization. Membership role is.
+The project is early. An owner can sign in from tinyclient. Rooms, invites, and calls are not here yet. Media is not started.
 
-## Run the database
+## What works today
 
-Postgres runs on Zen. From a checkout of this repo on Zen:
+| | |
+| --- | --- |
+| **Owner** | `bootstrap` creates the first owner from the environment. It refuses to run twice. |
+| **Sign-in** | `POST /v1/session` returns a token. `GET /v1/me` reads it. `DELETE /v1/session` ends it. |
+| **Health** | `GET /health` |
 
-```bash
+## Run
+
+From a checkout:
+
+```sh
 cp .env.example .env
 docker compose up -d
-```
-
-Port `54329` is published on the tailnet. The values in `.env.example` are local defaults.
-
-## Run the process
-
-On a machine that can reach that port:
-
-```bash
-cp .env.example .env
 cargo run -- migrate
 cargo run -- bootstrap
 cargo run -- serve
 ```
 
-`GET /health` is ready when `schema` is `ready` and `db_role` is `app_runtime`.
+`.env.example` is the local default. Copy it to `.env` and keep that file to yourself. `bootstrap` reads `TINYSERVER_OWNER_EMAIL`, `TINYSERVER_OWNER_NAME`, and `TINYSERVER_OWNER_PASSWORD`. The password stays in the environment.
 
-`bootstrap` reads `TINYSERVER_OWNER_EMAIL`, `TINYSERVER_OWNER_NAME`, and `TINYSERVER_OWNER_PASSWORD`. It refuses to run twice. The password stays in the environment, not on the command line.
+`GET /health` is ready when `schema` is `ready` and `db_role` is `app_runtime`. The server listens on `127.0.0.1:8080` unless `BIND` says otherwise.
 
-## What is here
+## Repository
 
-| Path | Role |
-|---|---|
-| `crates/db` | Migrations, owner bootstrap, sessions |
-| `crates/api` | `GET /health`, `POST /v1/session`, `GET /v1/me`, `DELETE /v1/session` |
-| `crates/sfu` | Media boundary. The plane is not started |
-| `crates/server` | `migrate`, `bootstrap`, `serve` |
-
-Invites, rooms, and calls are not here. Media is not started.
-
-## Rules that stay
-
-- The serving process never connects as `app_owner`.
-- RTP does not go in Postgres.
-- Direct membership writes are rejected. Role changes go through `app_set_member_role` and `app_remove_member`.
-- The last owner cannot be removed or demoted. An admin cannot touch an owner.
+| Path | What it is |
+| --- | --- |
+| [`crates/db`](crates/db) | Migrations, the first owner, and sessions |
+| [`crates/api`](crates/api) | `GET /health`, `POST /v1/session`, `GET /v1/me`, `DELETE /v1/session` |
+| [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve` |
+| [`crates/sfu`](crates/sfu) | The media boundary. Nothing is listening yet |
