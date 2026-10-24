@@ -11,9 +11,7 @@ pub async fn bootstrap_owner(
 ) -> Result<(), DbError> {
     let email = normalize_email(email)?;
     let display_name = normalize_name(display_name)?;
-    if !(12..=128).contains(&password.len()) {
-        return Err(DbError::PasswordTooShort);
-    }
+    check_password(password)?;
 
     let owners: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships WHERE role = 'owner'")
         .fetch_one(pool)
@@ -43,6 +41,15 @@ pub async fn bootstrap_owner(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Every password a person sets is 12 to 128 bytes.
+pub(crate) fn check_password(password: &str) -> Result<(), DbError> {
+    if (12..=128).contains(&password.len()) {
+        Ok(())
+    } else {
+        Err(DbError::PasswordTooShort)
+    }
 }
 
 pub(crate) fn hash_password(password: &str) -> Result<String, DbError> {
@@ -81,7 +88,15 @@ pub(crate) fn normalize_name(name: &str) -> Result<String, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_email, normalize_name};
+    use super::{check_password, normalize_email, normalize_name};
+
+    #[test]
+    fn a_password_is_12_to_128_bytes() {
+        assert!(check_password(&"a".repeat(11)).is_err());
+        assert!(check_password(&"a".repeat(12)).is_ok());
+        assert!(check_password(&"a".repeat(128)).is_ok());
+        assert!(check_password(&"a".repeat(129)).is_err());
+    }
 
     #[test]
     fn email_is_trimmed_and_lowered() {

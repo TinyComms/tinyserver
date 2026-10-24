@@ -9,10 +9,11 @@ The project is early. An owner can sign in, make rooms, and invite people. Calls
 | | |
 | --- | --- |
 | **Owner** | `bootstrap` creates the first owner from the environment. It refuses to run twice. |
-| **Sign-in** | `POST /v1/session` returns a token. `GET /v1/me` reads it. `DELETE /v1/session` ends it. |
+| **Sign-in** | `POST /v1/session` returns a token. `GET /v1/me` reads it. `DELETE /v1/session` ends it. `DELETE /v1/sessions` ends every session you have. |
+| **Account** | `PATCH /v1/me` changes your display name. `POST /v1/me/password` changes your password and signs out your other sessions. |
 | **Rooms** | A member lists rooms. An owner or admin adds, renames, and removes them. |
-| **People** | A member lists people. An owner or admin changes a role or removes someone. The last owner stays. An admin cannot change an owner. |
-| **Invites** | An owner or admin creates an invite for an admin or a member. The token is returned once and lasts 7 days. `POST /v1/invites/accept` creates the account, or brings an existing one back, and signs in. |
+| **People** | A member lists people. An owner or admin changes a role or removes someone. A removed person is signed out everywhere. The last owner stays. An admin cannot change an owner. |
+| **Invites** | An owner or admin creates an invite for an admin or a member. The token is returned once and lasts 7 days. `DELETE /v1/invites/{id}` revokes one nobody has accepted. `POST /v1/invites/accept` creates the account, or brings an existing one back, and signs in. |
 | **Audit** | An owner or admin reads `GET /v1/audit`. |
 | **Health** | `GET /health` |
 
@@ -36,7 +37,7 @@ cargo run -- serve
 
 | Path | What it is |
 | --- | --- |
-| [`crates/db`](crates/db) | Migrations, the first owner, sessions, rooms, and invites |
-| [`crates/api`](crates/api) | Health, sign-in, rooms, people, invites, and the audit log |
+| [`crates/db`](crates/db) | Migrations, the first owner, sessions, accounts, rooms, and invites |
+| [`crates/api`](crates/api) | Health, sign-in, your account, rooms, people, invites, and the audit log |
 | [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve` |
 | [`crates/sfu`](crates/sfu) | The media boundary. Nothing is listening yet |
