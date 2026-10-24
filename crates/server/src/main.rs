@@ -89,9 +89,32 @@ async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> any
     Ok(())
 }
 
+/// Resolves on SIGINT or SIGTERM. `docker stop` sends SIGTERM to PID 1.
 async fn shutdown() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        tracing::warn!("failed to listen for ctrl-c");
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            tracing::warn!("failed to listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => tracing::info!("interrupt received"),
+        () = terminate => tracing::info!("terminate received"),
     }
 }
 
