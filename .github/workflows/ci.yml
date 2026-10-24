@@ -1,0 +1,64 @@
+# Format, lint, and test. The integration tests run against Postgres 17 with the same
+# app_owner and app_runtime roles that docker/postgres/init/01-roles.sh makes in production.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tinyserver
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tinyserver"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL_MIGRATE: postgres://app_owner:app_owner@localhost:5432/tinyserver?sslmode=disable
+      TEST_DATABASE_URL: postgres://app_runtime:app_runtime@localhost:5432/tinyserver?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Database roles
+        env:
+          PGHOST: localhost
+          PGPASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: tinyserver
+          APP_OWNER_PASSWORD: app_owner
+          APP_RUNTIME_PASSWORD: app_runtime
+        run: |
+          command -v psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+          sh docker/postgres/init/01-roles.sh
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test

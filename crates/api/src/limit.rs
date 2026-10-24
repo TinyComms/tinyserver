@@ -43,15 +43,16 @@ impl Gate {
         let mut keys = lock(&self.keys);
         let mut global = lock(&self.global_hits);
         prune(&mut global, now, self.window);
-        let hits = keys.entry(key.to_string()).or_default();
-        prune(hits, now, self.window);
-        if hits.len() >= self.per_key || global.len() >= self.global_limit {
-            if hits.is_empty() {
-                keys.remove(key);
-            }
+        // Allowed hits are capped by the global limit, so this walk stays small.
+        keys.retain(|_, hits| {
+            prune(hits, now, self.window);
+            !hits.is_empty()
+        });
+        let used = keys.get(key).map_or(0, Vec::len);
+        if used >= self.per_key || global.len() >= self.global_limit {
             return false;
         }
-        hits.push(now);
+        keys.entry(key.to_string()).or_default().push(now);
         global.push(now);
         true
     }
@@ -112,7 +113,7 @@ fn prune(hits: &mut Vec<Instant>, now: Instant, window: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_key, Gate};
+    use super::{client_key, lock, Gate};
     use axum::http::{HeaderMap, HeaderValue};
     use std::time::Duration;
 
@@ -124,6 +125,24 @@ mod tests {
         assert!(!gate.allow("a"));
         assert!(gate.allow("b"));
         assert!(!gate.allow("b"));
+    }
+
+    #[test]
+    fn an_address_whose_hits_aged_out_is_forgotten() {
+        let gate = Gate::new(2, 30, Duration::from_millis(20));
+        assert!(gate.allow("a"));
+        assert!(gate.allow("b"));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(gate.allow("c"));
+        assert_eq!(lock(&gate.keys).len(), 1);
+    }
+
+    #[test]
+    fn a_denied_address_leaves_no_entry() {
+        let gate = Gate::new(1, 1, Duration::from_secs(60));
+        assert!(gate.allow("a"));
+        assert!(!gate.allow("b"));
+        assert_eq!(lock(&gate.keys).len(), 1);
     }
 
     #[test]

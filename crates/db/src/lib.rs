@@ -8,8 +8,9 @@ mod community;
 mod error;
 mod migrate;
 mod session;
+mod sweep;
 
-pub use bootstrap::bootstrap_owner;
+pub use bootstrap::{bootstrap_owner, owner_exists};
 pub use community::{
     accept_invite, create_invite, create_room, delete_room, list_audit, list_invites, list_members,
     list_rooms, remove_member, rename_room, set_member_role, Accepted, AuditRow, Caller,
@@ -21,6 +22,7 @@ pub use session::{
     close_session, current_session, open_session, Identity, OpenedSession, SessionError,
 };
 pub use sqlx::PgPool;
+pub use sweep::{sweep, Swept};
 
 use std::time::Duration;
 

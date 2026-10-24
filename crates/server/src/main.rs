@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use db::DbError;
+use db::{DbError, PgPool};
 
 #[derive(Parser)]
 #[command(name = "tinyserver", about = "Self-hosted voice and video server")]
@@ -49,10 +50,14 @@ async fn migrate() -> anyhow::Result<()> {
 
 async fn bootstrap() -> anyhow::Result<()> {
     let url = env_var("DATABASE_URL_MIGRATE")?;
+    let pool = db::owner_pool(&url).await?;
+    // Checked first, so a later start needs none of the owner variables.
+    if db::owner_exists(&pool).await? {
+        bail!("an owner already exists");
+    }
     let email = env_var("TINYSERVER_OWNER_EMAIL")?;
     let name = env_var("TINYSERVER_OWNER_NAME")?;
     let password = env_var("TINYSERVER_OWNER_PASSWORD")?;
-    let pool = db::owner_pool(&url).await?;
     match db::bootstrap_owner(&pool, &email, &name, &password).await {
         Ok(()) => {
             tracing::info!(email = %email.trim(), "owner created");
@@ -73,12 +78,36 @@ async fn serve() -> anyhow::Result<()> {
         .parse()
         .context("BIND is not a socket address")?;
     let pool = db::runtime_pool(&url).await?;
-    let app = api::router(pool);
+    let app = api::router(pool.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(%bind, "listening");
-    axum_serve(listener, app).await
+    let sweeper = tokio::spawn(sweep_every(pool, SWEEP_EVERY));
+    let served = axum_serve(listener, app).await;
+    sweeper.abort();
+    served
+}
+
+const SWEEP_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Deletes expired sessions, invites, and idempotency keys. The first sweep runs at start.
+async fn sweep_every(pool: PgPool, period: Duration) {
+    let mut ticks = tokio::time::interval(period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        match db::sweep(&pool).await {
+            Ok(swept) if swept.total() > 0 => tracing::info!(
+                sessions = swept.sessions,
+                invites = swept.invites,
+                idempotency_keys = swept.idempotency_keys,
+                "expired rows deleted"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "sweep failed"),
+        }
+    }
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> anyhow::Result<()> {
@@ -89,12 +118,39 @@ async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> any
     Ok(())
 }
 
+/// Resolves on SIGINT or SIGTERM. `docker stop` sends SIGTERM to PID 1.
 async fn shutdown() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        tracing::warn!("failed to listen for ctrl-c");
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            tracing::warn!("failed to listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => tracing::info!("interrupt received"),
+        () = terminate => tracing::info!("terminate received"),
     }
 }
 
+/// An empty value counts as unset. Compose passes `${NAME:-}` through as empty.
 fn env_var(name: &str) -> anyhow::Result<String> {
-    std::env::var(name).with_context(|| format!("{name} is not set"))
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{name} is not set"))
 }
