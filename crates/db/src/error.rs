@@ -8,7 +8,7 @@ pub enum DbError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("an owner already exists")]
     OwnerExists,
-    #[error("password must be at least 12 characters")]
+    #[error("password must be 12 to 128 characters")]
     PasswordTooShort,
     #[error("email is not usable")]
     BadEmail,

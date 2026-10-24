@@ -364,7 +364,7 @@ pub async fn accept_invite(
     password: &str,
     display_name: &str,
 ) -> Result<Accepted, CommunityError> {
-    if password.len() < 12 {
+    if !(12..=128).contains(&password.len()) {
         return Err(CommunityError::Invalid);
     }
     let email = normalize_email(email).map_err(|_| CommunityError::Invalid)?;

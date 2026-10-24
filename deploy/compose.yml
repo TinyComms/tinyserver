@@ -1,0 +1,77 @@
+# One community. Postgres and the server share a network that has no route out.
+# cloudflared is the only process that can reach the internet, and it is the only
+# process that can reach the server. Nothing is published on the host.
+
+name: tinyserver
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: tinyserver
+      APP_OWNER_PASSWORD: ${APP_OWNER_PASSWORD:?set APP_OWNER_PASSWORD}
+      APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:?set APP_RUNTIME_PASSWORD}
+    volumes:
+      - ${TINYSERVER_PG_DIR:-tinyserver_pg}:/var/lib/postgresql/data
+      - ../docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tinyserver"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - inside
+    logging: *logging
+
+  tinyserver:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: tinyserver:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
+      DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
+      BIND: 0.0.0.0:8080
+      TINYSERVER_OWNER_EMAIL: ${TINYSERVER_OWNER_EMAIL:?set TINYSERVER_OWNER_EMAIL}
+      TINYSERVER_OWNER_NAME: ${TINYSERVER_OWNER_NAME:?set TINYSERVER_OWNER_NAME}
+      TINYSERVER_OWNER_PASSWORD: ${TINYSERVER_OWNER_PASSWORD:?set TINYSERVER_OWNER_PASSWORD}
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - inside
+    logging: *logging
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN}
+    depends_on:
+      - tinyserver
+    restart: unless-stopped
+    networks:
+      - inside
+      - edge
+    logging: *logging
+
+networks:
+  inside:
+    internal: true
+  edge:

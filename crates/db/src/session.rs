@@ -48,6 +48,9 @@ pub async fn open_session(
     password: &str,
 ) -> Result<OpenedSession, SessionError> {
     let email = email.trim();
+    if email.len() > 254 || password.len() > 128 {
+        return Err(SessionError::InvalidCredentials);
+    }
     let user: Option<(String, String, String, String)> = sqlx::query_as(
         "SELECT id::text, email, display_name, password_hash
          FROM users

@@ -11,7 +11,7 @@ pub async fn bootstrap_owner(
 ) -> Result<(), DbError> {
     let email = normalize_email(email)?;
     let display_name = normalize_name(display_name)?;
-    if password.len() < 12 {
+    if !(12..=128).contains(&password.len()) {
         return Err(DbError::PasswordTooShort);
     }
 
@@ -55,6 +55,9 @@ pub(crate) fn hash_password(password: &str) -> Result<String, DbError> {
 
 pub(crate) fn normalize_email(email: &str) -> Result<String, DbError> {
     let email = email.trim().to_lowercase();
+    if email.len() > 254 {
+        return Err(DbError::BadEmail);
+    }
     let Some((local, domain)) = email.split_once('@') else {
         return Err(DbError::BadEmail);
     };
