@@ -91,3 +91,29 @@ BEGIN
     );
 END;
 $$;
+
+-- Expired sessions, unused expired invites, and expired idempotency keys are deleted by the
+-- server on a timer. invites forces RLS, so the sweep runs here as the definer. Accepted
+-- invites stay: the invite list shows who joined through which invite.
+
+CREATE OR REPLACE FUNCTION app_sweep(
+    OUT expired_sessions bigint,
+    OUT expired_invites bigint,
+    OUT expired_keys bigint
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    DELETE FROM sessions WHERE expires_at <= now();
+    GET DIAGNOSTICS expired_sessions = ROW_COUNT;
+    DELETE FROM invites WHERE accepted_at IS NULL AND expires_at <= now();
+    GET DIAGNOSTICS expired_invites = ROW_COUNT;
+    DELETE FROM idempotency_keys WHERE expires_at <= now();
+    GET DIAGNOSTICS expired_keys = ROW_COUNT;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION app_sweep() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_sweep() TO app_runtime;

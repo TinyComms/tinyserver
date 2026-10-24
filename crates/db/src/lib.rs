@@ -8,6 +8,7 @@ mod community;
 mod error;
 mod migrate;
 mod session;
+mod sweep;
 
 pub use bootstrap::bootstrap_owner;
 pub use community::{
@@ -21,6 +22,7 @@ pub use session::{
     close_session, current_session, open_session, Identity, OpenedSession, SessionError,
 };
 pub use sqlx::PgPool;
+pub use sweep::{sweep, Swept};
 
 use std::time::Duration;
 

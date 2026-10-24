@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use db::DbError;
+use db::{DbError, PgPool};
 
 #[derive(Parser)]
 #[command(name = "tinyserver", about = "Self-hosted voice and video server")]
@@ -73,12 +74,36 @@ async fn serve() -> anyhow::Result<()> {
         .parse()
         .context("BIND is not a socket address")?;
     let pool = db::runtime_pool(&url).await?;
-    let app = api::router(pool);
+    let app = api::router(pool.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(%bind, "listening");
-    axum_serve(listener, app).await
+    let sweeper = tokio::spawn(sweep_every(pool, SWEEP_EVERY));
+    let served = axum_serve(listener, app).await;
+    sweeper.abort();
+    served
+}
+
+const SWEEP_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Deletes expired sessions, invites, and idempotency keys. The first sweep runs at start.
+async fn sweep_every(pool: PgPool, period: Duration) {
+    let mut ticks = tokio::time::interval(period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        match db::sweep(&pool).await {
+            Ok(swept) if swept.total() > 0 => tracing::info!(
+                sessions = swept.sessions,
+                invites = swept.invites,
+                idempotency_keys = swept.idempotency_keys,
+                "expired rows deleted"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "sweep failed"),
+        }
+    }
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> anyhow::Result<()> {
