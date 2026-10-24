@@ -1,5 +1,7 @@
 #!/bin/sh
 # Migrate, create the first owner once, then serve. A second start leaves the owner in place.
+# bootstrap reports an existing owner before it reads the owner variables, so they can be unset
+# after first boot. With no owner and no variables, bootstrap fails and the container stops.
 set -eu
 tinyserver migrate
 set +e

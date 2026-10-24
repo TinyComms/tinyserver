@@ -15,10 +15,7 @@ pub async fn bootstrap_owner(
         return Err(DbError::PasswordTooShort);
     }
 
-    let owners: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships WHERE role = 'owner'")
-        .fetch_one(pool)
-        .await?;
-    if owners > 0 {
+    if owner_exists(pool).await? {
         return Err(DbError::OwnerExists);
     }
 
@@ -43,6 +40,14 @@ pub async fn bootstrap_owner(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Reads memberships past RLS, so it needs the `app_owner` pool.
+pub async fn owner_exists(pool: &PgPool) -> Result<bool, DbError> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE role = 'owner')")
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::from)
 }
 
 pub(crate) fn hash_password(password: &str) -> Result<String, DbError> {

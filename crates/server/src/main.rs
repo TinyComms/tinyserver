@@ -50,10 +50,14 @@ async fn migrate() -> anyhow::Result<()> {
 
 async fn bootstrap() -> anyhow::Result<()> {
     let url = env_var("DATABASE_URL_MIGRATE")?;
+    let pool = db::owner_pool(&url).await?;
+    // Checked first, so a later start needs none of the owner variables.
+    if db::owner_exists(&pool).await? {
+        bail!("an owner already exists");
+    }
     let email = env_var("TINYSERVER_OWNER_EMAIL")?;
     let name = env_var("TINYSERVER_OWNER_NAME")?;
     let password = env_var("TINYSERVER_OWNER_PASSWORD")?;
-    let pool = db::owner_pool(&url).await?;
     match db::bootstrap_owner(&pool, &email, &name, &password).await {
         Ok(()) => {
             tracing::info!(email = %email.trim(), "owner created");
@@ -143,6 +147,10 @@ async fn shutdown() {
     }
 }
 
+/// An empty value counts as unset. Compose passes `${NAME:-}` through as empty.
 fn env_var(name: &str) -> anyhow::Result<String> {
-    std::env::var(name).with_context(|| format!("{name} is not set"))
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{name} is not set"))
 }
