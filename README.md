@@ -2,7 +2,7 @@
 
 Self-hosted voice and video for [tinyclient](https://github.com/itz4blitz/tinyclient). One server, one community. It is written in Rust. [MIT licensed](LICENSE).
 
-The project is early. An owner can sign in from tinyclient. Rooms, invites, and calls are not here yet. Media is not started.
+The project is early. An owner can sign in, make rooms, and invite people. Calls are not here yet. Media is not started.
 
 ## What works today
 
@@ -10,6 +10,10 @@ The project is early. An owner can sign in from tinyclient. Rooms, invites, and 
 | --- | --- |
 | **Owner** | `bootstrap` creates the first owner from the environment. It refuses to run twice. |
 | **Sign-in** | `POST /v1/session` returns a token. `GET /v1/me` reads it. `DELETE /v1/session` ends it. |
+| **Rooms** | A member lists rooms. An owner or admin adds, renames, and removes them. |
+| **People** | A member lists people. An owner or admin changes a role or removes someone. The last owner stays. An admin cannot change an owner. |
+| **Invites** | An owner or admin creates an invite for an admin or a member. The token is returned once and lasts 7 days. `POST /v1/invites/accept` creates the account, or brings an existing one back, and signs in. |
+| **Audit** | An owner or admin reads `GET /v1/audit`. |
 | **Health** | `GET /health` |
 
 ## Run
@@ -32,7 +36,7 @@ cargo run -- serve
 
 | Path | What it is |
 | --- | --- |
-| [`crates/db`](crates/db) | Migrations, the first owner, and sessions |
-| [`crates/api`](crates/api) | `GET /health`, `POST /v1/session`, `GET /v1/me`, `DELETE /v1/session` |
+| [`crates/db`](crates/db) | Migrations, the first owner, sessions, rooms, and invites |
+| [`crates/api`](crates/api) | Health, sign-in, rooms, people, invites, and the audit log |
 | [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve` |
 | [`crates/sfu`](crates/sfu) | The media boundary. Nothing is listening yet |

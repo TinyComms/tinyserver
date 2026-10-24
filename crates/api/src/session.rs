@@ -110,7 +110,7 @@ async fn close(State(pool): State<PgPool>, headers: HeaderMap) -> Result<StatusC
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?;
     if token.is_empty() {

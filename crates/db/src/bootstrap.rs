@@ -45,7 +45,7 @@ pub async fn bootstrap_owner(
     Ok(())
 }
 
-fn hash_password(password: &str) -> Result<String, DbError> {
+pub(crate) fn hash_password(password: &str) -> Result<String, DbError> {
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -53,7 +53,7 @@ fn hash_password(password: &str) -> Result<String, DbError> {
         .map_err(|_| DbError::Hash)
 }
 
-fn normalize_email(email: &str) -> Result<String, DbError> {
+pub(crate) fn normalize_email(email: &str) -> Result<String, DbError> {
     let email = email.trim().to_lowercase();
     let Some((local, domain)) = email.split_once('@') else {
         return Err(DbError::BadEmail);
@@ -68,7 +68,7 @@ fn normalize_email(email: &str) -> Result<String, DbError> {
     Ok(email)
 }
 
-fn normalize_name(name: &str) -> Result<String, DbError> {
+pub(crate) fn normalize_name(name: &str) -> Result<String, DbError> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 80 {
         return Err(DbError::BadName);

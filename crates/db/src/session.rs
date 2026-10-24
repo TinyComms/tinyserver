@@ -147,7 +147,7 @@ fn known_role(role: Option<String>) -> Option<String> {
     }
 }
 
-fn password_matches(password: &str, encoded: &str) -> bool {
+pub(crate) fn password_matches(password: &str, encoded: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(encoded) else {
         return false;
     };
@@ -156,14 +156,14 @@ fn password_matches(password: &str, encoded: &str) -> bool {
         .is_ok()
 }
 
-fn new_token() -> String {
+pub(crate) fn new_token() -> String {
     let mut raw = [0u8; 32];
     OsRng.fill_bytes(&mut raw);
     URL_SAFE_NO_PAD.encode(raw)
 }
 
 /// SHA-256 of the token string the client presents, not of the raw random bytes.
-fn token_digest(token: &str) -> [u8; 32] {
+pub(crate) fn token_digest(token: &str) -> [u8; 32] {
     let digest = Sha256::digest(token.as_bytes());
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&digest);
