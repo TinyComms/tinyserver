@@ -1,0 +1,20 @@
+#!/bin/sh
+# First-boot only. The volume keeps these roles afterwards.
+set -eu
+
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<SQL
+CREATE USER app_owner WITH LOGIN PASSWORD '${APP_OWNER_PASSWORD}' CREATEDB BYPASSRLS;
+CREATE USER app_runtime WITH LOGIN PASSWORD '${APP_RUNTIME_PASSWORD}' NOSUPERUSER NOBYPASSRLS;
+
+GRANT CONNECT ON DATABASE tinyserver TO app_owner, app_runtime;
+ALTER SCHEMA public OWNER TO app_owner;
+GRANT USAGE ON SCHEMA public TO app_runtime;
+GRANT CREATE ON SCHEMA public TO app_owner;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO app_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+  GRANT EXECUTE ON FUNCTIONS TO app_runtime;
+SQL

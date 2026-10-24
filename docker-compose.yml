@@ -1,0 +1,29 @@
+# Development database on Zen. The app connects as app_runtime.
+# app_owner is migrations and the first-owner bootstrap only.
+
+name: tinyserver
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: tinyserver
+      APP_OWNER_PASSWORD: ${APP_OWNER_PASSWORD}
+      APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD}
+    ports:
+      - "0.0.0.0:54329:5432"
+    volumes:
+      - tinyserver_pg:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tinyserver"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  tinyserver_pg:

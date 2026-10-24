@@ -1,0 +1,21 @@
+[package]
+name = "tinyserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+api = { path = "../api" }
+axum.workspace = true
+clap.workspace = true
+db = { path = "../db" }
+dotenvy.workspace = true
+sfu = { path = "../sfu" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
