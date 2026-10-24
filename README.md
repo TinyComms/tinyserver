@@ -32,6 +32,18 @@ cargo run -- serve
 
 `GET /health` is ready when `schema` is `ready` and `db_role` is `app_runtime`. The server listens on `127.0.0.1:8080` unless `BIND` says otherwise.
 
+## Test
+
+`cargo test` runs the unit tests. The integration tests in [`crates/api/tests`](crates/api/tests) need Postgres and pass without running when it is not configured:
+
+```sh
+export TEST_DATABASE_URL_MIGRATE=postgres://app_owner:app_owner@127.0.0.1:54329/tinyserver?sslmode=disable
+export TEST_DATABASE_URL=postgres://app_runtime:app_runtime@127.0.0.1:54329/tinyserver?sslmode=disable
+cargo test
+```
+
+Each test creates its own database as `app_owner`, migrates it, serves it as `app_runtime`, and drops it. Only the host, roles, and passwords in those URLs are used. CI runs the same tests against `postgres:17-alpine`.
+
 ## Repository
 
 | Path | What it is |
