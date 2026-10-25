@@ -6,7 +6,8 @@
 use sqlx::PgPool;
 
 use crate::bootstrap::{check_password, hash_password, normalize_name};
-use crate::community::{audit, from_sql, scope};
+use crate::community::{audit, from_sql, member_event, scope};
+use crate::outbox::emit;
 use crate::session::{password_matches, token_digest};
 use crate::{Caller, CommunityError, Identity};
 
@@ -58,6 +59,9 @@ pub async fn change_password(
         serde_json::json!({"user_id": caller.user_id, "sessions_ended": ended}),
     )
     .await?;
+    if ended > 0 {
+        session_ended(&mut tx, &caller.user_id).await?;
+    }
     tx.commit().await.map_err(from_sql)?;
     Ok(ended)
 }
@@ -91,6 +95,12 @@ pub async fn rename_me(
         serde_json::json!({"user_id": user_id, "display_name": display_name}),
     )
     .await?;
+    emit(
+        &mut tx,
+        "member.renamed",
+        member_event(&user_id, &display_name, &caller.role),
+    )
+    .await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(Identity {
         user_id,
@@ -116,6 +126,15 @@ pub async fn close_all_sessions(pool: &PgPool, caller: &Caller) -> Result<u64, C
         serde_json::json!({"user_id": caller.user_id, "sessions_ended": ended}),
     )
     .await?;
+    session_ended(&mut tx, &caller.user_id).await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(ended)
+}
+
+/// Tells live sockets of `user_id` to check their session now. Never sent to a client.
+async fn session_ended(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
+) -> Result<(), CommunityError> {
+    emit(tx, "session.ended", serde_json::json!({"user_id": user_id})).await
 }
