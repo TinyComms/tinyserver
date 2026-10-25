@@ -2,7 +2,7 @@
 
 Self-hosted voice and video for [tinyclient](https://github.com/itz4blitz/tinyclient). One server, one community. It is written in Rust. [MIT licensed](LICENSE).
 
-The project is early. An owner can sign in, make rooms, and invite people, and every signed-in device sees changes live. Members can join a room's call, everyone sees who is in it, and the people in it hear each other through the server's SFU. There is no video yet.
+The project is early. An owner can sign in, make rooms, and invite people, and every signed-in device sees changes live. Members can join a room's call, everyone sees who is in it, and the people in it hear each other and see the active speaker's camera through the server's SFU. Screen share is not built yet.
 
 ## What works today
 
@@ -18,6 +18,7 @@ The project is early. An owner can sign in, make rooms, and invite people, and e
 | **Live** | `GET /v1/live` is a WebSocket with the same bearer token. It sends `ready` with who is online, then room, member, and invite changes in order with a `seq`, and presence. Reconnect with `?since=<seq>` to get what was missed, up to 24 hours back. Invite events go to owners and admins only. Frames and limits are in [`docs/calls.md`](docs/calls.md#realtime-channel). |
 | **Calls** | Over the live socket, a member sends `call.join` for a room and `call.leave` to hang up. Everyone sees `call.joined` and `call.left`, and `ready.calls` lists who is in each call. One call per person. 12 per room and 32 per server, set with `TINYSERVER_CALL_ROOM_MAX` and `TINYSERVER_CALL_SERVER_MAX`. An owner or admin sends `call.kick` to remove someone, which is audited; an admin cannot remove an owner. Calls live in memory and a restart ends them. |
 | **Audio** | `call.join` carries a WebRTC offer and gets `call.answer`. Audio goes over one UDP port, or ICE-TCP on the same number for networks that block UDP, to a str0m SFU in the server, which forwards each person's Opus to everyone else in the room. `call.slots` says which receive slot carries whom, `call.speaking` who is talking, and `call.state` who is muted or deafened. Media runs when `TINYSERVER_PUBLIC_IP` is set, on `TINYSERVER_MEDIA_PORT` (50000); `TINYSERVER_LAN_IP` adds the host's home-network address for members on it. Without a public address calls have no audio and an offer gets `media_unavailable`. Members see the host's address. Setup is in [`deploy/README.md`](deploy/README.md#calls-and-the-media-port). |
+| **Video** | A camera starts and stops with `call.offer`, and everyone sees it in `call.state` and `ready`. Each listener gets one video, the active speaker's camera, or the previous speaker's when they are the one talking; `call.slots` `video` says whose. Cameras send H.264 in two simulcast layers, and the SFU picks one per listener from its bandwidth estimate and `call.quality`. `TINYSERVER_MEDIA_EGRESS_KBPS` sets an upload budget: over it, everyone drops to the low layer, then to audio only. |
 | **Health** | `GET /health`, with `media` `off`, `up`, or `down`, and `transports`, the media transports up: `udp`, `tcp`, and `lan` |
 
 ## Run
@@ -38,7 +39,7 @@ cargo run -- serve
 
 ## Test
 
-`cargo test` runs the unit tests and the SFU tests in [`crates/sfu/tests`](crates/sfu/tests), which send audio between headless clients on `127.0.0.1`. The integration tests in [`crates/api/tests`](crates/api/tests) need Postgres and pass without running when it is not configured:
+`cargo test` runs the unit tests and the SFU tests in [`crates/sfu/tests`](crates/sfu/tests), which send audio and H.264 video between headless clients on `127.0.0.1`. The integration tests in [`crates/api/tests`](crates/api/tests) need Postgres and pass without running when it is not configured:
 
 ```sh
 export TEST_DATABASE_URL_MIGRATE=postgres://app_owner:app_owner@127.0.0.1:54329/tinyserver?sslmode=disable
@@ -55,5 +56,5 @@ Each test creates its own database as `app_owner`, migrates it, serves it as `ap
 | [`crates/db`](crates/db) | Migrations, the first owner, sessions, accounts, rooms, invites, and the outbox |
 | [`crates/api`](crates/api) | Health, sign-in, your account, rooms, people, invites, the audit log, the live socket, and who is in each call |
 | [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve` |
-| [`crates/sfu`](crates/sfu) | The SFU: one thread, one UDP socket and an ICE-TCP listener on the same port, str0m. Also the headless test client that tinyclient's `mediad` follows |
-| [`fuzz`](fuzz) | cargo-fuzz targets for live-socket frames, SDP offers, ICE-TCP framing, and packets into str0m. Outside the workspace; `cargo +nightly fuzz run sdp_offer` |
+| [`crates/sfu`](crates/sfu) | The SFU: one thread, one UDP socket and an ICE-TCP listener on the same port, str0m. Also the headless test client that tinyclient's `mediad` follows, and its canned H.264 clips in [`fixtures`](crates/sfu/fixtures) |
+| [`fuzz`](fuzz) | cargo-fuzz targets for live-socket frames, SDP offers, ICE-TCP framing, packets into str0m, and video routing. Outside the workspace; `cargo +nightly fuzz run sdp_offer` |

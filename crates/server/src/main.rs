@@ -111,6 +111,7 @@ async fn serve() -> anyhow::Result<()> {
 /// Media binds every interface on `TINYSERVER_MEDIA_PORT`, UDP and TCP, and advertises
 /// `TINYSERVER_PUBLIC_IP` with the same port, and `TINYSERVER_LAN_IP` too when set. No public
 /// address means no media. An offer may have one audio m-line per seat in a room.
+/// `TINYSERVER_MEDIA_EGRESS_KBPS` caps what media uploads to everyone, in kb/s.
 fn media_config(room_max: usize) -> anyhow::Result<Option<sfu::Config>> {
     let Ok(public) = env_var("TINYSERVER_PUBLIC_IP") else {
         return Ok(None);
@@ -145,6 +146,16 @@ fn media_config(room_max: usize) -> anyhow::Result<Option<sfu::Config>> {
     let mut config = sfu::Config::new(bind, public_ip);
     config.lan_ip = lan_ip;
     config.offer_audio = room_max;
+    config.egress_kbps = match env_var("TINYSERVER_MEDIA_EGRESS_KBPS") {
+        Err(_) => None,
+        Ok(value) => Some(
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|kbps| *kbps > 0)
+                .context("TINYSERVER_MEDIA_EGRESS_KBPS is not a positive whole number")?,
+        ),
+    };
     Ok(Some(config))
 }
 

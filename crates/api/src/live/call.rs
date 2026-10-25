@@ -56,6 +56,7 @@ pub(crate) enum Change {
         user_id: String,
         muted: bool,
         deafened: bool,
+        camera: bool,
     },
 }
 
@@ -93,6 +94,7 @@ pub(crate) struct Participant {
     pub user_id: String,
     pub muted: bool,
     pub deafened: bool,
+    pub camera: bool,
 }
 
 /// Where a person sits. `conn` is the socket that joined; `None` once it closed.
@@ -104,6 +106,20 @@ struct Seat {
     call_id: Option<String>,
     muted: bool,
     deafened: bool,
+    /// Their camera m-line is sending, as the SFU's last answer said.
+    camera: bool,
+}
+
+impl Seat {
+    fn state(&self, user_id: &str) -> Change {
+        Change::State {
+            room_id: self.room_id.clone(),
+            user_id: user_id.to_string(),
+            muted: self.muted,
+            deafened: self.deafened,
+            camera: self.camera,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -168,6 +184,7 @@ impl Calls {
                 call_id,
                 muted: false,
                 deafened: false,
+                camera: false,
             },
         );
         self.rooms
@@ -233,12 +250,18 @@ impl Calls {
         }
         seat.muted = muted;
         seat.deafened = deafened;
-        Some(Change::State {
-            room_id: seat.room_id.clone(),
-            user_id: user_id.to_string(),
-            muted,
-            deafened,
-        })
+        Some(seat.state(user_id))
+    }
+
+    /// Records whether `user_id`'s camera sends, if `call_id` is still their participant.
+    /// `None` if it is not or nothing changed.
+    pub fn set_camera(&mut self, user_id: &str, call_id: &str, camera: bool) -> Option<Change> {
+        let seat = self.seats.get_mut(user_id)?;
+        if seat.call_id.as_deref() != Some(call_id) || seat.camera == camera {
+            return None;
+        }
+        seat.camera = camera;
+        Some(seat.state(user_id))
     }
 
     /// The socket `conn` closed. If it held the seat, returns an epoch for `expire`.
@@ -288,6 +311,7 @@ impl Calls {
                             user_id: user_id.clone(),
                             muted: seat.is_some_and(|seat| seat.muted),
                             deafened: seat.is_some_and(|seat| seat.deafened),
+                            camera: seat.is_some_and(|seat| seat.camera),
                         }
                     })
                     .collect(),
@@ -467,6 +491,19 @@ mod tests {
         assert!(calls.set_state("u", true, false).is_some());
         assert_eq!(calls.set_state("u", true, false), None);
         assert!(calls.snapshot()[0].participants[0].muted);
+        assert_eq!(calls.set_camera("u", "c-1", true), None, "a stale call id");
+        assert_eq!(
+            calls.set_camera("u", "c-2", true),
+            Some(Change::State {
+                room_id: "a".to_string(),
+                user_id: "u".to_string(),
+                muted: true,
+                deafened: false,
+                camera: true,
+            })
+        );
+        assert_eq!(calls.set_camera("u", "c-2", true), None);
+        assert!(calls.snapshot()[0].participants[0].camera);
         assert_eq!(
             calls.leave("u", Reason::MediaLost),
             Some(Change::Left {

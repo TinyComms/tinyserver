@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
 use super::call::{Calls, Change, Occupancy, Reason, Refused};
-use super::frame::{Event, Out, SlotFrame};
+use super::frame::{Event, Out, SlotFrame, VideoSlotFrame};
 use super::socket::Close;
 use super::Limits;
 
@@ -277,13 +277,14 @@ impl Hub {
     }
 
     /// Seats `user_id` in `room_id` for socket `conn`, with SFU participant `call_id` if the
-    /// join had media. Refused once the hub is closing.
+    /// join had media, and its camera on or off. Refused once the hub is closing.
     pub fn call_join(
         &self,
         user_id: &str,
         room_id: &str,
         conn: u64,
         call_id: Option<&str>,
+        camera: bool,
     ) -> Result<(), Refused> {
         let mut people = lock(&self.people);
         if self.closing() {
@@ -298,6 +299,10 @@ impl Hub {
             self.limits.call_server_max,
         )?;
         self.tell(&mut people, changes);
+        if let Some(call_id) = call_id {
+            let change = people.calls.set_camera(user_id, call_id, camera);
+            self.tell(&mut people, change);
+        }
         // Slots the SFU sent before the seat existed. The socket reads them after its answer.
         if let Some(frame) = call_id.and_then(|call_id| people.slots.get(call_id)) {
             people.direct(user_id, conn, frame.clone());
@@ -334,6 +339,14 @@ impl Hub {
         }
         self.tell(&mut people, change);
         true
+    }
+
+    /// Records whether `user_id`'s camera sends after an answer for `call_id`, and tells
+    /// everyone if it changed.
+    pub fn call_camera(&self, user_id: &str, call_id: &str, camera: bool) {
+        let mut people = lock(&self.people);
+        let change = people.calls.set_camera(user_id, call_id, camera);
+        self.tell(&mut people, change);
     }
 
     /// Ends `user_id`'s call, if they are in one.
@@ -436,11 +449,13 @@ impl Hub {
                     user_id,
                     muted,
                     deafened,
+                    camera,
                 } => Out::CallState {
                     room_id,
                     user_id,
                     muted: *muted,
                     deafened: *deafened,
+                    camera: *camera,
                 }
                 .text(),
             };
@@ -455,7 +470,11 @@ impl Hub {
             sfu::Event::Connected { call_id } => {
                 tracing::debug!(%call_id, "media connected");
             }
-            sfu::Event::Slots { call_id, audio } => {
+            sfu::Event::Slots {
+                call_id,
+                audio,
+                video,
+            } => {
                 let slots: Vec<SlotFrame<'_>> = audio
                     .iter()
                     .map(|slot| SlotFrame {
@@ -463,11 +482,16 @@ impl Hub {
                         user_id: &slot.user_id,
                     })
                     .collect();
+                let video = video.as_ref().map(|slot| VideoSlotFrame {
+                    mid: &slot.mid,
+                    user_id: &slot.user_id,
+                    kind: slot.kind.as_str(),
+                });
                 let frame: Arc<str> = Arc::from(
                     Out::CallSlots {
                         call_id: &call_id,
                         audio: &slots,
-                        video: None,
+                        video,
                     }
                     .text(),
                 );

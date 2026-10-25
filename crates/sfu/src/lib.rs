@@ -1,5 +1,6 @@
 //! Media plane. One OS thread owns one UDP socket, an ICE-TCP listener on the same port
-//! number, and one `str0m::Rtc` per participant.
+//! number, and one `str0m::Rtc` per participant. It forwards Opus audio and H.264 camera
+//! video, one simulcast layer of one camera to each listener.
 //!
 //! The API sends [`Media`] commands and reads [`Event`]s. str0m types stay in this crate.
 //! RTP stays in memory. Postgres never stores it.
@@ -9,6 +10,7 @@ mod limit;
 mod room;
 mod sdp;
 mod tcp;
+mod video;
 
 #[cfg(feature = "headless")]
 pub mod client;
@@ -24,6 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc as async_mpsc, oneshot};
+
+pub use video::Quality;
 
 /// Commands waiting for the media thread. A full queue refuses the next one.
 const COMMANDS: usize = 1024;
@@ -46,6 +50,18 @@ pub struct Config {
     pub consent_timeout: Duration,
     /// Audio a publisher may send, in kb/s of payload. Frames over it are not forwarded.
     pub audio_kbps: u32,
+    /// Camera video a publisher may send on each simulcast layer, in kb/s of payload, from a
+    /// bucket of one second. A frame over it is dropped, and so is that layer until its next
+    /// keyframe that fits.
+    pub camera_high_kbps: u32,
+    pub camera_low_kbps: u32,
+    /// What the server may upload to everyone, in kb/s. `None` is no budget. Over it,
+    /// listeners drop to `l`, then to audio only.
+    pub egress_kbps: Option<u32>,
+    /// Where each listener's TWCC bandwidth estimate starts, in kb/s. Below 1,600 a listener
+    /// starts on `l` and moves up as the estimate climbs. `None` turns the estimator off;
+    /// layers then follow only the client's REMB, `call.quality`, and the upload budget.
+    pub bwe_start_kbps: Option<u32>,
     /// Packets one source address may send a second, and the burst above that.
     pub packets_per_second: u32,
     pub packet_burst: u32,
@@ -76,6 +92,10 @@ impl Config {
             connect_timeout: Duration::from_secs(15),
             consent_timeout: Duration::from_secs(30),
             audio_kbps: 64,
+            camera_high_kbps: 2400,
+            camera_low_kbps: 700,
+            egress_kbps: None,
+            bwe_start_kbps: Some(1000),
             packets_per_second: 500,
             packet_burst: 1000,
             tcp_streams: 256,
@@ -96,6 +116,8 @@ pub struct Answer {
     /// Names this participant until they leave. A rejoin gets a new one.
     pub call_id: String,
     pub sdp: String,
+    /// The offer's camera m-line is sending.
+    pub camera: bool,
 }
 
 /// Why the SFU refused a join or an offer.
@@ -125,13 +147,40 @@ pub struct Slot {
     pub user_id: String,
 }
 
+/// What a listener's one video slot carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoKind {
+    Camera,
+}
+
+impl VideoKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Camera => "camera",
+        }
+    }
+}
+
+/// The video receive m-line `mid` carries `user_id`'s `kind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoSlot {
+    pub mid: String,
+    pub user_id: String,
+    pub kind: VideoKind,
+}
+
 /// What the media thread tells the API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// ICE and DTLS are up.
     Connected { call_id: String },
-    /// The whole slot map for one listener. Sent on every change.
-    Slots { call_id: String, audio: Vec<Slot> },
+    /// The whole slot map for one listener. Sent on every change. `video` changes on the
+    /// keyframe that starts a new source, so frames after it decode on their own.
+    Slots {
+        call_id: String,
+        audio: Vec<Slot>,
+        video: Option<VideoSlot>,
+    },
     /// Who is speaking in a room. Sent when it changes, at most 4 times a second.
     Speaking {
         room_id: String,
@@ -164,6 +213,10 @@ pub(crate) enum Command {
         call_id: String,
         muted: bool,
         deafened: bool,
+    },
+    Quality {
+        call_id: String,
+        video: Quality,
     },
     Leave {
         call_id: String,
@@ -260,6 +313,14 @@ impl Media {
             call_id: call_id.to_string(),
             muted,
             deafened,
+        });
+    }
+
+    /// What a listener's video slot may carry, from `call.quality`. It starts at `High`.
+    pub fn quality(&self, call_id: &str, video: Quality) {
+        let _ = self.send(Command::Quality {
+            call_id: call_id.to_string(),
+            video,
         });
     }
 

@@ -45,3 +45,10 @@ path = "fuzz_targets/packets.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "video_routing"
+path = "fuzz_targets/video_routing.rs"
+test = false
+doc = false
+bench = false

@@ -108,6 +108,11 @@ impl Speech {
             .is_some_and(|at| now.saturating_duration_since(at) < HOLD)
     }
 
+    /// The smoothed level, in dBov.
+    pub fn level(&self) -> f32 {
+        self.level
+    }
+
     /// Silence, for a muted publisher.
     pub fn hush(&mut self) {
         self.level = -127.0;

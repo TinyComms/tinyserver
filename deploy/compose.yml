@@ -55,6 +55,8 @@ services:
       TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}
       # The host's address on the home network, for members on it. Optional.
       TINYSERVER_LAN_IP: ${TINYSERVER_LAN_IP:-}
+      # What media may upload to everyone, in kb/s. Optional; unset is no budget.
+      TINYSERVER_MEDIA_EGRESS_KBPS: ${TINYSERVER_MEDIA_EGRESS_KBPS:-}
     # The same number inside and out: the SFU advertises the port it binds. TCP is ICE-TCP,
     # for networks that block UDP.
     ports:

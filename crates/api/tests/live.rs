@@ -30,7 +30,7 @@ async fn a_socket_gets_ready_and_answers_ping() {
         assert_eq!(ready["calls"], json!([]));
 
         ping(&mut ws).await;
-        ws.send(Message::text(r#"{"type":"call.quality","ref":"7"}"#))
+        ws.send(Message::text(r#"{"type":"call.candidate","ref":"7"}"#))
             .await
             .expect("send");
         assert_eq!(

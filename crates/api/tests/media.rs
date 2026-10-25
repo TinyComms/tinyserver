@@ -12,7 +12,7 @@ use common::live::*;
 use common::{first_owner, join, run, Call, TestDb};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use sfu::client::{Client, Frame, Running};
+use sfu::client::{Client, Frame, Running, VideoFrame};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -162,6 +162,50 @@ async fn heard_over(person: &Person, period: Duration) -> Vec<Frame> {
     person.running.take();
     tokio::time::sleep(period).await;
     person.running.take()
+}
+
+/// Waits until `person` has received a camera frame from `marker`, and returns the frames
+/// from the first one of `marker`'s on.
+async fn sees(person: &Person, marker: u8) -> Vec<VideoFrame> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        seen.extend(person.running.take_video());
+        if let Some(first) = seen.iter().position(|frame| frame.marker == marker) {
+            return seen.split_off(first);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no camera frame from {marker} within 3 s");
+}
+
+/// Turns `person`'s camera on or off with `call.offer`, and takes the answer.
+async fn camera(person: &mut Person, on: bool) {
+    let offer = person.running.camera(on).expect("a camera offer");
+    let request = json!({"type": "call.offer", "ref": "o", "sdp": offer});
+    person
+        .ws
+        .send(Message::text(request.to_string()))
+        .await
+        .expect("send");
+    let reply = until(&mut person.ws, |value| {
+        (value["type"] == "call.answer" || value["type"] == "error").then(|| value.clone())
+    })
+    .await;
+    assert_eq!(reply["type"], "call.answer", "{reply}");
+    assert_eq!(reply["call_id"], person.call_id.as_str());
+    let sdp = reply["sdp"].as_str().expect("sdp");
+    person.running.accept(sdp).expect("accept the answer");
+}
+
+/// Waits for this socket's `call.slots` whose video slot carries `user_id`, or nobody.
+async fn video_slot(ws: &mut Ws, call_id: &str, user_id: Option<&str>) -> Value {
+    until(ws, |value| {
+        let holder = value["video"]["user_id"].as_str();
+        (value["type"] == "call.slots" && value["call_id"] == call_id && holder == user_id)
+            .then(|| value["video"].clone())
+    })
+    .await
 }
 
 /// The owner, two members, and two rooms, on a server with media.
@@ -344,7 +388,7 @@ async fn mute_is_shown_to_everyone_and_stops_forwarding() {
         let mute = json!({"type": "call.state", "ref": "m", "muted": true, "deafened": false});
         let reply = answer(&mut a.ws, mute).await;
         assert_eq!(reply, json!({"type": "ok", "ref": "m"}));
-        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false});
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false, "camera": false});
         until(&mut b.ws, |value| (*value == shown).then_some(())).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let muted = heard_over(&b, Duration::from_millis(400)).await;
@@ -538,6 +582,72 @@ async fn rapid_offers_get_slow_down() {
                 "slow_down"
             ]
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_camera_is_shown_to_everyone_and_reaches_the_other_listener() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut b = dial(ws, &cast.members[0].0, &cast.lobby, b'B').await;
+        slots(&mut b.ws, &b.call_id, 1).await;
+
+        camera(&mut a, true).await;
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": true});
+        until(&mut b.ws, |value| (*value == shown).then_some(())).await;
+        let video = video_slot(&mut b.ws, &b.call_id, Some(&a.user_id)).await;
+        assert_eq!(video["kind"], "camera");
+        let frames = sees(&b, b'A').await;
+        assert!(frames[0].keyframe, "the first frame is not a keyframe");
+        assert!(frames.iter().all(|frame| video["mid"] == frame.mid.as_str()));
+        let (_, ready) = connect(&cast.server, &cast.owner.1, None).await;
+        let participants = &ready["calls"][0]["participants"];
+        assert_eq!(participants[0]["camera"], true, "{ready}");
+        assert_eq!(participants[1]["camera"], false, "{ready}");
+
+        let low = json!({"type": "call.quality", "ref": "q", "video": "low"});
+        assert_eq!(answer(&mut b.ws, low).await, json!({"type": "ok", "ref": "q"}));
+        let bad = json!({"type": "call.quality", "ref": "q", "video": "max"});
+        assert_eq!(answer(&mut b.ws, bad).await["code"], "bad_frame");
+
+        camera(&mut a, false).await;
+        let hidden = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": false});
+        until(&mut b.ws, |value| (*value == hidden).then_some(())).await;
+        video_slot(&mut b.ws, &b.call_id, None).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn call_quality_needs_a_call_with_media() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let mut ws = socket(&cast, &cast.owner).await;
+        let quality = json!({"type": "call.quality", "ref": 1, "video": "off"});
+        assert_eq!(
+            answer(&mut ws, quality).await,
+            json!({"type": "error", "ref": 1, "code": "not_found"})
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_tcp_client_receives_video_through_the_live_socket() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let client = Client::tcp(LOOPBACK.into(), SLOTS).expect("TCP client");
+        let mut b = dial_with(ws, client, &cast.members[0].0, &cast.lobby, b'B').await;
+        camera(&mut a, true).await;
+        video_slot(&mut b.ws, &b.call_id, Some(&a.user_id)).await;
+        assert!(sees(&b, b'A').await[0].keyframe);
     })
     .await;
 }
