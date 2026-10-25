@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod live;
+
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};

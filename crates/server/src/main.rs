@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -18,7 +18,7 @@ enum Command {
     Migrate,
     /// Create the first owner. Refuses when one already exists.
     Bootstrap,
-    /// Serve HTTP and the live socket. Media is not started.
+    /// Serve HTTP and the live socket, and media when `TINYSERVER_PUBLIC_IP` is set.
     Serve,
 }
 
@@ -69,9 +69,7 @@ async fn bootstrap() -> anyhow::Result<()> {
 }
 
 async fn serve() -> anyhow::Result<()> {
-    if sfu::running() {
-        bail!("media plane was not supposed to start in this build");
-    }
+    let media = media_config()?;
     let url = env_var("DATABASE_URL")?;
     let bind: SocketAddr = env_var("BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -84,7 +82,17 @@ async fn serve() -> anyhow::Result<()> {
         call_server_max: env_count("TINYSERVER_CALL_SERVER_MAX", defaults.call_server_max)?,
         ..defaults
     };
-    let live = api::Live::start(pool.clone(), limits);
+    let live = match media {
+        Some(config) => {
+            let (media, events) = sfu::start(config).context("start media")?;
+            tracing::info!(addr = %media.addr(), "media advertised");
+            api::Live::with_media(pool.clone(), limits, media, events)
+        }
+        None => {
+            tracing::warn!("TINYSERVER_PUBLIC_IP is not set; calls have no media");
+            api::Live::start(pool.clone(), limits)
+        }
+    };
     let app = api::app(pool.clone(), live.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -99,6 +107,32 @@ async fn serve() -> anyhow::Result<()> {
     }
     served
 }
+
+/// Media binds every interface on `TINYSERVER_MEDIA_PORT` and advertises
+/// `TINYSERVER_PUBLIC_IP` with the same port. No public address means no media.
+fn media_config() -> anyhow::Result<Option<sfu::Config>> {
+    let Ok(public) = env_var("TINYSERVER_PUBLIC_IP") else {
+        return Ok(None);
+    };
+    let public_ip: IpAddr = public
+        .parse()
+        .context("TINYSERVER_PUBLIC_IP is not an IP address")?;
+    if !public_ip.is_ipv4() {
+        bail!("TINYSERVER_PUBLIC_IP must be IPv4 for now");
+    }
+    let port = match env_var("TINYSERVER_MEDIA_PORT") {
+        Err(_) => DEFAULT_MEDIA_PORT,
+        Ok(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .context("TINYSERVER_MEDIA_PORT is not a port number")?,
+    };
+    let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    Ok(Some(sfu::Config::new(bind, public_ip)))
+}
+
+const DEFAULT_MEDIA_PORT: u16 = 50000;
 
 /// How long live sockets get to take their close frame on shutdown.
 const DRAIN: Duration = Duration::from_secs(5);

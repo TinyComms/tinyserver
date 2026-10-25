@@ -98,6 +98,12 @@ pub(crate) struct Me<'a> {
 }
 
 #[derive(Serialize)]
+pub(crate) struct SlotFrame<'a> {
+    pub mid: &'a str,
+    pub user_id: &'a str,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum Out<'a> {
     #[serde(rename = "ready")]
@@ -116,6 +122,33 @@ pub(crate) enum Out<'a> {
         room_id: &'a str,
         user_id: &'a str,
         reason: &'static str,
+    },
+    #[serde(rename = "call.state")]
+    CallState {
+        room_id: &'a str,
+        user_id: &'a str,
+        muted: bool,
+        deafened: bool,
+    },
+    /// The SFU's answer to `call.join` or `call.offer`.
+    #[serde(rename = "call.answer")]
+    CallAnswer {
+        #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+        reference: Option<&'a Value>,
+        call_id: &'a str,
+        sdp: &'a str,
+    },
+    /// Which receive slot carries whom. `video` is always null until video exists.
+    #[serde(rename = "call.slots")]
+    CallSlots {
+        call_id: &'a str,
+        audio: &'a [SlotFrame<'a>],
+        video: Option<()>,
+    },
+    #[serde(rename = "call.speaking")]
+    CallSpeaking {
+        room_id: &'a str,
+        user_ids: &'a [String],
     },
     /// A client request succeeded.
     #[serde(rename = "ok")]
@@ -144,7 +177,7 @@ impl Out<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Audience, Event, Me, Out};
+    use super::{Audience, Event, Me, Out, SlotFrame};
     use crate::live::call::{Occupancy, Participant};
     use db::OutboxRow;
     use serde_json::{json, Value};
@@ -196,6 +229,50 @@ mod tests {
     }
 
     #[test]
+    fn media_frames_have_their_documented_shape() {
+        let reference = json!(7);
+        let answer = Out::CallAnswer {
+            reference: Some(&reference),
+            call_id: "c-1",
+            sdp: "v=0",
+        };
+        assert_eq!(
+            answer.text(),
+            r#"{"type":"call.answer","ref":7,"call_id":"c-1","sdp":"v=0"}"#
+        );
+        let slots = Out::CallSlots {
+            call_id: "c-1",
+            audio: &[SlotFrame {
+                mid: "1",
+                user_id: "u",
+            }],
+            video: None,
+        };
+        assert_eq!(
+            slots.text(),
+            r#"{"type":"call.slots","call_id":"c-1","audio":[{"mid":"1","user_id":"u"}],"video":null}"#
+        );
+        let speaking = Out::CallSpeaking {
+            room_id: "r",
+            user_ids: &["u".to_string()],
+        };
+        assert_eq!(
+            speaking.text(),
+            r#"{"type":"call.speaking","room_id":"r","user_ids":["u"]}"#
+        );
+        let state = Out::CallState {
+            room_id: "r",
+            user_id: "u",
+            muted: true,
+            deafened: false,
+        };
+        assert_eq!(
+            state.text(),
+            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false}"#
+        );
+    }
+
+    #[test]
     fn ready_and_error_have_their_documented_shape() {
         let online = ["u".to_string()];
         let ready = Out::Ready {
@@ -209,12 +286,14 @@ mod tests {
                 room_id: "r".to_string(),
                 participants: vec![Participant {
                     user_id: "u".to_string(),
+                    muted: false,
+                    deafened: true,
                 }],
             }],
         };
         assert_eq!(
             ready.text(),
-            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u"}]}]}"#
+            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true}]}]}"#
         );
         let reference = json!("7");
         let error = Out::Error {

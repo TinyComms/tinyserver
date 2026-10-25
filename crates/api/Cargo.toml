@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
 db = { path = "../db" }
+sfu = { path = "../sfu" }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -19,6 +20,7 @@ tracing.workspace = true
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 http-body-util = "0.1"
+sfu = { path = "../sfu", features = ["headless"] }
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 
