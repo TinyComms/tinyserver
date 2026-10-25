@@ -15,9 +15,10 @@ mod sweep;
 pub use account::{change_password, close_all_sessions, rename_me};
 pub use bootstrap::{bootstrap_owner, owner_exists};
 pub use community::{
-    accept_invite, create_invite, create_room, delete_room, list_audit, list_invites, list_members,
-    list_rooms, remove_member, rename_room, revoke_invite, set_member_role, Accepted, AuditRow,
-    Caller, CommunityError, Invite, InviteIssued, Member, Room, Wrote,
+    accept_invite, create_invite, create_room, delete_room, kick_from_call, list_audit,
+    list_invites, list_members, list_rooms, remove_member, rename_room, revoke_invite, room_exists,
+    set_member_role, Accepted, AuditRow, Caller, CommunityError, Invite, InviteIssued, Member,
+    Room, Wrote,
 };
 pub use error::DbError;
 pub use migrate::migrate;

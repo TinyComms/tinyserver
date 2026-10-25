@@ -1,4 +1,5 @@
-//! Who is connected, who is online, and the one task that reads the outbox.
+//! Who is connected, who is online, who is in which call, and the one task that reads the
+//! outbox.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,6 +11,7 @@ use sqlx::postgres::PgListener;
 use tokio::sync::{broadcast, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
+use super::call::{Calls, Change, Occupancy, Reason, Refused};
 use super::frame::{Event, Out};
 use super::socket::Close;
 use super::Limits;
@@ -23,7 +25,7 @@ pub(crate) struct Hub {
     pub pool: PgPool,
     pub limits: Limits,
     pub events: broadcast::Sender<Arc<Event>>,
-    /// Presence frames, already serialised. Every member gets every one.
+    /// Presence and call frames, already serialised. Every member gets every one.
     ephemeral: broadcast::Sender<Arc<str>>,
     people: Mutex<People>,
     open: AtomicUsize,
@@ -36,6 +38,7 @@ pub(crate) struct Hub {
 struct People {
     users: HashMap<String, Person>,
     next_conn: u64,
+    calls: Calls,
 }
 
 /// Online while this exists. It outlives the last socket by the presence grace.
@@ -56,6 +59,7 @@ pub(crate) struct Joined {
     pub kicked: oneshot::Receiver<Close>,
     pub presence: broadcast::Receiver<Arc<str>>,
     pub online: Vec<String>,
+    pub calls: Vec<Occupancy>,
 }
 
 /// One reserved socket. Dropping it frees the place.
@@ -91,8 +95,10 @@ impl Hub {
         hub
     }
 
+    /// Also ends every call. The `1012` close is how callers learn it.
     pub fn close(&self) {
         self.stop.send_replace(true);
+        lock(&self.people).calls.clear();
     }
 
     pub fn closing(&self) -> bool {
@@ -157,6 +163,7 @@ impl Hub {
             kicked,
             presence,
             online,
+            calls: people.calls.snapshot(),
         }
     }
 
@@ -194,6 +201,113 @@ impl Hub {
     fn announce(&self, user_id: &str, online: bool) {
         let frame = Out::Presence { user_id, online }.text();
         let _ = self.ephemeral.send(Arc::from(frame));
+    }
+
+    /// Seats `user_id` in `room_id` for socket `conn`. Refused once the hub is closing.
+    pub fn call_join(&self, user_id: &str, room_id: &str, conn: u64) -> Result<(), Refused> {
+        let mut people = lock(&self.people);
+        if self.closing() {
+            return Err(Refused::Closing);
+        }
+        let changes = people.calls.join(
+            user_id,
+            room_id,
+            conn,
+            self.limits.call_room_max,
+            self.limits.call_server_max,
+        )?;
+        self.tell(changes);
+        Ok(())
+    }
+
+    /// Ends `user_id`'s call, if they are in one.
+    pub fn call_leave(&self, user_id: &str, reason: Reason) {
+        let mut people = lock(&self.people);
+        let change = people.calls.leave(user_id, reason);
+        self.tell(change);
+    }
+
+    /// Ends `user_id`'s call if it is in `room_id`. False if they were not there.
+    pub fn call_kick(&self, room_id: &str, user_id: &str) -> bool {
+        let mut people = lock(&self.people);
+        if people.calls.room_of(user_id) != Some(room_id) {
+            return false;
+        }
+        let change = people.calls.leave(user_id, Reason::Kicked);
+        self.tell(change);
+        true
+    }
+
+    pub fn in_call(&self, room_id: &str, user_id: &str) -> bool {
+        lock(&self.people).calls.room_of(user_id) == Some(room_id)
+    }
+
+    pub fn end_room(&self, room_id: &str, reason: Reason) {
+        let mut people = lock(&self.people);
+        let changes = people.calls.end_room(room_id, reason);
+        self.tell(changes);
+    }
+
+    /// Socket `conn` closed with `reason`. If it held its person's seat, they leave now, or
+    /// after the presence grace when `reason` is `None` and no socket of theirs rejoins first.
+    pub fn hang_up(self: &Arc<Self>, user_id: &str, conn: u64, reason: Option<Reason>) {
+        let epoch = {
+            let mut people = lock(&self.people);
+            let Some(epoch) = people.calls.orphan(user_id, conn) else {
+                return;
+            };
+            if let Some(reason) = reason {
+                let change = people.calls.leave(user_id, reason);
+                self.tell(change);
+                return;
+            }
+            epoch
+        };
+        let hub = self.clone();
+        let user_id = user_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(hub.limits.presence_grace).await;
+            let mut people = lock(&hub.people);
+            let change = people.calls.expire(&user_id, epoch);
+            hub.tell(change);
+        });
+    }
+
+    /// Acts on durable events that end calls.
+    fn follow(&self, event: &Event) {
+        match event.topic.as_str() {
+            "room.deleted" => {
+                if let Some(room_id) = &event.room {
+                    self.end_room(room_id, Reason::RoomDeleted);
+                }
+            }
+            "member.removed" => {
+                if let Some(user_id) = &event.subject {
+                    self.call_leave(user_id, Reason::Removed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Sends call changes. Called with `people` locked, so frames go out in registry order.
+    fn tell(&self, changes: impl IntoIterator<Item = Change>) {
+        for change in changes {
+            let frame = match &change {
+                Change::Joined { room_id, user_id } => Out::CallJoined { room_id, user_id }.text(),
+                Change::Left {
+                    room_id,
+                    user_id,
+                    reason,
+                } => Out::CallLeft {
+                    room_id,
+                    user_id,
+                    reason: reason.as_str(),
+                }
+                .text(),
+            };
+            let _ = self.ephemeral.send(Arc::from(frame));
+        }
     }
 }
 
@@ -271,7 +385,9 @@ async fn drain(hub: &Hub, mut cursor: i64) -> i64 {
         let full = rows.len() as i64 == BATCH;
         for row in rows {
             cursor = row.seq;
-            let _ = hub.events.send(Arc::new(Event::from_row(row)));
+            let event = Arc::new(Event::from_row(row));
+            hub.follow(&event);
+            let _ = hub.events.send(event);
         }
         if !full {
             return cursor;

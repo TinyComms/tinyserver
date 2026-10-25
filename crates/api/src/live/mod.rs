@@ -1,6 +1,7 @@
 //! `GET /v1/live`: one WebSocket per signed-in device. Durable events come from the outbox in
-//! seq order, presence from memory. The frames are in `docs/calls.md`.
+//! seq order, presence and call occupancy from memory. The frames are in `docs/calls.md`.
 
+mod call;
 mod frame;
 mod hub;
 mod socket;
@@ -44,6 +45,13 @@ pub struct Limits {
     /// Client messages a second, and the burst above that.
     pub messages_per_second: u32,
     pub message_burst: u32,
+    /// People in one room's call. A join past it gets `full`.
+    pub call_room_max: usize,
+    /// People in calls on the server. A join past it gets `server_full`.
+    pub call_server_max: usize,
+    /// Joins and leaves one socket may make at once, and how often it gets one more back.
+    pub call_move_burst: u32,
+    pub call_move_every: Duration,
 }
 
 impl Default for Limits {
@@ -60,6 +68,10 @@ impl Default for Limits {
             poll: Duration::from_secs(5),
             messages_per_second: 20,
             message_burst: 40,
+            call_room_max: 12,
+            call_server_max: 32,
+            call_move_burst: 5,
+            call_move_every: Duration::from_secs(3),
         }
     }
 }

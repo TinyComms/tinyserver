@@ -2,7 +2,7 @@
 
 Self-hosted voice and video for [tinyclient](https://github.com/itz4blitz/tinyclient). One server, one community. It is written in Rust. [MIT licensed](LICENSE).
 
-The project is early. An owner can sign in, make rooms, and invite people, and every signed-in device sees changes live. Calls are not here yet. Media is not started.
+The project is early. An owner can sign in, make rooms, and invite people, and every signed-in device sees changes live. Members can join a room's call and everyone sees who is in it, but there is no audio or video yet. Media is not started.
 
 ## What works today
 
@@ -16,6 +16,7 @@ The project is early. An owner can sign in, make rooms, and invite people, and e
 | **Invites** | An owner or admin creates an invite for an admin or a member. The token is returned once and lasts 7 days. `DELETE /v1/invites/{id}` revokes one nobody has accepted. `POST /v1/invites/accept` creates the account, or brings an existing one back, and signs in. |
 | **Audit** | An owner or admin reads `GET /v1/audit`. |
 | **Live** | `GET /v1/live` is a WebSocket with the same bearer token. It sends `ready` with who is online, then room, member, and invite changes in order with a `seq`, and presence. Reconnect with `?since=<seq>` to get what was missed, up to 24 hours back. Invite events go to owners and admins only. Frames and limits are in [`docs/calls.md`](docs/calls.md#realtime-channel). |
+| **Calls** | Over the live socket, a member sends `call.join` for a room and `call.leave` to hang up. Everyone sees `call.joined` and `call.left`, and `ready.calls` lists who is in each call. One call per person. 12 per room and 32 per server, set with `TINYSERVER_CALL_ROOM_MAX` and `TINYSERVER_CALL_SERVER_MAX`. An owner or admin sends `call.kick` to remove someone, which is audited; an admin cannot remove an owner. Calls live in memory and a restart ends them. No media yet. |
 | **Health** | `GET /health` |
 
 ## Run
@@ -51,6 +52,6 @@ Each test creates its own database as `app_owner`, migrates it, serves it as `ap
 | Path | What it is |
 | --- | --- |
 | [`crates/db`](crates/db) | Migrations, the first owner, sessions, accounts, rooms, invites, and the outbox |
-| [`crates/api`](crates/api) | Health, sign-in, your account, rooms, people, invites, the audit log, and the live socket |
+| [`crates/api`](crates/api) | Health, sign-in, your account, rooms, people, invites, the audit log, the live socket, and who is in each call |
 | [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve` |
 | [`crates/sfu`](crates/sfu) | The media boundary. Nothing is listening yet |

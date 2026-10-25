@@ -1,15 +1,17 @@
-//! One live socket: `ready`, the replay, then events and presence until something closes it.
+//! One live socket: `ready`, the replay, then events, presence, and calls until something
+//! closes it.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use db::SessionError;
+use db::{Caller, CommunityError, SessionError};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use super::call::{Moves, Reason};
 use super::frame::{Audience, Event, Me as MeFrame, Out};
 use super::hub::{Hub, Joined, Slot};
 
@@ -67,6 +69,13 @@ impl Me {
     fn manages(&self) -> bool {
         matches!(self.role.as_str(), "owner" | "admin")
     }
+
+    fn caller(&self) -> Caller {
+        Caller {
+            user_id: self.user_id.clone(),
+            role: self.role.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -75,7 +84,12 @@ struct Incoming {
     kind: String,
     #[serde(rename = "ref")]
     reference: Option<Value>,
+    room_id: Option<String>,
+    user_id: Option<String>,
 }
+
+/// What a request gets back: `ok`, or `error` with this code.
+type Answer = Result<(), &'static str>;
 
 pub(crate) async fn run(
     hub: Arc<Hub>,
@@ -88,6 +102,11 @@ pub(crate) async fn run(
     let conn = joined.conn;
     tracing::info!(user_id = %me.user_id, conn, "live socket opened");
     let end = serve(&hub, &mut socket, &mut me, since, joined).await;
+    let reason = match end {
+        End::Close(Close::Removed) => Some(Reason::Removed),
+        End::Close(Close::SessionEnded) => Some(Reason::SessionEnded),
+        _ => None,
+    };
     if let End::Close(close) = end {
         tracing::info!(user_id = %me.user_id, conn, ?close, "live socket closed");
         let frame = Message::Close(Some(close.frame()));
@@ -95,6 +114,7 @@ pub(crate) async fn run(
     } else {
         tracing::info!(user_id = %me.user_id, conn, "live socket gone");
     }
+    hub.hang_up(&me.user_id, conn, reason);
     hub.leave(&me.user_id, conn);
     drop(slot);
 }
@@ -107,10 +127,11 @@ async fn serve(
     joined: Joined,
 ) -> End {
     let Joined {
+        conn,
         mut kicked,
         mut presence,
         online,
-        ..
+        calls,
     } = joined;
     // Subscribed before the outbox is read, so nothing falls between the replay and the stream.
     let mut events = hub.events.subscribe();
@@ -138,7 +159,7 @@ async fn serve(
             role: &me.role,
         },
         online: &online,
-        calls: [],
+        calls: &calls,
     };
     if let Err(end) = send(hub, socket, ready.text()).await {
         return end;
@@ -166,6 +187,12 @@ async fn serve(
     let mut recheck = tokio::time::interval_at(Instant::now() + limits.recheck, limits.recheck);
     recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut bucket = Bucket::new(limits.messages_per_second, limits.message_burst);
+    let mut moves = Moves::new(limits.call_move_burst, limits.call_move_every);
+    let mut asking = Asking {
+        conn,
+        bucket: &mut bucket,
+        moves: &mut moves,
+    };
 
     loop {
         let step = tokio::select! {
@@ -187,7 +214,7 @@ async fn serve(
             },
             message = socket.recv() => {
                 seen = Instant::now();
-                receive(hub, socket, &mut bucket, message).await
+                receive(hub, socket, me, &mut asking, message).await
             }
             () = tokio::time::sleep_until(seen + limits.idle) => Err(End::Close(Close::Idle)),
             _ = recheck.tick() => check(hub, me).await,
@@ -256,10 +283,18 @@ async fn check(hub: &Hub, me: &mut Me) -> Step {
     }
 }
 
+/// Per-socket state for client requests.
+struct Asking<'a> {
+    conn: u64,
+    bucket: &'a mut Bucket,
+    moves: &'a mut Moves,
+}
+
 async fn receive(
     hub: &Hub,
     socket: &mut WebSocket,
-    bucket: &mut Bucket,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
     message: Option<Result<Message, axum::Error>>,
 ) -> Step {
     let message = match message {
@@ -278,7 +313,7 @@ async fn receive(
         Message::Ping(_) | Message::Pong(_) => return Ok(()),
         Message::Close(_) => return Err(End::Gone),
     };
-    match bucket.take() {
+    match asking.bucket.take() {
         Take::Allowed => {}
         Take::Warn => {
             let warning = Out::Error {
@@ -290,20 +325,126 @@ async fn receive(
         Take::Dropped => return Ok(()),
         Take::Exceeded => return Err(End::Close(Close::SlowDown)),
     }
-    let reply = match serde_json::from_str::<Incoming>(text.as_str()) {
-        Ok(incoming) if incoming.kind == "ping" => Out::Pong.text(),
-        Ok(incoming) => Out::Error {
-            reference: incoming.reference.as_ref(),
-            code: "unknown_type",
-        }
-        .text(),
-        Err(_) => Out::Error {
+    let Ok(incoming) = serde_json::from_str::<Incoming>(text.as_str()) else {
+        let reply = Out::Error {
             reference: None,
             code: "bad_frame",
-        }
-        .text(),
+        };
+        return send(hub, socket, reply.text()).await;
     };
-    send(hub, socket, reply).await
+    let room_id = incoming.room_id.as_deref();
+    let answer = match incoming.kind.as_str() {
+        "ping" => return send(hub, socket, Out::Pong.text()).await,
+        "call.join" => call_join(hub, me, asking, room_id).await?,
+        "call.leave" => call_leave(hub, me, asking),
+        "call.kick" => call_kick(hub, me, room_id, incoming.user_id.as_deref()).await?,
+        _ => Err("unknown_type"),
+    };
+    let reference = incoming.reference.as_ref();
+    let reply = match answer {
+        Ok(()) => Out::Ok { reference },
+        Err(code) => Out::Error { reference, code },
+    };
+    send(hub, socket, reply.text()).await
+}
+
+/// Re-reads the session before a call request. An ended session closes the socket.
+async fn fresh(hub: &Hub, me: &mut Me) -> Result<Answer, End> {
+    match db::current_session(&hub.pool, &me.token).await {
+        Ok(identity) => {
+            me.role = identity.role;
+            Ok(Ok(()))
+        }
+        Err(SessionError::Unauthorized | SessionError::InvalidCredentials) => {
+            Err(End::Close(Close::SessionEnded))
+        }
+        Err(SessionError::Database(error)) => {
+            tracing::warn!(%error, "live session check failed");
+            Ok(Err("unavailable"))
+        }
+    }
+}
+
+async fn room_exists(hub: &Hub, me: &Me, room_id: &str) -> Answer {
+    match db::room_exists(&hub.pool, &me.caller(), room_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("not_found"),
+        Err(error) => {
+            tracing::warn!(%error, "room check failed");
+            Err("unavailable")
+        }
+    }
+}
+
+/// Any member may join any room they can see. Leaves the person's other call first.
+async fn call_join(
+    hub: &Hub,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
+    room_id: Option<&str>,
+) -> Result<Answer, End> {
+    let Some(room_id) = room_id else {
+        return Ok(Err("bad_frame"));
+    };
+    if !asking.moves.take() {
+        return Ok(Err("slow_down"));
+    }
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    if let Err(code) = room_exists(hub, me, room_id).await {
+        return Ok(Err(code));
+    }
+    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn) {
+        return Ok(Err(refused.code()));
+    }
+    // A delete that committed during the first check was followed before this seat existed.
+    if let Err("not_found") = room_exists(hub, me, room_id).await {
+        hub.end_room(room_id, Reason::RoomDeleted);
+        return Ok(Err("not_found"));
+    }
+    Ok(Ok(()))
+}
+
+/// Leaving with no call is not an error.
+fn call_leave(hub: &Hub, me: &Me, asking: &mut Asking<'_>) -> Answer {
+    if !asking.moves.take() {
+        return Err("slow_down");
+    }
+    hub.call_leave(&me.user_id, Reason::Left);
+    Ok(())
+}
+
+/// Owners and admins may remove someone from a call. An admin may not remove an owner.
+async fn call_kick(
+    hub: &Hub,
+    me: &mut Me,
+    room_id: Option<&str>,
+    user_id: Option<&str>,
+) -> Result<Answer, End> {
+    let (Some(room_id), Some(user_id)) = (room_id, user_id) else {
+        return Ok(Err("bad_frame"));
+    };
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    if !me.manages() {
+        return Ok(Err("forbidden"));
+    }
+    if !hub.in_call(room_id, user_id) {
+        return Ok(Err("not_found"));
+    }
+    match db::kick_from_call(&hub.pool, &me.caller(), room_id, user_id).await {
+        Ok(()) => {}
+        Err(CommunityError::Forbidden) => return Ok(Err("forbidden")),
+        Err(CommunityError::NotFound) => return Ok(Err("not_found")),
+        Err(error) => {
+            tracing::warn!(%error, "call kick failed");
+            return Ok(Err("unavailable"));
+        }
+    }
+    hub.call_kick(room_id, user_id);
+    Ok(Ok(()))
 }
 
 fn is_too_big(error: &axum::Error) -> bool {

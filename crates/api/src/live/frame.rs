@@ -4,6 +4,8 @@ use db::OutboxRow;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::call::Occupancy;
+
 /// Who may see a durable event. Invites follow the `invites_all` RLS rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Audience {
@@ -23,6 +25,8 @@ pub(crate) struct Event {
     pub subject: Option<String>,
     /// The new role, for `member.role`.
     pub role: Option<String>,
+    /// The room, for `room.deleted`.
+    pub room: Option<String>,
     pub frame: Option<String>,
 }
 
@@ -54,6 +58,11 @@ impl Event {
             .and_then(|member| member.get("role"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let room = row
+            .payload
+            .get("room_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let frame = match audience {
             Audience::Server => None,
             Audience::Everyone | Audience::Managers => {
@@ -76,6 +85,7 @@ impl Event {
             audience,
             subject,
             role,
+            room,
             frame,
         }
     }
@@ -95,11 +105,24 @@ pub(crate) enum Out<'a> {
         seq: i64,
         me: Me<'a>,
         online: &'a [String],
-        /// Always empty until calls exist.
-        calls: [(); 0],
+        calls: &'a [Occupancy],
     },
     #[serde(rename = "presence")]
     Presence { user_id: &'a str, online: bool },
+    #[serde(rename = "call.joined")]
+    CallJoined { room_id: &'a str, user_id: &'a str },
+    #[serde(rename = "call.left")]
+    CallLeft {
+        room_id: &'a str,
+        user_id: &'a str,
+        reason: &'static str,
+    },
+    /// A client request succeeded.
+    #[serde(rename = "ok")]
+    Ok {
+        #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+        reference: Option<&'a Value>,
+    },
     #[serde(rename = "resync")]
     Resync,
     #[serde(rename = "pong")]
@@ -114,7 +137,7 @@ pub(crate) enum Out<'a> {
 
 impl Out<'_> {
     pub fn text(&self) -> String {
-        // Every variant is plain strings, numbers, and slices, so this cannot fail.
+        // Every variant is plain strings, numbers, and sequences, so this cannot fail.
         serde_json::to_string(self).unwrap_or_default()
     }
 }
@@ -122,6 +145,7 @@ impl Out<'_> {
 #[cfg(test)]
 mod tests {
     use super::{Audience, Event, Me, Out};
+    use crate::live::call::{Occupancy, Participant};
     use db::OutboxRow;
     use serde_json::{json, Value};
 
@@ -181,11 +205,16 @@ mod tests {
                 role: "owner",
             },
             online: &online,
-            calls: [],
+            calls: &[Occupancy {
+                room_id: "r".to_string(),
+                participants: vec![Participant {
+                    user_id: "u".to_string(),
+                }],
+            }],
         };
         assert_eq!(
             ready.text(),
-            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[]}"#
+            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u"}]}]}"#
         );
         let reference = json!("7");
         let error = Out::Error {
@@ -197,5 +226,21 @@ mod tests {
             r#"{"type":"error","ref":"7","code":"unknown_type"}"#
         );
         assert_eq!(Out::Pong.text(), r#"{"type":"pong"}"#);
+        assert_eq!(
+            Out::Ok {
+                reference: Some(&reference)
+            }
+            .text(),
+            r#"{"type":"ok","ref":"7"}"#
+        );
+        assert_eq!(
+            Out::CallLeft {
+                room_id: "r",
+                user_id: "u",
+                reason: "kicked"
+            }
+            .text(),
+            r#"{"type":"call.left","room_id":"r","user_id":"u","reason":"kicked"}"#
+        );
     }
 }

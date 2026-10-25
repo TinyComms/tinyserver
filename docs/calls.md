@@ -1,6 +1,6 @@
 # Calls
 
-Design for voice and video in tinyserver. Slice 1, the live socket, is built; the rest is not. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
+Design for voice and video in tinyserver. Slices 1 and 2, the live socket and call occupancy, are built; the rest is not. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
 
 ## Recommendation
 
@@ -47,8 +47,8 @@ Upgrade: websocket
 
 | Rule | Value |
 | --- | --- |
-| Auth | The existing session token, in the `Authorization: Bearer` header only. tinyclient's `tungstenite` sets headers on the handshake request, so there is no query-string token to leak into logs. Checked before the upgrade: no token or a bad one is a plain `401 {"error":"unauthorized"}`. Then checked again every 60 s, at once on a `session.ended` event, and (from slice 2) on every `call.join`. An expired or deleted session closes the socket with `4001 session_ended`. Sign-out, sign-out everywhere, and a password change all emit `session.ended`, so their sockets close within one event delivery. |
-| Membership | Removed member: the socket gets `member.removed` about itself, then closes with `4003 removed`. From slice 2, any call is dropped. |
+| Auth | The existing session token, in the `Authorization: Bearer` header only. tinyclient's `tungstenite` sets headers on the handshake request, so there is no query-string token to leak into logs. Checked before the upgrade: no token or a bad one is a plain `401 {"error":"unauthorized"}`. Then checked again every 60 s, at once on a `session.ended` event, and on every `call.join` and `call.kick`. An expired or deleted session closes the socket with `4001 session_ended`. Sign-out, sign-out everywhere, and a password change all emit `session.ended`, so their sockets close within one event delivery. |
+| Membership | Removed member: the socket gets `member.removed` about itself, then closes with `4003 removed`. Their call ends at once with `call.left {reason: "removed"}`. |
 | Query | `since=<seq>`, a non-negative integer. Anything else is `400 {"error":"invalid"}`. Other parameters are ignored. |
 | Frame size | 64 KiB, for one frame and one message. SDP with simulcast fits. Bigger closes the socket with `1009 too_big`. Binary frames close it with `1003 text_only`. |
 | Client message rate | 20 a second, burst 40. A message over that is dropped, and the first one dropped gets `error {code: "slow_down"}`. 40 dropped in a row closes with `4029 slow_down`. |
@@ -56,7 +56,7 @@ Upgrade: websocket
 | Sockets in all | 1,024. Over that, `503 {"error":"busy"}` before the upgrade. |
 | Keepalive | Client sends `ping` every 25 s. Server answers `pong`. No traffic for 60 s closes with `4000 idle`. WebSocket ping frames count as traffic. |
 | Slow consumer | The server never buffers without bound. A send that does not finish in 10 s drops the socket. A socket more than 1,024 events behind gets `resync` and is closed. |
-| Shutdown | SIGTERM closes every socket with `1012 restart`, refuses new ones with `503 {"error":"restarting"}`, and waits up to 5 s for them to go. |
+| Shutdown | SIGTERM ends every call, closes every socket with `1012 restart`, refuses new ones with `503 {"error":"restarting"}`, and waits up to 5 s for them to go. No `call.left` is sent; the close is the signal. |
 | Encoding | JSON text frames, one object each, `type` first. Unknown types from the server are ignored by the client. |
 
 Close codes:
@@ -82,6 +82,8 @@ Browsers cannot set the `Authorization` header on a WebSocket, so a hostile page
 | Durable | room created, renamed, deleted; member joined, role changed, renamed, removed; invite created, accepted, revoked | `outbox` row, written in the transaction that made the change | Yes | Yes, replayed from `since` |
 | Ephemeral | presence, occupancy, speaking, call signaling | Memory, sent straight to the sockets that need it | No | No. `ready` carries a fresh snapshot |
 
+Call occupancy is ephemeral. `call.joined` and `call.left` never touch the outbox and carry no `seq`, so `since` does not replay them. Every `ready`, with or without `since`, carries the whole of `calls`; the client replaces its occupancy with it and applies `call.joined` and `call.left` after that. The socket subscribes to call frames under the same lock that takes the snapshot, so nothing between the two is lost or counted twice. Durable and ephemeral frames take separate paths, so `room.deleted` and that room's `call.left` frames can arrive in either order.
+
 ### Outbox and LISTEN/NOTIFY
 
 The `outbox` table and the `outbox_wake` trigger are in `0001_init.sql`; `0003_live.sql` adds the rest.
@@ -103,19 +105,20 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 
 | `type` | Fields | When |
 | --- | --- | --- |
-| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants}]` | First frame after connect. Snapshot of everything ephemeral. `online` is sorted and includes the caller. `calls` is always `[]` until slice 2. |
+| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants [{user_id}]}]` | First frame after connect. Snapshot of everything ephemeral. `online` is sorted and includes the caller. `calls` lists rooms with anyone in them, sorted by `room_id`, participants in join order. Later slices add fields to each participant. |
 | `room.created`, `room.renamed` | `seq`, `room {id, name, created_by, created_at}` | Durable. The same shape as `GET /v1/rooms`. |
-| `room.deleted` | `seq`, `room_id` | Durable. Ends that room's call. |
+| `room.deleted` | `seq`, `room_id` | Durable. Ends that room's call: everyone in it gets `call.left {reason: "room_deleted"}`. |
 | `member.joined`, `member.role`, `member.renamed` | `seq`, `member {user_id, display_name, role}` | Durable. No email; `GET /v1/members` has it. `member.renamed` is a display name change. |
 | `member.removed` | `seq`, `user_id` | Durable |
 | `invite.created`, `invite.accepted` | `seq`, `invite {id, role, created_by, expires_at, accepted_at, accepted_by}` | Durable. Owners and admins only. The same shape as `GET /v1/invites`. |
 | `invite.revoked` | `seq`, `invite_id` | Durable. Owners and admins only. Invites the sweep deletes after they expire send nothing. |
 | `presence` | `user_id`, `online` | First socket opens, or last socket closes after a 10 s grace. Several sockets for one person are one presence. |
-| `call.participants` | `room_id`, `participants [{user_id, muted, deafened, camera, share}]` | Someone joins, leaves, or changes state. Sent to every member, so the sidebar shows who is in which room. |
-| `call.answer` | `ref`, `call_id`, `sdp` | Reply to `call.join` or `call.offer` |
-| `call.slots` | `call_id`, `audio [{mid, user_id}]`, `video {mid, user_id, kind}` | Which receive slot carries whom. `kind` is `camera` or `share`. |
-| `call.speaking` | `room_id`, `user_ids` | At most 4 a second, in-call sockets only |
-| `call.ended` | `room_id`, `reason` | `left`, `joined_elsewhere`, `room_deleted`, `removed`, `media_timeout`, `restart`, `full` |
+| `call.joined` | `room_id`, `user_id` | Ephemeral. Someone joined a room's call. Sent to every member, including the person who joined, so the sidebar shows who is in which room. |
+| `call.left` | `room_id`, `user_id`, `reason` | Ephemeral. Someone left a room's call. `reason` is below. Sent to every member. |
+| `ok` | `ref` | A `call.join`, `call.leave`, or `call.kick` succeeded. Sent before the `call.joined` or `call.left` it caused. |
+| `call.answer` | `ref`, `call_id`, `sdp` | From slice 3. Reply to `call.join` or `call.offer` |
+| `call.slots` | `call_id`, `audio [{mid, user_id}]`, `video {mid, user_id, kind}` | From slice 3. Which receive slot carries whom. `kind` is `camera` or `share`. |
+| `call.speaking` | `room_id`, `user_ids` | From slice 3. At most 4 a second, in-call sockets only |
 | `resync` | none | The server closes with `4002` next. Client refetches rooms and members, then reconnects with no `since`. |
 | `error` | `ref`, `code` | A client request failed. `ref` is echoed when the request had one. |
 | `pong` | none | Reply to `ping` |
@@ -125,13 +128,40 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `ping` | none | Keepalive |
-| `call.join` | `ref`, `room_id`, `sdp` | Join the room's call with an SDP offer. Leaves any other call first. |
-| `call.offer` | `ref`, `sdp` | Renegotiate, for example to start a camera or a share |
-| `call.state` | `muted`, `deafened` | Shown to others. The SFU also stops forwarding a muted publisher. |
-| `call.quality` | `video` (`high`, `low`, `off`) | What the listener's one video surface can use |
-| `call.leave` | none | Hang up. Closing the socket does the same after a 10 s grace. |
+| `call.join` | `ref`, `room_id`, `sdp` | Join the room's call. Leaves any other call first. `sdp` is the offer from slice 3; until then it is ignored and may be left out. |
+| `call.leave` | `ref` | Hang up. Not being in a call is not an error. Closing the socket that joined does the same after a 10 s grace. |
+| `call.kick` | `ref`, `room_id`, `user_id` | Owners and admins only. Removes someone from that room's call. |
+| `call.offer` | `ref`, `sdp` | From slice 3. Renegotiate, for example to start a camera or a share |
+| `call.state` | `muted`, `deafened` | From slice 3. Shown to others. The SFU also stops forwarding a muted publisher. |
+| `call.quality` | `video` (`high`, `low`, `off`) | From slice 5. What the listener's one video surface can use |
 
-Error codes: `not_found`, `forbidden`, `full`, `share_taken`, `bad_sdp`, `media_unavailable`, `slow_down`, `unknown_type` (a `type` this server does not take; every `call.*` in slice 1), `bad_frame` (not a JSON object with a `type`).
+`ref` is any JSON value. It is echoed in the `ok` or `error` reply. Requests without one get replies without one.
+
+Error codes:
+
+| Code | Meaning |
+| --- | --- |
+| `not_found` | `call.join`: no such room, or `room_id` is not a room id. `call.kick`: that person is not in that room's call. |
+| `forbidden` | `call.kick` from a member, or from an admin against an owner |
+| `full` | The room's call has 12 people |
+| `server_full` | 32 people are in calls on the server |
+| `slow_down` | With a `ref`: too many joins and leaves from this socket. Without one: too many messages. |
+| `unavailable` | The database did not answer, or the server is shutting down. Try again. |
+| `unknown_type` | A `type` this server does not take, such as `call.offer` before slice 3 |
+| `bad_frame` | Not a JSON object with a `type`, or a request without a field it needs |
+| `share_taken`, `bad_sdp`, `media_unavailable` | From later slices |
+
+`call.left` reasons:
+
+| Reason | When |
+| --- | --- |
+| `left` | `call.leave` |
+| `joined_elsewhere` | The same person joined another room |
+| `disconnected` | The socket that joined closed and none of the person's sockets joined again within 10 s |
+| `room_deleted` | The room was deleted |
+| `removed` | The person was removed from the community |
+| `session_ended` | The socket that joined closed with `4001 session_ended` |
+| `kicked` | An owner or admin sent `call.kick` |
 
 ```json
 {"type":"ready","seq":41,"me":{"user_id":"9d1e…","role":"member"},"online":["5a0c…","9d1e…"],"calls":[]}
@@ -140,10 +170,21 @@ Error codes: `not_found`, `forbidden`, `full`, `share_taken`, `bad_sdp`, `media_
 ```
 
 ```json
+{"type":"ready","seq":41,"me":{"user_id":"9d1e…","role":"member"},"online":["5a0c…","9d1e…"],"calls":[{"room_id":"0b6f…","participants":[{"user_id":"5a0c…"}]}]}
+{"type":"call.join","ref":"7","room_id":"0b6f…"}
+{"type":"ok","ref":"7"}
+{"type":"call.joined","room_id":"0b6f…","user_id":"9d1e…"}
+{"type":"call.kick","ref":"8","room_id":"0b6f…","user_id":"9d1e…"}
+{"type":"error","ref":"8","code":"forbidden"}
+{"type":"call.left","room_id":"0b6f…","user_id":"9d1e…","reason":"left"}
+```
+
+From slice 3, a join also carries media:
+
+```json
 {"type":"call.join","ref":"7","room_id":"0b6f…","sdp":"v=0\r\n…"}
 {"type":"call.answer","ref":"7","call_id":"c-3f2a…","sdp":"v=0\r\n…"}
 {"type":"call.slots","call_id":"c-3f2a…","audio":[{"mid":"1","user_id":"9d1e…"}],"video":{"mid":"5","user_id":"9d1e…","kind":"camera"}}
-{"type":"call.participants","room_id":"0b6f…","participants":[{"user_id":"9d1e…","muted":false,"deafened":false,"camera":true,"share":false}]}
 ```
 
 ## Signaling and SDP
@@ -207,20 +248,39 @@ Commands go through a bounded `std::sync::mpsc` channel and wake the loop with t
 
 The API decides; the SFU trusts the command. On `call.join`:
 
-1. The session is still valid. Re-read it from Postgres, as `GET /v1/me` does.
-2. The caller is a member. Any role may join any room. Per-room permissions are an open question below.
-3. The room exists and is visible under RLS (`rooms_select`).
-4. The room and the server are under their caps.
-5. If the user is already in a call, on any socket, that call ends with `joined_elsewhere`.
+1. The socket is under its join and leave rate: 5 at once, then one more every 3 s. Over it gets `slow_down`.
+2. The session is still valid. Re-read it from Postgres, as `GET /v1/me` does. An ended session closes the socket with `4001`.
+3. The caller is a member. Any role may join any room. Per-room permissions are an open question below.
+4. The room exists and is visible under RLS (`rooms_select`).
+5. The room and the server are under their caps.
+6. If the user is already in a call, on any socket, that call ends with `joined_elsewhere`. Joining the room they are already in changes nothing and sends nothing.
 
-Removal, room deletion, and a deleted session all reach the API as outbox events or session checks. The API then sends `Leave` or `EndRoom`. One user is in at most one call.
+The room is checked again after the seat is taken. A delete that committed in between would otherwise leave a seat in a room that is gone.
+
+### Call registry
+
+`crates/api/src/live/call.rs` holds who is in which call. It sits under the same lock as presence, and every change is sent to every socket from inside that lock, so frames go out in the order the registry changed.
+
+| Rule | Behaviour |
+| --- | --- |
+| One call per person | A seat belongs to the person, not the socket. Any of their sockets may leave it. |
+| The socket that joined | Holds the seat. A later `call.join` to the same room from another of their sockets takes the seat over without a frame. |
+| That socket closes | The person leaves with `disconnected` after the presence grace (10 s), unless one of their sockets joins again first. A close with `4003` or `4001` leaves at once with `removed` or `session_ended`. |
+| Room deleted | The dispatcher sees `room.deleted` and ends the room's call with `room_deleted`. |
+| Member removed | The dispatcher sees `member.removed` and ends their call with `removed`, even if the socket that joined had already gone. |
+| Kick | `call.kick` re-reads the caller's session. A member gets `forbidden`. The target must be in that room's call. An admin may not kick an owner. The check and the `call.kick` audit row (`subject` `call`, `detail {room_id, user_id}`) are one transaction, then the person leaves with `kicked`. |
+| Audit | Joins and leaves are not audited. Only `call.kick` is. |
+| Restart | `Live::close` empties the registry before the sockets close with `1012`. |
+
+Removal, room deletion, and a deleted session all reach the API as outbox events or session checks. From slice 3 the API then sends `Leave` or `EndRoom`. One user is in at most one call.
 
 ### Limits
 
 | Limit | Default | Setting |
 | --- | --- | --- |
-| People in one room's call | 12 | `TINYSERVER_CALL_ROOM_MAX` |
-| People in calls on the server | 32 | `TINYSERVER_CALL_SERVER_MAX` |
+| People in one room's call | 12. The 13th gets `full`. | `TINYSERVER_CALL_ROOM_MAX` |
+| People in calls on the server | 32. The 33rd gets `server_full`. Moving between rooms does not count twice. | `TINYSERVER_CALL_SERVER_MAX` |
+| Joins and leaves per socket | 5 at once, then one every 3 s. Over it gets `slow_down`. | |
 | Audio from each publisher | Opus mono 32 kb/s. Up to 64 kb/s accepted. | |
 | Camera | Simulcast `h` 1280×720 at about 1.2 Mb/s, `l` 640×360 at about 350 kb/s. 30 fps. | |
 | Share | One per room. Up to 1920×1080, 2.5 Mb/s, 5–15 fps. | |
@@ -235,7 +295,7 @@ Calls live in memory and end on restart. That is the trade for keeping RTP out o
 
 | Step | Behaviour |
 | --- | --- |
-| SIGTERM | The API sends `call.ended {reason: "restart"}` to every caller, then `Shutdown` to the SFU. Every live socket closes with `1012 restart`, and the process exits. |
+| SIGTERM | The API empties the call registry, and from slice 3 sends `Shutdown` to the SFU. Every live socket closes with `1012 restart`, and the process exits. No `call.left` is sent. |
 | Crash | Sockets drop. Nothing in Postgres needs cleaning. |
 | Client | Reconnects `/v1/live` with backoff (0.5 s, 1, 2, 4, cap 10). If it was in a call and the user did not hang up, `mediad` sends a fresh `call.join` to the same room. Target: back in the call within 5 s of the server answering. |
 | Durable events | Replayed from `since`. Nothing is lost. |
@@ -376,7 +436,7 @@ Each slice is one PR, merges on its own, and leaves the server working.
 | # | Slice | Scope | Acceptance check | Size |
 | --- | --- | --- | --- | --- |
 | 1 | **Live socket and presence** (built) | `GET /v1/live` with bearer auth, ping, limits, `ready`, `presence`. Outbox writes in every room, member, and invite change. Dispatcher on `LISTEN app_wake`, replay with `since`, `resync`, 24 h sweep. No media. | Integration test: two sessions connect; A renames a room; B gets `room.renamed` with a `seq`. B reconnects with an old `since` and gets the missed events. A removed member's socket closes with `4003`. A rolled-back write emits nothing. | M, ~800 lines |
-| 2 | **Call occupancy without media** | `call.join` / `call.leave` / `call.state`, the call registry, authorization, caps, `joined_elsewhere`, `call.participants` to every member. `call.join` takes an SDP field but answers `media_unavailable`. | Test: three members join a room; everyone sees `call.participants` with three entries. A fourth joins elsewhere and moves. The cap returns `full`. Deleting the room sends `call.ended {room_deleted}`. | S, ~400 lines |
+| 2 | **Call occupancy without media** (built) | `call.join`, `call.leave`, and `call.kick`, the call registry, authorization, caps, a join and leave rate, `joined_elsewhere`, `call.joined` and `call.left` to every member, `ready.calls`. `call.join` ignores `sdp`. `call.state` moves to slice 3, with the media it describes. | Integration tests: a join reaches everyone and later `ready` frames; joining elsewhere leaves the first room; a second socket is one seat; a dropped socket leaves after the grace; caps return `full` and `server_full`; a deleted room empties; a removed member leaves; kick works for an admin, fails against an owner and for a member, and is audited. | S, ~400 lines |
 | 3 | **SFU audio, UDP** | `crates/sfu` thread with mio, str0m pinned, ICE-lite, DTLS-SRTP, Opus forwarding, slots, active speaker, consent timeout, graceful shutdown. Compose and `deploy/README.md` gain the media port. `/health` reports `media`. | A headless test client (str0m, in `crates/sfu/tests`) joins with two peers on loopback; each receives the other's Opus frames within 2 s; killing one peer frees its slot within 35 s. Manual: two machines on different networks talk. | L, ~1,500 lines |
 | 4 | **ICE-TCP and hardening** | TCP passive candidate on the same port, RFC 4571 framing, stream caps, per-source rate limit, a fuzz target for the packet entry point, `TINYSERVER_LAN_IP`. | Test client with UDP blocked connects over TCP. Fuzz runs 10 minutes without a panic. A flood from an unknown source does not raise CPU above a set bound. | M, ~600 lines |
 | 5 | **Camera video** | H.264 simulcast receive, per-listener layer choice from bandwidth estimate and `call.quality`, speaker-switched video slot with PLI, `TINYSERVER_MEDIA_EGRESS_KBPS`. | Test client publishes two layers; a listener capped at 500 kb/s gets `l`; switching speaker delivers the new speaker's keyframe within 1 s. | L, ~1,000 lines |

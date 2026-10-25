@@ -78,7 +78,13 @@ async fn serve() -> anyhow::Result<()> {
         .parse()
         .context("BIND is not a socket address")?;
     let pool = db::runtime_pool(&url).await?;
-    let live = api::Live::start(pool.clone(), api::Limits::default());
+    let defaults = api::Limits::default();
+    let limits = api::Limits {
+        call_room_max: env_count("TINYSERVER_CALL_ROOM_MAX", defaults.call_room_max)?,
+        call_server_max: env_count("TINYSERVER_CALL_SERVER_MAX", defaults.call_server_max)?,
+        ..defaults
+    };
+    let live = api::Live::start(pool.clone(), limits);
     let app = api::app(pool.clone(), live.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -167,6 +173,18 @@ async fn shutdown() {
 }
 
 /// An empty value counts as unset. Compose passes `${NAME:-}` through as empty.
+/// A positive count from the environment, or `default` when unset.
+fn env_count(name: &str, default: usize) -> anyhow::Result<usize> {
+    match env_var(name) {
+        Err(_) => Ok(default),
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|count| *count > 0)
+            .with_context(|| format!("{name} is not a positive whole number")),
+    }
+}
+
 fn env_var(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
         .ok()
