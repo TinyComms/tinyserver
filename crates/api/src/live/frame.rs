@@ -103,6 +103,8 @@ pub(crate) struct Incoming {
     pub sdp: Option<String>,
     pub muted: Option<bool>,
     pub deafened: Option<bool>,
+    /// `call.quality`: `high`, `low`, or `off`.
+    pub video: Option<String>,
 }
 
 impl Incoming {
@@ -122,6 +124,13 @@ pub(crate) struct Me<'a> {
 pub(crate) struct SlotFrame<'a> {
     pub mid: &'a str,
     pub user_id: &'a str,
+}
+
+#[derive(Serialize)]
+pub(crate) struct VideoSlotFrame<'a> {
+    pub mid: &'a str,
+    pub user_id: &'a str,
+    pub kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -150,6 +159,7 @@ pub(crate) enum Out<'a> {
         user_id: &'a str,
         muted: bool,
         deafened: bool,
+        camera: bool,
     },
     /// The SFU's answer to `call.join` or `call.offer`.
     #[serde(rename = "call.answer")]
@@ -159,12 +169,12 @@ pub(crate) enum Out<'a> {
         call_id: &'a str,
         sdp: &'a str,
     },
-    /// Which receive slot carries whom. `video` is always null until video exists.
+    /// Which receive slot carries whom. `video` is null while the video slot carries nobody.
     #[serde(rename = "call.slots")]
     CallSlots {
         call_id: &'a str,
         audio: &'a [SlotFrame<'a>],
-        video: Option<()>,
+        video: Option<VideoSlotFrame<'a>>,
     },
     #[serde(rename = "call.speaking")]
     CallSpeaking {
@@ -198,7 +208,7 @@ impl Out<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Audience, Event, Me, Out, SlotFrame};
+    use super::{Audience, Event, Me, Out, SlotFrame, VideoSlotFrame};
     use crate::live::call::{Occupancy, Participant};
     use db::OutboxRow;
     use serde_json::{json, Value};
@@ -273,6 +283,19 @@ mod tests {
             slots.text(),
             r#"{"type":"call.slots","call_id":"c-1","audio":[{"mid":"1","user_id":"u"}],"video":null}"#
         );
+        let slots = Out::CallSlots {
+            call_id: "c-1",
+            audio: &[],
+            video: Some(VideoSlotFrame {
+                mid: "2",
+                user_id: "u",
+                kind: "camera",
+            }),
+        };
+        assert_eq!(
+            slots.text(),
+            r#"{"type":"call.slots","call_id":"c-1","audio":[],"video":{"mid":"2","user_id":"u","kind":"camera"}}"#
+        );
         let speaking = Out::CallSpeaking {
             room_id: "r",
             user_ids: &["u".to_string()],
@@ -286,10 +309,11 @@ mod tests {
             user_id: "u",
             muted: true,
             deafened: false,
+            camera: true,
         };
         assert_eq!(
             state.text(),
-            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false}"#
+            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false,"camera":true}"#
         );
     }
 
@@ -309,12 +333,13 @@ mod tests {
                     user_id: "u".to_string(),
                     muted: false,
                     deafened: true,
+                    camera: false,
                 }],
             }],
         };
         assert_eq!(
             ready.text(),
-            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true}]}]}"#
+            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true,"camera":false}]}]}"#
         );
         let reference = json!("7");
         let error = Out::Error {

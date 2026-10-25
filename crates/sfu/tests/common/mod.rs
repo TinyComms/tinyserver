@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use sfu::client::{Client, Frame, Running};
-use sfu::{Config, Event, Media, Slot};
+use sfu::client::{Client, Frame, Running, VideoFrame};
+use sfu::{Config, Event, Media, Slot, VideoSlot};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{timeout, Instant};
 
@@ -21,6 +21,9 @@ pub fn config() -> Config {
     config.connect_timeout = Duration::from_secs(2);
     // A silent str0m client still sends a STUN check or RTCP about every 3 s.
     config.consent_timeout = Duration::from_secs(5);
+    // TWCC estimates depend on how busy the machine is. Layers follow the clients' REMB
+    // instead, except in `bwe.rs`.
+    config.bwe_start_kbps = None;
     config
 }
 
@@ -29,6 +32,7 @@ pub struct Sfu {
     pub events: Receiver<Event>,
     /// The latest slot map for each call id, kept while waiting for other events.
     pub slots: HashMap<String, Vec<Slot>>,
+    pub video: HashMap<String, Option<VideoSlot>>,
 }
 
 impl Drop for Sfu {
@@ -43,6 +47,7 @@ pub fn start(config: Config) -> Sfu {
         media,
         events,
         slots: HashMap::new(),
+        video: HashMap::new(),
     }
 }
 
@@ -58,8 +63,14 @@ impl Sfu {
             .await
             .expect("an event in time")
             .expect("SFU running");
-            if let Event::Slots { call_id, audio } = &event {
+            if let Event::Slots {
+                call_id,
+                audio,
+                video,
+            } = &event
+            {
                 self.slots.insert(call_id.clone(), audio.clone());
+                self.video.insert(call_id.clone(), video.clone());
             }
             if let Some(found) = pick(&event) {
                 return found;
@@ -73,12 +84,46 @@ impl Sfu {
             return audio.clone();
         }
         self.wait_for(|event| match event {
-            Event::Slots { call_id: id, audio } if id == call_id && audio.len() == want => {
-                Some(audio.clone())
-            }
+            Event::Slots {
+                call_id: id, audio, ..
+            } if id == call_id && audio.len() == want => Some(audio.clone()),
             _ => None,
         })
         .await
+    }
+
+    /// Waits until `call_id`'s video slot carries `user_id`, or nobody for `None`.
+    pub async fn video_for(&mut self, call_id: &str, user_id: Option<&str>) -> Option<VideoSlot> {
+        let held =
+            |video: &Option<VideoSlot>| video.as_ref().map(|slot| slot.user_id.as_str()) == user_id;
+        if let Some(video) = self.video.get(call_id).filter(|video| held(video)) {
+            return video.clone();
+        }
+        if user_id.is_none() && !self.video.contains_key(call_id) {
+            return None;
+        }
+        self.wait_for(|event| match event {
+            Event::Slots {
+                call_id: id, video, ..
+            } if id == call_id && held(video) => Some(video.clone()),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Turns `person`'s camera on or off with a renegotiation, as `call.offer` does.
+    pub async fn camera(&mut self, person: &Person, on: bool) {
+        let offer = person.running.camera(on).expect("a camera offer");
+        let answer = self
+            .media
+            .offer(&person.call_id, &offer)
+            .await
+            .expect("an answer to the camera offer");
+        assert_eq!(answer.camera, on);
+        person
+            .running
+            .accept(&answer.sdp)
+            .expect("accept the answer");
     }
 }
 
@@ -141,6 +186,28 @@ pub async fn hears(person: &Person, mid: &str, marker: u8) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("no frame from {marker} on mid {mid} within 2 s");
+}
+
+/// Waits until `person` has received a camera frame from `marker`, and returns the frames
+/// from the first one of `marker`'s on.
+pub async fn sees(person: &Person, marker: u8) -> Vec<VideoFrame> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        seen.extend(person.running.take_video());
+        if let Some(first) = seen.iter().position(|frame| frame.marker == marker) {
+            return seen.split_off(first);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no camera frame from {marker} within 3 s; saw {seen:?}");
+}
+
+/// Camera frames `person` receives over `period`.
+pub async fn seen_over(person: &Person, period: Duration) -> Vec<VideoFrame> {
+    person.running.take_video();
+    tokio::time::sleep(period).await;
+    person.running.take_video()
 }
 
 /// Frames `person` receives over `period`.

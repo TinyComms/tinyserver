@@ -3,7 +3,8 @@
 //!
 //! Every `Rtc` is driven the way str0m requires: one input, then `poll_output` until it
 //! returns a timeout. Audio frames are copied from each publisher to everyone else in the
-//! room, on the receive slot that listener keeps for them.
+//! room, on the receive slot that listener keeps for them. Camera frames go to each
+//! listener's one video slot: one layer of one publisher's camera, switched on a keyframe.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -18,9 +19,11 @@ use std::time::{Duration, Instant};
 use mio::event::Event as Ready;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpOffer;
 use str0m::config::{CryptoProvider, DtlsCert};
-use str0m::media::{Direction, MediaData, MediaKind, Mid};
+use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaData, MediaKind, MediaTime};
+use str0m::media::{Mid, Rid};
 use str0m::net::{DatagramRecv, Protocol, Receive, TcpType};
 use str0m::{Candidate, Event as RtcEvent, Input, Output, Rtc, RtcConfig};
 use tokio::sync::mpsc as async_mpsc;
@@ -28,7 +31,8 @@ use tokio::sync::mpsc as async_mpsc;
 use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
 use crate::tcp::{Conn, Readout};
-use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot};
+use crate::video::{self, Floor, Layer, Quality, Rebase};
+use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot, VideoKind, VideoSlot};
 
 const SOCKET: Token = Token(0);
 const WAKE: Token = Token(1);
@@ -48,8 +52,56 @@ const SOURCES: usize = 4096;
 /// A source silent this long loses its budget entry.
 const SOURCE_IDLE: Duration = Duration::from_secs(10);
 const LOAD_EVERY: Duration = Duration::from_secs(5);
+/// Video slots are planned again at least this often.
+const PLAN_EVERY: Duration = Duration::from_millis(50);
 
 type PeerId = u64;
+/// One layer of one publisher's camera.
+type Source = (PeerId, Layer);
+
+/// One simulcast layer of a publisher's camera, as it arrives.
+struct Inbound {
+    /// A frame has arrived since the camera started, with this rid.
+    arrived: bool,
+    rid: Option<Rid>,
+    budget: Bucket,
+    /// The last frame within budget. A layer dropped over budget goes stale.
+    seen: Option<Instant>,
+    /// A frame was dropped over budget. Nothing more is forwarded until a keyframe fits.
+    broken: bool,
+    asked: Option<Instant>,
+}
+
+impl Inbound {
+    fn new(kbps: u32, now: Instant) -> Self {
+        let rate = kbps.saturating_mul(1000) / 8;
+        Self {
+            arrived: false,
+            rid: None,
+            budget: Bucket::new(rate, rate, now),
+            seen: None,
+            broken: false,
+            asked: None,
+        }
+    }
+
+    fn fresh(&self, now: Instant) -> bool {
+        self.seen
+            .is_some_and(|at| now.saturating_duration_since(at) < video::STALE)
+    }
+}
+
+/// A listener's one video receive m-line.
+struct Screen {
+    mid: Mid,
+    /// What it carries now.
+    showing: Option<Source>,
+    /// What it should carry. It switches on that source's next keyframe.
+    wanted: Option<Source>,
+    rebase: Rebase<Source>,
+    /// The bitrate the estimator was last told to probe for, in kb/s.
+    probing: Option<u64>,
+}
 
 struct Peer {
     call_id: String,
@@ -70,15 +122,51 @@ struct Peer {
     deafened: bool,
     speech: Speech,
     audio: Bucket,
+    /// The client's camera m-line: the first video m-line it may send on.
+    camera: Option<Mid>,
+    /// The camera m-line is sending, as the last offer said.
+    camera_on: bool,
+    /// The camera's layers, `h` then `l`.
+    layers: [Inbound; 2],
+    screen: Option<Screen>,
+    quality: Quality,
+    /// The latest bandwidth estimates for what the SFU sends this listener, in kb/s: str0m's
+    /// TWCC estimator, and the last REMB the client sent.
+    twcc: Option<u64>,
+    remb: Option<u64>,
+    told_video: Option<VideoSlot>,
     timeout: Instant,
     lost: Option<Lost>,
 }
 
-#[derive(Default)]
+impl Peer {
+    fn camera_live(&self) -> bool {
+        self.connected && self.camera_on
+    }
+
+    fn estimate(&self) -> Option<u64> {
+        match (self.twcc, self.remb) {
+            (Some(twcc), Some(remb)) => Some(twcc.min(remb)),
+            (twcc, remb) => twcc.or(remb),
+        }
+    }
+}
+
 struct Room {
     /// In join order.
     members: Vec<PeerId>,
     announced: Announced,
+    floor: Floor<PeerId>,
+}
+
+impl Default for Room {
+    fn default() -> Self {
+        Self {
+            members: Vec::new(),
+            announced: Announced::default(),
+            floor: Floor::new(),
+        }
+    }
 }
 
 /// One accepted TCP stream.
@@ -163,6 +251,8 @@ struct Sink<'a> {
     events: &'a async_mpsc::Sender<Event>,
     egress: &'a mut u64,
     forward: &'a mut VecDeque<(PeerId, MediaData)>,
+    /// Listeners who asked for a keyframe on their video slot.
+    asks: &'a mut Vec<PeerId>,
 }
 
 pub(crate) struct Engine {
@@ -184,6 +274,10 @@ pub(crate) struct Engine {
     sources: HashMap<SocketAddr, Bucket>,
     rooms: HashMap<String, Room>,
     forward: VecDeque<(PeerId, MediaData)>,
+    asks: Vec<PeerId>,
+    /// Something changed that moves video slots; plan them at the next tick.
+    replan: bool,
+    planned_at: Instant,
     next_id: u64,
     ids: RandomState,
     egress: u64,
@@ -246,6 +340,9 @@ impl Engine {
             sources: HashMap::new(),
             rooms: HashMap::new(),
             forward: VecDeque::new(),
+            asks: Vec::new(),
+            replan: false,
+            planned_at: now,
             next_id: 0,
             ids: RandomState::new(),
             egress: 0,
@@ -454,6 +551,13 @@ impl Engine {
                             peer.speech.hush();
                         }
                     }
+                    self.replan = true;
+                }
+                Command::Quality { call_id, video } => {
+                    if let Some(peer) = self.peer_mut(&call_id) {
+                        peer.quality = video;
+                    }
+                    self.replan = true;
                 }
                 Command::Leave { call_id } => {
                     if let Some(id) = self.by_call.get(&call_id).copied() {
@@ -479,7 +583,7 @@ impl Engine {
         for id in replaced {
             self.remove(id, None);
         }
-        let mut rtc = rtc_config(&self.crypto, &self.cert).build(now);
+        let mut rtc = rtc_config(&self.crypto, &self.cert, self.config.bwe_start_kbps).build(now);
         for candidate in candidates(self.public, self.lan) {
             match candidate {
                 Ok(candidate) => {
@@ -520,6 +624,17 @@ impl Engine {
             deafened: false,
             speech: Speech::new(),
             audio: Bucket::new(rate, rate, now),
+            camera: None,
+            camera_on: false,
+            layers: [
+                Inbound::new(self.config.camera_high_kbps, now),
+                Inbound::new(self.config.camera_low_kbps, now),
+            ],
+            screen: None,
+            quality: Quality::High,
+            twcc: None,
+            remb: None,
+            told_video: None,
             timeout: now,
             lost: None,
         };
@@ -527,12 +642,14 @@ impl Engine {
         self.by_call.insert(call_id.clone(), id);
         self.rooms.entry(room_id).or_default().members.push(id);
         self.drain(id);
+        let camera = self.camera_changed(id);
         self.seat(id);
         self.settle();
-        tracing::info!(%call_id, "media joined");
+        tracing::info!(%call_id, camera, "media joined");
         let _ = reply.send(Ok(Answer {
             call_id,
             sdp: answer.to_sdp_string(),
+            camera,
         }));
     }
 
@@ -558,11 +675,35 @@ impl Engine {
             }
         };
         self.drain(id);
+        let camera = self.camera_changed(id);
         self.settle();
         let _ = reply.send(Ok(Answer {
             call_id: call_id.to_string(),
             sdp: answer.to_sdp_string(),
+            camera,
         }));
+    }
+
+    /// Reads whether `id`'s camera m-line sends, after an offer. A camera that stops forgets
+    /// its layers, so a restart waits for fresh frames.
+    fn camera_changed(&mut self, id: PeerId) -> bool {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return false;
+        };
+        let on = peer
+            .camera
+            .and_then(|mid| peer.rtc.media(mid))
+            .is_some_and(|media| media.direction().is_receiving());
+        if on != peer.camera_on {
+            peer.camera_on = on;
+            for layer in &mut peer.layers {
+                layer.arrived = false;
+                layer.seen = None;
+                layer.broken = false;
+            }
+            self.replan = true;
+        }
+        on
     }
 
     /// Gives `id` a slot with every other member of its room, and them one with it.
@@ -604,6 +745,8 @@ impl Engine {
             self.close_stream(token);
         }
         self.forward.retain(|(origin, _)| *origin != id);
+        self.asks.retain(|asker| *asker != id);
+        self.replan = true;
         if let Some(lost) = lost {
             tracing::info!(call_id = %peer.call_id, ?lost, "media lost");
             tell(
@@ -617,6 +760,7 @@ impl Engine {
         let members = match self.rooms.get_mut(&peer.room_id) {
             Some(room) => {
                 room.members.retain(|member| *member != id);
+                room.floor.forget(&id);
                 room.members.clone()
             }
             None => Vec::new(),
@@ -673,14 +817,30 @@ impl Engine {
                 })
             })
             .collect();
-        if audio == peer.told {
+        let video = peer.screen.as_ref().and_then(|screen| {
+            let (publisher, _) = screen.showing?;
+            self.peers.get(&publisher).map(|publisher| VideoSlot {
+                mid: screen.mid.to_string(),
+                user_id: publisher.user_id.clone(),
+                kind: VideoKind::Camera,
+            })
+        });
+        if audio == peer.told && video == peer.told_video {
             return;
         }
         let call_id = peer.call_id.clone();
         if let Some(peer) = self.peers.get_mut(&id) {
             peer.told.clone_from(&audio);
+            peer.told_video.clone_from(&video);
         }
-        tell(&self.events, Event::Slots { call_id, audio });
+        tell(
+            &self.events,
+            Event::Slots {
+                call_id,
+                audio,
+                video,
+            },
+        );
     }
 
     fn peer_mut(&mut self, call_id: &str) -> Option<&mut Peer> {
@@ -840,6 +1000,9 @@ impl Engine {
         }
 
         self.speaking(now);
+        if self.replan || now.saturating_duration_since(self.planned_at) >= PLAN_EVERY {
+            self.plan(now);
+        }
         self.expire_streams(now);
         if now.saturating_duration_since(self.swept_at) >= Duration::from_secs(1) {
             self.swept_at = now;
@@ -883,6 +1046,16 @@ impl Engine {
 
     fn speaking(&mut self, now: Instant) {
         for (room_id, room) in &mut self.rooms {
+            let loud: Vec<(PeerId, f32)> = room
+                .members
+                .iter()
+                .filter_map(|id| self.peers.get(id).map(|peer| (*id, peer)))
+                .filter(|(_, peer)| !peer.muted && peer.speech.speaking(now))
+                .map(|(id, peer)| (id, peer.speech.level()))
+                .collect();
+            if room.floor.hear(&loud, now) {
+                self.replan = true;
+            }
             let user_ids: Vec<String> = room
                 .members
                 .iter()
@@ -913,16 +1086,22 @@ impl Engine {
             events: &self.events,
             egress: &mut self.egress,
             forward: &mut self.forward,
+            asks: &mut self.asks,
         };
         drain(id, peer, &mut sink);
     }
 
-    /// Copies each queued audio frame to every listener in its room.
+    /// Copies each queued audio frame to every listener in its room, and each camera frame
+    /// to the listeners whose video slot carries it. Then passes on keyframe requests.
     fn forward_all(&mut self, now: Instant) {
         while let Some((origin, data)) = self.forward.pop_front() {
             let Some(publisher) = self.peers.get_mut(&origin) else {
                 continue;
             };
+            if publisher.camera == Some(data.mid) {
+                self.forward_video(origin, &data, now);
+                continue;
+            }
             if publisher.muted {
                 continue;
             }
@@ -963,9 +1142,224 @@ impl Engine {
                     events: &self.events,
                     egress: &mut self.egress,
                     forward: &mut self.forward,
+                    asks: &mut self.asks,
                 };
                 drain(listener, peer, &mut sink);
             }
+        }
+        for asker in std::mem::take(&mut self.asks) {
+            let showing = self
+                .peers
+                .get(&asker)
+                .and_then(|peer| peer.screen.as_ref())
+                .and_then(|screen| screen.showing);
+            if let Some((publisher, layer)) = showing {
+                self.ask_keyframe(publisher, layer, now);
+            }
+        }
+    }
+
+    /// One camera frame. Over its layer's budget it is dropped, and the layer stays dropped
+    /// until a keyframe fits. Each listener showing this layer gets it; a listener waiting
+    /// for this layer switches to it on a keyframe.
+    fn forward_video(&mut self, origin: PeerId, data: &MediaData, now: Instant) {
+        let layer = Layer::of_rid(data.rid.as_deref());
+        let keyframe = data.is_keyframe();
+        let size = u32::try_from(data.data.len()).unwrap_or(u32::MAX);
+        let Some(publisher) = self.peers.get_mut(&origin) else {
+            return;
+        };
+        let inbound = &mut publisher.layers[layer.index()];
+        inbound.arrived = true;
+        inbound.rid = data.rid;
+        let fits = inbound.budget.take(size, now);
+        if !fits {
+            inbound.broken = true;
+        }
+        let pass = fits && (keyframe || !inbound.broken);
+        if pass {
+            inbound.broken = false;
+            inbound.seen = Some(now);
+        }
+        let room_id = publisher.room_id.clone();
+        if !pass || !data.contiguous {
+            self.ask_keyframe(origin, layer, now);
+        }
+        if !pass {
+            return;
+        }
+        let source = (origin, layer);
+        let time = data.time.rebase(Frequency::NINETY_KHZ).numer();
+        for listener in self.members(&room_id) {
+            if listener == origin {
+                continue;
+            }
+            let Some(peer) = self.peers.get_mut(&listener) else {
+                continue;
+            };
+            if peer.deafened || !peer.connected {
+                continue;
+            }
+            let Some(screen) = peer.screen.as_mut() else {
+                continue;
+            };
+            let switched = screen.showing != Some(source);
+            if switched && !(keyframe && screen.wanted == Some(source)) {
+                continue;
+            }
+            screen.showing = Some(source);
+            let mid = screen.mid;
+            let out = screen.rebase.map(source, time, now);
+            let Some(writer) = peer.rtc.writer(mid) else {
+                continue;
+            };
+            let Some(pt) = writer.match_params(data.params) else {
+                continue;
+            };
+            let at = MediaTime::new(out, Frequency::NINETY_KHZ);
+            if let Err(error) = writer.write(pt, data.network_time, at, data.data.clone()) {
+                tracing::info!(call_id = %peer.call_id, ?error, "media write failed");
+                peer.rtc.disconnect();
+            }
+            let mut sink = Sink {
+                socket: &self.socket,
+                tcp: &mut self.tcp,
+                events: &self.events,
+                egress: &mut self.egress,
+                forward: &mut self.forward,
+                asks: &mut self.asks,
+            };
+            drain(listener, peer, &mut sink);
+            if switched {
+                self.tell_slots(listener);
+            }
+        }
+    }
+
+    /// Asks a publisher for a keyframe on one layer, at most every `KEYFRAME_EVERY`. A layer
+    /// that has not sent a frame has no rid to ask on yet.
+    fn ask_keyframe(&mut self, publisher: PeerId, layer: Layer, now: Instant) {
+        let Some(peer) = self.peers.get_mut(&publisher) else {
+            return;
+        };
+        let Some(mid) = peer.camera else {
+            return;
+        };
+        let inbound = &mut peer.layers[layer.index()];
+        if !inbound.arrived
+            || inbound
+                .asked
+                .is_some_and(|at| now.saturating_duration_since(at) < video::KEYFRAME_EVERY)
+        {
+            return;
+        }
+        inbound.asked = Some(now);
+        let rid = inbound.rid;
+        if let Some(mut writer) = peer.rtc.writer(mid) {
+            if let Err(error) = writer.request_keyframe(rid, KeyframeRequestKind::Pli) {
+                tracing::debug!(call_id = %peer.call_id, ?error, "keyframe request failed");
+            }
+        }
+        self.drain(publisher);
+    }
+
+    /// Chooses what every listener's video slot should carry: the newest holder of the floor
+    /// with a live camera other than the listener, else the first such camera in join order;
+    /// and its layer from the listener's estimate, their `call.quality`, and the server's
+    /// upload budget. A listener keeps what it shows until the wanted source's keyframe. A
+    /// deafened listener gets nothing.
+    fn plan(&mut self, now: Instant) {
+        self.replan = false;
+        self.planned_at = now;
+        let (mut audio_streams, mut viewers) = (0u64, 0u64);
+        for room in self.rooms.values() {
+            let cameras: Vec<PeerId> = room
+                .members
+                .iter()
+                .copied()
+                .filter(|id| self.peers.get(id).is_some_and(Peer::camera_live))
+                .collect();
+            for id in &room.members {
+                let Some(peer) = self.peers.get(id) else {
+                    continue;
+                };
+                if !peer.connected || peer.deafened {
+                    continue;
+                }
+                audio_streams += peer.slots.held().count() as u64;
+                if peer.screen.is_some()
+                    && peer.quality != Quality::Off
+                    && cameras.iter().any(|camera| camera != id)
+                {
+                    viewers += 1;
+                }
+            }
+        }
+        let ceiling = video::ceiling(self.config.egress_kbps, audio_streams, viewers);
+        let ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        for id in ids {
+            self.plan_screen(id, ceiling, now);
+        }
+    }
+
+    fn plan_screen(&mut self, id: PeerId, ceiling: Quality, now: Instant) {
+        let Some(peer) = self.peers.get(&id) else {
+            return;
+        };
+        let Some(screen) = &peer.screen else {
+            return;
+        };
+        let live =
+            |other: &PeerId| *other != id && self.peers.get(other).is_some_and(Peer::camera_live);
+        // A deafened listener's slot empties, so it starts again on a keyframe.
+        let watching = peer.connected && !peer.deafened;
+        let room = self.rooms.get(&peer.room_id).filter(|_| watching);
+        let publisher = room.and_then(|room| {
+            room.floor
+                .recent()
+                .iter()
+                .chain(&room.members)
+                .find(|other| live(other))
+                .copied()
+        });
+        let most = peer.quality.min(ceiling);
+        let current = screen.wanted.map(|(_, layer)| layer);
+        let wanted = publisher.and_then(|publisher| {
+            let layer = video::pick_layer(current, peer.estimate(), peer.quality, ceiling)?;
+            let layers = &self.peers.get(&publisher)?.layers;
+            let fresh = |layer: Layer| layers[layer.index()].fresh(now);
+            let other = layer.other();
+            let fallback =
+                !fresh(layer) && fresh(other) && (other == Layer::Low || most == Quality::High);
+            Some((publisher, if fallback { other } else { layer }))
+        });
+        let showing = screen
+            .showing
+            .filter(|(publisher, _)| wanted.is_some() && live(publisher));
+        let probe = if wanted.is_some() && most == Quality::High {
+            video::PROBE_KBPS
+        } else {
+            video::LOW_KBPS
+        };
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
+        };
+        let Some(screen) = peer.screen.as_mut() else {
+            return;
+        };
+        let changed = screen.showing != showing;
+        screen.wanted = wanted;
+        screen.showing = showing;
+        if screen.probing != Some(probe) {
+            screen.probing = Some(probe);
+            peer.rtc.bwe().set_desired_bitrate(Bitrate::kbps(probe));
+            self.drain(id);
+        }
+        if changed {
+            self.tell_slots(id);
+        }
+        if let Some((publisher, layer)) = wanted.filter(|wanted| Some(*wanted) != showing) {
+            self.ask_keyframe(publisher, layer, now);
         }
     }
 }
@@ -1026,8 +1420,42 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                         _ => {}
                     }
                 }
-                RtcEvent::MediaData(data) if Some(data.mid) == peer.publish => {
+                RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
+                    match added.direction {
+                        Direction::SendOnly if peer.screen.is_none() => {
+                            peer.screen = Some(Screen {
+                                mid: added.mid,
+                                showing: None,
+                                wanted: None,
+                                rebase: Rebase::default(),
+                                probing: None,
+                            });
+                        }
+                        Direction::RecvOnly | Direction::SendRecv | Direction::Inactive
+                            if peer.camera.is_none() =>
+                        {
+                            peer.camera = Some(added.mid);
+                        }
+                        _ => {}
+                    }
+                }
+                RtcEvent::MediaData(data)
+                    if Some(data.mid) == peer.publish || Some(data.mid) == peer.camera =>
+                {
                     sink.forward.push_back((id, data));
+                }
+                RtcEvent::KeyframeRequest(request)
+                    if peer.screen.as_ref().map(|screen| screen.mid) == Some(request.mid) =>
+                {
+                    sink.asks.push(id);
+                }
+                RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
+                    peer.twcc = Some(kbps(estimate));
+                }
+                RtcEvent::EgressBitrateEstimate(BweKind::Remb { estimate, mid })
+                    if peer.screen.as_ref().map(|screen| screen.mid) == Some(mid) =>
+                {
+                    peer.remb = Some(kbps(estimate));
                 }
                 RtcEvent::Closed => {
                     peer.lost.get_or_insert(Lost::Gone);
@@ -1061,14 +1489,34 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
     }
 }
 
-/// ICE-lite, the process's DTLS certificate, and Opus only.
-pub(crate) fn rtc_config(crypto: &Arc<CryptoProvider>, cert: &DtlsCert) -> RtcConfig {
-    RtcConfig::new()
+/// ICE-lite, the process's DTLS certificate, Opus, and H.264 constrained baseline in
+/// packetization mode 1 with RTX. TWCC bandwidth estimation starts at `bwe_kbps`, for
+/// choosing layers; `None` leaves it off.
+pub(crate) fn rtc_config(
+    crypto: &Arc<CryptoProvider>,
+    cert: &DtlsCert,
+    bwe_kbps: Option<u32>,
+) -> RtcConfig {
+    let mut config = RtcConfig::new()
         .set_ice_lite(true)
         .set_crypto_provider(crypto.clone())
         .set_dtls_cert(cert.clone())
         .clear_codecs()
         .enable_opus(true, false)
+        .enable_bwe(bwe_kbps.map(|kbps| Bitrate::kbps(u64::from(kbps))));
+    config
+        .codec_config()
+        .add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
+    config
+}
+
+/// H.264 constrained baseline, level 3.1: enough for 1280×720 at 30 fps.
+pub(crate) const H264_PROFILE: u32 = 0x42e01f;
+const H264_PT: u8 = 108;
+const H264_RTX_PT: u8 = 109;
+
+fn kbps(bitrate: Bitrate) -> u64 {
+    bitrate.as_u64() / 1000
 }
 
 /// A UDP host candidate and a passive TCP one on the public address, and the same pair on

@@ -339,6 +339,7 @@ async fn receive(
         "call.kick" => call_kick(hub, me, room_id, incoming.user_id.as_deref()).await?,
         "call.offer" => call_offer(hub, me, asking, sdp).await,
         "call.state" => call_state(hub, me, incoming.muted, incoming.deafened),
+        "call.quality" => call_quality(hub, me, incoming.video.as_deref()),
         _ => Err("unknown_type"),
     };
     let reference = incoming.reference.as_ref();
@@ -423,7 +424,8 @@ async fn call_join(
         }
     };
     let call_id = answer.as_ref().map(|answer| answer.call_id.as_str());
-    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn, call_id) {
+    let camera = answer.as_ref().is_some_and(|answer| answer.camera);
+    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn, call_id, camera) {
         if let Some(call_id) = call_id {
             hub.forget(call_id);
         }
@@ -445,7 +447,8 @@ fn media_code(refused: sfu::Refused) -> &'static str {
     }
 }
 
-/// Renegotiates the caller's media. The SFU answers; nothing else changes.
+/// Renegotiates the caller's media. The SFU answers, and a camera that started or stopped
+/// is shown to everyone as `call.state`.
 async fn call_offer(hub: &Hub, me: &Me, asking: &mut Asking<'_>, sdp: Option<&str>) -> Answer {
     let Some(sdp) = sdp else {
         return Err("bad_frame");
@@ -459,11 +462,25 @@ async fn call_offer(hub: &Hub, me: &Me, asking: &mut Asking<'_>, sdp: Option<&st
     let Some(call_id) = hub.call_of(&me.user_id) else {
         return Err("not_found");
     };
-    media
-        .offer(&call_id, sdp)
-        .await
-        .map(Done::Answer)
-        .map_err(media_code)
+    let answer = media.offer(&call_id, sdp).await.map_err(media_code)?;
+    hub.call_camera(&me.user_id, &call_id, answer.camera);
+    Ok(Done::Answer(answer))
+}
+
+/// What the caller's one video slot may carry. Not being in a call with media is
+/// `not_found`.
+fn call_quality(hub: &Hub, me: &Me, video: Option<&str>) -> Answer {
+    let video = match video {
+        Some("high") => sfu::Quality::High,
+        Some("low") => sfu::Quality::Low,
+        Some("off") => sfu::Quality::Off,
+        _ => return Err("bad_frame"),
+    };
+    let (Some(media), Some(call_id)) = (&hub.media, hub.call_of(&me.user_id)) else {
+        return Err("not_found");
+    };
+    media.quality(&call_id, video);
+    Ok(Done::Ok)
 }
 
 /// Mute and deafen, shown to everyone. Not being in a call is `not_found`.
