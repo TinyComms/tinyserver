@@ -1,6 +1,6 @@
 # Calls
 
-Design for voice and video in tinyserver. Slices 1 to 3, the live socket, call occupancy, and audio through the SFU over UDP, are built; the rest is not. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
+Design for voice and video in tinyserver. Slices 1 to 4, the live socket, call occupancy, audio through the SFU over UDP, and ICE-TCP with hardening, are built; the rest is not. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
 
 ## Recommendation
 
@@ -15,7 +15,7 @@ A room is a voice channel. People drop in and out; nobody rings anyone. Signalin
 | Audio | Opus, mono, 32 kb/s, in-band FEC, DTX |
 | Video | H.264 constrained baseline. Camera simulcast in two layers. One share per room |
 | What each listener receives | Every speaker's audio, and one video: the share if there is one, otherwise the active speaker |
-| Network | Publish one UDP port, and from slice 4 the same TCP port. HTTP stays behind the tunnel |
+| Network | Publish one UDP port and the same TCP port. HTTP stays behind the tunnel |
 | No-port mode | Cloudflare Realtime TURN, minted by tinyserver, in a later slice |
 | Persistence | None for media or call state. A restart ends every call; clients rejoin |
 
@@ -132,7 +132,7 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `call.join` | `ref`, `room_id`, `sdp` | Join the room's call. Leaves any other call first. `sdp` is the offer. While media runs it is required; without media, a join with it gets `media_unavailable` and a join without it takes a seat with no audio, as in slice 2. |
 | `call.leave` | `ref` | Hang up. Not being in a call is not an error. Closing the socket that joined does the same after a 10 s grace. |
 | `call.kick` | `ref`, `room_id`, `user_id` | Owners and admins only. Removes someone from that room's call. |
-| `call.offer` | `ref`, `sdp` | Renegotiate the caller's media session, for example to start a camera or a share. The reply is `call.answer`. Counts against the join and leave rate. |
+| `call.offer` | `ref`, `sdp` | Renegotiate the caller's media session, for example to start a camera or a share. The reply is `call.answer`. Counts against the join and leave rate, so a client sending them fast gets `slow_down`. |
 | `call.state` | `ref`, `muted`, `deafened` | Both booleans are required. Shown to everyone as `call.state`, and in `ready`. The SFU stops forwarding a muted publisher, and sends a deafened listener nothing. |
 | `call.quality` | `video` (`high`, `low`, `off`) | From slice 5. What the listener's one video surface can use |
 
@@ -150,7 +150,7 @@ Error codes:
 | `unavailable` | The database did not answer, or the server is shutting down. Try again. |
 | `unknown_type` | A `type` this server does not take, such as `call.quality` before slice 5 |
 | `bad_frame` | Not a JSON object with a `type`, or a request without a field it needs. A `call.join` without `sdp` while media runs. |
-| `bad_sdp` | The SFU could not parse or accept the offer |
+| `bad_sdp` | The SFU could not parse or accept the offer, or the offer is over the caps: 32 KiB, more audio m-lines than the room cap, more than 3 video m-lines, or any other kind of m-line |
 | `media_unavailable` | A `call.join` or `call.offer` with an offer on a server without media, or with the SFU stopped |
 | `share_taken` | From slice 6 |
 
@@ -211,17 +211,17 @@ The client is always the offerer. The server never sends an offer, so there is n
 | `N - 1` `recvonly` audio m-lines, where `N` is the room cap | One per possible other speaker. Mapped by `call.slots`. With the default cap, 11. The SFU uses as many as are offered; others in a bigger room are not heard until a slot frees. |
 | One `recvonly` video m-line | From slice 5. The single video surface |
 
-The SFU enables Opus and nothing else in slice 3.
+The SFU enables Opus and nothing else in slice 3. Before str0m parses an offer, the SFU's handle checks it against the caps under `bad_sdp`: the room cap bounds the audio m-lines (one microphone and `N - 1` slots), 3 video m-lines leave room for slices 5 and 6, and other kinds, such as a data channel, are refused. An 11-slot offer from the headless client is about 12 KB.
 
 Starting or stopping a camera or share is a `call.offer` that flips that m-line's direction. Nobody joining or leaving changes SDP; only `call.slots` changes.
 
-The answer carries the SFU's ICE-lite credentials, its DTLS fingerprint, and its candidates: one UDP host candidate on the public address, and from slice 4 one TCP passive candidate on the same address. The client does not trickle. The SFU learns the client's NAT address from its first STUN check (a peer-reflexive candidate). ICE credentials are random per join and only travel over the authenticated socket.
+The answer carries the SFU's ICE-lite credentials, its DTLS fingerprint, and its candidates: one UDP host candidate and one TCP passive candidate (`tcptype passive`) on the public address, and the same pair on `TINYSERVER_LAN_IP` when it is set. The client does not trickle. The SFU learns the client's NAT address from its first STUN check (a peer-reflexive candidate). ICE credentials are random per join and only travel over the authenticated socket.
 
 ## SFU
 
 ### Shape
 
-`crates/sfu` owns one OS thread. It holds the UDP socket, from slice 4 the ICE-TCP listener, and one `str0m::Rtc` per participant. It never touches Postgres or the session table. The API crate never sees an RTP packet, and no str0m type crosses the crate boundary.
+`crates/sfu` owns one OS thread. It holds the UDP socket, the ICE-TCP listener and its streams, and one `str0m::Rtc` per participant. It never touches Postgres or the session table. The API crate never sees an RTP packet, and no str0m type crosses the crate boundary.
 
 ```
  tokio runtime (api crate)                       sfu thread (std, mio)
@@ -234,11 +234,11 @@ The answer carries the SFU's ICE-lite credentials, its DTLS fingerprint, and its
 
 | Piece | Choice |
 | --- | --- |
-| Loop | `mio::Poll` over the UDP socket and a `mio::Waker`; from slice 4 also the TCP listener and accepted TCP streams. Timeout is the earliest `Output::Timeout` across all `Rtc`s, capped at 50 ms. Each `Rtc` is drained until it returns a timeout, as str0m requires, after every input and every frame written to it. |
-| Packet routing | A per-source packet budget first. Then look up the source address in a map. Unknown address: only STUN is accepted, routed by ICE username, everything else dropped. `Rtc::accepts` decides. Every datagram is handed to str0m with the advertised address as its destination, because the socket binds every interface. |
+| Loop | `mio::Poll` over the UDP socket, the TCP listener, accepted TCP streams, and a `mio::Waker`. Timeout is the earliest `Output::Timeout` across all `Rtc`s, capped at 50 ms. Each `Rtc` is drained until it returns a timeout, as str0m requires, after every input and every frame written to it. |
+| Packet routing | A per-source packet budget first. Then look up the protocol and source address in a map. Unknown address: only STUN (a first byte of 0 to 3, RFC 7983) gets past, routed by ICE username, and everything else is dropped before str0m sees it. `Rtc::accepts` decides. Every datagram and TCP frame is handed to str0m with the public address as its destination, because the socket binds every interface and, in Docker, never sees the address the client used. Traffic to the LAN candidate is answered the same way. |
 | Slots | Each listener's `recvonly` m-lines are its slots. A joiner takes the first free slot in every other listener's map and fills its own with everyone already there, in join order. A leaver's slot frees and goes to anyone in the room without one. Every change sends that listener's whole map. |
 | Forwarding | Each audio frame from a publisher is written to every other connected, undeafened listener in the room, on that listener's slot for the publisher, with the publisher's RTP time and the receive time as wallclock. str0m packetizes it again, so each slot has its own SSRC and sequence numbers. |
-| ICE-TCP | RFC 4571 framing (2-byte length). A TCP stream with no valid STUN in 5 s is closed. At most 64 unauthenticated streams. |
+| ICE-TCP | Passive only (RFC 6544), on the same port number as UDP. str0m 0.24.1 takes TCP candidates with `tcptype` and pairs by protocol, and emits each `Transmit` with its protocol; it does no socket work and no framing, so the SFU owns both: RFC 4571 framing (a 2-byte length), frames of 1 to 2,000 bytes, and anything else closes the stream. A stream's first frame must be STUN, or it is closed; until a participant's `Rtc` accepts one, the stream is unverified. A stream is verified to the participant whose STUN it carried first, and closes when they leave. Each `Transmit` over TCP goes to the stream from that address, framed; a stream with 256 KiB waiting drops the packet, as UDP would. One stream reads at most 64 KiB a turn of the loop. |
 | Media API | str0m frame mode, as in its `chat` example. Switching which speaker feeds the one video slot is a frame-level choice, and str0m rewrites sequence numbers and timestamps. RTP mode is a later optimisation. |
 | Simulcast | Per listener, pick `h` or `l` from str0m's bandwidth estimate and the listener's `call.quality`. Switch only on a keyframe; ask the publisher for one with PLI. |
 | Active speaker | From the RFC 6464 audio level on each publisher's audio: an average weighted 0.4 to the newest packet, speaking above -50 dBov, held 1.5 s after the last loud packet. No decoding. In slice 3 it only feeds `call.speaking`. |
@@ -304,7 +304,11 @@ Removal, room deletion, and a deleted session all reach the API as outbox events
 | People in calls on the server | 32. The 33rd gets `server_full`. Moving between rooms does not count twice. | `TINYSERVER_CALL_SERVER_MAX` |
 | Joins and leaves per socket | 5 at once, then one every 3 s. Over it gets `slow_down`. | |
 | Audio from each publisher | Opus mono 32 kb/s. Up to 64 kb/s of payload is forwarded, from a bucket of one second; frames over it are dropped. | `sfu::Config::audio_kbps` |
-| Packets from one source address | 500 a second, burst 1,000, before str0m sees them. At most 4,096 sources tracked; a new one past that is dropped. | `sfu::Config::packets_per_second` |
+| Packets from one source address | 500 a second, burst 1,000, before str0m sees them, UDP datagrams and TCP frames alike. At most 4,096 sources tracked; a new one past that is dropped. | `sfu::Config::packets_per_second` |
+| TCP streams | 256 open, 16 from one IP address, 64 unverified. A stream over any of them is closed as soon as it is accepted. | `sfu::Config::tcp_streams`, `tcp_per_source`, `tcp_unverified` |
+| TCP handshake and idle | A stream with no STUN for a participant within 5 s is closed. A stream with no whole frame for 30 s is closed; half-open ones end this way. | `sfu::Config::tcp_handshake`, `tcp_idle` |
+| Offers | 32 KiB. Audio m-lines up to the room cap, video up to 3, no other kinds. Over that is `bad_sdp`, checked before the media thread sees it. | `sfu::Config::offer_bytes`, `offer_audio` (set from `TINYSERVER_CALL_ROOM_MAX`), `offer_video` |
+| Renegotiation | `call.offer` shares the join and leave rate: 5 at once, then one every 3 s. | |
 | Consent | A connected participant the SFU hears nothing from for 30 s leaves with `media_lost`. str0m clients send STUN consent checks every few seconds even in silence. | `sfu::Config::consent_timeout` |
 | Camera | Simulcast `h` 1280×720 at about 1.2 Mb/s, `l` 640×360 at about 350 kb/s. 30 fps. | |
 | Share | One per room. Up to 1920×1080, 2.5 Mb/s, 5–15 fps. | |
@@ -343,7 +347,7 @@ The tunnel is the only way in today, and the host publishes nothing. That hides 
 
 ### A: the default deploy change
 
-The server joins a third network that Docker can publish from. HTTP on 8080 stays unpublished and behind the tunnel. As built in slice 3, UDP only; slice 4 adds the TCP line and `TINYSERVER_LAN_IP`.
+The server joins a third network that Docker can publish from. HTTP on 8080 stays unpublished and behind the tunnel. As built.
 
 ```diff
    tinyserver:
@@ -352,8 +356,10 @@ The server joins a third network that Docker can publish from. HTTP on 8080 stay
        BIND: 0.0.0.0:8080
 +      TINYSERVER_MEDIA_PORT: ${TINYSERVER_MEDIA_PORT:-50000}
 +      TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}
++      TINYSERVER_LAN_IP: ${TINYSERVER_LAN_IP:-}
 +    ports:
 +      - "${TINYSERVER_MEDIA_PORT:-50000}:${TINYSERVER_MEDIA_PORT:-50000}/udp"
++      - "${TINYSERVER_MEDIA_PORT:-50000}:${TINYSERVER_MEDIA_PORT:-50000}/tcp"
      networks:
        - inside
 +      - media
@@ -367,14 +373,14 @@ The server joins a third network that Docker can publish from. HTTP on 8080 stay
 
 | Detail | Rule |
 | --- | --- |
-| Same port inside and out | The SFU binds `0.0.0.0` on `TINYSERVER_MEDIA_PORT` and advertises that port. Keep host and container numbers equal. |
+| Same port inside and out | The SFU binds `0.0.0.0` on `TINYSERVER_MEDIA_PORT`, UDP and TCP, and advertises that port. Keep host and container numbers equal. |
 | Public address | `TINYSERVER_PUBLIC_IP`, IPv4. The server does not guess it, because guessing needs an outbound STUN call and a wrong guess fails silently. Unset, the server runs without media and `/health` says `"media": "off"`; the design had compose require it, but a host without a port should still start. |
-| Health | `GET /health` has `media`: `off`, `up`, or `down`. `down` makes `ok` false and the status 503. |
-| Same-LAN members | Many home routers do not hairpin. From slice 4, `TINYSERVER_LAN_IP` adds a second host candidate for members on the same network. |
-| Router | Forward the UDP port, and from slice 4 the TCP port, to the host. `deploy/README.md` gives the steps. |
+| Health | `GET /health` has `media`: `off`, `up`, or `down`, and `transports`, what members can reach while media is up: `udp`, `tcp`, and `lan` when a LAN address is set. Empty when media is off or down. `down` makes `ok` false and the status 503. |
+| Same-LAN members | Many home routers do not hairpin. `TINYSERVER_LAN_IP`, IPv4, adds a UDP and a TCP host candidate on that address for members on the same network. Equal to the public address, it adds nothing. |
+| Router | Forward the port, UDP and TCP, to the host. `deploy/README.md` gives the steps. |
 | Docker | Default iptables DNAT keeps the client's source address, which ICE needs. |
 | IPv6 | Not in the first cut. `TINYSERVER_PUBLIC_IP6` later. |
-| Restrictive client networks | From slice 4, ICE-TCP covers networks that block UDP. An owner whose host has 443/tcp free can map 443 to the TCP port for networks that only allow 443. |
+| Restrictive client networks | ICE-TCP covers networks that block UDP. Networks that allow only 443 are not covered yet: the SFU advertises the port it binds, and binding 443 needs a capability the container drops. An advertised port separate from the bound one would fix it, later. |
 
 ### Security of an open media port
 
@@ -382,10 +388,10 @@ The server joins a third network that Docker can publish from. HTTP on 8080 stay
 | --- | --- |
 | The host address becomes visible to every member, in the SDP answer | True. The tunnel hid it before. `deploy/README.md` says so, and relay mode (B) is the answer for owners who care. |
 | Strangers sending packets | Unknown sources get STUN handling only. Without the per-join ICE password, which only travels over the authenticated socket, nothing else is processed. |
-| Parser exposure | str0m parses STUN, DTLS, and SRTP from the internet. Pin the version, follow its fixes (0.23.1 hardened SRTP and RTCP parsing), and fuzz the packet entry point. |
+| Parser exposure | str0m parses STUN, DTLS, and SRTP from the internet. Pin the version, follow its fixes (0.23.1 hardened SRTP and RTCP parsing), and fuzz. `fuzz/` has cargo-fuzz targets for live-socket frames (client messages and outbox payloads), SDP offers through the caps and str0m's parser into a participant, ICE-TCP framing, and packets into a participant with an answer out. CI builds them on nightly and runs each for 60 s, in a job apart from `check`. |
 | Media privacy | DTLS-SRTP from client to SFU. The SFU sees plaintext media, as every SFU does without E2EE. Cloudflare sees signaling, and so the DTLS fingerprints, but not media in mode A. |
 | Egress | Joining `media` gives the server a route out, which it did not have. In mode A the server makes no outbound connections. An owner can add a `DOCKER-USER` rule allowing only replies. |
-| Floods | Per-source packet rate limit before str0m (built in slice 3; slice 4 measures it under a flood). Caps on rooms and the server. TCP stream caps above. |
+| Floods | Per-source packet rate limit before str0m, and strangers' non-STUN dropped before any `Rtc` is asked. Caps on rooms and the server. TCP stream caps above. A test floods the port from 8 unknown sources for 2 s while a call runs, and the call keeps forwarding. Measured once by hand on an Apple M-series laptop, a release build: idle, the media thread uses no measurable CPU; 174,000 packets a second of STUN and RTP from 8 strangers on loopback use about 72% of one core, nearly all of it receiving and dropping at the per-source budget. A flood at line rate can fill the one media thread; the kernel and the router are the next limits. |
 
 ### B: relay mode on Cloudflare Realtime TURN
 
@@ -435,10 +441,10 @@ Cost, budgeted as if every byte both ways is billed: a 6-person camera call is a
 | Step | What it does |
 | --- | --- |
 | Config | `RtcConfig::new().clear_codecs().enable_opus(true, false)`, the same pinned str0m. Not ICE-lite: the client is the full ICE agent and sends the checks. |
-| Candidate | One host candidate for its own bound socket. No trickle, no STUN server. |
+| Candidate | One host candidate for its own bound socket. No trickle, no STUN server. `Client::tcp` offers one active TCP candidate on port 9 instead (RFC 6544), and no UDP. |
 | Offer | `sdp_api()`: one `add_media(Audio, SendOnly)` for the microphone, then `room cap - 1` `add_media(Audio, RecvOnly)`. `apply()` gives the offer and the pending state. The offer is `call.join` `sdp`. |
 | Answer | `call.answer` `sdp` into `SdpAnswer::from_sdp_string`, then `accept_answer(pending, answer)`. |
-| Loop | Drain `poll_output` to its timeout; send each `Transmit`; on `Event::Connected` start the microphone; every 20 ms write one Opus frame with `writer(mic).audio_level(level, voice).write(pt, now, MediaTime::new(n * 960, 48 kHz), frame)`; then wait on the socket until the next str0m timeout or frame, and feed what arrives as `Input::Receive` with the socket's own address as destination, or `Input::Timeout`. |
+| Loop | Drain `poll_output` to its timeout; send each `Transmit` by its protocol, and over TCP open a stream to that address on first use and frame each packet with a 2-byte length; on `Event::Connected` start the microphone; every 20 ms write one Opus frame with `writer(mic).audio_level(level, voice).write(pt, now, MediaTime::new(n * 960, 48 kHz), frame)`; then wait on the socket, through `mio`, until the next str0m timeout or frame, and feed what arrives as `Input::Receive` with the local candidate's address as destination, one packet at a time with a drain after each, or `Input::Timeout`. |
 | Receive | `Event::MediaData` on a slot mid. `call.slots` says whose voice that mid carries. Reset that slot's jitter buffer and decoder when its `user_id` changes; the SFU keeps one SSRC per slot and the new speaker's RTP times. |
 | Mute | Send `call.state` and stop writing frames. The SFU drops a muted publisher's frames anyway. |
 | Leave | Send `call.leave`. A client that just stops is dropped after 30 s with `media_lost`. |
@@ -478,7 +484,7 @@ Each slice is one PR, merges on its own, and leaves the server working.
 | 1 | **Live socket and presence** (built) | `GET /v1/live` with bearer auth, ping, limits, `ready`, `presence`. Outbox writes in every room, member, and invite change. Dispatcher on `LISTEN app_wake`, replay with `since`, `resync`, 24 h sweep. No media. | Integration test: two sessions connect; A renames a room; B gets `room.renamed` with a `seq`. B reconnects with an old `since` and gets the missed events. A removed member's socket closes with `4003`. A rolled-back write emits nothing. | M, ~800 lines |
 | 2 | **Call occupancy without media** (built) | `call.join`, `call.leave`, and `call.kick`, the call registry, authorization, caps, a join and leave rate, `joined_elsewhere`, `call.joined` and `call.left` to every member, `ready.calls`. `call.join` ignores `sdp`. `call.state` moves to slice 3, with the media it describes. | Integration tests: a join reaches everyone and later `ready` frames; joining elsewhere leaves the first room; a second socket is one seat; a dropped socket leaves after the grace; caps return `full` and `server_full`; a deleted room empties; a removed member leaves; kick works for an admin, fails against an owner and for a member, and is audited. | S, ~400 lines |
 | 3 | **SFU audio, UDP** (built) | `crates/sfu` thread with mio, str0m 0.24.1 pinned, ICE-lite, DTLS-SRTP, Opus forwarding, slots, active speaker and `call.speaking`, `call.offer`, `call.state` with mute and deafen, connect and consent timeouts, per-source packet and per-publisher bitrate caps, graceful shutdown. Compose and `deploy/README.md` gain the UDP media port. `/health` reports `media`. | A headless str0m client (`crates/sfu/src/client.rs`) joins with two peers on loopback; each receives the other's Opus frames within 2 s, and a client in another room receives nothing; leaving, a kick, and mute stop forwarding; killing one peer frees its slot after the consent timeout; a peer that never connects leaves with `media_timeout`. The SFU tests need no database; the same cases run through the live socket in `crates/api/tests/media.rs`. Manual, not yet done: two machines on different networks talk. | L, ~1,500 lines |
-| 4 | **ICE-TCP and hardening** | TCP passive candidate on the same port, RFC 4571 framing, stream caps, per-source rate limit, a fuzz target for the packet entry point, `TINYSERVER_LAN_IP`. | Test client with UDP blocked connects over TCP. Fuzz runs 10 minutes without a panic. A flood from an unknown source does not raise CPU above a set bound. | M, ~600 lines |
+| 4 | **ICE-TCP and hardening** (built) | TCP passive candidate on the same port, RFC 4571 framing, stream caps, handshake and idle timeouts, the per-source rate limit on TCP too, offer size and m-line caps, `call.offer` on the join rate, cargo-fuzz targets and a CI job, `TINYSERVER_LAN_IP`, `transports` in `/health`. Compose publishes the TCP port. | A headless client with only a TCP candidate hears and is heard, alone and through the live socket. The answer has the LAN candidates when set. Streams over each cap are closed; silent, non-STUN, oversized, and idle streams are closed. Oversized and crowded offers get `bad_sdp`; rapid `call.offer` gets `slow_down`. Each fuzz target ran 10 minutes without a panic. A 2 s flood from unknown sources does not stop a call, and a hand-measured flood of 174,000 packets a second costs about 72% of one core. Not done: a CPU bound enforced in a test, and two machines on different networks over TCP. | M, ~1,400 lines |
 | 5 | **Camera video** | H.264 simulcast receive, per-listener layer choice from bandwidth estimate and `call.quality`, speaker-switched video slot with PLI, `TINYSERVER_MEDIA_EGRESS_KBPS`. | Test client publishes two layers; a listener capped at 500 kb/s gets `l`; switching speaker delivers the new speaker's keyframe within 1 s. | L, ~1,000 lines |
 | 6 | **Screen share** | Share m-line, one share per room, `share_taken`, share wins the video slot, admin ends a share. | Second share returns `share_taken`. While a share runs every listener's video slot carries it; stopping it brings the speaker back. | S, ~400 lines |
 | 7 | **Relay mode** | Cloudflare Realtime TURN credentials, sans-IO TURN client in `crates/sfu`, relay-only candidates, `call.candidate`, revoke on leave. Compose variant without `ports:`. | With no published ports and only outbound traffic allowed, two clients on different networks talk. The SDP answer contains no host address. Credentials are revoked when a participant leaves. | L, ~1,200 lines |

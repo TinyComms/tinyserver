@@ -1,6 +1,6 @@
 # Running a community
 
-Postgres and tinyserver sit on a Docker network that has no route to the internet. cloudflared is on that network and on a second network that can reach Cloudflare, and it carries HTTP and the live socket. The one published port is the media port, UDP, for call audio. Sign-in and invite acceptance are limited to a few tries a minute. Passwords are 12 to 128 characters.
+Postgres and tinyserver sit on a Docker network that has no route to the internet. cloudflared is on that network and on a second network that can reach Cloudflare, and it carries HTTP and the live socket. The one published port is the media port, UDP and the same number on TCP, for call audio. Sign-in and invite acceptance are limited to a few tries a minute. Passwords are 12 to 128 characters.
 
 The tunnel hostname is the address people type into tinyclient. The database password and the tunnel token stay in the environment file next to the compose file. That file is not committed.
 
@@ -14,19 +14,20 @@ Once the owner exists, delete the three lines from the environment file and run 
 
 ## Calls and the media port
 
-Call audio does not fit through the tunnel, so it goes straight to the server on one UDP port. Without it the server still runs, and a `call.join` with an offer gets `media_unavailable`.
+Call audio does not fit through the tunnel, so it goes straight to the server on one port number, UDP first and TCP for networks that block UDP. Without it the server still runs, and a `call.join` with an offer gets `media_unavailable`.
 
 1. Set `TINYSERVER_PUBLIC_IP` in the environment file to the address members reach: the router's public IPv4 address. The server does not guess it.
-2. `TINYSERVER_MEDIA_PORT` is 50000 unless set. Compose publishes the same number inside and out, because the server advertises the port it binds.
-3. On the router, forward that UDP port to the host.
-4. On the host firewall, allow it, for example `ufw allow 50000/udp`.
-5. `docker compose up -d`, then check that `GET /health` says `"media": "up"`.
+2. `TINYSERVER_MEDIA_PORT` is 50000 unless set. Compose publishes the same number inside and out, on UDP and TCP, because the server advertises the port it binds.
+3. On the router, forward that port to the host, both UDP and TCP.
+4. On the host firewall, allow both: `ufw allow 50000/udp` and `ufw allow 50000/tcp`.
+5. Optional: set `TINYSERVER_LAN_IP` to the host's address on the home network, such as `192.168.1.20`. Many routers do not hairpin, so members at home cannot reach the public address from inside; with this set, the answer offers them the LAN address too. Members elsewhere see it in the SDP but cannot use it.
+6. `docker compose up -d`, then check that `GET /health` says `"media": "up"` and lists `"transports": ["udp", "tcp"]`, with `"lan"` as well when step 5 is set.
 
 Every member in a call sees `TINYSERVER_PUBLIC_IP` in the SDP answer. The tunnel no longer hides the host's address from members. Strangers who find the port get STUN handling only; nothing else is processed without the per-join ICE password, which only travels over the signed-in live socket.
 
 Joining the `media` network gives the server a route out, which it did not have. It makes no outbound connections; an owner who wants that enforced can add a `DOCKER-USER` rule that allows only replies.
 
-TCP on the same port, for networks that block UDP, comes in a later release. So does a relay mode for hosts that cannot open a port.
+TCP streams are capped at 256 in all and 16 from one address. One that sends no STUN for a call within 5 s, or nothing at all for 30 s, is closed. A relay mode for hosts that cannot open a port comes in a later release.
 
 ## Stopping
 
