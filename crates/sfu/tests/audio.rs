@@ -11,13 +11,15 @@ use tokio::sync::mpsc::Receiver;
 use tokio::time::{timeout, Instant};
 
 const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
-const WAIT: Duration = Duration::from_secs(5);
+/// Longer than the consent timeout, so a drop is waited for in one go.
+const WAIT: Duration = Duration::from_secs(10);
 const SLOTS: usize = 11;
 
 fn config() -> Config {
     let mut config = Config::new(SocketAddr::from((LOOPBACK, 0)), LOOPBACK.into());
     config.connect_timeout = Duration::from_secs(2);
-    config.consent_timeout = Duration::from_secs(2);
+    // A silent str0m client still sends a STUN check or RTCP about every 3 s.
+    config.consent_timeout = Duration::from_secs(5);
     config
 }
 
@@ -209,7 +211,7 @@ async fn a_killed_peer_is_dropped_after_the_consent_timeout() {
         .await;
     assert_eq!(lost, Lost::Gone);
     // The last packet may predate `started` by a frame or two.
-    assert!(started.elapsed() >= Duration::from_millis(1500));
+    assert!(started.elapsed() >= Duration::from_millis(4500));
     sfu.slots_for(&b.call_id, 0).await;
 }
 

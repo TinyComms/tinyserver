@@ -10,7 +10,7 @@ use api::{Limits, Live};
 use axum::http::{Method, StatusCode};
 use common::live::*;
 use common::{first_owner, join, run, Call, TestDb};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sfu::client::{Client, Frame, Running};
 use tokio::time::Instant;
@@ -22,7 +22,8 @@ const SLOTS: usize = 11;
 fn media_config() -> sfu::Config {
     let mut config = sfu::Config::new(SocketAddr::from((LOOPBACK, 0)), LOOPBACK.into());
     config.connect_timeout = Duration::from_millis(1500);
-    config.consent_timeout = Duration::from_secs(2);
+    // A silent str0m client still sends a STUN check or RTCP about every 3 s.
+    config.consent_timeout = Duration::from_secs(5);
     config
 }
 
@@ -32,16 +33,25 @@ async fn serve_media(db: &TestDb) -> Server {
     serve_live(db, live).await
 }
 
-/// Reads frames until `pick` returns something, skipping the rest. Panics after 5 s.
+/// Reads frames until `pick` returns something, skipping the rest. Panics after 10 s, which
+/// is longer than the consent timeout.
 async fn until<T>(ws: &mut Ws, mut pick: impl FnMut(&Value) -> Option<T>) -> T {
-    let deadline = Instant::now() + WAIT;
-    while Instant::now() < deadline {
-        let value = frame(ws).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let message = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("a matching frame in time")
+            .expect("socket open")
+            .expect("frame");
+        let Message::Text(text) = message else {
+            assert!(!message.is_close(), "closed: {message:?}");
+            continue;
+        };
+        let value: Value = serde_json::from_str(text.as_str()).expect("json");
         if let Some(found) = pick(&value) {
             return found;
         }
     }
-    panic!("no matching frame within {WAIT:?}");
 }
 
 /// Waits for this socket's `call.slots` with `want` entries and returns `user_id` to mid.
