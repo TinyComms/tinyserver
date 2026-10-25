@@ -237,6 +237,55 @@ pub async fn delete_room(pool: &PgPool, caller: &Caller, id: &str) -> Result<(),
     Ok(())
 }
 
+/// Whether a room exists and the caller may see it under `rooms_select`.
+pub async fn room_exists(pool: &PgPool, caller: &Caller, id: &str) -> Result<bool, CommunityError> {
+    let mut tx = scope(pool, caller).await?;
+    let found = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM rooms WHERE id = $1::uuid)")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(from_sql);
+    let found = match found {
+        Ok(found) => found,
+        Err(CommunityError::NotFound) => false,
+        Err(error) => return Err(error),
+    };
+    tx.commit().await.map_err(from_sql)?;
+    Ok(found)
+}
+
+/// Checks that the caller may remove `user_id` from a call and writes the `call.kick` audit
+/// row. Owners and admins may; an admin may not remove an owner. The call itself is in memory.
+pub async fn kick_from_call(
+    pool: &PgPool,
+    caller: &Caller,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), CommunityError> {
+    managers(caller)?;
+    let mut tx = scope(pool, caller).await?;
+    let role: Option<String> = sqlx::query_scalar("SELECT app_member_role($1::uuid)")
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(from_sql)?;
+    let Some(role) = role else {
+        return Err(CommunityError::NotFound);
+    };
+    if role == "owner" && caller.role != "owner" {
+        return Err(CommunityError::Forbidden);
+    }
+    audit(
+        &mut tx,
+        "call.kick",
+        "call",
+        serde_json::json!({"room_id": room_id, "user_id": user_id}),
+    )
+    .await?;
+    tx.commit().await.map_err(from_sql)?;
+    Ok(())
+}
+
 pub async fn list_members(pool: &PgPool, caller: &Caller) -> Result<Vec<Member>, CommunityError> {
     let mut tx = scope(pool, caller).await?;
     let rows = sqlx::query(&format!(
