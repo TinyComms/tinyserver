@@ -1,0 +1,47 @@
+# cargo-fuzz targets, on nightly. Outside the workspace, so stable builds never see them.
+#   cargo +nightly fuzz run live_frame -- -max_total_time=60
+
+[package]
+name = "tinyserver-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+api = { path = "../crates/api", features = ["fuzz"] }
+sfu = { path = "../crates/sfu", features = ["fuzz"] }
+
+[[bin]]
+name = "live_frame"
+path = "fuzz_targets/live_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sdp_offer"
+path = "fuzz_targets/sdp_offer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_frames"
+path = "fuzz_targets/tcp_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packets"
+path = "fuzz_targets/packets.rs"
+test = false
+doc = false
+bench = false

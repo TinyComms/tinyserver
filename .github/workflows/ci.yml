@@ -62,3 +62,40 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  # The cargo-fuzz targets in fuzz/, built on nightly and run for a minute each. Apart from
+  # check, so a nightly break does not hold up a merge.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build
+        run: cargo +nightly fuzz build
+
+      - name: Run
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            mkdir -p fuzz/corpus/$target
+            seeds=fuzz/seeds/$target
+            [ -d "$seeds" ] || seeds=
+            cargo +nightly fuzz run $target fuzz/corpus/$target $seeds -- -max_total_time=60
+          done
+
+      - name: Crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
