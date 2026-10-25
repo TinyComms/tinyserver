@@ -37,8 +37,10 @@ pub fn live_frame(data: &[u8]) {
             topic: topic.to_string(),
             payload,
         });
+        // Valid JSON. Not read back as a `Value`: serde_json takes an object whose first key
+        // is its private raw-value token as a raw value, and the payload may have that key.
         if let Some(frame) = event.frame {
-            assert!(serde_json::from_str::<Value>(&frame).is_ok());
+            assert!(serde_json::from_str::<serde::de::IgnoredAny>(&frame).is_ok());
         }
     }
 }
