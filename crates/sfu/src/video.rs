@@ -1,11 +1,14 @@
 //! Video routing without the network: the speaker who holds the floor, which simulcast layer
-//! a listener gets, and the RTP time a listener's one video slot carries across switches.
+//! a listener gets, what the upload budget allows, and the RTP time a listener's one video
+//! slot carries across switches.
 
 use std::time::{Duration, Instant};
 
 /// Nominal camera bitrates from `docs/calls.md`, in kb/s. The upload budget plans with them.
 pub(crate) const HIGH_KBPS: u64 = 1200;
 pub(crate) const LOW_KBPS: u64 = 350;
+/// The nominal screen share bitrate, in kb/s.
+pub(crate) const SHARE_KBPS: u64 = 2500;
 /// One forwarded audio stream with its headers, in kb/s, for the upload budget.
 pub(crate) const AUDIO_KBPS: u64 = 50;
 /// A listener on `l` moves up to `h` at this estimate, and back down below `DOWN_KBPS`.
@@ -24,11 +27,13 @@ pub(crate) const FLOOR_MARGIN: f32 = 6.0;
 /// The 90 kHz RTP clock of every video codec.
 const VIDEO_HZ: u64 = 90_000;
 
-/// One simulcast layer. `h` is high, `l` is low; a camera without rids is high.
+/// One simulcast layer of a camera, or a share's one layer. `h` is high, `l` is low; a
+/// camera without rids is high.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Layer {
     High,
     Low,
+    Share,
 }
 
 impl Layer {
@@ -43,13 +48,16 @@ impl Layer {
         match self {
             Self::High => 0,
             Self::Low => 1,
+            Self::Share => 2,
         }
     }
 
+    /// The camera's other layer. A share has only one.
     pub fn other(self) -> Self {
         match self {
             Self::High => Self::Low,
             Self::Low => Self::High,
+            Self::Share => Self::Share,
         }
     }
 }
@@ -92,23 +100,48 @@ pub(crate) fn pick_layer(
     }
 }
 
-/// The most every listener may get under the server's upload budget: `h` if all of them
-/// fit on `h`, `l` if they fit on `l`, else audio only. `audio_streams` is the number of
-/// audio streams forwarded and `viewers` the listeners with a camera to watch.
-pub(crate) fn ceiling(budget_kbps: Option<u32>, audio_streams: u64, viewers: u64) -> Quality {
+/// What the server's upload budget lets every listener have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ceiling {
+    /// Listeners in a room with a share get it.
+    pub share: bool,
+    /// The most a camera listener may get.
+    pub camera: Quality,
+}
+
+/// The plan under the server's upload budget. Shares come first, because text on a screen
+/// matters more than a face: they fit after audio, or nobody gets one. Then cameras, with
+/// what is left: `h` if every camera listener fits on `h`, `l` if they fit on `l`, else
+/// audio only. `audio_streams` is the number of audio streams forwarded, `share_viewers` the
+/// listeners with a share to watch, and `camera_viewers` those with only a camera.
+pub(crate) fn ceiling(
+    budget_kbps: Option<u32>,
+    audio_streams: u64,
+    share_viewers: u64,
+    camera_viewers: u64,
+) -> Ceiling {
     let Some(budget) = budget_kbps else {
-        return Quality::High;
+        return Ceiling {
+            share: true,
+            camera: Quality::High,
+        };
     };
     let budget = u64::from(budget);
     let audio = audio_streams.saturating_mul(AUDIO_KBPS);
-    let fits = |layer_kbps: u64| audio.saturating_add(viewers.saturating_mul(layer_kbps)) <= budget;
-    if fits(HIGH_KBPS) {
+    let shares = audio.saturating_add(share_viewers.saturating_mul(SHARE_KBPS));
+    let share = shares <= budget;
+    let planned = if share { shares } else { audio };
+    let fits = |layer_kbps: u64| {
+        planned.saturating_add(camera_viewers.saturating_mul(layer_kbps)) <= budget
+    };
+    let camera = if fits(HIGH_KBPS) {
         Quality::High
     } else if fits(LOW_KBPS) {
         Quality::Low
     } else {
         Quality::Off
-    }
+    };
+    Ceiling { share, camera }
 }
 
 /// Maps each source's RTP time onto one continuous timeline for a listener's video slot.
@@ -238,6 +271,7 @@ mod tests {
         assert_eq!(Layer::of_rid(Some("l")), Layer::Low);
         assert_eq!(Layer::of_rid(None), Layer::High);
         assert_eq!(Layer::High.other(), Layer::Low);
+        assert_eq!(Layer::Share.other(), Layer::Share);
     }
 
     #[test]
@@ -278,14 +312,38 @@ mod tests {
         assert_eq!(pick_layer(None, lots, Quality::High, Quality::Off), None);
     }
 
+    fn camera(budget: Option<u32>, audio: u64, viewers: u64) -> Quality {
+        ceiling(budget, audio, 0, viewers).camera
+    }
+
     #[test]
     fn the_budget_drops_to_low_then_to_audio_only() {
-        assert_eq!(ceiling(None, 100, 100), Quality::High);
+        assert_eq!(camera(None, 100, 100), Quality::High);
         // Two listeners, one audio stream each.
-        assert_eq!(ceiling(Some(2500), 2, 2), Quality::High);
-        assert_eq!(ceiling(Some(2000), 2, 2), Quality::Low);
-        assert_eq!(ceiling(Some(500), 2, 2), Quality::Off);
-        assert_eq!(ceiling(Some(500), 2, 0), Quality::High);
+        assert_eq!(camera(Some(2500), 2, 2), Quality::High);
+        assert_eq!(camera(Some(2000), 2, 2), Quality::Low);
+        assert_eq!(camera(Some(500), 2, 2), Quality::Off);
+        assert_eq!(camera(Some(500), 2, 0), Quality::High);
+    }
+
+    #[test]
+    fn shares_are_planned_before_cameras() {
+        let all = ceiling(None, 100, 100, 100);
+        assert!(all.share);
+        assert_eq!(all.camera, Quality::High);
+        // Two share viewers and one camera viewer, the sharer, with three audio streams.
+        let roomy = ceiling(Some(6400), 3, 2, 1);
+        assert_eq!((roomy.share, roomy.camera), (true, Quality::High));
+        let tight = ceiling(Some(5500), 3, 2, 1);
+        assert_eq!((tight.share, tight.camera), (true, Quality::Low));
+        let shares_only = ceiling(Some(5200), 3, 2, 1);
+        assert_eq!(
+            (shares_only.share, shares_only.camera),
+            (true, Quality::Off)
+        );
+        // No room for the shares: cameras get the budget instead.
+        let cameras = ceiling(Some(2000), 3, 2, 1);
+        assert_eq!((cameras.share, cameras.camera), (false, Quality::High));
     }
 
     #[test]

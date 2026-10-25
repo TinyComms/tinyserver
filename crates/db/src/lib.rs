@@ -15,7 +15,7 @@ mod sweep;
 pub use account::{change_password, close_all_sessions, rename_me};
 pub use bootstrap::{bootstrap_owner, owner_exists};
 pub use community::{
-    accept_invite, create_invite, create_room, delete_room, kick_from_call, list_audit,
+    accept_invite, create_invite, create_room, delete_room, end_share, kick_from_call, list_audit,
     list_invites, list_members, list_rooms, remove_member, rename_room, revoke_invite, room_exists,
     set_member_role, Accepted, AuditRow, Caller, CommunityError, Invite, InviteIssued, Member,
     Room, Wrote,

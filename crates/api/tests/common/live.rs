@@ -178,7 +178,7 @@ pub fn left(room_id: &str, user_id: &str, reason: &str) -> Value {
 pub fn occupancy(room_id: &str, user_ids: &[&str]) -> Value {
     let participants: Vec<Value> = user_ids
         .iter()
-        .map(|user_id| json!({"user_id": user_id, "muted": false, "deafened": false, "camera": false}))
+        .map(|user_id| json!({"user_id": user_id, "muted": false, "deafened": false, "camera": false, "sharing": false}))
         .collect();
     json!({"room_id": room_id, "participants": participants})
 }

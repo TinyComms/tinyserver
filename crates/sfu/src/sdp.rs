@@ -1,4 +1,5 @@
-//! Caps on an offer, checked before it reaches the media thread or str0m's parser.
+//! Caps on an offer, checked before it reaches the media thread or str0m's parser, and
+//! whether it starts a share.
 
 use crate::{Config, Refused};
 
@@ -44,9 +45,40 @@ impl Caps {
     }
 }
 
+/// Whether the offer's share m-line sends: the second video m-line that is not `recvonly`,
+/// with `sendonly` or `sendrecv`, which is the default. Read before str0m takes the offer, so
+/// a share that is taken can be refused without changing anything.
+pub(crate) fn share_sending(offer: &str) -> bool {
+    let mut sections: Vec<&str> = Vec::new();
+    let mut video = false;
+    for line in offer.split(['\r', '\n']) {
+        if let Some(media) = line.strip_prefix("m=") {
+            video = media.starts_with("video ");
+            if video {
+                sections.push("sendrecv");
+            }
+            continue;
+        }
+        let direction = line.strip_prefix("a=").filter(|attribute| {
+            matches!(
+                *attribute,
+                "sendonly" | "recvonly" | "sendrecv" | "inactive"
+            )
+        });
+        if let (true, Some(direction), Some(last)) = (video, direction, sections.last_mut()) {
+            *last = direction;
+        }
+    }
+    sections
+        .iter()
+        .filter(|direction| **direction != "recvonly")
+        .nth(1)
+        .is_some_and(|direction| matches!(*direction, "sendonly" | "sendrecv"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Caps;
+    use super::{share_sending, Caps};
     use crate::Refused;
 
     const CAPS: Caps = Caps {
@@ -71,5 +103,27 @@ mod tests {
         let data = "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
         assert_eq!(CAPS.check(data), Err(Refused::BadSdp));
         assert_eq!(CAPS.check(&"a".repeat(201)), Err(Refused::BadSdp));
+    }
+
+    #[test]
+    fn the_share_is_the_second_video_m_line_that_may_send() {
+        let camera = "m=video 9 x\r\na=mid:1\r\na=sendonly\r\n";
+        let slot = "m=video 9 x\r\na=recvonly\r\n";
+        let share = |direction: &str| format!("m=video 9 x\r\na={direction}\r\n");
+        let audio = "m=audio 9 x\r\na=sendonly\r\n";
+        let offer = format!("v=0\r\n{audio}{camera}{}{slot}", share("sendonly"));
+        assert!(share_sending(&offer));
+        let offer = format!("v=0\r\n{audio}{camera}{slot}{}", share("sendrecv"));
+        assert!(share_sending(&offer));
+        let offer = format!("v=0\r\n{audio}{camera}{}{slot}", share("inactive"));
+        assert!(!share_sending(&offer));
+        // Without a direction an m-line is sendrecv.
+        let offer = format!("v=0\r\n{camera}m=video 9 x\r\na=mid:2\r\n");
+        assert!(share_sending(&offer));
+        assert!(!share_sending(&format!("v=0\r\n{audio}{camera}{slot}")));
+        assert!(!share_sending(&format!("v=0\r\n{slot}{slot}{slot}")));
+        // A direction on an audio m-line says nothing about video.
+        let offer = format!("v=0\r\n{camera}m=video 9 x\r\na=inactive\r\n{audio}");
+        assert!(!share_sending(&offer));
     }
 }

@@ -262,6 +262,29 @@ pub async fn kick_from_call(
     room_id: &str,
     user_id: &str,
 ) -> Result<(), CommunityError> {
+    call_action(pool, caller, "call.kick", room_id, user_id).await
+}
+
+/// Checks that the caller may end `user_id`'s screen share and writes the `call.share_end`
+/// audit row, under the same rule as a kick. The share itself is in memory.
+pub async fn end_share(
+    pool: &PgPool,
+    caller: &Caller,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), CommunityError> {
+    call_action(pool, caller, "call.share_end", room_id, user_id).await
+}
+
+/// An owner or admin acting on someone in a call: the role check and the audit row in one
+/// transaction.
+async fn call_action(
+    pool: &PgPool,
+    caller: &Caller,
+    action: &str,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), CommunityError> {
     managers(caller)?;
     let mut tx = scope(pool, caller).await?;
     let role: Option<String> = sqlx::query_scalar("SELECT app_member_role($1::uuid)")
@@ -277,7 +300,7 @@ pub async fn kick_from_call(
     }
     audit(
         &mut tx,
-        "call.kick",
+        action,
         "call",
         serde_json::json!({"room_id": room_id, "user_id": user_id}),
     )

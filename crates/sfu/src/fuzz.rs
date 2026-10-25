@@ -12,7 +12,7 @@ use str0m::net::{DatagramRecv, Protocol, Receive};
 use str0m::{Input, Output, Rtc, RtcConfig};
 
 use crate::engine::{candidates, rtc_config, H264_PROFILE};
-use crate::sdp::Caps;
+use crate::sdp::{share_sending, Caps};
 use crate::tcp::{encode, BadFrame, Framer, FRAME_MAX};
 use crate::video::{ceiling, pick_layer, Floor, Layer, Quality, Rebase};
 use crate::Config;
@@ -79,8 +79,8 @@ pub fn tcp_frames(data: &[u8]) {
     }
 }
 
-/// An offer as the API passes it on: the caps, str0m's parser, then a fresh participant
-/// accepting it.
+/// An offer as the API passes it on: the caps, the share check, str0m's parser, then a
+/// fresh participant accepting it.
 pub fn offer(data: &[u8]) {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
@@ -89,6 +89,7 @@ pub fn offer(data: &[u8]) {
     if Caps::from(&config).check(text).is_err() {
         return;
     }
+    let _ = share_sending(text);
     let Ok(offer) = SdpOffer::from_sdp_string(text) else {
         return;
     };
@@ -103,7 +104,8 @@ pub fn offer(data: &[u8]) {
 }
 
 /// Packets from the network into a participant that has an answer out, the way the media
-/// thread hands them over: a microphone, an audio slot, a simulcast camera, and a video slot.
+/// thread hands them over: a microphone, an audio slot, a simulcast camera, a share, and a
+/// video slot.
 /// The first byte of each packet says UDP or TCP and how long it is.
 pub fn packets(data: &[u8]) {
     let now = Instant::now();
@@ -125,6 +127,7 @@ pub fn packets(data: &[u8]) {
         None,
         Some(layers),
     );
+    change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
     change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
     let Some((offer, _)) = change.apply() else {
         return;
@@ -209,13 +212,16 @@ pub fn video(data: &[u8]) {
             _ => {
                 let quality = [Quality::Off, Quality::Low, Quality::High][usize::from(b % 3)];
                 let budget = (value & 1 == 1).then_some((value >> 1) as u32);
-                let most = ceiling(budget, value >> 40, value >> 52);
+                let most = ceiling(budget, value >> 40, value >> 56, value >> 52);
+                if budget.is_none() {
+                    assert!(most.share && most.camera == Quality::High);
+                }
                 let estimate = (a % 2 == 1).then_some(value >> 8);
-                layer = pick_layer(layer, estimate, quality, most);
-                if most == Quality::Off || quality == Quality::Off {
+                layer = pick_layer(layer, estimate, quality, most.camera);
+                if most.camera == Quality::Off || quality == Quality::Off {
                     assert_eq!(layer, None);
                 }
-                if quality.min(most) == Quality::Low {
+                if quality.min(most.camera) == Quality::Low {
                     assert_eq!(layer, Some(Layer::Low));
                 }
             }

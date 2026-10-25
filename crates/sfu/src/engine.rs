@@ -3,8 +3,9 @@
 //!
 //! Every `Rtc` is driven the way str0m requires: one input, then `poll_output` until it
 //! returns a timeout. Audio frames are copied from each publisher to everyone else in the
-//! room, on the receive slot that listener keeps for them. Camera frames go to each
-//! listener's one video slot: one layer of one publisher's camera, switched on a keyframe.
+//! room, on the receive slot that listener keeps for them. Video goes to each listener's one
+//! video slot: the room's share while there is one, else one layer of one publisher's camera,
+//! switched on a keyframe.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -30,8 +31,9 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
+use crate::sdp;
 use crate::tcp::{Conn, Readout};
-use crate::video::{self, Floor, Layer, Quality, Rebase};
+use crate::video::{self, Ceiling, Floor, Layer, Quality, Rebase};
 use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot, VideoKind, VideoSlot};
 
 const SOCKET: Token = Token(0);
@@ -56,10 +58,10 @@ const LOAD_EVERY: Duration = Duration::from_secs(5);
 const PLAN_EVERY: Duration = Duration::from_millis(50);
 
 type PeerId = u64;
-/// One layer of one publisher's camera.
+/// One layer of one publisher's camera, or their share.
 type Source = (PeerId, Layer);
 
-/// One simulcast layer of a publisher's camera, as it arrives.
+/// One simulcast layer of a publisher's camera, or their share, as it arrives.
 struct Inbound {
     /// A frame has arrived since the camera started, with this rid.
     arrived: bool,
@@ -83,6 +85,13 @@ impl Inbound {
             broken: false,
             asked: None,
         }
+    }
+
+    /// Forgets what arrived, so a restarted camera or share waits for fresh frames.
+    fn restart(&mut self) {
+        self.arrived = false;
+        self.seen = None;
+        self.broken = false;
     }
 
     fn fresh(&self, now: Instant) -> bool {
@@ -126,8 +135,15 @@ struct Peer {
     camera: Option<Mid>,
     /// The camera m-line is sending, as the last offer said.
     camera_on: bool,
-    /// The camera's layers, `h` then `l`.
-    layers: [Inbound; 2],
+    /// The client's share m-line: the second video m-line it may send on.
+    share: Option<Mid>,
+    /// The share m-line is sending, as the last offer said.
+    share_on: bool,
+    /// This participant holds the room's share. It ends when the m-line stops or an owner or
+    /// admin ends it, and an ended share waits for the m-line to stop and start again.
+    sharing: bool,
+    /// The camera's layers, `h` then `l`, then the share.
+    layers: [Inbound; 3],
     screen: Option<Screen>,
     quality: Quality,
     /// The latest bandwidth estimates for what the SFU sends this listener, in kb/s: str0m's
@@ -144,6 +160,18 @@ impl Peer {
         self.connected && self.camera_on
     }
 
+    fn share_live(&self) -> bool {
+        self.connected && self.sharing
+    }
+
+    /// Whether this publisher still sends `layer`.
+    fn sends(&self, layer: Layer) -> bool {
+        match layer {
+            Layer::Share => self.share_live(),
+            Layer::High | Layer::Low => self.camera_live(),
+        }
+    }
+
     fn estimate(&self) -> Option<u64> {
         match (self.twcc, self.remb) {
             (Some(twcc), Some(remb)) => Some(twcc.min(remb)),
@@ -157,6 +185,8 @@ struct Room {
     members: Vec<PeerId>,
     announced: Announced,
     floor: Floor<PeerId>,
+    /// Who holds the room's one share.
+    sharer: Option<PeerId>,
 }
 
 impl Default for Room {
@@ -165,6 +195,7 @@ impl Default for Room {
             members: Vec::new(),
             announced: Announced::default(),
             floor: Floor::new(),
+            sharer: None,
         }
     }
 }
@@ -559,6 +590,11 @@ impl Engine {
                     }
                     self.replan = true;
                 }
+                Command::EndShare { call_id } => {
+                    if let Some(id) = self.by_call.get(&call_id).copied() {
+                        self.stop_share(id);
+                    }
+                }
                 Command::Leave { call_id } => {
                     if let Some(id) = self.by_call.get(&call_id).copied() {
                         self.remove(id, None);
@@ -570,10 +606,16 @@ impl Engine {
     }
 
     fn join(&mut self, room_id: String, user_id: String, offer: &str, reply: Reply, now: Instant) {
+        let starts_share = sdp::share_sending(offer);
         let Ok(offer) = SdpOffer::from_sdp_string(offer) else {
             let _ = reply.send(Err(Refused::BadSdp));
             return;
         };
+        let sharer = self.sharer(&room_id);
+        if starts_share && sharer.is_some_and(|sharer| sharer.user_id != user_id) {
+            let _ = reply.send(Err(Refused::ShareTaken));
+            return;
+        }
         let replaced: Vec<PeerId> = self
             .peers
             .iter()
@@ -626,9 +668,13 @@ impl Engine {
             audio: Bucket::new(rate, rate, now),
             camera: None,
             camera_on: false,
+            share: None,
+            share_on: false,
+            sharing: false,
             layers: [
                 Inbound::new(self.config.camera_high_kbps, now),
                 Inbound::new(self.config.camera_low_kbps, now),
+                Inbound::new(self.config.share_kbps, now),
             ],
             screen: None,
             quality: Quality::High,
@@ -643,13 +689,15 @@ impl Engine {
         self.rooms.entry(room_id).or_default().members.push(id);
         self.drain(id);
         let camera = self.camera_changed(id);
+        let share = self.share_changed(id);
         self.seat(id);
         self.settle();
-        tracing::info!(%call_id, camera, "media joined");
+        tracing::info!(%call_id, camera, share, "media joined");
         let _ = reply.send(Ok(Answer {
             call_id,
             sdp: answer.to_sdp_string(),
             camera,
+            share,
         }));
     }
 
@@ -658,10 +706,24 @@ impl Engine {
             let _ = reply.send(Err(Refused::NotFound));
             return;
         };
+        let starts_share = sdp::share_sending(offer);
         let Ok(offer) = SdpOffer::from_sdp_string(offer) else {
             let _ = reply.send(Err(Refused::BadSdp));
             return;
         };
+        let Some(peer) = self.peers.get(&id) else {
+            let _ = reply.send(Err(Refused::NotFound));
+            return;
+        };
+        let taken = self
+            .rooms
+            .get(&peer.room_id)
+            .and_then(|room| room.sharer)
+            .is_some_and(|sharer| sharer != id);
+        if starts_share && !peer.share_on && taken {
+            let _ = reply.send(Err(Refused::ShareTaken));
+            return;
+        }
         let Some(peer) = self.peers.get_mut(&id) else {
             let _ = reply.send(Err(Refused::NotFound));
             return;
@@ -676,11 +738,13 @@ impl Engine {
         };
         self.drain(id);
         let camera = self.camera_changed(id);
+        let share = self.share_changed(id);
         self.settle();
         let _ = reply.send(Ok(Answer {
             call_id: call_id.to_string(),
             sdp: answer.to_sdp_string(),
             camera,
+            share,
         }));
     }
 
@@ -696,14 +760,70 @@ impl Engine {
             .is_some_and(|media| media.direction().is_receiving());
         if on != peer.camera_on {
             peer.camera_on = on;
-            for layer in &mut peer.layers {
-                layer.arrived = false;
-                layer.seen = None;
-                layer.broken = false;
+            for layer in &mut peer.layers[..2] {
+                layer.restart();
             }
             self.replan = true;
         }
         on
+    }
+
+    /// Reads whether `id`'s share m-line sends, after an offer, and whether they hold the
+    /// room's share. A share starts when the m-line starts sending and nobody else holds it;
+    /// the offer was refused before this if someone did. It stops when the m-line stops.
+    fn share_changed(&mut self, id: PeerId) -> bool {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return false;
+        };
+        let on = peer
+            .share
+            .and_then(|mid| peer.rtc.media(mid))
+            .is_some_and(|media| media.direction().is_receiving());
+        let started = on && !peer.share_on;
+        peer.share_on = on;
+        if !on {
+            self.stop_share(id);
+            return false;
+        }
+        if started {
+            let free = self
+                .rooms
+                .get(&peer.room_id)
+                .is_some_and(|room| room.sharer.is_none_or(|sharer| sharer == id));
+            if free {
+                peer.sharing = true;
+                peer.layers[Layer::Share.index()].restart();
+                let room_id = peer.room_id.clone();
+                if let Some(room) = self.rooms.get_mut(&room_id) {
+                    room.sharer = Some(id);
+                }
+                self.replan = true;
+            }
+        }
+        self.peers.get(&id).is_some_and(|peer| peer.sharing)
+    }
+
+    /// Ends `id`'s share, if they hold one. Listeners go back to a camera on its keyframe.
+    fn stop_share(&mut self, id: PeerId) {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
+        };
+        if !peer.sharing {
+            return;
+        }
+        peer.sharing = false;
+        if let Some(room) = self.rooms.get_mut(&peer.room_id) {
+            if room.sharer == Some(id) {
+                room.sharer = None;
+            }
+        }
+        self.replan = true;
+    }
+
+    /// The participant holding `room_id`'s share.
+    fn sharer(&self, room_id: &str) -> Option<&Peer> {
+        let sharer = self.rooms.get(room_id)?.sharer?;
+        self.peers.get(&sharer)
     }
 
     /// Gives `id` a slot with every other member of its room, and them one with it.
@@ -761,6 +881,9 @@ impl Engine {
             Some(room) => {
                 room.members.retain(|member| *member != id);
                 room.floor.forget(&id);
+                if room.sharer == Some(id) {
+                    room.sharer = None;
+                }
                 room.members.clone()
             }
             None => Vec::new(),
@@ -818,11 +941,15 @@ impl Engine {
             })
             .collect();
         let video = peer.screen.as_ref().and_then(|screen| {
-            let (publisher, _) = screen.showing?;
+            let (publisher, layer) = screen.showing?;
             self.peers.get(&publisher).map(|publisher| VideoSlot {
                 mid: screen.mid.to_string(),
                 user_id: publisher.user_id.clone(),
-                kind: VideoKind::Camera,
+                kind: if layer == Layer::Share {
+                    VideoKind::Share
+                } else {
+                    VideoKind::Camera
+                },
             })
         });
         if audio == peer.told && video == peer.told_video {
@@ -1091,15 +1218,22 @@ impl Engine {
         drain(id, peer, &mut sink);
     }
 
-    /// Copies each queued audio frame to every listener in its room, and each camera frame
-    /// to the listeners whose video slot carries it. Then passes on keyframe requests.
+    /// Copies each queued audio frame to every listener in its room, and each camera or share
+    /// frame to the listeners whose video slot carries it. Then passes on keyframe requests.
     fn forward_all(&mut self, now: Instant) {
         while let Some((origin, data)) = self.forward.pop_front() {
             let Some(publisher) = self.peers.get_mut(&origin) else {
                 continue;
             };
             if publisher.camera == Some(data.mid) {
-                self.forward_video(origin, &data, now);
+                let layer = Layer::of_rid(data.rid.as_deref());
+                self.forward_video(origin, &data, layer, now);
+                continue;
+            }
+            if publisher.share == Some(data.mid) {
+                if publisher.sharing {
+                    self.forward_video(origin, &data, Layer::Share, now);
+                }
                 continue;
             }
             if publisher.muted {
@@ -1159,11 +1293,10 @@ impl Engine {
         }
     }
 
-    /// One camera frame. Over its layer's budget it is dropped, and the layer stays dropped
-    /// until a keyframe fits. Each listener showing this layer gets it; a listener waiting
-    /// for this layer switches to it on a keyframe.
-    fn forward_video(&mut self, origin: PeerId, data: &MediaData, now: Instant) {
-        let layer = Layer::of_rid(data.rid.as_deref());
+    /// One camera or share frame on `layer`. Over its layer's budget it is dropped, and the
+    /// layer stays dropped until a keyframe fits. Each listener showing this layer gets it; a
+    /// listener waiting for this layer switches to it on a keyframe.
+    fn forward_video(&mut self, origin: PeerId, data: &MediaData, layer: Layer, now: Instant) {
         let keyframe = data.is_keyframe();
         let size = u32::try_from(data.data.len()).unwrap_or(u32::MAX);
         let Some(publisher) = self.peers.get_mut(&origin) else {
@@ -1242,7 +1375,11 @@ impl Engine {
         let Some(peer) = self.peers.get_mut(&publisher) else {
             return;
         };
-        let Some(mid) = peer.camera else {
+        let mid = match layer {
+            Layer::Share => peer.share,
+            Layer::High | Layer::Low => peer.camera,
+        };
+        let Some(mid) = mid else {
             return;
         };
         let inbound = &mut peer.layers[layer.index()];
@@ -1263,16 +1400,20 @@ impl Engine {
         self.drain(publisher);
     }
 
-    /// Chooses what every listener's video slot should carry: the newest holder of the floor
-    /// with a live camera other than the listener, else the first such camera in join order;
-    /// and its layer from the listener's estimate, their `call.quality`, and the server's
-    /// upload budget. A listener keeps what it shows until the wanted source's keyframe. A
-    /// deafened listener gets nothing.
+    /// Chooses what every listener's video slot should carry: the room's share if there is
+    /// one and the listener is not its sharer; else the newest holder of the floor with a
+    /// live camera other than the listener, else the first such camera in join order, and its
+    /// layer from the listener's estimate, their `call.quality`, and the server's upload
+    /// budget. A listener keeps what it shows until the wanted source's keyframe. A deafened
+    /// listener gets nothing.
     fn plan(&mut self, now: Instant) {
         self.replan = false;
         self.planned_at = now;
-        let (mut audio_streams, mut viewers) = (0u64, 0u64);
+        let (mut audio_streams, mut share_viewers, mut camera_viewers) = (0u64, 0u64, 0u64);
         for room in self.rooms.values() {
+            let sharer = room
+                .sharer
+                .filter(|id| self.peers.get(id).is_some_and(Peer::share_live));
             let cameras: Vec<PeerId> = room
                 .members
                 .iter()
@@ -1287,34 +1428,48 @@ impl Engine {
                     continue;
                 }
                 audio_streams += peer.slots.held().count() as u64;
-                if peer.screen.is_some()
-                    && peer.quality != Quality::Off
-                    && cameras.iter().any(|camera| camera != id)
-                {
-                    viewers += 1;
+                if peer.screen.is_none() || peer.quality == Quality::Off {
+                    continue;
+                }
+                if sharer.is_some_and(|sharer| sharer != *id) {
+                    share_viewers += 1;
+                } else if cameras.iter().any(|camera| camera != id) {
+                    camera_viewers += 1;
                 }
             }
         }
-        let ceiling = video::ceiling(self.config.egress_kbps, audio_streams, viewers);
+        let ceiling = video::ceiling(
+            self.config.egress_kbps,
+            audio_streams,
+            share_viewers,
+            camera_viewers,
+        );
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
         for id in ids {
             self.plan_screen(id, ceiling, now);
         }
     }
 
-    fn plan_screen(&mut self, id: PeerId, ceiling: Quality, now: Instant) {
+    fn plan_screen(&mut self, id: PeerId, ceiling: Ceiling, now: Instant) {
         let Some(peer) = self.peers.get(&id) else {
             return;
         };
         let Some(screen) = &peer.screen else {
             return;
         };
-        let live =
-            |other: &PeerId| *other != id && self.peers.get(other).is_some_and(Peer::camera_live);
+        let sends = |(other, layer): &Source| {
+            *other != id && self.peers.get(other).is_some_and(|peer| peer.sends(*layer))
+        };
+        let live = |other: &PeerId| sends(&(*other, Layer::High));
         // A deafened listener's slot empties, so it starts again on a keyframe.
         let watching = peer.connected && !peer.deafened;
         let room = self.rooms.get(&peer.room_id).filter(|_| watching);
-        let publisher = room.and_then(|room| {
+        let share = room
+            .and_then(|room| room.sharer)
+            .map(|sharer| (sharer, Layer::Share))
+            .filter(sends);
+        let ceiling_camera = ceiling.camera;
+        let publisher = room.filter(|_| share.is_none()).and_then(|room| {
             room.floor
                 .recent()
                 .iter()
@@ -1322,10 +1477,10 @@ impl Engine {
                 .find(|other| live(other))
                 .copied()
         });
-        let most = peer.quality.min(ceiling);
+        let most = peer.quality.min(ceiling_camera);
         let current = screen.wanted.map(|(_, layer)| layer);
-        let wanted = publisher.and_then(|publisher| {
-            let layer = video::pick_layer(current, peer.estimate(), peer.quality, ceiling)?;
+        let camera = publisher.and_then(|publisher| {
+            let layer = video::pick_layer(current, peer.estimate(), peer.quality, ceiling_camera)?;
             let layers = &self.peers.get(&publisher)?.layers;
             let fresh = |layer: Layer| layers[layer.index()].fresh(now);
             let other = layer.other();
@@ -1333,13 +1488,18 @@ impl Engine {
                 !fresh(layer) && fresh(other) && (other == Layer::Low || most == Quality::High);
             Some((publisher, if fallback { other } else { layer }))
         });
+        // A share has one layer, so the estimate does not choose it; `off` and the budget may.
+        let wanted = match share {
+            Some(share) => (ceiling.share && peer.quality != Quality::Off).then_some(share),
+            None => camera,
+        };
         let showing = screen
             .showing
-            .filter(|(publisher, _)| wanted.is_some() && live(publisher));
-        let probe = if wanted.is_some() && most == Quality::High {
-            video::PROBE_KBPS
-        } else {
-            video::LOW_KBPS
+            .filter(|source| wanted.is_some() && sends(source));
+        let probe = match wanted {
+            Some((_, Layer::Share)) => video::SHARE_KBPS,
+            Some(_) if most == Quality::High => video::PROBE_KBPS,
+            _ => video::LOW_KBPS,
         };
         let Some(peer) = self.peers.get_mut(&id) else {
             return;
@@ -1436,11 +1596,16 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                         {
                             peer.camera = Some(added.mid);
                         }
+                        Direction::RecvOnly | Direction::SendRecv | Direction::Inactive
+                            if peer.share.is_none() =>
+                        {
+                            peer.share = Some(added.mid);
+                        }
                         _ => {}
                     }
                 }
                 RtcEvent::MediaData(data)
-                    if Some(data.mid) == peer.publish || Some(data.mid) == peer.camera =>
+                    if [peer.publish, peer.camera, peer.share].contains(&Some(data.mid)) =>
                 {
                     sink.forward.push_back((id, data));
                 }

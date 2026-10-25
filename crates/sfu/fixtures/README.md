@@ -4,6 +4,8 @@
 
 The headless client's two camera layers. Each is a raw H.264 Annex B stream: 300 frames at 30 fps, constrained baseline, level 3.1, one IDR frame (with its SPS and PPS) and then 299 P frames, one slice each, no B frames. `h` is 320×180 and `l` is 160×90. The picture is SMPTE colour bars, which do not move, so the P frames are a few bytes each.
 
+The headless client's share sends `camera-h.h264` too, at 15 fps, tagged layer `s` and padded to 2.5 Mb/s. A share of colour bars is not a screen, but the SFU never looks inside a frame, so it routes the same.
+
 `client.rs` cuts each stream into frames, puts an SEI message in front of each one that names the sender and the layer, and pads it to the layer's nominal bitrate. A keyframe request from the SFU starts the layer over at its IDR frame; otherwise it loops every 10 s.
 
 They were made with FFmpeg 9.0.2 and libx264 0.165 on 2026-10-24, from FFmpeg's built-in `smptebars` source. libx264's SEI with its version and settings is stripped:

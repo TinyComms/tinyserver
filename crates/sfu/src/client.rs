@@ -2,28 +2,36 @@
 //!
 //! 1. [`Client::new`] binds a UDP socket and builds the offer: one `sendonly` audio m-line for
 //!    the microphone, one `recvonly` audio m-line per receive slot, one video m-line for the
-//!    camera with simulcast rids `h` and `l`, `inactive` until the camera starts, and one
-//!    `recvonly` video m-line for the one video slot. [`Client::tcp`] offers one active TCP
+//!    camera with simulcast rids `h` and `l`, `inactive` until the camera starts, one video
+//!    m-line for a screen share, `inactive` until it starts, and one `recvonly` video m-line
+//!    for the one video slot. [`Client::tcp`] offers one active TCP
 //!    candidate instead, and no UDP at all, as on a network that blocks UDP. It connects to
 //!    the SFU's passive TCP candidate when str0m first sends to it, and frames each packet
 //!    with a 2-byte length (RFC 4571).
 //! 2. The offer goes out as `call.join` `sdp`. The `call.answer` `sdp` comes back to
 //!    [`Client::accept`]. The client never trickles; the SFU learns its address from STUN.
 //! 3. [`Client::start`] drives str0m on its own thread, with no async runtime: a 20 ms Opus
-//!    frame out, a camera frame on each layer every 1/30 s while the camera is on, and every
-//!    frame in, tagged with the mid it arrived on.
+//!    frame out, a camera frame on each layer every 1/30 s while the camera is on, a share
+//!    frame every 1/15 s while the share is on, and every frame in, tagged with the mid it
+//!    arrived on.
 //! 4. `call.slots` says which mid carries whom. The SFU rewrites sequence numbers, but a slot
 //!    that changes hands carries a new speaker's timestamps, so reset that slot's jitter
 //!    buffer and decoder when its `user_id` changes. The video slot changes hands on a
-//!    keyframe; reset the video decoder then.
+//!    keyframe; reset the video decoder then. A frame str0m marks not contiguous was lost:
+//!    drop frames until a keyframe, and ask for one with PLI every 300 ms.
 //! 5. [`Running::camera`] flips the camera m-line and returns the offer for `call.offer`;
-//!    [`Running::accept`] takes its answer. A keyframe request from the SFU restarts that
-//!    layer at its keyframe.
+//!    [`Running::accept`] takes its answer. [`Running::share`] does the same for the share.
+//!    Either starts sending only once the answer is accepted: the SFU drops what comes before
+//!    it takes the offer, and could keep the tail of a frame cut that way. str0m flips the
+//!    m-line when it makes the offer, so an offer refused with `share_taken` is undone with
+//!    [`Running::reject`]. A share an owner or admin ended is stopped with `share(false)`. A
+//!    keyframe request from the SFU restarts that layer at its keyframe.
 //!
 //! The audio frames are not real Opus. Each one is a TOC byte, a marker byte that says who
 //! sent it, and a counter. The SFU never decodes, so it cannot tell. The camera frames are
 //! real H.264 constrained baseline from `fixtures/` (see its README), each with an SEI
 //! message that says who sent it and on which layer, padded to the layer's nominal bitrate.
+//! The share sends the `h` clip, tagged layer `s` and padded to the share's 2.5 Mb/s.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -39,7 +47,7 @@ use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token, Waker};
 use str0m::bwe::Bitrate;
 use str0m::change::{SdpAnswer, SdpPendingOffer};
-use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid, Rid};
+use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid, Rid};
 use str0m::media::{Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive, TcpType};
 use str0m::{Candidate, Event, Input, Output, Rtc, RtcConfig};
@@ -68,9 +76,27 @@ const LAYERS: [Layer; 2] = [
         bytes: 1458,
     },
 ];
+/// One share frame: 15 fps on the 90 kHz video clock.
+const SHARE_FRAME: Duration = Duration::from_nanos(66_666_667);
+const TICKS_PER_SHARE_FRAME: u64 = 6000;
+/// The share's nominal bitrate, in kb/s. [`Running::share_kbps`] changes it.
+const SHARE_KBPS: u64 = 2500;
+/// The share: the `h` clip, tagged `s`, padded to the share bitrate at 15 fps.
+const SHARE: Layer = Layer {
+    rid: "s",
+    clip: include_bytes!("../fixtures/camera-h.h264"),
+    bytes: share_bytes(SHARE_KBPS),
+};
+
+/// One share frame's size at `kbps`.
+const fn share_bytes(kbps: u64) -> usize {
+    (kbps * 1000 / 8 / 15) as usize
+}
 /// Names the SEI message that tags each camera frame. No zero bytes, so it needs no
 /// emulation prevention.
 const TAG: &[u8; 16] = b"tinyserver-video";
+/// After a lost frame on the video slot, a PLI goes out this often until a keyframe comes.
+const PLI_EVERY: Duration = Duration::from_millis(300);
 /// A REMB goes out this often while one is set, as browsers send them.
 const REMB_EVERY: Duration = Duration::from_secs(1);
 const UDP: Token = Token(0);
@@ -94,18 +120,19 @@ pub struct Frame {
     pub marker: u8,
 }
 
-/// A camera frame the client received on its video slot.
+/// A camera or share frame the client received on its video slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrame {
     pub mid: String,
     /// The sender's marker byte, from the frame's SEI tag. 0 if it has none.
     pub marker: u8,
-    /// The layer it was sent on, `b'h'` or `b'l'`, from the same tag.
+    /// The layer it was sent on, `b'h'` or `b'l'`, or `b's'` for a share, from the same tag.
     pub layer: u8,
     pub keyframe: bool,
 }
 
 struct Layer {
+    /// The simulcast rid. The share sends none; its first byte only tags the frames.
     rid: &'static str,
     clip: &'static [u8],
     /// Every frame is padded to this size.
@@ -124,7 +151,10 @@ enum Link {
 
 /// A request from [`Running`] to the client's thread.
 enum Request {
-    Camera(bool, SyncSender<Result<String, String>>),
+    /// Turn the camera, or with `true` first the share, on or off.
+    Flip(bool, bool, SyncSender<Result<String, String>>),
+    /// The SFU refused the last offer.
+    Reject(SyncSender<()>),
     Answer(String, SyncSender<Result<(), String>>),
 }
 
@@ -136,9 +166,16 @@ pub struct Client {
     local: SocketAddr,
     microphone: Mid,
     camera: Mid,
+    share: Mid,
     screen: Mid,
     pending: Option<SdpPendingOffer>,
     offer: String,
+    /// The m-line and direction the pending offer changed from, to undo it if refused.
+    flipped: Option<(Mid, Direction)>,
+    /// A frame on the video slot was lost. Frames are dropped until a keyframe, as a decoder
+    /// would, and asked for with PLI.
+    lost: bool,
+    asked: Option<Instant>,
 }
 
 impl Client {
@@ -199,6 +236,7 @@ impl Client {
             None,
             Some(layers),
         );
+        let share = change.add_media(MediaKind::Video, Direction::Inactive, None, None, None);
         let screen = change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         let (offer, pending) = change
             .apply()
@@ -209,9 +247,13 @@ impl Client {
             local,
             microphone,
             camera,
+            share,
             screen,
             pending: Some(pending),
             offer: offer.to_sdp_string(),
+            flipped: None,
+            lost: false,
+            asked: None,
         })
     }
 
@@ -260,13 +302,15 @@ impl Client {
         }
         let mut events = Events::with_capacity(64);
         let mut camera = Camera::default();
+        let mut share = Share::default();
         let mut next_frame = Instant::now();
         let mut next_video = Instant::now();
+        let mut next_share = Instant::now();
         let mut next_remb = Instant::now();
         let mut sent: u64 = 0;
         let mut packets: VecDeque<Packet> = VecDeque::new();
         while !shared.stop.load(Ordering::Acquire) {
-            let Some(timeout) = self.drain(shared, &poll, &mut camera) else {
+            let Some(timeout) = self.drain(shared, &poll, &mut camera, &mut share) else {
                 return;
             };
             if let Some((proto, source, packet)) = packets.pop_front() {
@@ -289,11 +333,15 @@ impl Client {
                 next_frame += FRAME;
                 continue;
             }
-            let camera_on = connected && self.camera_sending();
+            // A camera or share starts once its answer is accepted, so the SFU never gets the
+            // tail of a frame sent before it took the offer.
+            let settled = self.pending.is_none();
+            let camera_on = connected && self.sending_on(self.camera);
+            let camera_due = camera_on && (camera.on || settled);
             if !camera_on {
                 camera.on = false;
                 next_video = now;
-            } else if now >= next_video {
+            } else if camera_due && now >= next_video {
                 if !camera.on {
                     // A camera that starts begins each layer at its keyframe.
                     camera = Camera {
@@ -305,6 +353,22 @@ impl Client {
                 next_video += VIDEO_FRAME;
                 continue;
             }
+            let share_on = connected && self.sending_on(self.share);
+            let share_due = share_on && (share.on || settled);
+            if !share_on {
+                share.on = false;
+                next_share = now;
+            } else if share_due && now >= next_share {
+                if !share.on {
+                    share = Share {
+                        on: true,
+                        ..Share::default()
+                    };
+                }
+                self.send_share(marker, &mut share, shared, now);
+                next_share += SHARE_FRAME;
+                continue;
+            }
             let remb = shared.remb.load(Ordering::Acquire);
             if connected && remb > 0 && now >= next_remb {
                 if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(self.screen, None) {
@@ -314,8 +378,11 @@ impl Client {
                 continue;
             }
             let mut wake = timeout.min(next_frame.max(now + Duration::from_millis(1)));
-            if camera_on {
+            if camera_due {
                 wake = wake.min(next_video);
+            }
+            if share_due {
+                wake = wake.min(next_share);
             }
             let wait = wake
                 .saturating_duration_since(now)
@@ -339,17 +406,20 @@ impl Client {
         }
     }
 
-    /// Renegotiates for [`Running`]: a new offer with the camera on or off, or its answer.
+    /// Renegotiates for [`Running`]: a new offer with the camera or share on or off, or its
+    /// answer.
     fn answer(&mut self, request: Request) {
         match request {
-            Request::Camera(on, reply) => {
+            Request::Flip(share, on, reply) => {
                 let direction = if on {
                     Direction::SendOnly
                 } else {
                     Direction::Inactive
                 };
+                let mid = if share { self.share } else { self.camera };
+                self.flipped = self.rtc.media(mid).map(|media| (mid, media.direction()));
                 let mut change = self.rtc.sdp_api();
-                change.set_direction(self.camera, direction);
+                change.set_direction(mid, direction);
                 let offer = match change.apply() {
                     Some((offer, pending)) => {
                         self.pending = Some(pending);
@@ -360,14 +430,26 @@ impl Client {
                 let _ = reply.send(offer);
             }
             Request::Answer(answer, reply) => {
+                self.flipped = None;
                 let _ = reply.send(accept(&mut self.rtc, &mut self.pending, &answer));
+            }
+            Request::Reject(reply) => {
+                // str0m flipped the m-line when it made the offer. Flip it back, and drop
+                // both offers: the SFU still has the state before the first.
+                if let Some((mid, direction)) = self.flipped.take() {
+                    let mut change = self.rtc.sdp_api();
+                    change.set_direction(mid, direction);
+                    let _ = change.apply();
+                }
+                self.pending = None;
+                let _ = reply.send(());
             }
         }
     }
 
-    fn camera_sending(&self) -> bool {
+    fn sending_on(&self, mid: Mid) -> bool {
         self.rtc
-            .media(self.camera)
+            .media(mid)
             .is_some_and(|media| media.direction().is_sending())
     }
 
@@ -439,7 +521,13 @@ impl Client {
     }
 
     /// Polls str0m until it asks for a timeout. `None` once the connection is over.
-    fn drain(&mut self, shared: &Shared, poll: &Poll, camera: &mut Camera) -> Option<Instant> {
+    fn drain(
+        &mut self,
+        shared: &Shared,
+        poll: &Poll,
+        camera: &mut Camera,
+        share: &mut Share,
+    ) -> Option<Instant> {
         loop {
             if !self.rtc.is_alive() {
                 return None;
@@ -452,12 +540,18 @@ impl Client {
                 }
                 Output::Event(Event::Connected) => shared.connected.store(true, Ordering::Release),
                 Output::Event(Event::MediaData(data)) if data.mid == self.screen => {
+                    let keyframe = data.is_keyframe();
+                    self.lost = !keyframe && (self.lost || !data.contiguous);
+                    if self.lost {
+                        self.ask_keyframe();
+                        continue;
+                    }
                     let (marker, layer) = tag(&data.data).unwrap_or_default();
                     let frame = VideoFrame {
                         mid: data.mid.to_string(),
                         marker,
                         layer,
-                        keyframe: data.is_keyframe(),
+                        keyframe,
                     };
                     lock(&shared.video).push(frame);
                 }
@@ -478,8 +572,27 @@ impl Client {
                         }
                     }
                 }
+                Output::Event(Event::KeyframeRequest(request)) if request.mid == self.share => {
+                    shared.share_keyframes_asked.fetch_add(1, Ordering::AcqRel);
+                    share.restart = true;
+                }
                 Output::Event(_) => {}
             }
+        }
+    }
+
+    /// Asks the SFU for a keyframe on the video slot, at most every `PLI_EVERY`.
+    fn ask_keyframe(&mut self) {
+        let now = Instant::now();
+        if self
+            .asked
+            .is_some_and(|at| now.saturating_duration_since(at) < PLI_EVERY)
+        {
+            return;
+        }
+        self.asked = Some(now);
+        if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(self.screen, None) {
+            stream.request_keyframe(KeyframeRequestKind::Pli);
         }
     }
 
@@ -521,6 +634,56 @@ impl Client {
                 return;
             };
             let _ = writer.rid(Rid::from(layer.rid)).write(pt, now, time, frame);
+        }
+    }
+}
+
+impl Client {
+    /// One share frame, without a rid.
+    fn send_share(&mut self, marker: u8, share: &mut Share, shared: &Shared, now: Instant) {
+        let time = MediaTime::new(share.sent * TICKS_PER_SHARE_FRAME, Frequency::NINETY_KHZ);
+        share.sent += 1;
+        if share.restart {
+            share.restart = false;
+            share.next = 0;
+        }
+        let Some(picture) = share.clip.get(share.next) else {
+            return;
+        };
+        share.next = (share.next + 1) % share.clip.len();
+        let kbps = shared.share_kbps.load(Ordering::Acquire);
+        let layer = Layer {
+            bytes: share_bytes(kbps),
+            ..SHARE
+        };
+        let frame = tagged(picture, marker, &layer);
+        let Some(writer) = self.rtc.writer(self.share) else {
+            return;
+        };
+        let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
+            return;
+        };
+        let _ = writer.write(pt, now, time, frame);
+    }
+}
+
+/// Where the share is in its clip.
+struct Share {
+    on: bool,
+    clip: Vec<Vec<u8>>,
+    next: usize,
+    restart: bool,
+    sent: u64,
+}
+
+impl Default for Share {
+    fn default() -> Self {
+        Self {
+            on: false,
+            clip: frames(SHARE.clip),
+            next: 0,
+            restart: false,
+            sent: 0,
         }
     }
 }
@@ -664,7 +827,6 @@ fn input(
     ))
 }
 
-#[derive(Default)]
 struct Shared {
     stop: AtomicBool,
     connected: AtomicBool,
@@ -672,8 +834,26 @@ struct Shared {
     /// The REMB to send on the video slot, in kb/s. 0 sends none.
     remb: AtomicU64,
     keyframes_asked: AtomicU64,
+    share_keyframes_asked: AtomicU64,
+    share_kbps: AtomicU64,
     frames: Mutex<Vec<Frame>>,
     video: Mutex<Vec<VideoFrame>>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            stop: AtomicBool::default(),
+            connected: AtomicBool::default(),
+            sending: AtomicBool::default(),
+            remb: AtomicU64::default(),
+            keyframes_asked: AtomicU64::default(),
+            share_keyframes_asked: AtomicU64::default(),
+            share_kbps: AtomicU64::new(SHARE_KBPS),
+            frames: Mutex::default(),
+            video: Mutex::default(),
+        }
+    }
 }
 
 /// A client in a call. Dropping it stops it.
@@ -700,7 +880,7 @@ impl Running {
         std::mem::take(&mut *lock(&self.shared.frames))
     }
 
-    /// Camera frames received since the last call, in order.
+    /// Camera and share frames received since the last call, in order.
     pub fn take_video(&self) -> Vec<VideoFrame> {
         std::mem::take(&mut *lock(&self.shared.video))
     }
@@ -710,15 +890,41 @@ impl Running {
         self.shared.keyframes_asked.load(Ordering::Acquire)
     }
 
+    /// Keyframe requests the SFU has sent for the share.
+    pub fn share_keyframes_asked(&self) -> u64 {
+        self.shared.share_keyframes_asked.load(Ordering::Acquire)
+    }
+
     /// The offer for `call.offer` that turns the camera on or off. The camera sends once
     /// its answer is accepted.
     pub fn camera(&self, on: bool) -> Result<String, String> {
         let (reply, answer) = mpsc::sync_channel(1);
-        self.ask(Request::Camera(on, reply))?;
+        self.ask(Request::Flip(false, on, reply))?;
         answer.recv().map_err(|_| "client stopped".to_string())?
     }
 
-    /// Takes the `call.answer` for the last [`Running::camera`] offer.
+    /// The offer for `call.offer` that starts or stops the share. The share sends once its
+    /// answer is accepted.
+    pub fn share(&self, on: bool) -> Result<String, String> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.ask(Request::Flip(true, on, reply))?;
+        answer.recv().map_err(|_| "client stopped".to_string())?
+    }
+
+    /// Pads share frames to `kbps` from the next one on. It starts at 2,500.
+    pub fn share_kbps(&self, kbps: u64) {
+        self.shared.share_kbps.store(kbps, Ordering::Release);
+    }
+
+    /// Undoes the last [`Running::camera`] or [`Running::share`] offer, which the SFU refused,
+    /// as with `share_taken`.
+    pub fn reject(&self) -> Result<(), String> {
+        let (reply, done) = mpsc::sync_channel(1);
+        self.ask(Request::Reject(reply))?;
+        done.recv().map_err(|_| "client stopped".to_string())
+    }
+
+    /// Takes the `call.answer` for the last [`Running::camera`] or [`Running::share`] offer.
     pub fn accept(&self, answer: &str) -> Result<(), String> {
         let (reply, done) = mpsc::sync_channel(1);
         self.ask(Request::Answer(answer.to_string(), reply))?;

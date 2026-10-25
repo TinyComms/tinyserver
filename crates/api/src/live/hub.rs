@@ -276,16 +276,16 @@ impl Hub {
         )
     }
 
-    /// Seats `user_id` in `room_id` for socket `conn`, with SFU participant `call_id` if the
-    /// join had media, and its camera on or off. Refused once the hub is closing.
+    /// Seats `user_id` in `room_id` for socket `conn`, with the SFU's answer if the join had
+    /// media. Refused once the hub is closing.
     pub fn call_join(
         &self,
         user_id: &str,
         room_id: &str,
         conn: u64,
-        call_id: Option<&str>,
-        camera: bool,
+        answer: Option<&sfu::Answer>,
     ) -> Result<(), Refused> {
+        let call_id = answer.map(|answer| answer.call_id.as_str());
         let mut people = lock(&self.people);
         if self.closing() {
             return Err(Refused::Closing);
@@ -299,8 +299,11 @@ impl Hub {
             self.limits.call_server_max,
         )?;
         self.tell(&mut people, changes);
-        if let Some(call_id) = call_id {
-            let change = people.calls.set_camera(user_id, call_id, camera);
+        if let Some(answer) = answer {
+            let change =
+                people
+                    .calls
+                    .set_media(user_id, &answer.call_id, answer.camera, answer.share);
             self.tell(&mut people, change);
         }
         // Slots the SFU sent before the seat existed. The socket reads them after its answer.
@@ -341,12 +344,33 @@ impl Hub {
         true
     }
 
-    /// Records whether `user_id`'s camera sends after an answer for `call_id`, and tells
-    /// everyone if it changed.
-    pub fn call_camera(&self, user_id: &str, call_id: &str, camera: bool) {
+    /// Records whether `user_id`'s camera sends and whether they share after `answer`, and
+    /// tells everyone if either changed.
+    pub fn call_media(&self, user_id: &str, answer: &sfu::Answer) {
         let mut people = lock(&self.people);
-        let change = people.calls.set_camera(user_id, call_id, camera);
+        let change = people
+            .calls
+            .set_media(user_id, &answer.call_id, answer.camera, answer.share);
         self.tell(&mut people, change);
+    }
+
+    /// Who shares their screen in `room_id`'s call.
+    pub fn sharer(&self, room_id: &str) -> Option<String> {
+        lock(&self.people).calls.sharer(room_id).map(str::to_string)
+    }
+
+    /// Ends `user_id`'s share in `room_id`, tells everyone, and stops it in the SFU. False if
+    /// they were not sharing there.
+    pub fn end_share(&self, room_id: &str, user_id: &str) -> bool {
+        let mut people = lock(&self.people);
+        let Some((call_id, change)) = people.calls.end_share(room_id, user_id) else {
+            return false;
+        };
+        if let (Some(media), Some(call_id)) = (&self.media, call_id) {
+            media.end_share(&call_id);
+        }
+        self.tell(&mut people, Some(change));
+        true
     }
 
     /// Ends `user_id`'s call, if they are in one.
@@ -450,12 +474,14 @@ impl Hub {
                     muted,
                     deafened,
                     camera,
+                    sharing,
                 } => Out::CallState {
                     room_id,
                     user_id,
                     muted: *muted,
                     deafened: *deafened,
                     camera: *camera,
+                    sharing: *sharing,
                 }
                 .text(),
             };

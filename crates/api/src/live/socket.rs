@@ -337,6 +337,7 @@ async fn receive(
         "call.join" => call_join(hub, me, asking, room_id, sdp).await?,
         "call.leave" => call_leave(hub, me, asking),
         "call.kick" => call_kick(hub, me, room_id, incoming.user_id.as_deref()).await?,
+        "call.share_end" => call_share_end(hub, me, room_id).await?,
         "call.offer" => call_offer(hub, me, asking, sdp).await,
         "call.state" => call_state(hub, me, incoming.muted, incoming.deafened),
         "call.quality" => call_quality(hub, me, incoming.video.as_deref()),
@@ -423,11 +424,9 @@ async fn call_join(
             }
         }
     };
-    let call_id = answer.as_ref().map(|answer| answer.call_id.as_str());
-    let camera = answer.as_ref().is_some_and(|answer| answer.camera);
-    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn, call_id, camera) {
-        if let Some(call_id) = call_id {
-            hub.forget(call_id);
+    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn, answer.as_ref()) {
+        if let Some(answer) = &answer {
+            hub.forget(&answer.call_id);
         }
         return Ok(Err(refused.code()));
     }
@@ -443,12 +442,14 @@ fn media_code(refused: sfu::Refused) -> &'static str {
     match refused {
         sfu::Refused::BadSdp => "bad_sdp",
         sfu::Refused::NotFound => "not_found",
+        sfu::Refused::ShareTaken => "share_taken",
         sfu::Refused::Unavailable => Refused::NoMedia.code(),
     }
 }
 
-/// Renegotiates the caller's media. The SFU answers, and a camera that started or stopped
-/// is shown to everyone as `call.state`.
+/// Renegotiates the caller's media. The SFU answers, and a camera or share that started or
+/// stopped is shown to everyone as `call.state`. A share someone else holds is
+/// `share_taken`.
 async fn call_offer(hub: &Hub, me: &Me, asking: &mut Asking<'_>, sdp: Option<&str>) -> Answer {
     let Some(sdp) = sdp else {
         return Err("bad_frame");
@@ -463,7 +464,7 @@ async fn call_offer(hub: &Hub, me: &Me, asking: &mut Asking<'_>, sdp: Option<&st
         return Err("not_found");
     };
     let answer = media.offer(&call_id, sdp).await.map_err(media_code)?;
-    hub.call_camera(&me.user_id, &call_id, answer.camera);
+    hub.call_media(&me.user_id, &answer);
     Ok(Done::Answer(answer))
 }
 
@@ -532,6 +533,33 @@ async fn call_kick(
         }
     }
     hub.call_kick(room_id, user_id);
+    Ok(Ok(Done::Ok))
+}
+
+/// Owners and admins may end the screen share in a room. An admin may not end an owner's.
+async fn call_share_end(hub: &Hub, me: &mut Me, room_id: Option<&str>) -> Result<Answer, End> {
+    let Some(room_id) = room_id else {
+        return Ok(Err("bad_frame"));
+    };
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    if !me.manages() {
+        return Ok(Err("forbidden"));
+    }
+    let Some(user_id) = hub.sharer(room_id) else {
+        return Ok(Err("not_found"));
+    };
+    match db::end_share(&hub.pool, &me.caller(), room_id, &user_id).await {
+        Ok(()) => {}
+        Err(CommunityError::Forbidden) => return Ok(Err("forbidden")),
+        Err(CommunityError::NotFound) => return Ok(Err("not_found")),
+        Err(error) => {
+            tracing::warn!(%error, "share end failed");
+            return Ok(Err("unavailable"));
+        }
+    }
+    hub.end_share(room_id, &user_id);
     Ok(Ok(Done::Ok))
 }
 
