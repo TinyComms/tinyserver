@@ -1,6 +1,7 @@
 # One community. Postgres and the server share a network that has no route out.
-# cloudflared is the only process that can reach the internet, and it is the only
-# process that can reach the server. Nothing is published on the host.
+# cloudflared carries HTTP and the live socket; it is the only way to the server's
+# HTTP port. The one thing published on the host is the media port, UDP, for call
+# audio straight to the SFU.
 
 name: tinyserver
 
@@ -49,6 +50,12 @@ services:
       TINYSERVER_OWNER_EMAIL: ${TINYSERVER_OWNER_EMAIL:-}
       TINYSERVER_OWNER_NAME: ${TINYSERVER_OWNER_NAME:-}
       TINYSERVER_OWNER_PASSWORD: ${TINYSERVER_OWNER_PASSWORD:-}
+      # Calls have media only when the public address is set. Members see it.
+      TINYSERVER_MEDIA_PORT: ${TINYSERVER_MEDIA_PORT:-50000}
+      TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}
+    # The same number inside and out: the SFU advertises the port it binds.
+    ports:
+      - "${TINYSERVER_MEDIA_PORT:-50000}:${TINYSERVER_MEDIA_PORT:-50000}/udp"
     restart: unless-stopped
     read_only: true
     cap_drop:
@@ -57,6 +64,7 @@ services:
       - no-new-privileges:true
     networks:
       - inside
+      - media
     logging: *logging
 
   tunnel:
@@ -76,6 +84,8 @@ networks:
   inside:
     internal: true
   edge:
+  # Docker publishes ports only from a network that is not internal.
+  media:
 
 volumes:
   tinyserver_pg:
