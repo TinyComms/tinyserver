@@ -298,9 +298,18 @@ async fn a_killed_client_leaves_with_media_lost() {
         hears(&a, &mid_for(&a_slots, &b.user_id), b'B').await;
 
         b.running.stop();
+        // `call.left` comes on the broadcast and `call.slots` on the socket's own channel, so
+        // either may arrive first.
         let lost = left(&cast.lobby, &cast.members[0].0, "media_lost");
-        until(&mut a.ws, |value| (*value == lost).then_some(())).await;
-        slots(&mut a.ws, &a.call_id, 0).await;
+        let (mut saw_left, mut saw_slots) = (false, false);
+        until(&mut a.ws, |value| {
+            saw_left |= *value == lost;
+            saw_slots |= value["type"] == "call.slots"
+                && value["call_id"] == a.call_id.as_str()
+                && value["audio"] == json!([]);
+            (saw_left && saw_slots).then_some(())
+        })
+        .await;
     })
     .await;
 }
