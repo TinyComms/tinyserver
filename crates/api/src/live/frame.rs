@@ -1,7 +1,7 @@
-//! Frames the server sends, and the durable events behind them.
+//! Frames the server sends and reads, and the durable events behind them.
 
 use db::OutboxRow;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::call::Occupancy;
@@ -88,6 +88,27 @@ impl Event {
             room,
             frame,
         }
+    }
+}
+
+/// One client message. Which fields a `type` needs is the handler's business.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Incoming {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "ref")]
+    pub reference: Option<Value>,
+    pub room_id: Option<String>,
+    pub user_id: Option<String>,
+    pub sdp: Option<String>,
+    pub muted: Option<bool>,
+    pub deafened: Option<bool>,
+}
+
+impl Incoming {
+    /// `None` for anything but a JSON object with a string `type`.
+    pub fn parse(text: &str) -> Option<Self> {
+        serde_json::from_str(text).ok()
     }
 }
 

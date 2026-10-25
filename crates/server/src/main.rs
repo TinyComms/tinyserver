@@ -69,7 +69,6 @@ async fn bootstrap() -> anyhow::Result<()> {
 }
 
 async fn serve() -> anyhow::Result<()> {
-    let media = media_config()?;
     let url = env_var("DATABASE_URL")?;
     let bind: SocketAddr = env_var("BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -82,10 +81,11 @@ async fn serve() -> anyhow::Result<()> {
         call_server_max: env_count("TINYSERVER_CALL_SERVER_MAX", defaults.call_server_max)?,
         ..defaults
     };
+    let media = media_config(limits.call_room_max)?;
     let live = match media {
         Some(config) => {
             let (media, events) = sfu::start(config).context("start media")?;
-            tracing::info!(addr = %media.addr(), "media advertised");
+            tracing::info!(addr = %media.addr(), transports = ?media.transports(), "media advertised");
             api::Live::with_media(pool.clone(), limits, media, events)
         }
         None => {
@@ -108,9 +108,10 @@ async fn serve() -> anyhow::Result<()> {
     served
 }
 
-/// Media binds every interface on `TINYSERVER_MEDIA_PORT` and advertises
-/// `TINYSERVER_PUBLIC_IP` with the same port. No public address means no media.
-fn media_config() -> anyhow::Result<Option<sfu::Config>> {
+/// Media binds every interface on `TINYSERVER_MEDIA_PORT`, UDP and TCP, and advertises
+/// `TINYSERVER_PUBLIC_IP` with the same port, and `TINYSERVER_LAN_IP` too when set. No public
+/// address means no media. An offer may have one audio m-line per seat in a room.
+fn media_config(room_max: usize) -> anyhow::Result<Option<sfu::Config>> {
     let Ok(public) = env_var("TINYSERVER_PUBLIC_IP") else {
         return Ok(None);
     };
@@ -128,8 +129,23 @@ fn media_config() -> anyhow::Result<Option<sfu::Config>> {
             .filter(|port| *port > 0)
             .context("TINYSERVER_MEDIA_PORT is not a port number")?,
     };
+    let lan_ip = match env_var("TINYSERVER_LAN_IP") {
+        Err(_) => None,
+        Ok(value) => {
+            let lan_ip: IpAddr = value
+                .parse()
+                .context("TINYSERVER_LAN_IP is not an IP address")?;
+            if !lan_ip.is_ipv4() {
+                bail!("TINYSERVER_LAN_IP must be IPv4 for now");
+            }
+            Some(lan_ip).filter(|lan_ip| *lan_ip != public_ip)
+        }
+    };
     let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-    Ok(Some(sfu::Config::new(bind, public_ip)))
+    let mut config = sfu::Config::new(bind, public_ip);
+    config.lan_ip = lan_ip;
+    config.offer_audio = room_max;
+    Ok(Some(config))
 }
 
 const DEFAULT_MEDIA_PORT: u16 = 50000;

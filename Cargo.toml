@@ -6,6 +6,8 @@ members = [
     "crates/server",
     "crates/sfu",
 ]
+# cargo-fuzz targets, built on nightly in their own CI job.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

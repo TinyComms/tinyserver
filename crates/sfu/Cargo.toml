@@ -8,6 +8,8 @@ publish.workspace = true
 [features]
 # The headless str0m client in `client.rs`. Tests use it; the server does not.
 headless = []
+# Entry points for the targets in `fuzz/`. Not for the server.
+fuzz = []
 
 [dependencies]
 mio = { version = "1", features = ["os-poll", "net"] }

@@ -1,7 +1,7 @@
 # One community. Postgres and the server share a network that has no route out.
 # cloudflared carries HTTP and the live socket; it is the only way to the server's
-# HTTP port. The one thing published on the host is the media port, UDP, for call
-# audio straight to the SFU.
+# HTTP port. The one thing published on the host is the media port, UDP and the same
+# number on TCP, for call audio straight to the SFU.
 
 name: tinyserver
 
@@ -53,9 +53,13 @@ services:
       # Calls have media only when the public address is set. Members see it.
       TINYSERVER_MEDIA_PORT: ${TINYSERVER_MEDIA_PORT:-50000}
       TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}
-    # The same number inside and out: the SFU advertises the port it binds.
+      # The host's address on the home network, for members on it. Optional.
+      TINYSERVER_LAN_IP: ${TINYSERVER_LAN_IP:-}
+    # The same number inside and out: the SFU advertises the port it binds. TCP is ICE-TCP,
+    # for networks that block UDP.
     ports:
       - "${TINYSERVER_MEDIA_PORT:-50000}:${TINYSERVER_MEDIA_PORT:-50000}/udp"
+      - "${TINYSERVER_MEDIA_PORT:-50000}:${TINYSERVER_MEDIA_PORT:-50000}/tcp"
     restart: unless-stopped
     read_only: true
     cap_drop:

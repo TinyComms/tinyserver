@@ -1,4 +1,5 @@
-//! Media plane. One OS thread owns one UDP socket and one `str0m::Rtc` per participant.
+//! Media plane. One OS thread owns one UDP socket, an ICE-TCP listener on the same port
+//! number, and one `str0m::Rtc` per participant.
 //!
 //! The API sends [`Media`] commands and reads [`Event`]s. str0m types stay in this crate.
 //! RTP stays in memory. Postgres never stores it.
@@ -6,9 +7,14 @@
 mod engine;
 mod limit;
 mod room;
+mod sdp;
+mod tcp;
 
 #[cfg(feature = "headless")]
 pub mod client;
+
+#[cfg(feature = "fuzz")]
+pub mod fuzz;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -27,10 +33,12 @@ const EVENTS: usize = 1024;
 /// Where the media thread listens, what it advertises, and its limits.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The UDP socket. Port 0 picks one; tests do that.
+    /// The UDP socket, and the TCP listener on the same port. Port 0 picks one; tests do that.
     pub bind: SocketAddr,
     /// The address members reach. The advertised port is the one bound.
     pub public_ip: IpAddr,
+    /// A second address for members on the same network, whose router may not hairpin.
+    pub lan_ip: Option<IpAddr>,
     /// A participant whose ICE and DTLS are not up by then is dropped.
     pub connect_timeout: Duration,
     /// A connected participant silent for this long is dropped. No packet at all, not even
@@ -41,6 +49,21 @@ pub struct Config {
     /// Packets one source address may send a second, and the burst above that.
     pub packets_per_second: u32,
     pub packet_burst: u32,
+    /// TCP streams open at once, from one source address, and not yet past their first STUN.
+    /// A stream over any of them is closed as soon as it is accepted.
+    pub tcp_streams: usize,
+    pub tcp_per_source: usize,
+    pub tcp_unverified: usize,
+    /// A TCP stream with no STUN for a participant by then is closed.
+    pub tcp_handshake: Duration,
+    /// A TCP stream that sends nothing for this long is closed. Half-open ones end this way.
+    pub tcp_idle: Duration,
+    /// The largest offer, in bytes.
+    pub offer_bytes: usize,
+    /// Audio and video m-lines an offer may have. Audio is the room cap: one microphone and
+    /// a slot for everyone else. Other kinds are refused.
+    pub offer_audio: usize,
+    pub offer_video: usize,
 }
 
 impl Config {
@@ -49,11 +72,20 @@ impl Config {
         Self {
             bind,
             public_ip,
+            lan_ip: None,
             connect_timeout: Duration::from_secs(15),
             consent_timeout: Duration::from_secs(30),
             audio_kbps: 64,
             packets_per_second: 500,
             packet_burst: 1000,
+            tcp_streams: 256,
+            tcp_per_source: 16,
+            tcp_unverified: 64,
+            tcp_handshake: Duration::from_secs(5),
+            tcp_idle: Duration::from_secs(30),
+            offer_bytes: 32 * 1024,
+            offer_audio: 12,
+            offer_video: 3,
         }
     }
 }
@@ -69,7 +101,7 @@ pub struct Answer {
 /// Why the SFU refused a join or an offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
-    /// Not an SDP offer str0m accepts.
+    /// Not an SDP offer str0m accepts, or over the offer caps.
     BadSdp,
     /// No such participant. For an offer only.
     NotFound,
@@ -146,15 +178,19 @@ pub struct Media {
     waker: Arc<mio::Waker>,
     alive: Arc<AtomicBool>,
     addr: SocketAddr,
+    lan: bool,
+    offers: sdp::Caps,
 }
 
-/// Binds the socket and starts the media thread.
+/// Binds the UDP socket and the TCP listener and starts the media thread.
 pub fn start(config: Config) -> io::Result<(Media, async_mpsc::Receiver<Event>)> {
     let (commands, inbox) = mpsc::sync_channel(COMMANDS);
     let (events, outbox) = async_mpsc::channel(EVENTS);
     let alive = Arc::new(AtomicBool::new(true));
-    let (engine, waker) = engine::Engine::bind(config, inbox, events, alive.clone())?;
+    let (engine, waker) = engine::Engine::bind(config.clone(), inbox, events, alive.clone())?;
     let addr = engine.advertised();
+    let lan = config.lan_ip.is_some();
+    let offers = sdp::Caps::from(&config);
     std::thread::Builder::new()
         .name("sfu".to_string())
         .spawn(move || engine.run())?;
@@ -163,14 +199,29 @@ pub fn start(config: Config) -> io::Result<(Media, async_mpsc::Receiver<Event>)>
         waker: Arc::new(waker),
         alive,
         addr,
+        lan,
+        offers,
     };
     Ok((media, outbox))
 }
 
 impl Media {
-    /// The address and port in every answer's candidate.
+    /// The public address and port in every answer's candidates, UDP and TCP.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The transports members can reach while the thread runs: `udp`, `tcp`, and `lan` when
+    /// a LAN address is advertised too. Empty once it stopped.
+    pub fn transports(&self) -> Vec<&'static str> {
+        if !self.running() {
+            return Vec::new();
+        }
+        let mut up = vec!["udp", "tcp"];
+        if self.lan {
+            up.push("lan");
+        }
+        up
     }
 
     /// False once the media thread has stopped.
@@ -180,6 +231,7 @@ impl Media {
 
     /// Adds `user_id` to `room_id` with `offer`, replacing any participant they already are.
     pub async fn join(&self, room_id: &str, user_id: &str, offer: &str) -> Result<Answer, Refused> {
+        self.offers.check(offer)?;
         let (reply, answer) = oneshot::channel();
         self.send(Command::Join {
             room_id: room_id.to_string(),
@@ -192,6 +244,7 @@ impl Media {
 
     /// Renegotiates with a new offer from the same participant.
     pub async fn offer(&self, call_id: &str, offer: &str) -> Result<Answer, Refused> {
+        self.offers.check(offer)?;
         let (reply, answer) = oneshot::channel();
         self.send(Command::Offer {
             call_id: call_id.to_string(),

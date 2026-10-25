@@ -17,8 +17,8 @@ The project is early. An owner can sign in, make rooms, and invite people, and e
 | **Audit** | An owner or admin reads `GET /v1/audit`. |
 | **Live** | `GET /v1/live` is a WebSocket with the same bearer token. It sends `ready` with who is online, then room, member, and invite changes in order with a `seq`, and presence. Reconnect with `?since=<seq>` to get what was missed, up to 24 hours back. Invite events go to owners and admins only. Frames and limits are in [`docs/calls.md`](docs/calls.md#realtime-channel). |
 | **Calls** | Over the live socket, a member sends `call.join` for a room and `call.leave` to hang up. Everyone sees `call.joined` and `call.left`, and `ready.calls` lists who is in each call. One call per person. 12 per room and 32 per server, set with `TINYSERVER_CALL_ROOM_MAX` and `TINYSERVER_CALL_SERVER_MAX`. An owner or admin sends `call.kick` to remove someone, which is audited; an admin cannot remove an owner. Calls live in memory and a restart ends them. |
-| **Audio** | `call.join` carries a WebRTC offer and gets `call.answer`. Audio goes over one UDP port to a str0m SFU in the server, which forwards each person's Opus to everyone else in the room. `call.slots` says which receive slot carries whom, `call.speaking` who is talking, and `call.state` who is muted or deafened. Media runs when `TINYSERVER_PUBLIC_IP` is set, on `TINYSERVER_MEDIA_PORT` (50000); without it calls have no audio and an offer gets `media_unavailable`. Members see the host's address. Setup is in [`deploy/README.md`](deploy/README.md#calls-and-the-media-port). |
-| **Health** | `GET /health`, with `media` `off`, `up`, or `down` |
+| **Audio** | `call.join` carries a WebRTC offer and gets `call.answer`. Audio goes over one UDP port, or ICE-TCP on the same number for networks that block UDP, to a str0m SFU in the server, which forwards each person's Opus to everyone else in the room. `call.slots` says which receive slot carries whom, `call.speaking` who is talking, and `call.state` who is muted or deafened. Media runs when `TINYSERVER_PUBLIC_IP` is set, on `TINYSERVER_MEDIA_PORT` (50000); `TINYSERVER_LAN_IP` adds the host's home-network address for members on it. Without a public address calls have no audio and an offer gets `media_unavailable`. Members see the host's address. Setup is in [`deploy/README.md`](deploy/README.md#calls-and-the-media-port). |
+| **Health** | `GET /health`, with `media` `off`, `up`, or `down`, and `transports`, the media transports up: `udp`, `tcp`, and `lan` |
 
 ## Run
 
@@ -55,4 +55,5 @@ Each test creates its own database as `app_owner`, migrates it, serves it as `ap
 | [`crates/db`](crates/db) | Migrations, the first owner, sessions, accounts, rooms, invites, and the outbox |
 | [`crates/api`](crates/api) | Health, sign-in, your account, rooms, people, invites, the audit log, the live socket, and who is in each call |
 | [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve` |
-| [`crates/sfu`](crates/sfu) | The SFU: one thread, one UDP socket, str0m. Also the headless test client that tinyclient's `mediad` follows |
+| [`crates/sfu`](crates/sfu) | The SFU: one thread, one UDP socket and an ICE-TCP listener on the same port, str0m. Also the headless test client that tinyclient's `mediad` follows |
+| [`fuzz`](fuzz) | cargo-fuzz targets for live-socket frames, SDP offers, ICE-TCP framing, and packets into str0m. Outside the workspace; `cargo +nightly fuzz run sdp_offer` |

@@ -8,6 +8,9 @@ mod limit;
 mod live;
 mod session;
 
+#[cfg(feature = "fuzz")]
+pub mod fuzz;
+
 pub use live::{Limits, Live};
 
 use axum::extract::{DefaultBodyLimit, Request};
