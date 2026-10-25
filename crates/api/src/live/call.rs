@@ -15,6 +15,10 @@ pub(crate) enum Reason {
     Removed,
     SessionEnded,
     Kicked,
+    /// Media never connected.
+    MediaTimeout,
+    /// Media connected, then stopped.
+    MediaLost,
 }
 
 impl Reason {
@@ -27,6 +31,8 @@ impl Reason {
             Self::Removed => "removed",
             Self::SessionEnded => "session_ended",
             Self::Kicked => "kicked",
+            Self::MediaTimeout => "media_timeout",
+            Self::MediaLost => "media_lost",
         }
     }
 }
@@ -42,6 +48,14 @@ pub(crate) enum Change {
         room_id: String,
         user_id: String,
         reason: Reason,
+        /// The media participant to drop, if the seat had one.
+        call_id: Option<String>,
+    },
+    State {
+        room_id: String,
+        user_id: String,
+        muted: bool,
+        deafened: bool,
     },
 }
 
@@ -52,6 +66,8 @@ pub(crate) enum Refused {
     ServerFull,
     /// The server is shutting down.
     Closing,
+    /// Media was asked for and is not running.
+    NoMedia,
 }
 
 impl Refused {
@@ -60,6 +76,7 @@ impl Refused {
             Self::Full => "full",
             Self::ServerFull => "server_full",
             Self::Closing => "unavailable",
+            Self::NoMedia => "media_unavailable",
         }
     }
 }
@@ -74,6 +91,8 @@ pub(crate) struct Occupancy {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct Participant {
     pub user_id: String,
+    pub muted: bool,
+    pub deafened: bool,
 }
 
 /// Where a person sits. `conn` is the socket that joined; `None` once it closed.
@@ -81,6 +100,10 @@ struct Seat {
     room_id: String,
     conn: Option<u64>,
     epoch: u64,
+    /// Their SFU participant. `None` for a join without media.
+    call_id: Option<String>,
+    muted: bool,
+    deafened: bool,
 }
 
 #[derive(Default)]
@@ -92,21 +115,16 @@ pub(crate) struct Calls {
 }
 
 impl Calls {
-    /// Seats `user_id` in `room_id` for socket `conn`, leaving any other call first. Joining
-    /// the room they are already in only moves the seat to `conn`.
-    pub fn join(
-        &mut self,
+    /// Whether `join` would seat `user_id` in `room_id` now.
+    pub fn check(
+        &self,
         user_id: &str,
         room_id: &str,
-        conn: u64,
         room_max: usize,
         server_max: usize,
-    ) -> Result<Vec<Change>, Refused> {
-        if let Some(seat) = self.seats.get_mut(user_id) {
-            if seat.room_id == room_id {
-                seat.conn = Some(conn);
-                return Ok(Vec::new());
-            }
+    ) -> Result<(), Refused> {
+        if self.room_of(user_id) == Some(room_id) {
+            return Ok(());
         }
         let here = self.rooms.get(room_id).map_or(0, Vec::len);
         if here >= room_max {
@@ -114,6 +132,29 @@ impl Calls {
         }
         if !self.seats.contains_key(user_id) && self.seats.len() >= server_max {
             return Err(Refused::ServerFull);
+        }
+        Ok(())
+    }
+
+    /// Seats `user_id` in `room_id` for socket `conn` with SFU participant `call_id`, leaving
+    /// any other call first. Joining the room they are already in only moves the seat to
+    /// `conn` and `call_id`.
+    pub fn join(
+        &mut self,
+        user_id: &str,
+        room_id: &str,
+        conn: u64,
+        call_id: Option<String>,
+        room_max: usize,
+        server_max: usize,
+    ) -> Result<Vec<Change>, Refused> {
+        self.check(user_id, room_id, room_max, server_max)?;
+        if let Some(seat) = self.seats.get_mut(user_id) {
+            if seat.room_id == room_id {
+                seat.conn = Some(conn);
+                seat.call_id = call_id;
+                return Ok(Vec::new());
+            }
         }
         let mut changes = Vec::new();
         changes.extend(self.leave(user_id, Reason::JoinedElsewhere));
@@ -124,6 +165,9 @@ impl Calls {
                 room_id: room_id.to_string(),
                 conn: Some(conn),
                 epoch: self.epoch,
+                call_id,
+                muted: false,
+                deafened: false,
             },
         );
         self.rooms
@@ -149,12 +193,52 @@ impl Calls {
             room_id: seat.room_id,
             user_id: user_id.to_string(),
             reason,
+            call_id: seat.call_id,
         })
     }
 
     /// The room `user_id` is in.
     pub fn room_of(&self, user_id: &str) -> Option<&str> {
         self.seats.get(user_id).map(|seat| seat.room_id.as_str())
+    }
+
+    /// `user_id`'s SFU participant.
+    pub fn call_of(&self, user_id: &str) -> Option<&str> {
+        self.seats.get(user_id)?.call_id.as_deref()
+    }
+
+    /// The socket holding `user_id`'s seat.
+    pub fn conn_of(&self, user_id: &str) -> Option<u64> {
+        self.seats.get(user_id)?.conn
+    }
+
+    /// Who holds SFU participant `call_id`.
+    pub fn holder(&self, call_id: &str) -> Option<&str> {
+        self.seats
+            .iter()
+            .find(|(_, seat)| seat.call_id.as_deref() == Some(call_id))
+            .map(|(user_id, _)| user_id.as_str())
+    }
+
+    /// Everyone in `room_id`'s call, in join order.
+    pub fn people(&self, room_id: &str) -> &[String] {
+        self.rooms.get(room_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records `user_id`'s mute and deafen. `None` if they are not in a call or nothing changed.
+    pub fn set_state(&mut self, user_id: &str, muted: bool, deafened: bool) -> Option<Change> {
+        let seat = self.seats.get_mut(user_id)?;
+        if seat.muted == muted && seat.deafened == deafened {
+            return None;
+        }
+        seat.muted = muted;
+        seat.deafened = deafened;
+        Some(Change::State {
+            room_id: seat.room_id.clone(),
+            user_id: user_id.to_string(),
+            muted,
+            deafened,
+        })
     }
 
     /// The socket `conn` closed. If it held the seat, returns an epoch for `expire`.
@@ -198,8 +282,13 @@ impl Calls {
                 room_id: room_id.clone(),
                 participants: people
                     .iter()
-                    .map(|user_id| Participant {
-                        user_id: user_id.clone(),
+                    .map(|user_id| {
+                        let seat = self.seats.get(user_id);
+                        Participant {
+                            user_id: user_id.clone(),
+                            muted: seat.is_some_and(|seat| seat.muted),
+                            deafened: seat.is_some_and(|seat| seat.deafened),
+                        }
                     })
                     .collect(),
             })
@@ -258,15 +347,19 @@ mod tests {
             room_id: room_id.to_string(),
             user_id: user_id.to_string(),
             reason,
+            call_id: None,
         }
     }
 
     #[test]
     fn joining_another_room_leaves_the_first() {
         let mut calls = Calls::default();
-        assert_eq!(calls.join("u", "a", 1, 12, 32), Ok(vec![joined("a", "u")]));
         assert_eq!(
-            calls.join("u", "b", 1, 12, 32),
+            calls.join("u", "a", 1, None, 12, 32),
+            Ok(vec![joined("a", "u")])
+        );
+        assert_eq!(
+            calls.join("u", "b", 1, None, 12, 32),
             Ok(vec![
                 left("a", "u", Reason::JoinedElsewhere),
                 joined("b", "u")
@@ -279,11 +372,11 @@ mod tests {
     #[test]
     fn a_second_socket_in_the_same_room_takes_the_seat_without_a_change() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, 12, 32).is_ok());
-        assert_eq!(calls.join("u", "a", 2, 12, 32), Ok(Vec::new()));
+        assert!(calls.join("u", "a", 1, None, 12, 32).is_ok());
+        assert_eq!(calls.join("u", "a", 2, None, 12, 32), Ok(Vec::new()));
         assert_eq!(calls.orphan("u", 1), None);
         let epoch = calls.orphan("u", 2).expect("seat held by 2");
-        assert!(calls.join("u", "a", 3, 12, 32).is_ok());
+        assert!(calls.join("u", "a", 3, None, 12, 32).is_ok());
         assert_eq!(calls.expire("u", epoch), None);
         assert_eq!(calls.room_of("u"), Some("a"));
     }
@@ -291,7 +384,7 @@ mod tests {
     #[test]
     fn an_orphaned_seat_expires() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, 12, 32).is_ok());
+        assert!(calls.join("u", "a", 1, None, 12, 32).is_ok());
         let epoch = calls.orphan("u", 1).expect("epoch");
         assert_eq!(
             calls.expire("u", epoch),
@@ -303,12 +396,15 @@ mod tests {
     #[test]
     fn caps_count_people_not_moves() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, 2, 3).is_ok());
-        assert!(calls.join("v", "a", 2, 2, 3).is_ok());
-        assert_eq!(calls.join("w", "a", 3, 2, 3), Err(Refused::Full));
-        assert!(calls.join("w", "b", 3, 2, 3).is_ok());
-        assert_eq!(calls.join("x", "b", 4, 2, 3), Err(Refused::ServerFull));
-        assert!(calls.join("u", "b", 1, 2, 3).is_ok());
+        assert!(calls.join("u", "a", 1, None, 2, 3).is_ok());
+        assert!(calls.join("v", "a", 2, None, 2, 3).is_ok());
+        assert_eq!(calls.join("w", "a", 3, None, 2, 3), Err(Refused::Full));
+        assert!(calls.join("w", "b", 3, None, 2, 3).is_ok());
+        assert_eq!(
+            calls.join("x", "b", 4, None, 2, 3),
+            Err(Refused::ServerFull)
+        );
+        assert!(calls.join("u", "b", 1, None, 2, 3).is_ok());
     }
 
     #[test]
@@ -321,13 +417,21 @@ mod tests {
                 &user_id,
                 "a",
                 n,
+                None,
                 limits.call_room_max,
                 limits.call_server_max,
             );
             assert!(joined.is_ok(), "{user_id}");
         }
         assert_eq!(
-            calls.join("u12", "a", 12, limits.call_room_max, limits.call_server_max),
+            calls.join(
+                "u12",
+                "a",
+                12,
+                None,
+                limits.call_room_max,
+                limits.call_server_max
+            ),
             Err(Refused::Full)
         );
     }
@@ -335,8 +439,8 @@ mod tests {
     #[test]
     fn ending_a_room_empties_it() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, 12, 32).is_ok());
-        assert!(calls.join("v", "a", 2, 12, 32).is_ok());
+        assert!(calls.join("u", "a", 1, None, 12, 32).is_ok());
+        assert!(calls.join("v", "a", 2, None, 12, 32).is_ok());
         assert_eq!(
             calls.end_room("a", Reason::RoomDeleted),
             vec![
@@ -345,6 +449,33 @@ mod tests {
             ]
         );
         assert!(calls.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_seat_keeps_its_call_id_and_state_until_it_leaves() {
+        let mut calls = Calls::default();
+        let joined = calls.join("u", "a", 1, Some("c-1".to_string()), 12, 32);
+        assert!(joined.is_ok());
+        assert_eq!(calls.call_of("u"), Some("c-1"));
+        assert_eq!(calls.holder("c-1"), Some("u"));
+        assert_eq!(
+            calls.join("u", "a", 2, Some("c-2".to_string()), 12, 32),
+            Ok(Vec::new())
+        );
+        assert_eq!(calls.holder("c-1"), None);
+        assert_eq!(calls.conn_of("u"), Some(2));
+        assert!(calls.set_state("u", true, false).is_some());
+        assert_eq!(calls.set_state("u", true, false), None);
+        assert!(calls.snapshot()[0].participants[0].muted);
+        assert_eq!(
+            calls.leave("u", Reason::MediaLost),
+            Some(Change::Left {
+                room_id: "a".to_string(),
+                user_id: "u".to_string(),
+                reason: Reason::MediaLost,
+                call_id: Some("c-2".to_string()),
+            })
+        );
     }
 
     #[test]

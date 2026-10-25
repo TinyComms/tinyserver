@@ -5,7 +5,20 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# The headless str0m client in `client.rs`. Tests use it; the server does not.
+headless = []
+
 [dependencies]
+mio = { version = "1", features = ["os-poll", "net"] }
+# Pinned. str0m breaks its API every few releases; bump on purpose, with the call tests.
+str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"] }
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+sfu = { path = ".", features = ["headless"] }
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 //! HTTP surface. Health, session, account, rooms, people, invites, and the live socket.
-//! Media does not enter this crate.
+//! Media does not enter this crate; it talks to `sfu` over channels.
 
 mod account;
 mod community;
@@ -29,7 +29,7 @@ pub fn app(pool: PgPool, live: Live) -> Router {
 
 fn build(pool: PgPool, live: Option<Live>) -> Router {
     let mut routes = Router::new()
-        .merge(health::routes())
+        .merge(health::routes(live.clone()))
         .merge(session::routes())
         .merge(account::routes())
         .merge(community::routes());

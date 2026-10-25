@@ -1,5 +1,6 @@
 //! `GET /v1/live`: one WebSocket per signed-in device. Durable events come from the outbox in
-//! seq order, presence and call occupancy from memory. The frames are in `docs/calls.md`.
+//! seq order, presence, call occupancy, and call signaling from memory. The frames are in
+//! `docs/calls.md`.
 
 mod call;
 mod frame;
@@ -83,14 +84,33 @@ pub struct Live {
 }
 
 impl Live {
-    /// Starts the outbox dispatcher. Call it inside a Tokio runtime.
+    /// Starts the outbox dispatcher, without media. A join with an offer gets
+    /// `media_unavailable`. Call it inside a Tokio runtime.
     pub fn start(pool: PgPool, limits: Limits) -> Self {
         Self {
-            hub: Hub::start(pool, limits),
+            hub: Hub::start(pool, limits, None),
         }
     }
 
-    /// Closes every socket with `1012 restart`, refuses new ones, and stops the dispatcher.
+    /// Starts the outbox dispatcher and follows the SFU from `sfu::start`.
+    pub fn with_media(
+        pool: PgPool,
+        limits: Limits,
+        media: sfu::Media,
+        events: tokio::sync::mpsc::Receiver<sfu::Event>,
+    ) -> Self {
+        Self {
+            hub: Hub::start(pool, limits, Some((media, events))),
+        }
+    }
+
+    /// `off` without an SFU, `up` while it runs, `down` once it stopped.
+    pub fn media(&self) -> &'static str {
+        self.hub.media_status()
+    }
+
+    /// Closes every socket with `1012 restart`, refuses new ones, and stops the dispatcher
+    /// and the SFU.
     pub fn close(&self) {
         self.hub.close();
     }

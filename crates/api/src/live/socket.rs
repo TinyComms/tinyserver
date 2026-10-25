@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::call::{Moves, Reason};
+use super::call::{Moves, Reason, Refused};
 use super::frame::{Audience, Event, Me as MeFrame, Out};
 use super::hub::{Hub, Joined, Slot};
 
@@ -86,10 +86,21 @@ struct Incoming {
     reference: Option<Value>,
     room_id: Option<String>,
     user_id: Option<String>,
+    sdp: Option<String>,
+    muted: Option<bool>,
+    deafened: Option<bool>,
 }
 
-/// What a request gets back: `ok`, or `error` with this code.
-type Answer = Result<(), &'static str>;
+/// A request that succeeded.
+enum Done {
+    /// Sent as `ok`.
+    Ok,
+    /// Sent as `call.answer`.
+    Answer(sfu::Answer),
+}
+
+/// What a request gets back: `ok` or `call.answer`, or `error` with this code.
+type Answer = Result<Done, &'static str>;
 
 pub(crate) async fn run(
     hub: Arc<Hub>,
@@ -130,6 +141,7 @@ async fn serve(
         conn,
         mut kicked,
         mut presence,
+        mut direct,
         online,
         calls,
     } = joined;
@@ -212,6 +224,7 @@ async fn serve(
                 Err(RecvError::Lagged(_)) => return resync(hub, socket).await,
                 Err(RecvError::Closed) => Err(End::Close(Close::Restart)),
             },
+            Some(frame) = direct.recv() => send(hub, socket, frame.to_string()).await,
             message = socket.recv() => {
                 seen = Instant::now();
                 receive(hub, socket, me, &mut asking, message).await
@@ -333,16 +346,24 @@ async fn receive(
         return send(hub, socket, reply.text()).await;
     };
     let room_id = incoming.room_id.as_deref();
+    let sdp = incoming.sdp.as_deref();
     let answer = match incoming.kind.as_str() {
         "ping" => return send(hub, socket, Out::Pong.text()).await,
-        "call.join" => call_join(hub, me, asking, room_id).await?,
+        "call.join" => call_join(hub, me, asking, room_id, sdp).await?,
         "call.leave" => call_leave(hub, me, asking),
         "call.kick" => call_kick(hub, me, room_id, incoming.user_id.as_deref()).await?,
+        "call.offer" => call_offer(hub, me, asking, sdp).await,
+        "call.state" => call_state(hub, me, incoming.muted, incoming.deafened),
         _ => Err("unknown_type"),
     };
     let reference = incoming.reference.as_ref();
-    let reply = match answer {
-        Ok(()) => Out::Ok { reference },
+    let reply = match &answer {
+        Ok(Done::Ok) => Out::Ok { reference },
+        Ok(Done::Answer(answer)) => Out::CallAnswer {
+            reference,
+            call_id: &answer.call_id,
+            sdp: &answer.sdp,
+        },
         Err(code) => Out::Error { reference, code },
     };
     send(hub, socket, reply.text()).await
@@ -353,7 +374,7 @@ async fn fresh(hub: &Hub, me: &mut Me) -> Result<Answer, End> {
     match db::current_session(&hub.pool, &me.token).await {
         Ok(identity) => {
             me.role = identity.role;
-            Ok(Ok(()))
+            Ok(Ok(Done::Ok))
         }
         Err(SessionError::Unauthorized | SessionError::InvalidCredentials) => {
             Err(End::Close(Close::SessionEnded))
@@ -367,7 +388,7 @@ async fn fresh(hub: &Hub, me: &mut Me) -> Result<Answer, End> {
 
 async fn room_exists(hub: &Hub, me: &Me, room_id: &str) -> Answer {
     match db::room_exists(&hub.pool, &me.caller(), room_id).await {
-        Ok(true) => Ok(()),
+        Ok(true) => Ok(Done::Ok),
         Ok(false) => Err("not_found"),
         Err(error) => {
             tracing::warn!(%error, "room check failed");
@@ -376,15 +397,24 @@ async fn room_exists(hub: &Hub, me: &Me, room_id: &str) -> Answer {
     }
 }
 
-/// Any member may join any room they can see. Leaves the person's other call first.
+/// Any member may join any room they can see. Leaves the person's other call first. With
+/// an SFU running the join must carry an offer, and the reply is the answer.
 async fn call_join(
     hub: &Hub,
     me: &mut Me,
     asking: &mut Asking<'_>,
     room_id: Option<&str>,
+    sdp: Option<&str>,
 ) -> Result<Answer, End> {
     let Some(room_id) = room_id else {
         return Ok(Err("bad_frame"));
+    };
+    let media = match (&hub.media, sdp) {
+        (None, None) => None,
+        (Some(_), None) => return Ok(Err("bad_frame")),
+        (None, Some(_)) => return Ok(Err(Refused::NoMedia.code())),
+        (Some(media), Some(_)) if !media.running() => return Ok(Err(Refused::NoMedia.code())),
+        (Some(media), Some(sdp)) => Some((media, sdp)),
     };
     if !asking.moves.take() {
         return Ok(Err("slow_down"));
@@ -395,7 +425,23 @@ async fn call_join(
     if let Err(code) = room_exists(hub, me, room_id).await {
         return Ok(Err(code));
     }
-    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn) {
+    let answer = match media {
+        None => None,
+        Some((media, sdp)) => {
+            if let Err(refused) = hub.call_check(&me.user_id, room_id) {
+                return Ok(Err(refused.code()));
+            }
+            match media.join(room_id, &me.user_id, sdp).await {
+                Ok(answer) => Some(answer),
+                Err(refused) => return Ok(Err(media_code(refused))),
+            }
+        }
+    };
+    let call_id = answer.as_ref().map(|answer| answer.call_id.as_str());
+    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn, call_id) {
+        if let Some(call_id) = call_id {
+            hub.forget(call_id);
+        }
         return Ok(Err(refused.code()));
     }
     // A delete that committed during the first check was followed before this seat existed.
@@ -403,7 +449,47 @@ async fn call_join(
         hub.end_room(room_id, Reason::RoomDeleted);
         return Ok(Err("not_found"));
     }
-    Ok(Ok(()))
+    Ok(Ok(answer.map_or(Done::Ok, Done::Answer)))
+}
+
+fn media_code(refused: sfu::Refused) -> &'static str {
+    match refused {
+        sfu::Refused::BadSdp => "bad_sdp",
+        sfu::Refused::NotFound => "not_found",
+        sfu::Refused::Unavailable => Refused::NoMedia.code(),
+    }
+}
+
+/// Renegotiates the caller's media. The SFU answers; nothing else changes.
+async fn call_offer(hub: &Hub, me: &Me, asking: &mut Asking<'_>, sdp: Option<&str>) -> Answer {
+    let Some(sdp) = sdp else {
+        return Err("bad_frame");
+    };
+    let Some(media) = &hub.media else {
+        return Err(Refused::NoMedia.code());
+    };
+    if !asking.moves.take() {
+        return Err("slow_down");
+    }
+    let Some(call_id) = hub.call_of(&me.user_id) else {
+        return Err("not_found");
+    };
+    media
+        .offer(&call_id, sdp)
+        .await
+        .map(Done::Answer)
+        .map_err(media_code)
+}
+
+/// Mute and deafen, shown to everyone. Not being in a call is `not_found`.
+fn call_state(hub: &Hub, me: &Me, muted: Option<bool>, deafened: Option<bool>) -> Answer {
+    let (Some(muted), Some(deafened)) = (muted, deafened) else {
+        return Err("bad_frame");
+    };
+    if !hub.call_state(&me.user_id, muted, deafened) {
+        return Err("not_found");
+    }
+    Ok(Done::Ok)
 }
 
 /// Leaving with no call is not an error.
@@ -412,7 +498,7 @@ fn call_leave(hub: &Hub, me: &Me, asking: &mut Asking<'_>) -> Answer {
         return Err("slow_down");
     }
     hub.call_leave(&me.user_id, Reason::Left);
-    Ok(())
+    Ok(Done::Ok)
 }
 
 /// Owners and admins may remove someone from a call. An admin may not remove an owner.
@@ -444,7 +530,7 @@ async fn call_kick(
         }
     }
     hub.call_kick(room_id, user_id);
-    Ok(Ok(()))
+    Ok(Ok(Done::Ok))
 }
 
 fn is_too_big(error: &axum::Error) -> bool {
