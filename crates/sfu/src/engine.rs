@@ -1,4 +1,5 @@
-//! The media thread: one `mio` loop over the UDP socket and a waker for commands.
+//! The media thread: one `mio` loop over the UDP socket, the ICE-TCP listener and its
+//! streams, and a waker for commands.
 //!
 //! Every `Rtc` is driven the way str0m requires: one input, then `poll_output` until it
 //! returns a timeout. Audio frames are copied from each publisher to everyone else in the
@@ -14,21 +15,30 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mio::net::UdpSocket;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::event::Event as Ready;
+use mio::net::{TcpListener, TcpStream, UdpSocket};
+use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use str0m::change::SdpOffer;
 use str0m::config::{CryptoProvider, DtlsCert};
 use str0m::media::{Direction, MediaData, MediaKind, Mid};
-use str0m::net::{DatagramRecv, Protocol, Receive};
+use str0m::net::{DatagramRecv, Protocol, Receive, TcpType};
 use str0m::{Candidate, Event as RtcEvent, Input, Output, Rtc, RtcConfig};
 use tokio::sync::mpsc as async_mpsc;
 
 use crate::limit::Bucket;
 use crate::room::{Announced, Slots, Speech};
+use crate::tcp::{Conn, Readout};
 use crate::{Answer, Command, Config, Event, Lost, Refused, Reply, Slot};
 
 const SOCKET: Token = Token(0);
 const WAKE: Token = Token(1);
+const LISTENER: Token = Token(2);
+/// TCP streams take tokens from here up.
+const FIRST_STREAM: usize = 3;
+/// Bytes read from one TCP stream per turn of the loop, so one cannot starve the rest.
+const STREAM_READ: usize = 64 * 1024;
+/// Port 0 picks a UDP port, and TCP may already hold that number. Tries before giving up.
+const BIND_TRIES: usize = 16;
 /// The loop wakes at least this often.
 const TICK: Duration = Duration::from_millis(50);
 /// Larger than any datagram str0m sends or accepts.
@@ -71,9 +81,85 @@ struct Room {
     announced: Announced,
 }
 
+/// One accepted TCP stream.
+struct Stream {
+    conn: Conn,
+    opened: Instant,
+    /// The last whole frame.
+    heard: Instant,
+    /// The participant whose STUN it carried first. Unverified until then.
+    owner: Option<PeerId>,
+    /// Registered for writable too, because its backlog did not drain.
+    writing: bool,
+    closed: bool,
+}
+
+/// The ICE-TCP streams, by token and by the client's address.
+struct Tcp {
+    registry: Registry,
+    streams: HashMap<Token, Stream>,
+    by_peer: HashMap<SocketAddr, Token>,
+    next: usize,
+    /// Streams that stopped at their read budget with bytes still waiting.
+    unread: Vec<Token>,
+}
+
+impl Tcp {
+    /// Frames `packet` onto the stream from `to`. Dropped if there is none or it is backed up.
+    fn send(&mut self, to: SocketAddr, packet: &[u8]) {
+        let Some(token) = self.by_peer.get(&to).copied() else {
+            return;
+        };
+        if let Some(stream) = self.streams.get_mut(&token) {
+            if stream.conn.queue(packet) {
+                self.flush(token);
+            }
+        }
+    }
+
+    /// Writes the backlog, and watches for writable only while some is left.
+    fn flush(&mut self, token: Token) {
+        let Some(stream) = self.streams.get_mut(&token) else {
+            return;
+        };
+        let done = match stream.conn.flush() {
+            Ok(done) => done,
+            Err(_) => {
+                stream.closed = true;
+                return;
+            }
+        };
+        if done == !stream.writing {
+            return;
+        }
+        let interest = if done {
+            Interest::READABLE
+        } else {
+            Interest::READABLE | Interest::WRITABLE
+        };
+        match self
+            .registry
+            .reregister(&mut stream.conn.socket, token, interest)
+        {
+            Ok(()) => stream.writing = !done,
+            Err(_) => stream.closed = true,
+        }
+    }
+
+    fn close(&mut self, token: Token) -> Option<Stream> {
+        let mut stream = self.streams.remove(&token)?;
+        let _ = self.registry.deregister(&mut stream.conn.socket);
+        if self.by_peer.get(&stream.conn.peer) == Some(&token) {
+            self.by_peer.remove(&stream.conn.peer);
+        }
+        Some(stream)
+    }
+}
+
 /// Where a drained `Rtc` puts what it produced.
 struct Sink<'a> {
     socket: &'a UdpSocket,
+    tcp: &'a mut Tcp,
     events: &'a async_mpsc::Sender<Event>,
     egress: &'a mut u64,
     forward: &'a mut VecDeque<(PeerId, MediaData)>,
@@ -83,7 +169,10 @@ pub(crate) struct Engine {
     config: Config,
     poll: Poll,
     socket: UdpSocket,
+    listener: TcpListener,
+    tcp: Tcp,
     public: SocketAddr,
+    lan: Option<SocketAddr>,
     inbox: Receiver<Command>,
     events: async_mpsc::Sender<Event>,
     alive: Arc<AtomicBool>,
@@ -91,7 +180,7 @@ pub(crate) struct Engine {
     cert: DtlsCert,
     peers: HashMap<PeerId, Peer>,
     by_call: HashMap<String, PeerId>,
-    by_addr: HashMap<SocketAddr, PeerId>,
+    by_addr: HashMap<(Protocol, SocketAddr), PeerId>,
     sources: HashMap<SocketAddr, Bucket>,
     rooms: HashMap<String, Room>,
     forward: VecDeque<(PeerId, MediaData)>,
@@ -118,13 +207,19 @@ impl Engine {
         events: async_mpsc::Sender<Event>,
         alive: Arc<AtomicBool>,
     ) -> io::Result<(Self, Waker)> {
-        let std_socket = std::net::UdpSocket::bind(config.bind)?;
-        std_socket.set_nonblocking(true)?;
-        let port = std_socket.local_addr()?.port();
-        let mut socket = UdpSocket::from_std(std_socket);
+        let (mut socket, mut listener, port) = bind(config.bind)?;
         let poll = Poll::new()?;
         poll.registry()
             .register(&mut socket, SOCKET, Interest::READABLE)?;
+        poll.registry()
+            .register(&mut listener, LISTENER, Interest::READABLE)?;
+        let tcp = Tcp {
+            registry: poll.registry().try_clone()?,
+            streams: HashMap::new(),
+            by_peer: HashMap::new(),
+            next: FIRST_STREAM,
+            unread: Vec::new(),
+        };
         let waker = Waker::new(poll.registry(), WAKE)?;
         let crypto = Arc::new(str0m::crypto::from_feature_flags());
         let cert = crypto
@@ -134,9 +229,12 @@ impl Engine {
         let now = Instant::now();
         let engine = Self {
             public: SocketAddr::new(config.public_ip, port),
+            lan: config.lan_ip.map(|ip| SocketAddr::new(ip, port)),
             config,
             poll,
             socket,
+            listener,
+            tcp,
             inbox,
             events,
             alive,
@@ -163,14 +261,17 @@ impl Engine {
 
     pub fn run(mut self) {
         let _running = Running(self.alive.clone());
-        tracing::info!(addr = %self.public, "media listening");
-        let mut events = Events::with_capacity(64);
+        tracing::info!(addr = %self.public, lan = ?self.lan, "media listening on UDP and TCP");
+        let mut events = Events::with_capacity(256);
         let mut buf = vec![0; DATAGRAM];
         loop {
-            let wait = self
-                .deadline()
-                .saturating_duration_since(Instant::now())
-                .min(TICK);
+            let wait = if self.tcp.unread.is_empty() {
+                self.deadline()
+                    .saturating_duration_since(Instant::now())
+                    .min(TICK)
+            } else {
+                Duration::ZERO
+            };
             if let Err(error) = self.poll.poll(&mut events, Some(wait)) {
                 if error.kind() != ErrorKind::Interrupted {
                     tracing::error!(%error, "media poll failed");
@@ -181,8 +282,132 @@ impl Engine {
                 tracing::info!("media stopped");
                 return;
             }
-            self.read(&mut buf);
+            let ready: Vec<(Token, bool, bool)> = events.iter().map(readiness).collect();
+            let mut unread = std::mem::take(&mut self.tcp.unread);
+            for (token, readable, writable) in ready {
+                match token {
+                    SOCKET => self.read(&mut buf),
+                    WAKE => {}
+                    LISTENER => self.accept(Instant::now(), &mut unread),
+                    token => {
+                        if writable {
+                            self.tcp.flush(token);
+                        }
+                        if readable && !unread.contains(&token) {
+                            unread.push(token);
+                        }
+                    }
+                }
+            }
+            for token in unread {
+                self.read_stream(token, Instant::now());
+            }
             self.tick(Instant::now());
+        }
+    }
+
+    /// Takes every waiting TCP connection, or closes it at once when it is over a cap.
+    fn accept(&mut self, now: Instant, unread: &mut Vec<Token>) {
+        loop {
+            match self.listener.accept() {
+                Ok((socket, peer)) => {
+                    if let Some(token) = self.admit(socket, peer, now) {
+                        // Bytes may have come before it was registered.
+                        unread.push(token);
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    tracing::warn!(%error, "media accept failed");
+                    return;
+                }
+            }
+        }
+    }
+
+    fn admit(&mut self, mut socket: TcpStream, peer: SocketAddr, now: Instant) -> Option<Token> {
+        let streams = &self.tcp.streams;
+        let from_source = streams
+            .values()
+            .filter(|stream| stream.conn.peer.ip() == peer.ip())
+            .count();
+        let unverified = streams
+            .values()
+            .filter(|stream| stream.owner.is_none())
+            .count();
+        if streams.len() >= self.config.tcp_streams
+            || from_source >= self.config.tcp_per_source
+            || unverified >= self.config.tcp_unverified
+        {
+            tracing::debug!(%peer, "media TCP stream refused");
+            return None;
+        }
+        let _ = socket.set_nodelay(true);
+        let token = Token(self.tcp.next);
+        self.tcp.next += 1;
+        if let Err(error) = self
+            .tcp
+            .registry
+            .register(&mut socket, token, Interest::READABLE)
+        {
+            tracing::warn!(%error, "media TCP register failed");
+            return None;
+        }
+        self.tcp.by_peer.insert(peer, token);
+        self.tcp.streams.insert(
+            token,
+            Stream {
+                conn: Conn::new(socket, peer),
+                opened: now,
+                heard: now,
+                owner: None,
+                writing: false,
+                closed: false,
+            },
+        );
+        Some(token)
+    }
+
+    /// Reads one stream's frames up to its budget. An unverified stream must start with
+    /// STUN; anything else closes it.
+    fn read_stream(&mut self, token: Token, now: Instant) {
+        let Some(stream) = self.tcp.streams.get_mut(&token) else {
+            return;
+        };
+        let mut frames = Vec::new();
+        let end = stream.conn.read(STREAM_READ, |frame| {
+            frames.push(frame.to_vec());
+            true
+        });
+        let peer = stream.conn.peer;
+        if !frames.is_empty() {
+            stream.heard = now;
+        }
+        for frame in frames {
+            let owner = self.tcp.streams.get(&token).and_then(|stream| stream.owner);
+            if owner.is_none() && !is_stun(&frame) {
+                self.close_stream(token);
+                return;
+            }
+            let taken = self.receive(&frame, Protocol::Tcp, peer, now);
+            if let (None, Some(id)) = (owner, taken) {
+                if let Some(stream) = self.tcp.streams.get_mut(&token) {
+                    stream.owner = Some(id);
+                }
+            }
+        }
+        match end {
+            Readout::Drained => {}
+            Readout::More => self.tcp.unread.push(token),
+            Readout::Closed => self.close_stream(token),
+        }
+    }
+
+    fn close_stream(&mut self, token: Token) {
+        if let Some(stream) = self.tcp.close(token) {
+            self.by_addr.remove(&(Protocol::Tcp, stream.conn.peer));
+            tracing::debug!(peer = %stream.conn.peer, "media TCP stream closed");
         }
     }
 
@@ -254,21 +479,17 @@ impl Engine {
         for id in replaced {
             self.remove(id, None);
         }
-        let mut rtc = RtcConfig::new()
-            .set_ice_lite(true)
-            .set_crypto_provider(self.crypto.clone())
-            .set_dtls_cert(self.cert.clone())
-            .clear_codecs()
-            .enable_opus(true, false)
-            .build(now);
-        match Candidate::host(self.public, "udp") {
-            Ok(candidate) => {
-                rtc.add_local_candidate(candidate);
-            }
-            Err(error) => {
-                tracing::error!(?error, "media candidate refused");
-                let _ = reply.send(Err(Refused::Unavailable));
-                return;
+        let mut rtc = rtc_config(&self.crypto, &self.cert).build(now);
+        for candidate in candidates(self.public, self.lan) {
+            match candidate {
+                Ok(candidate) => {
+                    rtc.add_local_candidate(candidate);
+                }
+                Err(error) => {
+                    tracing::error!(?error, "media candidate refused");
+                    let _ = reply.send(Err(Refused::Unavailable));
+                    return;
+                }
             }
         }
         let answer = match rtc.sdp_api().accept_offer(offer) {
@@ -372,6 +593,16 @@ impl Engine {
         peer.rtc.disconnect();
         self.by_call.remove(&peer.call_id);
         self.by_addr.retain(|_, owner| *owner != id);
+        let owned: Vec<Token> = self
+            .tcp
+            .streams
+            .iter()
+            .filter(|(_, stream)| stream.owner == Some(id))
+            .map(|(token, _)| *token)
+            .collect();
+        for token in owned {
+            self.close_stream(token);
+        }
         self.forward.retain(|(origin, _)| *origin != id);
         if let Some(lost) = lost {
             tracing::info!(call_id = %peer.call_id, ?lost, "media lost");
@@ -476,7 +707,7 @@ impl Engine {
                 Ok((n, source)) => {
                     let now = Instant::now();
                     if let Some(packet) = buf.get(..n) {
-                        self.receive(packet, source, now);
+                        self.receive(packet, Protocol::Udp, source, now);
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return,
@@ -491,11 +722,18 @@ impl Engine {
         }
     }
 
-    /// One datagram. Over its source's budget, or for nobody, it is dropped. An address no
-    /// participant uses yet gets through only as STUN carrying a participant's ICE username.
-    fn receive(&mut self, packet: &[u8], source: SocketAddr, now: Instant) {
+    /// One datagram, or one frame from a TCP stream. Over its source's budget, or for
+    /// nobody, it is dropped. An address no participant uses yet gets through only as STUN
+    /// carrying a participant's ICE username. Returns the participant that took it.
+    fn receive(
+        &mut self,
+        packet: &[u8],
+        proto: Protocol,
+        source: SocketAddr,
+        now: Instant,
+    ) -> Option<PeerId> {
         if !self.sources.contains_key(&source) && self.sources.len() >= SOURCES {
-            return;
+            return None;
         }
         let (rate, burst) = (self.config.packets_per_second, self.config.packet_burst);
         let budget = self
@@ -503,37 +741,33 @@ impl Engine {
             .entry(source)
             .or_insert_with(|| Bucket::new(rate, burst, now));
         if !budget.take(1, now) {
-            return;
+            return None;
         }
-        let Ok(contents) = DatagramRecv::try_from(packet) else {
-            return;
-        };
+        let known = self.by_addr.get(&(proto, source)).copied();
+        if known.is_none() && !is_stun(packet) {
+            return None;
+        }
+        let contents = DatagramRecv::try_from(packet).ok()?;
+        // The socket binds every interface, so the destination is always the public
+        // candidate. A LAN candidate's traffic is answered the same way.
         let input = Input::Receive(
             now,
             Receive {
-                proto: Protocol::Udp,
+                proto,
                 source,
                 destination: self.public,
                 contents,
             },
         );
-        let known = self
-            .by_addr
-            .get(&source)
-            .copied()
-            .filter(|id| self.peers.get(id).is_some_and(|p| p.rtc.accepts(&input)));
-        let Some(id) = known.or_else(|| {
+        let known = known.filter(|id| self.peers.get(id).is_some_and(|p| p.rtc.accepts(&input)));
+        let id = known.or_else(|| {
             self.peers
                 .iter()
                 .find(|(_, peer)| peer.rtc.accepts(&input))
                 .map(|(id, _)| *id)
-        }) else {
-            return;
-        };
-        self.by_addr.insert(source, id);
-        let Some(peer) = self.peers.get_mut(&id) else {
-            return;
-        };
+        })?;
+        self.by_addr.insert((proto, source), id);
+        let peer = self.peers.get_mut(&id)?;
         peer.heard_at = now;
         if let Err(error) = peer.rtc.handle_input(input) {
             tracing::info!(call_id = %peer.call_id, ?error, "media input refused");
@@ -542,6 +776,7 @@ impl Engine {
         self.drain(id);
         self.forward_all(now);
         self.settle();
+        Some(id)
     }
 
     /// Fills the slots of everyone whose `Rtc` reported new receive m-lines.
@@ -605,6 +840,7 @@ impl Engine {
         }
 
         self.speaking(now);
+        self.expire_streams(now);
         if now.saturating_duration_since(self.swept_at) >= Duration::from_secs(1) {
             self.swept_at = now;
             self.sources
@@ -622,6 +858,26 @@ impl Engine {
                     participants: self.peers.len(),
                 },
             );
+        }
+    }
+
+    /// Closes TCP streams that failed, never verified in time, or went quiet.
+    fn expire_streams(&mut self, now: Instant) {
+        let (handshake, idle) = (self.config.tcp_handshake, self.config.tcp_idle);
+        let expired: Vec<Token> = self
+            .tcp
+            .streams
+            .iter()
+            .filter(|(_, stream)| {
+                stream.closed
+                    || (stream.owner.is_none()
+                        && now.saturating_duration_since(stream.opened) >= handshake)
+                    || now.saturating_duration_since(stream.heard) >= idle
+            })
+            .map(|(token, _)| *token)
+            .collect();
+        for token in expired {
+            self.close_stream(token);
         }
     }
 
@@ -653,6 +909,7 @@ impl Engine {
         };
         let mut sink = Sink {
             socket: &self.socket,
+            tcp: &mut self.tcp,
             events: &self.events,
             egress: &mut self.egress,
             forward: &mut self.forward,
@@ -702,6 +959,7 @@ impl Engine {
                 }
                 let mut sink = Sink {
                     socket: &self.socket,
+                    tcp: &mut self.tcp,
                     events: &self.events,
                     egress: &mut self.egress,
                     forward: &mut self.forward,
@@ -734,7 +992,9 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
             }
             Output::Transmit(transmit) => {
                 *sink.egress += transmit.contents.len() as u64;
-                if let Err(error) = sink
+                if transmit.proto == Protocol::Tcp {
+                    sink.tcp.send(transmit.destination, &transmit.contents);
+                } else if let Err(error) = sink
                     .socket
                     .send_to(&transmit.contents, transmit.destination)
                 {
@@ -776,6 +1036,74 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
             },
         }
     }
+}
+
+/// Binds UDP, then TCP on the same port number. With port 0, TCP may find that number
+/// taken, so it tries another.
+fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let udp = std::net::UdpSocket::bind(addr)?;
+        let port = udp.local_addr()?.port();
+        match std::net::TcpListener::bind(SocketAddr::new(addr.ip(), port)) {
+            Ok(tcp) => {
+                udp.set_nonblocking(true)?;
+                tcp.set_nonblocking(true)?;
+                return Ok((UdpSocket::from_std(udp), TcpListener::from_std(tcp), port));
+            }
+            Err(error)
+                if addr.port() == 0
+                    && error.kind() == ErrorKind::AddrInUse
+                    && tries < BIND_TRIES => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// ICE-lite, the process's DTLS certificate, and Opus only.
+pub(crate) fn rtc_config(crypto: &Arc<CryptoProvider>, cert: &DtlsCert) -> RtcConfig {
+    RtcConfig::new()
+        .set_ice_lite(true)
+        .set_crypto_provider(crypto.clone())
+        .set_dtls_cert(cert.clone())
+        .clear_codecs()
+        .enable_opus(true, false)
+}
+
+/// A UDP host candidate and a passive TCP one on the public address, and the same pair on
+/// the LAN address when there is one.
+pub(crate) fn candidates(
+    public: SocketAddr,
+    lan: Option<SocketAddr>,
+) -> Vec<Result<Candidate, str0m::error::IceError>> {
+    [Some(public), lan]
+        .into_iter()
+        .flatten()
+        .flat_map(|addr| {
+            [
+                Candidate::host(addr, "udp"),
+                Candidate::builder()
+                    .tcp()
+                    .host(addr)
+                    .tcptype(TcpType::Passive)
+                    .build(),
+            ]
+        })
+        .collect()
+}
+
+/// RFC 7983: a first byte of 0 to 3 is STUN.
+fn is_stun(packet: &[u8]) -> bool {
+    packet.first().is_some_and(|byte| *byte < 4)
+}
+
+fn readiness(event: &Ready) -> (Token, bool, bool) {
+    (
+        event.token(),
+        event.is_readable() || event.is_read_closed() || event.is_error(),
+        event.is_writable(),
+    )
 }
 
 /// Events the API must see. The API drains its queue, so this waits rarely and briefly.

@@ -14,6 +14,8 @@ struct Health {
     schema: &'static str,
     /// `off` without an SFU, `up` while it runs, `down` once it stopped.
     media: &'static str,
+    /// What members can reach while media is up: `udp`, `tcp`, and `lan`.
+    transports: Vec<&'static str>,
 }
 
 pub fn routes(live: Option<Live>) -> Router<PgPool> {
@@ -27,9 +29,11 @@ async fn health(
     Extension(live): Extension<Option<Live>>,
 ) -> (StatusCode, Json<Health>) {
     let media = live.as_ref().map_or("off", Live::media);
+    let transports = live.as_ref().map(Live::transports).unwrap_or_default();
     match probe(&pool).await {
         Ok(mut body) => {
             body.media = media;
+            body.transports = transports;
             body.ok = body.ok && media != "down";
             let status = if body.ok {
                 StatusCode::OK
@@ -47,6 +51,7 @@ async fn health(
                     db_role: String::new(),
                     schema: "unreachable",
                     media,
+                    transports,
                 }),
             )
         }
@@ -64,5 +69,6 @@ async fn probe(pool: &PgPool) -> Result<Health, sqlx::Error> {
         db_role,
         schema,
         media: "off",
+        transports: Vec::new(),
     })
 }

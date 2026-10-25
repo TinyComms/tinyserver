@@ -28,7 +28,11 @@ fn media_config() -> sfu::Config {
 }
 
 async fn serve_media(db: &TestDb) -> Server {
-    let (media, events) = sfu::start(media_config()).expect("start the SFU");
+    serve_media_with(db, media_config()).await
+}
+
+async fn serve_media_with(db: &TestDb, config: sfu::Config) -> Server {
+    let (media, events) = sfu::start(config).expect("start the SFU");
     let live = Live::with_media(db.runtime.clone(), Limits::default(), media, events);
     serve_live(db, live).await
 }
@@ -94,8 +98,19 @@ struct Person {
 
 /// Joins `room_id` with a fresh offer, takes the answer, and waits until the client side of
 /// media is up. The SFU may see it a round trip later.
-async fn dial(mut ws: Ws, user_id: &str, room_id: &str, marker: u8) -> Person {
-    let mut client = Client::new(SocketAddr::from((LOOPBACK, 0)), SLOTS).expect("client");
+async fn dial(ws: Ws, user_id: &str, room_id: &str, marker: u8) -> Person {
+    let client = Client::new(SocketAddr::from((LOOPBACK, 0)), SLOTS).expect("client");
+    dial_with(ws, client, user_id, room_id, marker).await
+}
+
+/// `dial` with `client`, which may be a TCP one.
+async fn dial_with(
+    mut ws: Ws,
+    mut client: Client,
+    user_id: &str,
+    room_id: &str,
+    marker: u8,
+) -> Person {
     let request =
         json!({"type": "call.join", "ref": "j", "room_id": room_id, "sdp": client.offer()});
     ws.send(Message::text(request.to_string()))
@@ -394,23 +409,135 @@ async fn without_media_an_offer_is_refused_and_health_says_off() {
         let (status, body) = Call::new(Method::GET, "/health").send(&app).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["media"], "off");
+        assert_eq!(body["transports"], json!([]));
 
         let media = serve_media(&db).await;
         let app = api::app(db.runtime.clone(), media.live.clone());
         let (status, body) = Call::new(Method::GET, "/health").send(&app).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["media"], "up");
+        assert_eq!(body["transports"], json!(["udp", "tcp"]));
         media.live.close();
         let deadline = Instant::now() + WAIT;
         loop {
             let (status, body) = Call::new(Method::GET, "/health").send(&app).await;
             if body["media"] == "down" {
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(body["transports"], json!([]));
                 break;
             }
             assert!(Instant::now() < deadline, "media still {body}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_client_with_only_tcp_is_heard_through_the_live_socket() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let client = Client::tcp(LOOPBACK.into(), SLOTS).expect("TCP client");
+        let mut a = dial_with(ws, client, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut b = dial(ws, &cast.members[0].0, &cast.lobby, b'B').await;
+        let a_slots = slots(&mut a.ws, &a.call_id, 1).await;
+        let b_slots = slots(&mut b.ws, &b.call_id, 1).await;
+        a.running.sending(true);
+        b.running.sending(true);
+        hears(&b, &mid_for(&b_slots, &a.user_id), b'A').await;
+        hears(&a, &mid_for(&a_slots, &b.user_id), b'B').await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_answer_has_the_lan_candidate_when_set() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let mut config = media_config();
+        config.lan_ip = Some(Ipv4Addr::new(192, 0, 2, 10).into());
+        let server = serve_media_with(&db, config).await;
+        let (mut ws, _) = connect(&server, &owner_token(&db).await, None).await;
+        let client = Client::new(SocketAddr::from((LOOPBACK, 0)), SLOTS).expect("client");
+        let join =
+            json!({"type": "call.join", "ref": 1, "room_id": lobby.id, "sdp": client.offer()});
+        let reply = ask(&mut ws, join).await;
+        assert_eq!(reply["type"], "call.answer", "{reply}");
+        let sdp = reply["sdp"].as_str().expect("sdp");
+        let lan: Vec<&str> = sdp
+            .lines()
+            .filter(|line| line.starts_with("a=candidate") && line.contains("192.0.2.10"))
+            .collect();
+        assert_eq!(lan.len(), 2, "{sdp}");
+        assert!(lan.iter().any(|line| line.contains(" udp ")), "{sdp}");
+        assert!(lan.iter().any(|line| line.contains(" tcp ")), "{sdp}");
+
+        let app = api::app(db.runtime.clone(), server.live.clone());
+        let (_, body) = Call::new(Method::GET, "/health").send(&app).await;
+        assert_eq!(body["transports"], json!(["udp", "tcp", "lan"]));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn oversized_and_crowded_offers_are_bad_sdp() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let mut ws = socket(&cast, &cast.owner).await;
+        let crowded = Client::new(SocketAddr::from((LOOPBACK, 0)), 12).expect("client");
+        let join =
+            json!({"type": "call.join", "ref": 1, "room_id": cast.lobby, "sdp": crowded.offer()});
+        assert_eq!(
+            answer(&mut ws, join).await,
+            json!({"type": "error", "ref": 1, "code": "bad_sdp"})
+        );
+        let client = Client::new(SocketAddr::from((LOOPBACK, 0)), SLOTS).expect("client");
+        let padded = format!("{}a=x:{}\r\n", client.offer(), "y".repeat(32 * 1024));
+        let join = json!({"type": "call.join", "ref": 2, "room_id": cast.lobby, "sdp": padded});
+        assert_eq!(
+            answer(&mut ws, join).await,
+            json!({"type": "error", "ref": 2, "code": "bad_sdp"})
+        );
+        let (_, ready) = connect(&cast.server, &cast.owner.1, None).await;
+        assert_eq!(ready["calls"], json!([]), "a refused offer took a seat");
+
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let offer = json!({"type": "call.offer", "ref": 3, "sdp": crowded.offer()});
+        assert_eq!(
+            answer(&mut a.ws, offer).await,
+            json!({"type": "error", "ref": 3, "code": "bad_sdp"})
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rapid_offers_get_slow_down() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        // The join took one of five; four offers pass the rate and fail as SDP.
+        let mut codes = Vec::new();
+        for n in 0..6 {
+            let offer = json!({"type": "call.offer", "ref": n, "sdp": "v=0"});
+            let reply = answer(&mut a.ws, offer).await;
+            codes.push(reply["code"].as_str().unwrap_or_default().to_string());
+        }
+        assert_eq!(
+            codes,
+            [
+                "bad_sdp",
+                "bad_sdp",
+                "bad_sdp",
+                "bad_sdp",
+                "slow_down",
+                "slow_down"
+            ]
+        );
     })
     .await;
 }

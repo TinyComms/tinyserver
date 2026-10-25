@@ -6,13 +6,11 @@ use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use db::{Caller, CommunityError, SessionError};
-use serde::Deserialize;
-use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::call::{Moves, Reason, Refused};
-use super::frame::{Audience, Event, Me as MeFrame, Out};
+use super::frame::{Audience, Event, Incoming, Me as MeFrame, Out};
 use super::hub::{Hub, Joined, Slot};
 
 /// Why the server closed a socket. The code and reason are in `docs/calls.md`.
@@ -76,19 +74,6 @@ impl Me {
             role: self.role.clone(),
         }
     }
-}
-
-#[derive(Deserialize)]
-struct Incoming {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(rename = "ref")]
-    reference: Option<Value>,
-    room_id: Option<String>,
-    user_id: Option<String>,
-    sdp: Option<String>,
-    muted: Option<bool>,
-    deafened: Option<bool>,
 }
 
 /// A request that succeeded.
@@ -338,7 +323,7 @@ async fn receive(
         Take::Dropped => return Ok(()),
         Take::Exceeded => return Err(End::Close(Close::SlowDown)),
     }
-    let Ok(incoming) = serde_json::from_str::<Incoming>(text.as_str()) else {
+    let Some(incoming) = Incoming::parse(text.as_str()) else {
         let reply = Out::Error {
             reference: None,
             code: "bad_frame",

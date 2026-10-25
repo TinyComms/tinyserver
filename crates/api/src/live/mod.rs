@@ -3,7 +3,7 @@
 //! `docs/calls.md`.
 
 mod call;
-mod frame;
+pub(crate) mod frame;
 mod hub;
 mod socket;
 
@@ -107,6 +107,15 @@ impl Live {
     /// `off` without an SFU, `up` while it runs, `down` once it stopped.
     pub fn media(&self) -> &'static str {
         self.hub.media_status()
+    }
+
+    /// The media transports up now. Empty without an SFU or once it stopped.
+    pub fn transports(&self) -> Vec<&'static str> {
+        self.hub
+            .media
+            .as_ref()
+            .map(sfu::Media::transports)
+            .unwrap_or_default()
     }
 
     /// Closes every socket with `1012 restart`, refuses new ones, and stops the dispatcher
