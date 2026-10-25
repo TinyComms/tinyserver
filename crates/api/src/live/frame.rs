@@ -160,6 +160,7 @@ pub(crate) enum Out<'a> {
         muted: bool,
         deafened: bool,
         camera: bool,
+        sharing: bool,
     },
     /// The SFU's answer to `call.join` or `call.offer`.
     #[serde(rename = "call.answer")]
@@ -310,10 +311,24 @@ mod tests {
             muted: true,
             deafened: false,
             camera: true,
+            sharing: false,
         };
         assert_eq!(
             state.text(),
-            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false,"camera":true}"#
+            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false,"camera":true,"sharing":false}"#
+        );
+        let slots = Out::CallSlots {
+            call_id: "c-1",
+            audio: &[],
+            video: Some(VideoSlotFrame {
+                mid: "2",
+                user_id: "u",
+                kind: sfu::VideoKind::Share.as_str(),
+            }),
+        };
+        assert_eq!(
+            slots.text(),
+            r#"{"type":"call.slots","call_id":"c-1","audio":[],"video":{"mid":"2","user_id":"u","kind":"share"}}"#
         );
     }
 
@@ -334,12 +349,13 @@ mod tests {
                     muted: false,
                     deafened: true,
                     camera: false,
+                    sharing: true,
                 }],
             }],
         };
         assert_eq!(
             ready.text(),
-            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true,"camera":false}]}]}"#
+            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true,"camera":false,"sharing":true}]}]}"#
         );
         let reference = json!("7");
         let error = Out::Error {

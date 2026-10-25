@@ -388,7 +388,7 @@ async fn mute_is_shown_to_everyone_and_stops_forwarding() {
         let mute = json!({"type": "call.state", "ref": "m", "muted": true, "deafened": false});
         let reply = answer(&mut a.ws, mute).await;
         assert_eq!(reply, json!({"type": "ok", "ref": "m"}));
-        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false, "camera": false});
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false, "camera": false, "sharing": false});
         until(&mut b.ws, |value| (*value == shown).then_some(())).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let muted = heard_over(&b, Duration::from_millis(400)).await;
@@ -597,7 +597,7 @@ async fn a_camera_is_shown_to_everyone_and_reaches_the_other_listener() {
         slots(&mut b.ws, &b.call_id, 1).await;
 
         camera(&mut a, true).await;
-        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": true});
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": true, "sharing": false});
         until(&mut b.ws, |value| (*value == shown).then_some(())).await;
         let video = video_slot(&mut b.ws, &b.call_id, Some(&a.user_id)).await;
         assert_eq!(video["kind"], "camera");
@@ -615,7 +615,7 @@ async fn a_camera_is_shown_to_everyone_and_reaches_the_other_listener() {
         assert_eq!(answer(&mut b.ws, bad).await["code"], "bad_frame");
 
         camera(&mut a, false).await;
-        let hidden = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": false});
+        let hidden = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": false, "sharing": false});
         until(&mut b.ws, |value| (*value == hidden).then_some(())).await;
         video_slot(&mut b.ws, &b.call_id, None).await;
     })
@@ -648,6 +648,305 @@ async fn a_tcp_client_receives_video_through_the_live_socket() {
         camera(&mut a, true).await;
         video_slot(&mut b.ws, &b.call_id, Some(&a.user_id)).await;
         assert!(sees(&b, b'A').await[0].keyframe);
+    })
+    .await;
+}
+
+/// Shares here send 300 kb/s, so many tests at once stay light. The SFU's `share_rate.rs`
+/// sends the full 2.5 Mb/s.
+const LIGHT_SHARE_KBPS: u64 = 300;
+
+/// Starts or stops `person`'s share with `call.offer`, and returns the reply. An answer is
+/// accepted; a refused offer is undone on the client.
+async fn share(person: &mut Person, on: bool) -> Value {
+    person.running.share_kbps(LIGHT_SHARE_KBPS);
+    let offer = person.running.share(on).expect("a share offer");
+    let request = json!({"type": "call.offer", "ref": "s", "sdp": offer});
+    person
+        .ws
+        .send(Message::text(request.to_string()))
+        .await
+        .expect("send");
+    let reply = until(&mut person.ws, |value| {
+        (value["type"] == "call.answer" || value["type"] == "error").then(|| value.clone())
+    })
+    .await;
+    match reply["sdp"].as_str() {
+        Some(sdp) => person.running.accept(sdp).expect("accept the answer"),
+        None => person.running.reject().expect("undo the offer"),
+    }
+    reply
+}
+
+/// Waits for half a second in which `person` receives no video. Frames already on the way,
+/// or recovered late by a retransmission, may land first; a stream still forwarded at 15
+/// frames a second never leaves such a gap.
+async fn goes_quiet(person: &Person) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    person.running.take_video();
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let seen = person.running.take_video();
+        if seen.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "video still forwarded: {seen:?}");
+    }
+}
+
+/// The `call.state` everyone sees for `user_id` with a camera and share as given.
+fn state(room_id: &str, user_id: &str, camera: bool, sharing: bool) -> Value {
+    json!({"type": "call.state", "room_id": room_id, "user_id": user_id, "muted": false, "deafened": false, "camera": camera, "sharing": sharing})
+}
+
+/// Waits for this socket's `call.slots` whose video slot carries `user_id`'s share, then for
+/// its first share frame, which must be a keyframe.
+async fn sees_share(person: &mut Person, user_id: &str, marker: u8) {
+    let call_id = person.call_id.clone();
+    until(&mut person.ws, |value| {
+        let video = &value["video"];
+        (value["type"] == "call.slots"
+            && value["call_id"] == call_id.as_str()
+            && video["user_id"] == user_id
+            && video["kind"] == "share")
+            .then_some(())
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        seen.extend(person.running.take_video());
+        if let Some(first) = seen
+            .iter()
+            .find(|frame| frame.marker == marker && frame.layer == b's')
+        {
+            assert!(first.keyframe, "the share did not start on a keyframe");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no share frame from {marker} within 3 s; saw {seen:?}");
+}
+
+#[tokio::test]
+async fn a_share_reaches_everyone_else_and_a_second_one_is_refused() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut b = dial(ws, &cast.members[0].0, &cast.lobby, b'B').await;
+        let ws = socket(&cast, &cast.members[1]).await;
+        let mut c = dial(ws, &cast.members[1].0, &cast.lobby, b'C').await;
+
+        let reply = share(&mut a, true).await;
+        assert_eq!(reply["type"], "call.answer", "{reply}");
+        let shown = state(&cast.lobby, &a.user_id, false, true);
+        until(&mut b.ws, |value| (*value == shown).then_some(())).await;
+        sees_share(&mut b, &cast.owner.0, b'A').await;
+        sees_share(&mut c, &cast.owner.0, b'A').await;
+        let (_, ready) = connect(&cast.server, &cast.owner.1, None).await;
+        let participants = &ready["calls"][0]["participants"];
+        assert_eq!(participants[0]["sharing"], true, "{ready}");
+        assert_eq!(participants[1]["sharing"], false, "{ready}");
+
+        let refused = share(&mut b, true).await;
+        assert_eq!(
+            refused,
+            json!({"type": "error", "ref": "s", "code": "share_taken"})
+        );
+        let (_, ready) = connect(&cast.server, &cast.owner.1, None).await;
+        assert_eq!(ready["calls"][0]["participants"][1]["sharing"], false);
+        let frames = {
+            c.running.take_video();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            c.running.take_video()
+        };
+        assert!(!frames.is_empty());
+        assert!(
+            frames.iter().all(|frame| frame.marker == b'A'),
+            "{frames:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn stopping_a_share_returns_to_the_speaker_camera() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut b = dial(ws, &cast.members[0].0, &cast.lobby, b'B').await;
+        let ws = socket(&cast, &cast.members[1]).await;
+        let mut c = dial(ws, &cast.members[1].0, &cast.lobby, b'C').await;
+        camera(&mut b, true).await;
+        b.running.sending(true);
+        video_slot(&mut c.ws, &c.call_id, Some(&b.user_id)).await;
+        video_slot(&mut a.ws, &a.call_id, Some(&b.user_id)).await;
+
+        share(&mut a, true).await;
+        sees_share(&mut c, &cast.owner.0, b'A').await;
+        // The sharer keeps the speaker's camera.
+        a.running.take_video();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let at_a = a.running.take_video();
+        assert!(!at_a.is_empty());
+        assert!(at_a.iter().all(|frame| frame.marker == b'B'), "{at_a:?}");
+
+        let reply = share(&mut a, false).await;
+        assert_eq!(reply["type"], "call.answer", "{reply}");
+        let hidden = state(&cast.lobby, &a.user_id, false, false);
+        until(&mut c.ws, |value| (*value == hidden).then_some(())).await;
+        let video = video_slot(&mut c.ws, &c.call_id, Some(&b.user_id)).await;
+        assert_eq!(video["kind"], "camera");
+        let back = sees(&c, b'B').await;
+        assert!(
+            back[0].keyframe,
+            "the camera did not come back on a keyframe"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_sharer_leaving_ends_the_share() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut b = dial(ws, &cast.members[0].0, &cast.lobby, b'B').await;
+        let ws = socket(&cast, &cast.members[1]).await;
+        let mut c = dial(ws, &cast.members[1].0, &cast.lobby, b'C').await;
+        share(&mut a, true).await;
+        sees_share(&mut c, &cast.owner.0, b'A').await;
+
+        let reply = answer(&mut a.ws, json!({"type": "call.leave", "ref": "l"})).await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "l"}));
+        video_slot(&mut c.ws, &c.call_id, None).await;
+        let (_, ready) = connect(&cast.server, &cast.owner.1, None).await;
+        let participants = ready["calls"][0]["participants"]
+            .as_array()
+            .expect("participants");
+        assert!(participants.iter().all(|person| person["sharing"] == false));
+        let reply = share(&mut b, true).await;
+        assert_eq!(reply["type"], "call.answer", "{reply}");
+        sees_share(&mut c, &cast.members[0].0, b'B').await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_admin_ends_a_members_share_but_not_an_owners_and_it_is_audited() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (admin, admin_token) = join(&db, &owner, "admin@tinyserver.test", "admin").await;
+        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let server = serve_media(&db).await;
+        let owner_token = owner_token(&db).await;
+        let ws = connect(&server, &owner_token, None).await.0;
+        let mut o = dial(ws, &owner.user_id, &lobby.id, b'O').await;
+        let ws = connect(&server, &admin_token, None).await.0;
+        let mut a = dial(ws, &admin.user_id, &lobby.id, b'A').await;
+        let ws = connect(&server, &member_token, None).await.0;
+        let mut m = dial(ws, &member.user_id, &lobby.id, b'M').await;
+
+        share(&mut m, true).await;
+        sees_share(&mut o, &member.user_id, b'M').await;
+        let end = json!({"type": "call.share_end", "ref": "e", "room_id": lobby.id});
+        assert_eq!(
+            answer(&mut a.ws, end.clone()).await,
+            json!({"type": "ok", "ref": "e"})
+        );
+        let ended = state(&lobby.id, &member.user_id, false, false);
+        until(&mut m.ws, |value| (*value == ended).then_some(())).await;
+        until(&mut o.ws, |value| (*value == ended).then_some(())).await;
+        video_slot(&mut o.ws, &o.call_id, None).await;
+        goes_quiet(&o).await;
+        // Nothing to end now.
+        assert_eq!(
+            answer(&mut a.ws, end.clone()).await,
+            json!({"type": "error", "ref": "e", "code": "not_found"})
+        );
+        // The member stops the ended share, so another can start.
+        share(&mut m, false).await;
+
+        share(&mut o, true).await;
+        sees_share(&mut m, &owner.user_id, b'O').await;
+        assert_eq!(
+            answer(&mut a.ws, end.clone()).await,
+            json!({"type": "error", "ref": "e", "code": "forbidden"})
+        );
+        let (_, ready) = connect(&server, &owner_token, None).await;
+        assert_eq!(ready["calls"][0]["participants"][0]["sharing"], true);
+
+        let rows: Vec<(Option<String>, String, String, Value)> = sqlx::query_as(
+            "SELECT actor_id::text, action, subject, detail FROM audit_log
+             WHERE action LIKE 'call.%' ORDER BY id",
+        )
+        .fetch_all(&db.owner)
+        .await
+        .expect("audit");
+        assert_eq!(
+            rows,
+            vec![(
+                Some(admin.user_id.clone()),
+                "call.share_end".to_string(),
+                "call".to_string(),
+                json!({"room_id": lobby.id, "user_id": member.user_id}),
+            )]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_member_cannot_end_a_share() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut b = dial(ws, &cast.members[0].0, &cast.lobby, b'B').await;
+        let ws = socket(&cast, &cast.members[1]).await;
+        let mut c = dial(ws, &cast.members[1].0, &cast.lobby, b'C').await;
+        share(&mut c, true).await;
+        sees_share(&mut a, &cast.members[1].0, b'C').await;
+        let end = json!({"type": "call.share_end", "ref": 1, "room_id": cast.lobby});
+        assert_eq!(
+            answer(&mut b.ws, end.clone()).await,
+            json!({"type": "error", "ref": 1, "code": "forbidden"})
+        );
+        // Not even their own.
+        assert_eq!(answer(&mut c.ws, end).await["code"], "forbidden");
+        let bad = json!({"type": "call.share_end", "ref": 2});
+        assert_eq!(answer(&mut a.ws, bad).await["code"], "bad_frame");
+        let (_, ready) = connect(&cast.server, &cast.owner.1, None).await;
+        assert_eq!(ready["calls"][0]["participants"][2]["sharing"], true);
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action LIKE 'call.%'")
+                .fetch_one(&db.owner)
+                .await
+                .expect("audit");
+        assert_eq!(rows, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_tcp_client_gets_the_share_through_the_live_socket() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut a = dial(ws, &cast.owner.0, &cast.lobby, b'A').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let client = Client::tcp(LOOPBACK.into(), SLOTS).expect("TCP client");
+        let mut b = dial_with(ws, client, &cast.members[0].0, &cast.lobby, b'B').await;
+        share(&mut a, true).await;
+        sees_share(&mut b, &cast.owner.0, b'A').await;
     })
     .await;
 }

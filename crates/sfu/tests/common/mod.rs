@@ -7,7 +7,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use sfu::client::{Client, Frame, Running, VideoFrame};
-use sfu::{Config, Event, Media, Slot, VideoSlot};
+use sfu::{Config, Event, Media, Refused, Slot, VideoKind, VideoSlot};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{timeout, Instant};
 
@@ -15,6 +15,8 @@ pub const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// Longer than the consent timeout, so a drop is waited for in one go.
 pub const WAIT: Duration = Duration::from_secs(10);
 pub const SLOTS: usize = 11;
+/// What most share tests send, so many at once stay light.
+pub const LIGHT_SHARE_KBPS: u64 = 300;
 
 pub fn config() -> Config {
     let mut config = Config::new(SocketAddr::from((LOOPBACK, 0)), LOOPBACK.into());
@@ -111,6 +113,26 @@ impl Sfu {
         .await
     }
 
+    /// Waits until `call_id`'s video slot carries `user_id`'s `kind`.
+    pub async fn video_is(&mut self, call_id: &str, user_id: &str, kind: VideoKind) -> VideoSlot {
+        let held = |video: &Option<VideoSlot>| {
+            video
+                .as_ref()
+                .filter(|slot| slot.user_id == user_id && slot.kind == kind)
+                .cloned()
+        };
+        if let Some(slot) = self.video.get(call_id).and_then(held) {
+            return slot;
+        }
+        self.wait_for(|event| match event {
+            Event::Slots {
+                call_id: id, video, ..
+            } if id == call_id => held(video),
+            _ => None,
+        })
+        .await
+    }
+
     /// Turns `person`'s camera on or off with a renegotiation, as `call.offer` does.
     pub async fn camera(&mut self, person: &Person, on: bool) {
         let offer = person.running.camera(on).expect("a camera offer");
@@ -124,6 +146,38 @@ impl Sfu {
             .running
             .accept(&answer.sdp)
             .expect("accept the answer");
+    }
+}
+
+impl Sfu {
+    /// Starts or stops `person`'s share with a renegotiation, as `call.offer` does. `Ok` says
+    /// whether they hold the room's share. A refused offer is undone on the client.
+    pub async fn share(&mut self, person: &Person, on: bool) -> Result<bool, Refused> {
+        self.share_at(person, on, LIGHT_SHARE_KBPS).await
+    }
+
+    /// `share` at `kbps`.
+    pub async fn share_at(
+        &mut self,
+        person: &Person,
+        on: bool,
+        kbps: u64,
+    ) -> Result<bool, Refused> {
+        person.running.share_kbps(kbps);
+        let offer = person.running.share(on).expect("a share offer");
+        match self.media.offer(&person.call_id, &offer).await {
+            Ok(answer) => {
+                person
+                    .running
+                    .accept(&answer.sdp)
+                    .expect("accept the answer");
+                Ok(answer.share)
+            }
+            Err(refused) => {
+                person.running.reject().expect("undo the offer");
+                Err(refused)
+            }
+        }
     }
 }
 

@@ -57,6 +57,7 @@ pub(crate) enum Change {
         muted: bool,
         deafened: bool,
         camera: bool,
+        sharing: bool,
     },
 }
 
@@ -95,6 +96,7 @@ pub(crate) struct Participant {
     pub muted: bool,
     pub deafened: bool,
     pub camera: bool,
+    pub sharing: bool,
 }
 
 /// Where a person sits. `conn` is the socket that joined; `None` once it closed.
@@ -108,6 +110,8 @@ struct Seat {
     deafened: bool,
     /// Their camera m-line is sending, as the SFU's last answer said.
     camera: bool,
+    /// They hold the room's screen share, as the SFU's last answer said.
+    sharing: bool,
 }
 
 impl Seat {
@@ -118,6 +122,7 @@ impl Seat {
             muted: self.muted,
             deafened: self.deafened,
             camera: self.camera,
+            sharing: self.sharing,
         }
     }
 }
@@ -185,6 +190,7 @@ impl Calls {
                 muted: false,
                 deafened: false,
                 camera: false,
+                sharing: false,
             },
         );
         self.rooms
@@ -253,15 +259,43 @@ impl Calls {
         Some(seat.state(user_id))
     }
 
-    /// Records whether `user_id`'s camera sends, if `call_id` is still their participant.
-    /// `None` if it is not or nothing changed.
-    pub fn set_camera(&mut self, user_id: &str, call_id: &str, camera: bool) -> Option<Change> {
+    /// Records whether `user_id`'s camera sends and whether they share, if `call_id` is still
+    /// their participant. `None` if it is not or nothing changed.
+    pub fn set_media(
+        &mut self,
+        user_id: &str,
+        call_id: &str,
+        camera: bool,
+        sharing: bool,
+    ) -> Option<Change> {
         let seat = self.seats.get_mut(user_id)?;
-        if seat.call_id.as_deref() != Some(call_id) || seat.camera == camera {
+        if seat.call_id.as_deref() != Some(call_id)
+            || (seat.camera == camera && seat.sharing == sharing)
+        {
             return None;
         }
         seat.camera = camera;
+        seat.sharing = sharing;
         Some(seat.state(user_id))
+    }
+
+    /// Who shares their screen in `room_id`'s call.
+    pub fn sharer(&self, room_id: &str) -> Option<&str> {
+        self.people(room_id)
+            .iter()
+            .find(|user_id| self.seats.get(*user_id).is_some_and(|seat| seat.sharing))
+            .map(String::as_str)
+    }
+
+    /// Ends `user_id`'s share in `room_id`. Their SFU participant and the change, or `None`
+    /// if they were not sharing there.
+    pub fn end_share(&mut self, room_id: &str, user_id: &str) -> Option<(Option<String>, Change)> {
+        let seat = self.seats.get_mut(user_id)?;
+        if seat.room_id != room_id || !seat.sharing {
+            return None;
+        }
+        seat.sharing = false;
+        Some((seat.call_id.clone(), seat.state(user_id)))
     }
 
     /// The socket `conn` closed. If it held the seat, returns an epoch for `expire`.
@@ -312,6 +346,7 @@ impl Calls {
                             muted: seat.is_some_and(|seat| seat.muted),
                             deafened: seat.is_some_and(|seat| seat.deafened),
                             camera: seat.is_some_and(|seat| seat.camera),
+                            sharing: seat.is_some_and(|seat| seat.sharing),
                         }
                     })
                     .collect(),
@@ -491,19 +526,33 @@ mod tests {
         assert!(calls.set_state("u", true, false).is_some());
         assert_eq!(calls.set_state("u", true, false), None);
         assert!(calls.snapshot()[0].participants[0].muted);
-        assert_eq!(calls.set_camera("u", "c-1", true), None, "a stale call id");
         assert_eq!(
-            calls.set_camera("u", "c-2", true),
+            calls.set_media("u", "c-1", true, false),
+            None,
+            "a stale call id"
+        );
+        assert_eq!(
+            calls.set_media("u", "c-2", true, false),
             Some(Change::State {
                 room_id: "a".to_string(),
                 user_id: "u".to_string(),
                 muted: true,
                 deafened: false,
                 camera: true,
+                sharing: false,
             })
         );
-        assert_eq!(calls.set_camera("u", "c-2", true), None);
+        assert_eq!(calls.set_media("u", "c-2", true, false), None);
         assert!(calls.snapshot()[0].participants[0].camera);
+        assert_eq!(calls.sharer("a"), None);
+        assert!(calls.set_media("u", "c-2", true, true).is_some());
+        assert_eq!(calls.sharer("a"), Some("u"));
+        assert!(calls.snapshot()[0].participants[0].sharing);
+        assert_eq!(calls.end_share("b", "u"), None, "another room");
+        let ended = calls.end_share("a", "u").expect("ended");
+        assert_eq!(ended.0.as_deref(), Some("c-2"));
+        assert_eq!(calls.end_share("a", "u"), None);
+        assert_eq!(calls.sharer("a"), None);
         assert_eq!(
             calls.leave("u", Reason::MediaLost),
             Some(Change::Left {

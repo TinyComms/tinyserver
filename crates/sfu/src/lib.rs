@@ -1,6 +1,7 @@
 //! Media plane. One OS thread owns one UDP socket, an ICE-TCP listener on the same port
-//! number, and one `str0m::Rtc` per participant. It forwards Opus audio and H.264 camera
-//! video, one simulcast layer of one camera to each listener.
+//! number, and one `str0m::Rtc` per participant. It forwards Opus audio and H.264 video to
+//! each listener's one video slot: the room's screen share while there is one, else one
+//! simulcast layer of one camera.
 //!
 //! The API sends [`Media`] commands and reads [`Event`]s. str0m types stay in this crate.
 //! RTP stays in memory. Postgres never stores it.
@@ -55,8 +56,10 @@ pub struct Config {
     /// keyframe that fits.
     pub camera_high_kbps: u32,
     pub camera_low_kbps: u32,
-    /// What the server may upload to everyone, in kb/s. `None` is no budget. Over it,
-    /// listeners drop to `l`, then to audio only.
+    /// The same for a screen share's one layer.
+    pub share_kbps: u32,
+    /// What the server may upload to everyone, in kb/s. `None` is no budget. Shares are
+    /// planned first; over it, camera listeners drop to `l`, then to audio only.
     pub egress_kbps: Option<u32>,
     /// Where each listener's TWCC bandwidth estimate starts, in kb/s. Below 1,600 a listener
     /// starts on `l` and moves up as the estimate climbs. `None` turns the estimator off;
@@ -94,10 +97,11 @@ impl Config {
             audio_kbps: 64,
             camera_high_kbps: 2400,
             camera_low_kbps: 700,
+            share_kbps: 5000,
             egress_kbps: None,
             bwe_start_kbps: Some(1000),
-            packets_per_second: 500,
-            packet_burst: 1000,
+            packets_per_second: 1000,
+            packet_burst: 2000,
             tcp_streams: 256,
             tcp_per_source: 16,
             tcp_unverified: 64,
@@ -118,6 +122,8 @@ pub struct Answer {
     pub sdp: String,
     /// The offer's camera m-line is sending.
     pub camera: bool,
+    /// This participant holds the room's share.
+    pub share: bool,
 }
 
 /// Why the SFU refused a join or an offer.
@@ -127,6 +133,8 @@ pub enum Refused {
     BadSdp,
     /// No such participant. For an offer only.
     NotFound,
+    /// The offer starts a share, and someone else in the room holds it.
+    ShareTaken,
     /// The media thread is gone or its queue is full.
     Unavailable,
 }
@@ -151,12 +159,14 @@ pub struct Slot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoKind {
     Camera,
+    Share,
 }
 
 impl VideoKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Camera => "camera",
+            Self::Share => "share",
         }
     }
 }
@@ -217,6 +227,9 @@ pub(crate) enum Command {
     Quality {
         call_id: String,
         video: Quality,
+    },
+    EndShare {
+        call_id: String,
     },
     Leave {
         call_id: String,
@@ -321,6 +334,14 @@ impl Media {
         let _ = self.send(Command::Quality {
             call_id: call_id.to_string(),
             video,
+        });
+    }
+
+    /// Stops forwarding a participant's share. It stays stopped until an offer sets the
+    /// share m-line inactive and a later one starts it again.
+    pub fn end_share(&self, call_id: &str) {
+        let _ = self.send(Command::EndShare {
+            call_id: call_id.to_string(),
         });
     }
 
