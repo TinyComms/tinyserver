@@ -18,7 +18,7 @@ enum Command {
     Migrate,
     /// Create the first owner. Refuses when one already exists.
     Bootstrap,
-    /// Serve HTTP. Media is not started.
+    /// Serve HTTP and the live socket. Media is not started.
     Serve,
 }
 
@@ -78,20 +78,29 @@ async fn serve() -> anyhow::Result<()> {
         .parse()
         .context("BIND is not a socket address")?;
     let pool = db::runtime_pool(&url).await?;
-    let app = api::router(pool.clone());
+    let live = api::Live::start(pool.clone(), api::Limits::default());
+    let app = api::app(pool.clone(), live.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(%bind, "listening");
     let sweeper = tokio::spawn(sweep_every(pool, SWEEP_EVERY));
-    let served = axum_serve(listener, app).await;
+    let served = axum_serve(listener, app, live.clone()).await;
     sweeper.abort();
+    live.close();
+    if !live.closed(DRAIN).await {
+        tracing::warn!(sockets = live.sockets(), "live sockets still open at exit");
+    }
     served
 }
 
+/// How long live sockets get to take their close frame on shutdown.
+const DRAIN: Duration = Duration::from_secs(5);
+
 const SWEEP_EVERY: Duration = Duration::from_secs(10 * 60);
 
-/// Deletes expired sessions, invites, and idempotency keys. The first sweep runs at start.
+/// Deletes expired sessions, invites, idempotency keys, and old outbox rows. The first sweep
+/// runs at start.
 async fn sweep_every(pool: PgPool, period: Duration) {
     let mut ticks = tokio::time::interval(period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -102,6 +111,7 @@ async fn sweep_every(pool: PgPool, period: Duration) {
                 sessions = swept.sessions,
                 invites = swept.invites,
                 idempotency_keys = swept.idempotency_keys,
+                events = swept.events,
                 "expired rows deleted"
             ),
             Ok(_) => {}
@@ -110,9 +120,18 @@ async fn sweep_every(pool: PgPool, period: Duration) {
     }
 }
 
-async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> anyhow::Result<()> {
+/// On a signal, live sockets get `1012 restart` first, so graceful shutdown is not held open
+/// by them.
+async fn axum_serve(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    live: api::Live,
+) -> anyhow::Result<()> {
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(async move {
+            shutdown().await;
+            live.close();
+        })
         .await
         .context("server stopped")?;
     Ok(())

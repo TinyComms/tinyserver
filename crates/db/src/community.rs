@@ -14,6 +14,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
 use crate::bootstrap::{check_password, hash_password, normalize_email, normalize_name};
+use crate::outbox::emit;
 use crate::session::{new_token, password_matches, token_digest};
 use crate::DbError;
 
@@ -165,6 +166,7 @@ pub async fn create_room(
     )
     .await?;
     finish(&mut tx, claim, &room).await?;
+    emit(&mut tx, "room.created", room_event(&room)).await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(Wrote::Fresh(room))
 }
@@ -201,6 +203,7 @@ pub async fn rename_room(
         serde_json::json!({"id": room.id, "name": room.name}),
     )
     .await?;
+    emit(&mut tx, "room.renamed", room_event(&room)).await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(room)
 }
@@ -222,6 +225,12 @@ pub async fn delete_room(pool: &PgPool, caller: &Caller, id: &str) -> Result<(),
         "room.delete",
         "room",
         serde_json::json!({"id": gone}),
+    )
+    .await?;
+    emit(
+        &mut tx,
+        "room.deleted",
+        serde_json::json!({"room_id": gone}),
     )
     .await?;
     tx.commit().await.map_err(from_sql)?;
@@ -263,6 +272,18 @@ pub async fn set_member_role(
         .fetch_one(&mut *tx)
         .await
         .map_err(from_sql)?;
+    let display_name: String =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1::uuid")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(from_sql)?;
+    emit(
+        &mut tx,
+        "member.role",
+        member_event(user_id, &display_name, &stored),
+    )
+    .await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(stored)
 }
@@ -285,6 +306,12 @@ pub async fn remove_member(
         .execute(&mut *tx)
         .await
         .map_err(from_sql)?;
+    emit(
+        &mut tx,
+        "member.removed",
+        serde_json::json!({"user_id": user_id}),
+    )
+    .await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(())
 }
@@ -359,6 +386,20 @@ pub async fn create_invite(
     )
     .await?;
     finish(&mut tx, claim, &issued).await?;
+    let invite = Invite {
+        id: issued.id.clone(),
+        role: issued.role.clone(),
+        created_by: caller.user_id.clone(),
+        expires_at: issued.expires_at.clone(),
+        accepted_at: None,
+        accepted_by: None,
+    };
+    emit(
+        &mut tx,
+        "invite.created",
+        serde_json::json!({"invite": invite_value(&invite)}),
+    )
+    .await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(Wrote::Fresh(issued))
 }
@@ -385,6 +426,12 @@ pub async fn revoke_invite(pool: &PgPool, caller: &Caller, id: &str) -> Result<(
         "invite.revoke",
         "invite",
         serde_json::json!({"id": id, "role": role}),
+    )
+    .await?;
+    emit(
+        &mut tx,
+        "invite.revoked",
+        serde_json::json!({"invite_id": id}),
     )
     .await?;
     tx.commit().await.map_err(from_sql)?;
@@ -628,6 +675,36 @@ fn fingerprint(parts: &[&str]) -> String {
         hasher.update([0]);
     }
     URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+/// The payload of `room.created` and `room.renamed`.
+fn room_event(room: &Room) -> Value {
+    serde_json::json!({"room": {
+        "id": room.id,
+        "name": room.name,
+        "created_by": room.created_by,
+        "created_at": room.created_at,
+    }})
+}
+
+/// The payload of `member.joined`, `member.role`, and `member.renamed`. No email.
+pub(crate) fn member_event(user_id: &str, display_name: &str, role: &str) -> Value {
+    serde_json::json!({"member": {
+        "user_id": user_id,
+        "display_name": display_name,
+        "role": role,
+    }})
+}
+
+fn invite_value(invite: &Invite) -> Value {
+    serde_json::json!({
+        "id": invite.id,
+        "role": invite.role,
+        "created_by": invite.created_by,
+        "expires_at": invite.expires_at,
+        "accepted_at": invite.accepted_at,
+        "accepted_by": invite.accepted_by,
+    })
 }
 
 fn room_from(row: &PgRow) -> Result<Room, CommunityError> {

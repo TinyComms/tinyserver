@@ -1,6 +1,6 @@
 # Calls
 
-Design for voice and video in tinyserver. Nothing here is built yet. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
+Design for voice and video in tinyserver. Slice 1, the live socket, is built; the rest is not. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
 
 ## Recommendation
 
@@ -47,33 +47,55 @@ Upgrade: websocket
 
 | Rule | Value |
 | --- | --- |
-| Auth | The existing session token. Checked on upgrade, then every 60 s and on every `call.join`. An expired or deleted session closes the socket with `4001 session_ended`. |
-| Membership | Removed member: the socket closes with `4003 removed` and any call is dropped. |
-| Frame size | 64 KiB. SDP with simulcast fits. Bigger frames close the socket. |
-| Client message rate | 20 a second, burst 40. Over that, `error {code: "slow_down"}`, then close. |
-| Sockets per user | 3. A fourth closes the oldest. |
-| Keepalive | Client sends `ping` every 25 s. Server answers `pong`. No traffic for 60 s closes the socket. |
+| Auth | The existing session token, in the `Authorization: Bearer` header only. tinyclient's `tungstenite` sets headers on the handshake request, so there is no query-string token to leak into logs. Checked before the upgrade: no token or a bad one is a plain `401 {"error":"unauthorized"}`. Then checked again every 60 s, at once on a `session.ended` event, and (from slice 2) on every `call.join`. An expired or deleted session closes the socket with `4001 session_ended`. Sign-out, sign-out everywhere, and a password change all emit `session.ended`, so their sockets close within one event delivery. |
+| Membership | Removed member: the socket gets `member.removed` about itself, then closes with `4003 removed`. From slice 2, any call is dropped. |
+| Query | `since=<seq>`, a non-negative integer. Anything else is `400 {"error":"invalid"}`. Other parameters are ignored. |
+| Frame size | 64 KiB, for one frame and one message. SDP with simulcast fits. Bigger closes the socket with `1009 too_big`. Binary frames close it with `1003 text_only`. |
+| Client message rate | 20 a second, burst 40. A message over that is dropped, and the first one dropped gets `error {code: "slow_down"}`. 40 dropped in a row closes with `4029 slow_down`. |
+| Sockets per user | 3. A fourth closes the oldest with `4008 replaced`. |
+| Sockets in all | 1,024. Over that, `503 {"error":"busy"}` before the upgrade. |
+| Keepalive | Client sends `ping` every 25 s. Server answers `pong`. No traffic for 60 s closes with `4000 idle`. WebSocket ping frames count as traffic. |
+| Slow consumer | The server never buffers without bound. A send that does not finish in 10 s drops the socket. A socket more than 1,024 events behind gets `resync` and is closed. |
+| Shutdown | SIGTERM closes every socket with `1012 restart`, refuses new ones with `503 {"error":"restarting"}`, and waits up to 5 s for them to go. |
 | Encoding | JSON text frames, one object each, `type` first. Unknown types from the server are ignored by the client. |
+
+Close codes:
+
+| Code | Reason | Client does |
+| --- | --- | --- |
+| `1009` | `too_big` | Fix the sender |
+| `1011` | `unavailable` | The database did not answer. Reconnect with backoff and `since`. |
+| `1012` | `restart` | Reconnect with backoff and `since` |
+| `4000` | `idle` | Reconnect with `since` |
+| `4001` | `session_ended` | Sign in again |
+| `4002` | `resync` | Refetch rooms, members, and invites, then reconnect without `since` |
+| `4003` | `removed` | Stop. The account is no longer a member. |
+| `4008` | `replaced` | Another device of the same person took the place. Do not reconnect in a loop. |
+| `4029` | `slow_down` | Reconnect after a pause |
+
+Browsers cannot set the `Authorization` header on a WebSocket, so a hostile page cannot open this socket with someone's session. No `Origin` check is needed.
 
 ### Two kinds of events
 
 | Kind | Examples | Path | Has `seq` | Survives reconnect |
 | --- | --- | --- | --- | --- |
-| Durable | room created, renamed, deleted; member joined, role changed, removed; invite created or accepted | `outbox` row, written in the transaction that made the change | Yes | Yes, replayed from `since` |
+| Durable | room created, renamed, deleted; member joined, role changed, renamed, removed; invite created, accepted, revoked | `outbox` row, written in the transaction that made the change | Yes | Yes, replayed from `since` |
 | Ephemeral | presence, occupancy, speaking, call signaling | Memory, sent straight to the sockets that need it | No | No. `ready` carries a fresh snapshot |
 
 ### Outbox and LISTEN/NOTIFY
 
-The `outbox` table and the `outbox_wake` trigger already exist in `0001_init.sql`. Today nothing writes to them.
+The `outbox` table and the `outbox_wake` trigger are in `0001_init.sql`; `0003_live.sql` adds the rest.
 
-1. Every write in `db::community` and the `app_*` SECURITY DEFINER functions inserts one `outbox` row in the same transaction: `topic` like `room.renamed`, `payload` the public shape of the change. A rolled-back change never emits.
-2. The commit fires `pg_notify('app_wake', topic)`.
-3. One dispatcher task holds a dedicated `sqlx::postgres::PgListener` on `app_wake`. On a wake, and every 5 s regardless (a missed notify on reconnect costs at most 5 s), it reads `WHERE sent_at IS NULL ORDER BY id`, sends each row into a `tokio::sync::broadcast` channel, and sets `sent_at`.
-4. Each socket task subscribes to that channel and filters per recipient. Invite events go to owners and admins only. A `member.role` event for the socket's own user updates that socket's cached role.
-5. The row `id` is the event `seq`. A client reconnects with `?since=<last seq>`. The server replays rows with `id > since` that the caller may see. If `since` is older than the oldest kept row, the server sends `resync` and the client refetches over REST.
-6. A sweep deletes rows with `sent_at` older than 24 h.
+1. Every room, member, invite, and session write in `crates/db` calls `app_emit(topic, payload)` in the same transaction, just before it commits: `topic` like `room.renamed`, `payload` the public shape of the change. `app_accept_invite` emits from inside the function, because the invite row is behind RLS for the person accepting. A rolled-back change never emits. The runtime role cannot insert, update, or delete outbox rows itself.
+2. `app_emit` takes one transaction-scoped advisory lock before it inserts, so ids are handed out in commit order. Without it, a transaction that took id 10 could commit after one that took id 11, and a reader at 11 would never see 10. The lock is held only from the emit to the commit.
+3. The commit fires `pg_notify('app_wake', topic)`.
+4. One dispatcher task holds a `sqlx::postgres::PgListener` on `app_wake`. It starts at the newest id and keeps that cursor in memory. On a wake, on a listener reconnect, and every 5 s regardless, it reads `WHERE id > cursor ORDER BY id` and sends each row into a `tokio::sync::broadcast` channel of 1,024. Because of step 2 a cursor never skips a row, so `sent_at` is not used. The listener takes one connection, so the runtime pool has six.
+5. Each socket task subscribes to that channel before it reads the outbox, and filters per recipient. Invite events go to owners and admins only, matching `invites_all`. A `member.role` event for the socket's own user updates that socket's cached role, so a promotion starts invite events on the same socket. `session.ended` is never sent; it makes that user's sockets re-check their session.
+6. The row `id` is the event `seq`. Seqs only grow, but have gaps: rolled-back ids, and events the socket may not see. A client reconnects with `?since=<last seq>`. `ready.seq` is then `since`, and the server replays rows with `id > since` that the caller may see, then streams. Without `since`, `ready.seq` is the newest seq, and the client should fetch REST state after `ready`.
+7. `resync`, then close with `4002`, when `since` is below the highest pruned seq, above the newest seq (a seq this server never issued), more than 1,000 events back, or when the socket falls more than 1,024 events behind live.
+8. The existing 10-minute sweep (`app_sweep`) deletes outbox rows older than 24 h. It deletes every id up to the newest old row, so what is kept is one unbroken run, and it records the highest deleted id in `outbox_pruned`. A client may resume up to 24 h back.
 
-One process means one dispatcher, so there is no ordering problem across nodes. A lagged broadcast receiver (more than 1,024 events behind) gets `resync` instead of a gap.
+One process means one dispatcher, so there is no ordering problem across nodes.
 
 Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 
@@ -81,20 +103,21 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 
 | `type` | Fields | When |
 | --- | --- | --- |
-| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants}]` | First frame after connect. Snapshot of everything ephemeral. |
-| `room.created`, `room.renamed` | `seq`, `room {id, name, created_by, created_at}` | Durable |
+| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants}]` | First frame after connect. Snapshot of everything ephemeral. `online` is sorted and includes the caller. `calls` is always `[]` until slice 2. |
+| `room.created`, `room.renamed` | `seq`, `room {id, name, created_by, created_at}` | Durable. The same shape as `GET /v1/rooms`. |
 | `room.deleted` | `seq`, `room_id` | Durable. Ends that room's call. |
-| `member.joined`, `member.role` | `seq`, `member {user_id, display_name, role}` | Durable |
+| `member.joined`, `member.role`, `member.renamed` | `seq`, `member {user_id, display_name, role}` | Durable. No email; `GET /v1/members` has it. `member.renamed` is a display name change. |
 | `member.removed` | `seq`, `user_id` | Durable |
-| `invite.created`, `invite.accepted` | `seq`, `invite {id, role, expires_at, accepted_by}` | Durable. Owners and admins only. |
-| `presence` | `user_id`, `online` | First socket opens, or last socket closes after a 10 s grace |
+| `invite.created`, `invite.accepted` | `seq`, `invite {id, role, created_by, expires_at, accepted_at, accepted_by}` | Durable. Owners and admins only. The same shape as `GET /v1/invites`. |
+| `invite.revoked` | `seq`, `invite_id` | Durable. Owners and admins only. Invites the sweep deletes after they expire send nothing. |
+| `presence` | `user_id`, `online` | First socket opens, or last socket closes after a 10 s grace. Several sockets for one person are one presence. |
 | `call.participants` | `room_id`, `participants [{user_id, muted, deafened, camera, share}]` | Someone joins, leaves, or changes state. Sent to every member, so the sidebar shows who is in which room. |
 | `call.answer` | `ref`, `call_id`, `sdp` | Reply to `call.join` or `call.offer` |
 | `call.slots` | `call_id`, `audio [{mid, user_id}]`, `video {mid, user_id, kind}` | Which receive slot carries whom. `kind` is `camera` or `share`. |
 | `call.speaking` | `room_id`, `user_ids` | At most 4 a second, in-call sockets only |
 | `call.ended` | `room_id`, `reason` | `left`, `joined_elsewhere`, `room_deleted`, `removed`, `media_timeout`, `restart`, `full` |
-| `resync` | none | Client refetches rooms and members, then reconnects with no `since` |
-| `error` | `ref`, `code` | A client request failed |
+| `resync` | none | The server closes with `4002` next. Client refetches rooms and members, then reconnects with no `since`. |
+| `error` | `ref`, `code` | A client request failed. `ref` is echoed when the request had one. |
 | `pong` | none | Reply to `ping` |
 
 ### Client to server
@@ -108,7 +131,13 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `call.quality` | `video` (`high`, `low`, `off`) | What the listener's one video surface can use |
 | `call.leave` | none | Hang up. Closing the socket does the same after a 10 s grace. |
 
-Error codes: `not_found`, `forbidden`, `full`, `share_taken`, `bad_sdp`, `media_unavailable`, `slow_down`.
+Error codes: `not_found`, `forbidden`, `full`, `share_taken`, `bad_sdp`, `media_unavailable`, `slow_down`, `unknown_type` (a `type` this server does not take; every `call.*` in slice 1), `bad_frame` (not a JSON object with a `type`).
+
+```json
+{"type":"ready","seq":41,"me":{"user_id":"9d1e…","role":"member"},"online":["5a0c…","9d1e…"],"calls":[]}
+{"type":"room.renamed","seq":42,"room":{"id":"0b6f…","name":"Lobby","created_by":"5a0c…","created_at":"2026-10-24T12:00:00Z"}}
+{"type":"presence","user_id":"5a0c…","online":false}
+```
 
 ```json
 {"type":"call.join","ref":"7","room_id":"0b6f…","sdp":"v=0\r\n…"}
@@ -206,7 +235,7 @@ Calls live in memory and end on restart. That is the trade for keeping RTP out o
 
 | Step | Behaviour |
 | --- | --- |
-| SIGTERM | The API sends `call.ended {reason: "restart"}` to every caller, then `Shutdown` to the SFU, then exits. |
+| SIGTERM | The API sends `call.ended {reason: "restart"}` to every caller, then `Shutdown` to the SFU. Every live socket closes with `1012 restart`, and the process exits. |
 | Crash | Sockets drop. Nothing in Postgres needs cleaning. |
 | Client | Reconnects `/v1/live` with backoff (0.5 s, 1, 2, 4, cap 10). If it was in a call and the user did not hang up, `mediad` sends a fresh `call.join` to the same room. Target: back in the call within 5 s of the server answering. |
 | Durable events | Replayed from `since`. Nothing is lost. |
@@ -346,7 +375,7 @@ Each slice is one PR, merges on its own, and leaves the server working.
 
 | # | Slice | Scope | Acceptance check | Size |
 | --- | --- | --- | --- | --- |
-| 1 | **Live socket and presence** | `GET /v1/live` with bearer auth, ping, limits, `ready`, `presence`. Outbox writes in every room, member, and invite change. Dispatcher on `LISTEN app_wake`, replay with `since`, `resync`, 24 h sweep. No media. | Integration test: two sessions connect; A renames a room; B gets `room.renamed` with a `seq`. B reconnects with an old `since` and gets the missed events. A removed member's socket closes with `4003`. A rolled-back write emits nothing. | M, ~800 lines |
+| 1 | **Live socket and presence** (built) | `GET /v1/live` with bearer auth, ping, limits, `ready`, `presence`. Outbox writes in every room, member, and invite change. Dispatcher on `LISTEN app_wake`, replay with `since`, `resync`, 24 h sweep. No media. | Integration test: two sessions connect; A renames a room; B gets `room.renamed` with a `seq`. B reconnects with an old `since` and gets the missed events. A removed member's socket closes with `4003`. A rolled-back write emits nothing. | M, ~800 lines |
 | 2 | **Call occupancy without media** | `call.join` / `call.leave` / `call.state`, the call registry, authorization, caps, `joined_elsewhere`, `call.participants` to every member. `call.join` takes an SDP field but answers `media_unavailable`. | Test: three members join a room; everyone sees `call.participants` with three entries. A fourth joins elsewhere and moves. The cap returns `full`. Deleting the room sends `call.ended {room_deleted}`. | S, ~400 lines |
 | 3 | **SFU audio, UDP** | `crates/sfu` thread with mio, str0m pinned, ICE-lite, DTLS-SRTP, Opus forwarding, slots, active speaker, consent timeout, graceful shutdown. Compose and `deploy/README.md` gain the media port. `/health` reports `media`. | A headless test client (str0m, in `crates/sfu/tests`) joins with two peers on loopback; each receives the other's Opus frames within 2 s; killing one peer frees its slot within 35 s. Manual: two machines on different networks talk. | L, ~1,500 lines |
 | 4 | **ICE-TCP and hardening** | TCP passive candidate on the same port, RFC 4571 framing, stream caps, per-source rate limit, a fuzz target for the packet entry point, `TINYSERVER_LAN_IP`. | Test client with UDP blocked connects over TCP. Fuzz runs 10 minutes without a panic. A flood from an unknown source does not raise CPU above a set bound. | M, ~600 lines |

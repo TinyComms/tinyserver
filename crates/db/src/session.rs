@@ -128,8 +128,10 @@ pub async fn current_session(pool: &PgPool, token: &str) -> Result<Identity, Ses
     })
 }
 
+/// Also emits `session.ended`, so a live socket on this token closes.
 pub async fn close_session(pool: &PgPool, token: &str) -> Result<String, SessionError> {
     let digest = token_digest(token);
+    let mut tx = pool.begin().await?;
     let user_id: Option<String> = sqlx::query_scalar(
         "DELETE FROM sessions
          WHERE token_hash = $1
@@ -138,9 +140,15 @@ pub async fn close_session(pool: &PgPool, token: &str) -> Result<String, Session
          RETURNING user_id::text",
     )
     .bind(digest.as_slice())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    user_id.ok_or(SessionError::Unauthorized)
+    let user_id = user_id.ok_or(SessionError::Unauthorized)?;
+    sqlx::query("SELECT app_emit('session.ended', jsonb_build_object('user_id', $1::text))")
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(user_id)
 }
 
 fn known_role(role: Option<String>) -> Option<String> {
