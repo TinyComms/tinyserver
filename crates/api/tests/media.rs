@@ -449,14 +449,14 @@ async fn without_media_an_offer_is_refused_and_health_says_off() {
         );
         enter(&mut ws, &lobby.id, &owner.user_id).await;
 
-        let app = api::app(db.runtime.clone(), server.live.clone());
+        let app = api::app(db.runtime.clone(), server.live.clone(), None);
         let (status, body) = Call::new(Method::GET, "/health").send(&app).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["media"], "off");
         assert_eq!(body["transports"], json!([]));
 
         let media = serve_media(&db).await;
-        let app = api::app(db.runtime.clone(), media.live.clone());
+        let app = api::app(db.runtime.clone(), media.live.clone(), None);
         let (status, body) = Call::new(Method::GET, "/health").send(&app).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["media"], "up");
@@ -519,7 +519,7 @@ async fn the_answer_has_the_lan_candidate_when_set() {
         assert!(lan.iter().any(|line| line.contains(" udp ")), "{sdp}");
         assert!(lan.iter().any(|line| line.contains(" tcp ")), "{sdp}");
 
-        let app = api::app(db.runtime.clone(), server.live.clone());
+        let app = api::app(db.runtime.clone(), server.live.clone(), None);
         let (_, body) = Call::new(Method::GET, "/health").send(&app).await;
         assert_eq!(body["transports"], json!(["udp", "tcp", "lan"]));
     })

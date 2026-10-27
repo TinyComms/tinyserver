@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use api::Limits;
 use common::live::*;
-use common::{first_owner, join, run, PASSWORD};
+use common::{first_owner, invite_hash, join, profile, run, session, ISSUER};
 use db::Wrote;
 use futures_util::SinkExt;
 use serde_json::{json, Value};
@@ -132,12 +132,13 @@ async fn invite_events_reach_admins_and_not_members() {
         assert_eq!(event["invite"]["role"], "member");
         assert_eq!(event["invite"]["accepted_by"], Value::Null);
 
-        db::accept_invite(
+        let mut new = profile("new@tinyserver.test");
+        new.name = Some("New".to_string());
+        db::sign_in(
             &db.runtime,
-            &issued.token,
-            "new@tinyserver.test",
-            PASSWORD,
-            "New",
+            &new,
+            Some(&invite_hash(&issued.token)),
+            db::Groups::default(),
         )
         .await
         .expect("accept");
@@ -302,18 +303,26 @@ async fn a_removed_member_is_closed_with_4003() {
 }
 
 #[tokio::test]
-async fn sign_out_and_a_password_change_close_other_sockets() {
+async fn sign_out_and_a_provider_logout_close_other_sockets() {
     run(|db| async move {
         let owner = first_owner(&db).await;
         let (member, first) = join(&db, &owner, "member@tinyserver.test", "member").await;
-        let second = db::open_session(&db.runtime, "member@tinyserver.test", PASSWORD)
+        // A session from the provider session "sid-1", as a redeemed one-time code opens it.
+        let verifier = "v".repeat(43);
+        let code = db::issue_code(
+            &db.runtime,
+            &member.user_id,
+            &db::s256(&verifier),
+            ISSUER,
+            Some("sid-1"),
+        )
+        .await
+        .expect("code");
+        let second = db::redeem_code(&db.runtime, &code, &verifier, 30)
             .await
             .expect("second session")
             .token;
-        let third = db::open_session(&db.runtime, "member@tinyserver.test", PASSWORD)
-            .await
-            .expect("third session")
-            .token;
+        let third = session(&db, &member.user_id).await;
         let server = serve(&db, Limits::default()).await;
         let (mut first_ws, _) = connect(&server, &first, None).await;
         let (mut second_ws, _) = connect(&server, &second, None).await;
@@ -324,15 +333,10 @@ async fn sign_out_and_a_password_change_close_other_sockets() {
             .expect("sign out");
         assert_eq!(close_code(&mut third_ws).await, 4001);
 
-        db::change_password(
-            &db.runtime,
-            &member,
-            &first,
-            PASSWORD,
-            "another-test-password",
-        )
-        .await
-        .expect("change password");
+        let ended = db::end_provider_sessions(&db.runtime, ISSUER, None, Some("sid-1"))
+            .await
+            .expect("back-channel logout");
+        assert_eq!(ended, 1);
         assert_eq!(close_code(&mut second_ws).await, 4001);
         ping(&mut first_ws).await;
 

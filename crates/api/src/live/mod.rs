@@ -163,7 +163,7 @@ async fn upgrade(
     };
     let identity = match db::current_session(&hub.pool, token).await {
         Ok(identity) => identity,
-        Err(SessionError::Unauthorized | SessionError::InvalidCredentials) => {
+        Err(SessionError::Unauthorized) => {
             return refuse(StatusCode::UNAUTHORIZED, "unauthorized");
         }
         Err(SessionError::Database(error)) => {

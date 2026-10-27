@@ -1,70 +1,14 @@
-//! A signed-in person's own account: password, display name, and sessions.
+//! A signed-in person's own account: display name and sessions.
 //!
 //! `users` and `sessions` have no row level security. Each call still runs in the caller's scope
 //! so the audit row names the actor.
 
 use sqlx::PgPool;
 
-use crate::bootstrap::{check_password, hash_password, normalize_name};
+use crate::bootstrap::normalize_name;
 use crate::community::{audit, from_sql, member_event, scope};
 use crate::outbox::emit;
-use crate::session::{password_matches, token_digest};
 use crate::{Caller, CommunityError, Identity};
-
-/// Replaces the caller's password and ends every other session. The session behind `token`
-/// stays. A wrong current password is `InvalidCredentials`, the same as a failed sign-in.
-pub async fn change_password(
-    pool: &PgPool,
-    caller: &Caller,
-    token: &str,
-    current: &str,
-    new: &str,
-) -> Result<u64, CommunityError> {
-    check_password(new).map_err(|_| CommunityError::Invalid)?;
-    if current.is_empty() || current.len() > 128 {
-        return Err(CommunityError::InvalidCredentials);
-    }
-    let mut tx = scope(pool, caller).await?;
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1::uuid FOR UPDATE")
-            .bind(&caller.user_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(from_sql)?;
-    let Some(stored) = stored else {
-        return Err(CommunityError::InvalidCredentials);
-    };
-    if !password_matches(current, &stored) {
-        return Err(CommunityError::InvalidCredentials);
-    }
-    let hash = hash_password(new)?;
-    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1::uuid")
-        .bind(&caller.user_id)
-        .bind(&hash)
-        .execute(&mut *tx)
-        .await
-        .map_err(from_sql)?;
-    let digest = token_digest(token);
-    let ended = sqlx::query("DELETE FROM sessions WHERE user_id = $1::uuid AND token_hash <> $2")
-        .bind(&caller.user_id)
-        .bind(digest.as_slice())
-        .execute(&mut *tx)
-        .await
-        .map_err(from_sql)?
-        .rows_affected();
-    audit(
-        &mut tx,
-        "account.password",
-        "user",
-        serde_json::json!({"user_id": caller.user_id, "sessions_ended": ended}),
-    )
-    .await?;
-    if ended > 0 {
-        session_ended(&mut tx, &caller.user_id).await?;
-    }
-    tx.commit().await.map_err(from_sql)?;
-    Ok(ended)
-}
 
 /// Sets the caller's display name. It is trimmed and must be 1 to 80 characters.
 pub async fn rename_me(
@@ -74,7 +18,7 @@ pub async fn rename_me(
 ) -> Result<Identity, CommunityError> {
     let display_name = normalize_name(display_name).map_err(|_| CommunityError::Invalid)?;
     let mut tx = scope(pool, caller).await?;
-    let row: Option<(String, String, String)> = sqlx::query_as(
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
         "UPDATE users
          SET display_name = $2
          WHERE id = $1::uuid

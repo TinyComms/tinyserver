@@ -1,4 +1,5 @@
-//! Caps the posts a scanner can force through password hashing.
+//! Caps the sign-in posts one client can make: each `start` stores a pending sign-in, and each
+//! `token` tries a one-time code.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -13,12 +14,13 @@ use axum::Json;
 use serde::Serialize;
 
 const PER_KEY: usize = 5;
-const GLOBAL: usize = 30;
+/// No password hashing sits behind these any more, so the shared cap is looser than the
+/// per-address one: a pending sign-in is one small row, and a code try is one indexed delete.
+const GLOBAL: usize = 120;
 const WINDOW: Duration = Duration::from_secs(60);
 
-static SESSION: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
-static ACCEPT: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
-static PASSWORD: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
+static START: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
+static TOKEN: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
 
 struct Gate {
     per_key: usize,
@@ -66,9 +68,8 @@ struct SlowDown {
 
 pub async fn guard(request: Request<Body>, next: Next) -> Response {
     let gate = match (request.method(), request.uri().path()) {
-        (&Method::POST, "/v1/session") => Some(&*SESSION),
-        (&Method::POST, "/v1/invites/accept") => Some(&*ACCEPT),
-        (&Method::POST, "/v1/me/password") => Some(&*PASSWORD),
+        (&Method::POST, "/v1/auth/start") => Some(&*START),
+        (&Method::POST, "/v1/auth/token") => Some(&*TOKEN),
         _ => None,
     };
     if let Some(gate) = gate {

@@ -3,23 +3,32 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
-use common::{first_owner, run, sign_in, sqlstate, Call, OWNER_EMAIL, OWNER_PASSWORD, PASSWORD};
+use common::{first_owner, invite_hash, profile, run, session, sqlstate, Call, OWNER_EMAIL};
 use serde_json::json;
 
 #[tokio::test]
-async fn an_owner_signs_in_reads_me_and_signs_out() {
+async fn an_owner_reads_me_and_signs_out() {
     run(|db| async move {
-        first_owner(&db).await;
-        let app = api::router(db.runtime.clone());
+        let owner = first_owner(&db).await;
+        let app = api::router(db.runtime.clone(), None);
 
-        let (status, body) = Call::new(Method::POST, "/v1/session")
-            .json(json!({"email": OWNER_EMAIL, "password": "wrong-password-here"}))
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, json!({"error": "invalid_credentials"}));
+        // Password sign-in, invite acceptance, and password change are gone.
+        for (method, path) in [
+            (Method::POST, "/v1/session"),
+            (Method::POST, "/v1/invites/accept"),
+            (Method::POST, "/v1/me/password"),
+        ] {
+            let (status, _) = Call::new(method, path)
+                .json(json!({"email": OWNER_EMAIL, "password": "an-old-password"}))
+                .send(&app)
+                .await;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                "{path}: {status}"
+            );
+        }
 
-        let token = sign_in(&app, OWNER_EMAIL, OWNER_PASSWORD).await;
+        let token = session(&db, &owner.user_id).await;
         let (status, body) = Call::new(Method::GET, "/v1/me")
             .token(&token)
             .send(&app)
@@ -47,27 +56,11 @@ async fn an_owner_signs_in_reads_me_and_signs_out() {
 async fn a_member_cannot_make_rooms_or_invites_or_read_the_audit() {
     run(|db| async move {
         let owner = first_owner(&db).await;
-        let app = api::router(db.runtime.clone());
-        let owner_token = sign_in(&app, OWNER_EMAIL, OWNER_PASSWORD).await;
-
-        let (status, issued) = Call::new(Method::POST, "/v1/invites")
-            .token(&owner_token)
-            .json(json!({"role": "member"}))
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::CREATED);
-        let (status, accepted) = Call::new(Method::POST, "/v1/invites/accept")
-            .json(json!({
-                "token": issued["token"],
-                "email": "member@tinyserver.test",
-                "password": PASSWORD,
-                "display_name": "Member",
-            }))
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::OK);
-        let member_token = accepted["token"].as_str().expect("token");
-        let member_id = accepted["user_id"].as_str().expect("user id");
+        let app = api::router(db.runtime.clone(), None);
+        let (member, member_token) =
+            common::join(&db, &owner, "member@tinyserver.test", "member").await;
+        let member_token = member_token.as_str();
+        let member_id = member.user_id.as_str();
 
         let forbidden = json!({"error": "forbidden"});
         let calls = [
@@ -127,6 +120,24 @@ async fn a_member_cannot_make_rooms_or_invites_or_read_the_audit() {
         assert_eq!(visible, 0);
         drop(tx);
 
+        // An admin cannot make an owner invite even past the API. Only bootstrap can.
+        let mut tx = db.runtime.begin().await.expect("begin");
+        sqlx::query("SELECT set_config('app.user_id', $1, true), set_config('app.role', 'admin', true)")
+            .bind(member_id)
+            .execute(&mut *tx)
+            .await
+            .expect("scope");
+        let error = sqlx::query(
+            "INSERT INTO invites (role, token_hash, created_by, expires_at)
+             VALUES ('owner', sha256('y'::bytea), $1::uuid, now() + interval '1 day')",
+        )
+        .bind(member_id)
+        .execute(&mut *tx)
+        .await
+        .expect_err("RLS denies an owner invite");
+        assert_eq!(sqlstate(&error), "42501");
+        drop(tx);
+
         let audit = db::list_audit(&db.runtime, &owner, 50).await.expect("audit");
         assert!(audit.iter().any(|row| row.action == "invite.accept"));
     })
@@ -139,7 +150,7 @@ async fn an_admin_cannot_change_or_remove_an_owner() {
         let owner = first_owner(&db).await;
         let (admin, admin_token) =
             common::join(&db, &owner, "admin@tinyserver.test", "admin").await;
-        let app = api::router(db.runtime.clone());
+        let app = api::router(db.runtime.clone(), None);
         let owner_path = format!("/v1/members/{}", owner.user_id);
         let admin_path = format!("/v1/members/{}", admin.user_id);
 
@@ -178,8 +189,8 @@ async fn an_admin_cannot_change_or_remove_an_owner() {
 async fn the_last_owner_cannot_be_demoted_or_removed() {
     run(|db| async move {
         let owner = first_owner(&db).await;
-        let app = api::router(db.runtime.clone());
-        let token = sign_in(&app, OWNER_EMAIL, OWNER_PASSWORD).await;
+        let app = api::router(db.runtime.clone(), None);
+        let token = session(&db, &owner.user_id).await;
         let path = format!("/v1/members/{}", owner.user_id);
 
         let (status, body) = Call::new(Method::PATCH, &path)
@@ -217,45 +228,43 @@ async fn the_last_owner_cannot_be_demoted_or_removed() {
 }
 
 #[tokio::test]
-async fn an_invite_signs_a_person_in_once_and_not_after_it_expires() {
+async fn an_invite_lets_a_person_in_once_and_not_after_it_expires() {
     run(|db| async move {
-        first_owner(&db).await;
-        let app = api::router(db.runtime.clone());
-        let owner_token = sign_in(&app, OWNER_EMAIL, OWNER_PASSWORD).await;
+        let owner = first_owner(&db).await;
+        let app = api::router(db.runtime.clone(), None);
+        let owner_token = session(&db, &owner.user_id).await;
 
         let issued = invite(&app, &owner_token, Some("first-invite")).await;
         let replayed = invite(&app, &owner_token, Some("first-invite")).await;
         assert_eq!(replayed, issued);
+        let token = issued["token"].as_str().expect("token");
 
-        let accept = |token: serde_json::Value, email: &'static str| {
-            let app = app.clone();
-            async move {
-                Call::new(Method::POST, "/v1/invites/accept")
-                    .json(json!({
-                        "token": token,
-                        "email": email,
-                        "password": PASSWORD,
-                        "display_name": "Guest",
-                    }))
-                    .send(&app)
-                    .await
-            }
-        };
-
-        let (status, accepted) = accept(issued["token"].clone(), "guest@tinyserver.test").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(accepted["role"], "member");
+        let guest = db::sign_in(
+            &db.runtime,
+            &profile("guest@tinyserver.test"),
+            Some(&invite_hash(token)),
+            db::Groups::default(),
+        )
+        .await
+        .expect("join");
+        assert_eq!(guest.role, "member");
+        assert!(guest.joined);
         let (status, me) = Call::new(Method::GET, "/v1/me")
-            .token(accepted["token"].as_str().expect("token"))
+            .token(&session(&db, &guest.user_id).await)
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(me["email"], "guest@tinyserver.test");
         assert_eq!(me["role"], "member");
 
-        let (status, body) = accept(issued["token"].clone(), "other@tinyserver.test").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, json!({"error": "not_found"}));
+        let again = db::sign_in(
+            &db.runtime,
+            &profile("other@tinyserver.test"),
+            Some(&invite_hash(token)),
+            db::Groups::default(),
+        )
+        .await;
+        assert!(matches!(again, Err(db::AuthError::NotMember)));
 
         let stale = invite(&app, &owner_token, None).await;
         sqlx::query(
@@ -265,16 +274,21 @@ async fn an_invite_signs_a_person_in_once_and_not_after_it_expires() {
         .execute(&db.owner)
         .await
         .expect("expire invite");
-        let (status, body) = accept(stale["token"].clone(), "late@tinyserver.test").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, json!({"error": "not_found"}));
+        let late = db::sign_in(
+            &db.runtime,
+            &profile("late@tinyserver.test"),
+            Some(&invite_hash(stale["token"].as_str().expect("token"))),
+            db::Groups::default(),
+        )
+        .await;
+        assert!(matches!(late, Err(db::AuthError::NotMember)));
 
-        let late: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM users WHERE email = 'late@tinyserver.test'")
-                .fetch_one(&db.owner)
-                .await
-                .expect("user count");
-        assert_eq!(late, 0);
+        // Turned away means nothing written.
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+            .fetch_one(&db.owner)
+            .await
+            .expect("user count");
+        assert_eq!(users, 2);
     })
     .await;
 }

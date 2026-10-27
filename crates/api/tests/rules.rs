@@ -4,10 +4,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{first_owner, join, owner_count, run, TestDb, OWNER_EMAIL, OWNER_PASSWORD, PASSWORD};
+use common::{first_owner, invite_hash, join, owner_count, profile, run, session, TestDb};
 use db::{
-    accept_invite, create_invite, create_room, delete_room, list_audit, list_members, list_rooms,
-    remove_member, set_member_role, Caller, CommunityError, Swept, Wrote,
+    create_invite, create_room, delete_room, list_audit, list_members, list_rooms, remove_member,
+    set_member_role, AuthError, Caller, CommunityError, Groups, Swept, Wrote,
 };
 
 /// Two owners. The second is promoted by the first.
@@ -120,6 +120,13 @@ async fn the_sweep_deletes_expired_rows_and_keeps_accepted_invites() {
             "INSERT INTO idempotency_keys (key, request_hash, expires_at) VALUES
                  ($1 || '-expired', 'h', now() - interval '1 minute'),
                  ($1 || '-live', 'h', now() + interval '1 day')",
+            "INSERT INTO auth_pending (state_hash, provider, verifier, nonce, client_redirect,
+                                      client_challenge, client_state, expires_at) VALUES
+                 (sha256(('p-expired-' || $1)::bytea), 'default', 'v', 'n', 'r', 'c', 's', now() - interval '1 minute'),
+                 (sha256(('p-live-' || $1)::bytea), 'default', 'v', 'n', 'r', 'c', 's', now() + interval '5 minutes')",
+            "INSERT INTO auth_codes (code_hash, user_id, client_challenge, issuer, expires_at) VALUES
+                 (sha256('c-expired'::bytea), $1::uuid, 'c', 'i', now() - interval '1 second'),
+                 (sha256('c-live'::bytea), $1::uuid, 'c', 'i', now() + interval '1 minute')",
         ];
         for statement in arrange {
             sqlx::query(statement)
@@ -137,23 +144,27 @@ async fn the_sweep_deletes_expired_rows_and_keeps_accepted_invites() {
                 invites: 1,
                 idempotency_keys: 1,
                 events: 0,
+                logins: 2,
             }
         );
-        let left: (i64, i64, i64) = sqlx::query_as(
+        let left: (i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM sessions),
                     (SELECT count(*) FROM invites),
-                    (SELECT count(*) FROM idempotency_keys)",
+                    (SELECT count(*) FROM idempotency_keys),
+                    (SELECT count(*) FROM auth_pending),
+                    (SELECT count(*) FROM auth_codes)",
         )
         .fetch_one(&db.owner)
         .await
         .expect("counts");
-        assert_eq!(left, (1, 2, 1));
+        // The owner's own invite, accepted by first_owner, is kept too.
+        assert_eq!(left, (1, 3, 1, 1, 1));
         let accepted: i64 =
             sqlx::query_scalar("SELECT count(*) FROM invites WHERE accepted_at IS NOT NULL")
                 .fetch_one(&db.owner)
                 .await
                 .expect("accepted");
-        assert_eq!(accepted, 1);
+        assert_eq!(accepted, 2);
 
         assert_eq!(db::sweep(&db.runtime).await.expect("sweep").total(), 0);
     })
@@ -163,8 +174,8 @@ async fn the_sweep_deletes_expired_rows_and_keeps_accepted_invites() {
 #[tokio::test]
 async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
     run(|db| async move {
-        first_owner(&db).await;
-        let opened = db::open_session(&db.runtime, OWNER_EMAIL, OWNER_PASSWORD)
+        let first = first_owner(&db).await;
+        let opened = db::open_session(&db.runtime, &first.user_id)
             .await
             .expect("owner session");
         let owner = Caller {
@@ -198,16 +209,28 @@ async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
             panic!("invite");
         };
         assert!(matches!(
-            accept_invite(&db.runtime, &issued.token, guest_email, "short", "Guest").await,
-            Err(CommunityError::Invalid)
+            db::sign_in(
+                &db.runtime,
+                &profile(guest_email),
+                Some(&invite_hash("not-the-invite")),
+                Groups::default()
+            )
+            .await,
+            Err(AuthError::NotMember)
         ));
-        let accepted = accept_invite(&db.runtime, &issued.token, guest_email, PASSWORD, "Guest")
-            .await
-            .expect("accept");
+        let accepted = db::sign_in(
+            &db.runtime,
+            &profile(guest_email),
+            Some(&invite_hash(&issued.token)),
+            Groups::default(),
+        )
+        .await
+        .expect("accept");
         let guest = Caller {
             user_id: accepted.user_id.clone(),
             role: accepted.role.clone(),
         };
+        let guest_token = session(&db, &guest.user_id).await;
         assert_eq!(guest.role, "member");
         assert!(list_members(&db.runtime, &guest)
             .await
@@ -223,7 +246,7 @@ async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
         remove_member(&db.runtime, &owner, &guest.user_id)
             .await
             .expect("remove");
-        assert!(db::current_session(&db.runtime, &accepted.token)
+        assert!(db::current_session(&db.runtime, &guest_token)
             .await
             .is_err());
 
@@ -231,20 +254,22 @@ async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
         else {
             panic!("invite");
         };
+        // The same email at another subject is someone else, and the invite makes them a new
+        // account. Email never links.
+        let mut stranger = profile(guest_email);
+        stranger.subject = "someone-else".to_string();
         assert!(matches!(
-            accept_invite(
-                &db.runtime,
-                &again.token,
-                guest_email,
-                "wrong-password-x",
-                "Guest"
-            )
-            .await,
-            Err(CommunityError::InvalidCredentials)
+            db::sign_in(&db.runtime, &stranger, None, Groups::default()).await,
+            Err(AuthError::NotMember)
         ));
-        let returned = accept_invite(&db.runtime, &again.token, guest_email, PASSWORD, "Guest")
-            .await
-            .expect("return");
+        let returned = db::sign_in(
+            &db.runtime,
+            &profile(guest_email),
+            Some(&invite_hash(&again.token)),
+            Groups::default(),
+        )
+        .await
+        .expect("return");
         assert_eq!(returned.user_id, guest.user_id);
 
         delete_room(&db.runtime, &owner, &room.id)

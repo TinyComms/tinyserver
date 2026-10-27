@@ -1,36 +1,22 @@
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use db::{PgPool, SessionError};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
+/// A session is opened by sign-in; see `auth`.
 pub fn routes() -> Router<PgPool> {
     Router::new()
-        .route("/v1/session", post(open).delete(close))
+        .route("/v1/session", delete(close))
         .route("/v1/me", get(current))
-}
-
-#[derive(Deserialize)]
-struct Login {
-    email: String,
-    password: String,
-}
-
-#[derive(Serialize)]
-struct Opened {
-    token: String,
-    user_id: String,
-    email: String,
-    display_name: String,
-    role: String,
 }
 
 #[derive(Serialize)]
 pub(crate) struct Current {
     user_id: String,
-    email: String,
+    email: Option<String>,
     display_name: String,
     role: String,
 }
@@ -52,7 +38,6 @@ struct ErrorBody {
 }
 
 enum ApiError {
-    InvalidCredentials,
     Unauthorized,
     Unavailable,
 }
@@ -60,7 +45,6 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error) = match self {
-            Self::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Unavailable => (StatusCode::INTERNAL_SERVER_ERROR, "unavailable"),
         };
@@ -70,29 +54,12 @@ impl IntoResponse for ApiError {
 
 fn failure(error: SessionError, denied: ApiError) -> ApiError {
     match error {
-        SessionError::InvalidCredentials | SessionError::Unauthorized => denied,
+        SessionError::Unauthorized => denied,
         SessionError::Database(error) => {
             tracing::warn!(%error, "session query failed");
             ApiError::Unavailable
         }
     }
-}
-
-async fn open(
-    State(pool): State<PgPool>,
-    Json(body): Json<Login>,
-) -> Result<Json<Opened>, ApiError> {
-    let opened = db::open_session(&pool, &body.email, &body.password)
-        .await
-        .map_err(|error| failure(error, ApiError::InvalidCredentials))?;
-    tracing::info!(user_id = %opened.identity.user_id, "session opened");
-    Ok(Json(Opened {
-        token: opened.token,
-        user_id: opened.identity.user_id,
-        email: opened.identity.email,
-        display_name: opened.identity.display_name,
-        role: opened.identity.role,
-    }))
 }
 
 async fn current(

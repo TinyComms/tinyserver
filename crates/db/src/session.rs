@@ -1,23 +1,15 @@
 //! Login sessions. The client token is returned once. Postgres stores only its SHA-256.
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-use argon2::password_hash::{PasswordHash, PasswordVerifier};
-use argon2::Argon2;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 
 use crate::DbError;
 
-/// Not a credential. Verified when the email is missing so that path is not a fast reject.
-const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$govK/UJB4v6x7ZWAIEQpFg$i7GfCsrOPiWiG6ih+U5rTVnC/lAZvK/GaNSMFRH7qKw";
-
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error("invalid credentials")]
-    InvalidCredentials,
     #[error("unauthorized")]
     Unauthorized,
     #[error(transparent)]
@@ -32,7 +24,8 @@ impl From<sqlx::Error> for SessionError {
 
 pub struct Identity {
     pub user_id: String,
-    pub email: String,
+    /// What the provider said when the account was made. It may be missing.
+    pub email: Option<String>,
     pub display_name: String,
     pub role: String,
 }
@@ -42,53 +35,62 @@ pub struct OpenedSession {
     pub identity: Identity,
 }
 
-pub async fn open_session(
-    pool: &PgPool,
-    email: &str,
-    password: &str,
+/// Where a session came from, and how long it lasts.
+pub(crate) struct Origin<'a> {
+    /// The provider the person signed in at.
+    pub issuer: Option<&'a str>,
+    /// The provider's session id, for back-channel logout.
+    pub sid: Option<&'a str>,
+    /// After this many days the person signs in again. Nothing extends it.
+    pub days: u32,
+}
+
+/// Opens a 30-day session for a member that no provider knows about. Sign-in opens sessions
+/// through a redeemed one-time code instead; see `auth`. Tests and tools use this.
+pub async fn open_session(pool: &PgPool, user_id: &str) -> Result<OpenedSession, SessionError> {
+    let mut tx = pool.begin().await?;
+    let origin = Origin {
+        issuer: None,
+        sid: None,
+        days: 30,
+    };
+    let opened = open_session_in(&mut tx, user_id, origin).await?;
+    tx.commit().await?;
+    Ok(opened)
+}
+
+pub(crate) async fn open_session_in(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    origin: Origin<'_>,
 ) -> Result<OpenedSession, SessionError> {
-    let email = email.trim();
-    if email.len() > 254 || password.len() > 128 {
-        return Err(SessionError::InvalidCredentials);
-    }
-    let user: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT id::text, email, display_name, password_hash
+    let row: Option<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
+        "SELECT id::text, email, display_name, app_member_role(id)
          FROM users
-         WHERE lower(email) = lower($1)",
+         WHERE id = $1::uuid",
     )
-    .bind(email)
-    .fetch_optional(pool)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
     .await?;
-
-    let stored_hash = match &user {
-        Some((_, _, _, hash)) => hash.as_str(),
-        None => DUMMY_PASSWORD_HASH,
+    let Some((user_id, email, display_name, role)) = row else {
+        return Err(SessionError::Unauthorized);
     };
-    let password_ok = password_matches(password, stored_hash);
-    let Some((user_id, email, display_name, _)) = user else {
-        return Err(SessionError::InvalidCredentials);
-    };
-    if password.is_empty() || !password_ok {
-        return Err(SessionError::InvalidCredentials);
-    }
-
-    let role: Option<String> = sqlx::query_scalar("SELECT app_member_role($1::uuid)")
-        .bind(&user_id)
-        .fetch_one(pool)
-        .await?;
     let Some(role) = known_role(role) else {
-        return Err(SessionError::InvalidCredentials);
+        return Err(SessionError::Unauthorized);
     };
 
     let token = new_token();
     let digest = token_digest(&token);
     sqlx::query(
-        "INSERT INTO sessions (user_id, token_hash, expires_at)
-         VALUES ($1::uuid, $2, now() + interval '30 days')",
+        "INSERT INTO sessions (user_id, token_hash, issuer, sid, expires_at)
+         VALUES ($1::uuid, $2, $3, $4, now() + make_interval(days => $5))",
     )
     .bind(&user_id)
     .bind(digest.as_slice())
-    .execute(pool)
+    .bind(origin.issuer)
+    .bind(origin.sid)
+    .bind(origin.days.clamp(1, 365) as i32)
+    .execute(&mut **tx)
     .await?;
 
     Ok(OpenedSession {
@@ -104,7 +106,7 @@ pub async fn open_session(
 
 pub async fn current_session(pool: &PgPool, token: &str) -> Result<Identity, SessionError> {
     let digest = token_digest(token);
-    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+    let row: Option<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
         "SELECT u.id::text, u.email, u.display_name, app_member_role(u.id)
          FROM sessions s
          JOIN users u ON u.id = s.user_id
@@ -158,18 +160,11 @@ fn known_role(role: Option<String>) -> Option<String> {
     }
 }
 
-pub(crate) fn password_matches(password: &str, encoded: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(encoded) else {
-        return false;
-    };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
-}
-
+/// 32 random bytes, URL-safe base64 without padding. Session tokens, invite tokens, sign-in
+/// states, and one-time codes are all this shape.
 pub(crate) fn new_token() -> String {
     let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    getrandom::fill(&mut raw).expect("the OS random number generator failed");
     URL_SAFE_NO_PAD.encode(raw)
 }
 
@@ -183,9 +178,7 @@ pub(crate) fn token_digest(token: &str) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::{known_role, new_token, password_matches, token_digest, DUMMY_PASSWORD_HASH};
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    use argon2::Argon2;
+    use super::{known_role, new_token, token_digest};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
@@ -210,20 +203,6 @@ mod tests {
             0xf2, 0x00, 0x15, 0xad,
         ];
         assert_eq!(digest, expected);
-    }
-
-    #[test]
-    fn dummy_hash_rejects_a_password() {
-        let parsed = PasswordHash::new(DUMMY_PASSWORD_HASH).expect("dummy phc");
-        let rejected = Argon2::default()
-            .verify_password(b"not-the-dummy-input", &parsed)
-            .is_err();
-        assert!(rejected);
-    }
-
-    #[test]
-    fn empty_password_does_not_match_the_dummy_hash() {
-        assert!(!password_matches("", DUMMY_PASSWORD_HASH));
     }
 
     #[test]

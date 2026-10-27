@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use super::{TestDb, OWNER_EMAIL, OWNER_PASSWORD};
+use super::TestDb;
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -40,7 +40,7 @@ pub async fn serve(db: &TestDb, limits: Limits) -> Server {
 
 /// Serves `live`, which may have media.
 pub async fn serve_live(db: &TestDb, live: Live) -> Server {
-    let app = api::app(db.runtime.clone(), live.clone());
+    let app = api::app(db.runtime.clone(), live.clone(), None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -122,10 +122,13 @@ pub async fn ping(ws: &mut Ws) {
 }
 
 pub async fn owner_token(db: &TestDb) -> String {
-    db::open_session(&db.runtime, OWNER_EMAIL, OWNER_PASSWORD)
-        .await
-        .expect("owner session")
-        .token
+    let owner: String = sqlx::query_scalar(
+        "SELECT user_id::text FROM memberships WHERE role = 'owner' ORDER BY created_at LIMIT 1",
+    )
+    .fetch_one(&db.owner)
+    .await
+    .expect("owner id");
+    super::session(db, &owner).await
 }
 
 pub async fn room(db: &TestDb, owner: &Caller, name: &str) -> db::Room {

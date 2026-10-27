@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use db::{DbError, PgPool};
+use db::PgPool;
 
 #[derive(Parser)]
 #[command(name = "tinyserver", about = "Self-hosted voice and video server")]
@@ -16,8 +16,14 @@ struct Cli {
 enum Command {
     /// Apply SQL migrations as the database owner.
     Migrate,
-    /// Create the first owner. Refuses when one already exists.
-    Bootstrap,
+    /// Print a single-use owner invite, good for 24 hours, when there is no owner yet.
+    /// Does nothing when an owner exists.
+    Bootstrap {
+        /// Make the owner invite even though an owner exists. For an owner who signed in with a
+        /// password before sign-in moved to an OIDC provider.
+        #[arg(long)]
+        owner_invite: bool,
+    },
     /// Serve HTTP and the live socket, and media when `TINYSERVER_PUBLIC_IP` is set.
     Serve,
 }
@@ -34,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Migrate => migrate().await?,
-        Command::Bootstrap => bootstrap().await?,
+        Command::Bootstrap { owner_invite } => bootstrap(owner_invite).await?,
         Command::Serve => serve().await?,
     }
     Ok(())
@@ -48,24 +54,42 @@ async fn migrate() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn bootstrap() -> anyhow::Result<()> {
+async fn bootstrap(force: bool) -> anyhow::Result<()> {
     let url = env_var("DATABASE_URL_MIGRATE")?;
     let pool = db::owner_pool(&url).await?;
-    // Checked first, so a later start needs none of the owner variables.
-    if db::owner_exists(&pool).await? {
-        bail!("an owner already exists");
+    let Some(issued) = db::owner_invite(&pool, force)
+        .await
+        .context("bootstrap failed")?
+    else {
+        tracing::info!("an owner already exists");
+        return Ok(());
+    };
+    tracing::info!(invite_id = %issued.id, expires_at = %issued.expires_at, "owner invite created");
+    // Printed once, to the operator. The database keeps only its hash.
+    let code = env_var("TINYSERVER_PUBLIC_URL")
+        .ok()
+        .and_then(|origin| join_code(&origin, &issued.token));
+    println!();
+    println!("Owner invite, single use, until {}:", issued.expires_at);
+    match code {
+        Some(code) => println!("  {code}"),
+        None => println!("  {}", issued.token),
     }
-    let email = env_var("TINYSERVER_OWNER_EMAIL")?;
-    let name = env_var("TINYSERVER_OWNER_NAME")?;
-    let password = env_var("TINYSERVER_OWNER_PASSWORD")?;
-    match db::bootstrap_owner(&pool, &email, &name, &password).await {
-        Ok(()) => {
-            tracing::info!(email = %email.trim(), "owner created");
-            Ok(())
-        }
-        Err(DbError::OwnerExists) => bail!("an owner already exists"),
-        Err(error) => Err(error).context("bootstrap failed"),
+    println!(
+        "Paste it into tinyclient's \"Join a server\" and sign in. That person becomes the owner."
+    );
+    println!();
+    Ok(())
+}
+
+/// tinyclient's invite code: `tc1.`, the server origin in hex, `.`, the invite token.
+fn join_code(origin: &str, token: &str) -> Option<String> {
+    let origin = origin.trim().trim_end_matches('/');
+    if origin.is_empty() || origin.chars().any(char::is_whitespace) {
+        return None;
     }
+    let hex: String = origin.bytes().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!("tc1.{hex}.{token}"))
 }
 
 async fn serve() -> anyhow::Result<()> {
@@ -81,6 +105,7 @@ async fn serve() -> anyhow::Result<()> {
         call_server_max: env_count("TINYSERVER_CALL_SERVER_MAX", defaults.call_server_max)?,
         ..defaults
     };
+    let sign_in = sign_in().await?;
     let media = media_config(limits.call_room_max)?;
     let live = match media {
         Some(config) => {
@@ -93,7 +118,7 @@ async fn serve() -> anyhow::Result<()> {
             api::Live::start(pool.clone(), limits)
         }
     };
-    let app = api::app(pool.clone(), live.clone());
+    let app = api::app(pool.clone(), live.clone(), Some(sign_in));
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
@@ -106,6 +131,136 @@ async fn serve() -> anyhow::Result<()> {
         tracing::warn!(sockets = live.sockets(), "live sockets still open at exit");
     }
     served
+}
+
+/// The OIDC providers from the environment, discovered. A provider that cannot be reached is
+/// tried again for about a minute, since it may be starting next to this server; a wrong issuer
+/// or setting stops the start at once.
+async fn sign_in() -> anyhow::Result<api::SignIn> {
+    let session_days = match env_var("TINYSERVER_SESSION_MAX_DAYS") {
+        Err(_) => 30,
+        Ok(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|days| (1..=365).contains(days))
+            .context("TINYSERVER_SESSION_MAX_DAYS is not a whole number from 1 to 365")?,
+    };
+    let config = api::SignInConfig {
+        public_url: env_var("TINYSERVER_PUBLIC_URL")?,
+        session_days,
+        providers: providers_from_env()?,
+    };
+    let mut tries = 0;
+    loop {
+        match api::SignIn::discover(config.clone()).await {
+            Ok(sign_in) => {
+                tracing::info!(
+                    providers = config.providers.len(),
+                    default = %sign_in.provider_name(),
+                    "sign-in providers ready"
+                );
+                return Ok(sign_in);
+            }
+            Err(error) if error.transient && tries < DISCOVERY_TRIES => {
+                tries += 1;
+                tracing::warn!(%error, tries, "sign-in provider not ready; trying again");
+                tokio::time::sleep(DISCOVERY_PAUSE).await;
+            }
+            Err(error) => bail!("sign-in: {error}"),
+        }
+    }
+}
+
+const DISCOVERY_TRIES: u32 = 12;
+const DISCOVERY_PAUSE: Duration = Duration::from_secs(5);
+
+/// `TINYSERVER_OIDC_PROVIDERS=tinyauth,google` reads `TINYSERVER_OIDC_TINYAUTH_*` and
+/// `TINYSERVER_OIDC_GOOGLE_*`, first one the default. Without it, the single provider in
+/// `TINYSERVER_OIDC_*` has the id `default`.
+fn providers_from_env() -> anyhow::Result<Vec<api::ProviderConfig>> {
+    let Ok(list) = env_var("TINYSERVER_OIDC_PROVIDERS") else {
+        return Ok(vec![provider_from_env(
+            "default",
+            "TINYSERVER_OIDC_",
+            "TINYSERVER_OIDC_PROVIDER_NAME",
+        )?]);
+    };
+    list.split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            let id = id.to_ascii_lowercase();
+            let prefix = format!(
+                "TINYSERVER_OIDC_{}_",
+                id.to_ascii_uppercase().replace('-', "_")
+            );
+            let name = format!("{prefix}NAME");
+            provider_from_env(&id, &prefix, &name)
+        })
+        .collect()
+}
+
+fn provider_from_env(
+    id: &str,
+    prefix: &str,
+    name_key: &str,
+) -> anyhow::Result<api::ProviderConfig> {
+    let key = |suffix: &str| format!("{prefix}{suffix}");
+    let list = |suffix: &str| -> Vec<String> {
+        env_var(&key(suffix))
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(api::ProviderConfig {
+        id: id.to_string(),
+        issuer: env_var(&key("ISSUER"))?,
+        client_id: env_var(&key("CLIENT_ID"))?,
+        client_secret: secret_from_env(&key("CLIENT_SECRET"))?,
+        private_key_pem: match env_var(&key("PRIVATE_KEY_FILE")) {
+            Err(_) => None,
+            Ok(path) => Some(
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {} {path}", key("PRIVATE_KEY_FILE")))?,
+            ),
+        },
+        private_key_id: env_var(&key("PRIVATE_KEY_ID")).ok(),
+        scopes: env_var(&key("SCOPES"))
+            .unwrap_or_else(|_| "openid profile email".to_string())
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        name: env_var(name_key).ok(),
+        internal_url: env_var(&key("INTERNAL_URL")).ok(),
+        groups_claim: env_var(&key("GROUPS_CLAIM")).ok(),
+        admin_groups: list("ADMIN_GROUPS"),
+        member_groups: list("MEMBER_GROUPS"),
+    })
+}
+
+/// `<name>_FILE`, preferred, or `<name>`. Not both. `None` when neither is set.
+fn secret_from_env(name: &str) -> anyhow::Result<Option<String>> {
+    let file_name = format!("{name}_FILE");
+    match (env_var(name).ok(), env_var(&file_name).ok()) {
+        (Some(_), Some(_)) => bail!("set {name} or {file_name}, not both"),
+        (Some(secret), None) => Ok(Some(secret)),
+        (None, Some(path)) => {
+            let secret = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {file_name} {path}"))?;
+            let secret = secret.trim_end().to_string();
+            if secret.is_empty() {
+                bail!("{file_name} {path} is empty");
+            }
+            Ok(Some(secret))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 /// Media binds every interface on `TINYSERVER_MEDIA_PORT`, UDP and TCP, and advertises
@@ -166,7 +321,8 @@ const DRAIN: Duration = Duration::from_secs(5);
 
 const SWEEP_EVERY: Duration = Duration::from_secs(10 * 60);
 
-/// Deletes expired sessions, invites, idempotency keys, and old outbox rows. The first sweep
+/// Deletes expired sessions, invites, idempotency keys, sign-ins, one-time codes, and old
+/// outbox rows. The first sweep
 /// runs at start.
 async fn sweep_every(pool: PgPool, period: Duration) {
     let mut ticks = tokio::time::interval(period);
@@ -179,6 +335,7 @@ async fn sweep_every(pool: PgPool, period: Duration) {
                 invites = swept.invites,
                 idempotency_keys = swept.idempotency_keys,
                 events = swept.events,
+                logins = swept.logins,
                 "expired rows deleted"
             ),
             Ok(_) => {}
@@ -251,4 +408,19 @@ fn env_var(name: &str) -> anyhow::Result<String> {
         .ok()
         .filter(|value| !value.is_empty())
         .with_context(|| format!("{name} is not set"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_code;
+
+    #[test]
+    fn an_owner_invite_prints_as_a_tinyclient_code() {
+        // The same as tinyclient's `pack_join`: tc1, the origin in hex, the token.
+        assert_eq!(
+            join_code("https://a.b/", "tok-en_1").as_deref(),
+            Some("tc1.68747470733a2f2f612e62.tok-en_1")
+        );
+        assert_eq!(join_code("  ", "t"), None);
+    }
 }

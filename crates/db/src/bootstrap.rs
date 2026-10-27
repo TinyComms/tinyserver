@@ -1,43 +1,93 @@
-use crate::error::DbError;
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHasher};
+//! The first owner. tinyserver keeps no passwords, so bootstrap makes a single-use owner invite
+//! and the first person to sign in with it becomes the owner.
+
 use sqlx::PgPool;
 
-pub async fn bootstrap_owner(
-    pool: &PgPool,
-    email: &str,
-    display_name: &str,
-    password: &str,
-) -> Result<(), DbError> {
-    let email = normalize_email(email)?;
-    let display_name = normalize_name(display_name)?;
-    check_password(password)?;
+use crate::community::STAMP;
+use crate::error::DbError;
+use crate::session::{new_token, token_digest};
+use crate::InviteIssued;
 
-    if owner_exists(pool).await? {
-        return Err(DbError::OwnerExists);
+/// How long an owner invite lasts.
+const OWNER_INVITE_HOURS: i32 = 24;
+
+/// Makes an owner invite good for 24 hours and returns its token, which is not stored. Earlier
+/// owner invites nobody used are deleted, so only the newest one works.
+///
+/// Without `force`, an existing owner means nothing is made and this returns `None`. With
+/// `force` an invite is made anyway: an owner from before sign-in moved to OIDC has no identity
+/// and needs one to get back in.
+///
+/// Runs as `app_owner`: the invite has no creator and the runtime may not make owner invites.
+pub async fn owner_invite(pool: &PgPool, force: bool) -> Result<Option<InviteIssued>, DbError> {
+    let mut tx = pool.begin().await?;
+    // The same lock role changes take, so two bootstraps cannot both see no owner.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('tinyserver.owners'))")
+        .execute(&mut *tx)
+        .await?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE role = 'owner')")
+            .fetch_one(&mut *tx)
+            .await?;
+    if exists && !force {
+        return Ok(None);
     }
 
-    let hash = hash_password(password)?;
-    sqlx::query(
-        "WITH created AS (
-             INSERT INTO users (email, display_name, password_hash)
-             VALUES ($1, $2, $3)
-             RETURNING id
-         ),
-         member AS (
-             INSERT INTO memberships (user_id, role)
-             SELECT id, 'owner' FROM created
-             RETURNING user_id
-         )
-         INSERT INTO audit_log (actor_id, action, subject, detail)
-         SELECT user_id, 'bootstrap', 'membership', '{}'::jsonb FROM member",
+    let replaced: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM invites
+         WHERE role = 'owner' AND accepted_at IS NULL
+         RETURNING id::text",
     )
-    .bind(&email)
-    .bind(&display_name)
-    .bind(&hash)
-    .execute(pool)
+    .fetch_all(&mut *tx)
     .await?;
-    Ok(())
+    for id in &replaced {
+        sqlx::query(
+            "INSERT INTO audit_log (actor_id, action, subject, detail)
+             VALUES (NULL, 'invite.revoke', 'invite', jsonb_build_object('id', $1::text, 'role', 'owner'))",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT app_emit('invite.revoked', jsonb_build_object('invite_id', $1::text))")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    let token = new_token();
+    let digest = token_digest(&token);
+    let (id, expires_at): (String, String) = sqlx::query_as(&format!(
+        "INSERT INTO invites (role, token_hash, created_by, expires_at)
+         VALUES ('owner', $1, NULL, now() + make_interval(hours => $2))
+         RETURNING id::text, to_char(expires_at AT TIME ZONE 'UTC', '{STAMP}')"
+    ))
+    .bind(digest.as_slice())
+    .bind(OWNER_INVITE_HOURS)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_log (actor_id, action, subject, detail)
+         VALUES (NULL, 'bootstrap', 'invite', jsonb_build_object('id', $1::text, 'role', 'owner'))",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "SELECT app_emit('invite.created', jsonb_build_object('invite', jsonb_build_object(
+             'id', $1::text, 'role', 'owner', 'created_by', NULL, 'expires_at', $2::text,
+             'accepted_at', NULL, 'accepted_by', NULL)))",
+    )
+    .bind(&id)
+    .bind(&expires_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(InviteIssued {
+        id,
+        token,
+        role: "owner".to_string(),
+        expires_at,
+    }))
 }
 
 /// Reads memberships past RLS, so it needs the `app_owner` pool.
@@ -48,41 +98,7 @@ pub async fn owner_exists(pool: &PgPool) -> Result<bool, DbError> {
         .map_err(DbError::from)
 }
 
-/// Every password a person sets is 12 to 128 bytes.
-pub(crate) fn check_password(password: &str) -> Result<(), DbError> {
-    if (12..=128).contains(&password.len()) {
-        Ok(())
-    } else {
-        Err(DbError::PasswordTooShort)
-    }
-}
-
-pub(crate) fn hash_password(password: &str) -> Result<String, DbError> {
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|_| DbError::Hash)
-}
-
-pub(crate) fn normalize_email(email: &str) -> Result<String, DbError> {
-    let email = email.trim().to_lowercase();
-    if email.len() > 254 {
-        return Err(DbError::BadEmail);
-    }
-    let Some((local, domain)) = email.split_once('@') else {
-        return Err(DbError::BadEmail);
-    };
-    if local.is_empty()
-        || domain.is_empty()
-        || domain.contains('@')
-        || email.chars().any(char::is_whitespace)
-    {
-        return Err(DbError::BadEmail);
-    }
-    Ok(email)
-}
-
+/// A display name is trimmed and 1 to 80 characters.
 pub(crate) fn normalize_name(name: &str) -> Result<String, DbError> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 80 {
@@ -93,26 +109,11 @@ pub(crate) fn normalize_name(name: &str) -> Result<String, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_password, normalize_email, normalize_name};
+    use super::normalize_name;
 
     #[test]
-    fn a_password_is_12_to_128_bytes() {
-        assert!(check_password(&"a".repeat(11)).is_err());
-        assert!(check_password(&"a".repeat(12)).is_ok());
-        assert!(check_password(&"a".repeat(128)).is_ok());
-        assert!(check_password(&"a".repeat(129)).is_err());
-    }
-
-    #[test]
-    fn email_is_trimmed_and_lowered() {
-        let email = normalize_email("  Owner@TinyServer.Local ").expect("email");
-        assert_eq!(email, "owner@tinyserver.local");
-    }
-
-    #[test]
-    fn email_needs_one_at() {
-        assert!(normalize_email("owner").is_err());
-        assert!(normalize_email("a@b@c").is_err());
+    fn name_is_trimmed() {
+        assert_eq!(normalize_name("  Moss ").expect("name"), "Moss");
     }
 
     #[test]

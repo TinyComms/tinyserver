@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod live;
+pub mod oidc;
 
 use std::future::Future;
 use std::str::FromStr;
@@ -24,8 +25,8 @@ use sqlx::{Connection, Executor, PgConnection};
 use tower::ServiceExt;
 
 pub const OWNER_EMAIL: &str = "owner@tinyserver.test";
-pub const OWNER_PASSWORD: &str = "owner-test-password";
-pub const PASSWORD: &str = "person-test-password";
+/// The issuer of identities made through `db` directly, without a provider.
+pub const ISSUER: &str = "https://issuer.tinyserver.test";
 
 #[derive(Clone)]
 pub struct TestDb {
@@ -124,37 +125,76 @@ where
     }
 }
 
-/// Creates the first owner and returns the caller for them.
-pub async fn first_owner(db: &TestDb) -> Caller {
-    db::bootstrap_owner(&db.owner, OWNER_EMAIL, "Owner", OWNER_PASSWORD)
-        .await
-        .expect("bootstrap");
-    let user_id: String =
-        sqlx::query_scalar("SELECT id::text FROM users WHERE lower(email) = lower($1)")
-            .bind(OWNER_EMAIL)
-            .fetch_one(&db.owner)
-            .await
-            .expect("owner id");
-    Caller {
-        user_id,
-        role: "owner".to_string(),
+/// A verified identity at `ISSUER`, with `subject` also its email.
+pub fn profile(subject: &str) -> db::Profile {
+    db::Profile {
+        issuer: ISSUER.to_string(),
+        subject: subject.to_string(),
+        email: Some(subject.to_string()),
+        name: Some("Person".to_string()),
+        sid: None,
     }
 }
 
-/// Invites and accepts a person through the db functions. Returns the caller and a session token.
+/// The SHA-256 of an invite token, as a pending sign-in keeps it.
+pub fn invite_hash(token: &str) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(token.as_bytes()).to_vec()
+}
+
+/// Makes the owner invite as bootstrap does, signs in with it as `OWNER_EMAIL`, and returns the
+/// caller for the new owner.
+pub async fn first_owner(db: &TestDb) -> Caller {
+    let issued = db::owner_invite(&db.owner, false)
+        .await
+        .expect("owner invite")
+        .expect("no owner yet");
+    let mut owner = profile(OWNER_EMAIL);
+    owner.name = Some("Owner".to_string());
+    let signed_in = db::sign_in(
+        &db.runtime,
+        &owner,
+        Some(&invite_hash(&issued.token)),
+        db::Groups::default(),
+    )
+    .await
+    .expect("owner signs in");
+    assert_eq!(signed_in.role, "owner");
+    Caller {
+        user_id: signed_in.user_id,
+        role: signed_in.role,
+    }
+}
+
+/// A new session for `user_id`, as a redeemed one-time code opens it.
+pub async fn session(db: &TestDb, user_id: &str) -> String {
+    db::open_session(&db.runtime, user_id)
+        .await
+        .expect("session")
+        .token
+}
+
+/// Invites a person and signs them in through the db functions, with `email` as their subject.
+/// Returns the caller and a session token.
 pub async fn join(db: &TestDb, by: &Caller, email: &str, role: &str) -> (Caller, String) {
     let Ok(Wrote::Fresh(issued)) = db::create_invite(&db.runtime, by, role, None).await else {
         panic!("invite");
     };
-    let accepted = db::accept_invite(&db.runtime, &issued.token, email, PASSWORD, "Person")
-        .await
-        .expect("accept");
+    let signed_in = db::sign_in(
+        &db.runtime,
+        &profile(email),
+        Some(&invite_hash(&issued.token)),
+        db::Groups::default(),
+    )
+    .await
+    .expect("sign in with the invite");
+    let token = session(db, &signed_in.user_id).await;
     (
         Caller {
-            user_id: accepted.user_id,
-            role: accepted.role,
+            user_id: signed_in.user_id,
+            role: signed_in.role,
         },
-        accepted.token,
+        token,
     )
 }
 
@@ -264,14 +304,4 @@ impl<'a> Call<'a> {
         };
         (status, value)
     }
-}
-
-/// Signs in over HTTP and returns the session token.
-pub async fn sign_in(app: &Router, email: &str, password: &str) -> String {
-    let (status, body) = Call::new(Method::POST, "/v1/session")
-        .json(serde_json::json!({"email": email, "password": password}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "sign in: {body}");
-    body["token"].as_str().expect("token").to_string()
 }

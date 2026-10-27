@@ -271,9 +271,7 @@ async fn check(hub: &Hub, me: &mut Me) -> Step {
             me.role = identity.role;
             Ok(())
         }
-        Err(SessionError::Unauthorized | SessionError::InvalidCredentials) => {
-            Err(End::Close(Close::SessionEnded))
-        }
+        Err(SessionError::Unauthorized) => Err(End::Close(Close::SessionEnded)),
         Err(SessionError::Database(error)) => {
             tracing::warn!(%error, "live session check failed");
             Ok(())
@@ -363,9 +361,7 @@ async fn fresh(hub: &Hub, me: &mut Me) -> Result<Answer, End> {
             me.role = identity.role;
             Ok(Ok(Done::Ok))
         }
-        Err(SessionError::Unauthorized | SessionError::InvalidCredentials) => {
-            Err(End::Close(Close::SessionEnded))
-        }
+        Err(SessionError::Unauthorized) => Err(End::Close(Close::SessionEnded)),
         Err(SessionError::Database(error)) => {
             tracing::warn!(%error, "live session check failed");
             Ok(Err("unavailable"))
