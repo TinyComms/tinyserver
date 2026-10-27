@@ -13,12 +13,12 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
-use crate::bootstrap::{check_password, hash_password, normalize_email, normalize_name};
+use crate::bootstrap::normalize_name;
 use crate::outbox::emit;
-use crate::session::{new_token, password_matches, token_digest};
+use crate::session::{new_token, token_digest};
 use crate::DbError;
 
-const STAMP: &str = "YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"";
+pub(crate) const STAMP: &str = "YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"";
 
 #[derive(Debug, Error)]
 pub enum CommunityError {
@@ -32,10 +32,6 @@ pub enum CommunityError {
     Invalid,
     #[error("already a member")]
     AlreadyMember,
-    #[error("email taken")]
-    EmailTaken,
-    #[error("invalid credentials")]
-    InvalidCredentials,
     #[error("idempotency conflict")]
     IdempotencyConflict,
     #[error("idempotency key has no stored response")]
@@ -61,7 +57,7 @@ pub struct Room {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
     pub user_id: String,
-    pub email: String,
+    pub email: Option<String>,
     pub display_name: String,
     pub role: String,
     pub created_at: String,
@@ -71,7 +67,8 @@ pub struct Member {
 pub struct Invite {
     pub id: String,
     pub role: String,
-    pub created_by: String,
+    /// `None` for the owner invite that `tinyserver bootstrap` makes.
+    pub created_by: Option<String>,
     pub expires_at: String,
     pub accepted_at: Option<String>,
     pub accepted_by: Option<String>,
@@ -83,15 +80,6 @@ pub struct InviteIssued {
     pub token: String,
     pub role: String,
     pub expires_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Accepted {
-    pub token: String,
-    pub user_id: String,
-    pub email: String,
-    pub display_name: String,
-    pub role: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -461,7 +449,7 @@ pub async fn create_invite(
     let invite = Invite {
         id: issued.id.clone(),
         role: issued.role.clone(),
-        created_by: caller.user_id.clone(),
+        created_by: Some(caller.user_id.clone()),
         expires_at: issued.expires_at.clone(),
         accepted_at: None,
         accepted_by: None,
@@ -508,80 +496,6 @@ pub async fn revoke_invite(pool: &PgPool, caller: &Caller, id: &str) -> Result<(
     .await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(())
-}
-
-pub async fn accept_invite(
-    pool: &PgPool,
-    token: &str,
-    email: &str,
-    password: &str,
-    display_name: &str,
-) -> Result<Accepted, CommunityError> {
-    check_password(password).map_err(|_| CommunityError::Invalid)?;
-    let email = normalize_email(email).map_err(|_| CommunityError::Invalid)?;
-    let display_name = normalize_name(display_name).map_err(|_| CommunityError::Invalid)?;
-    let digest = token_digest(token);
-
-    let mut tx = pool.begin().await.map_err(from_sql)?;
-    let existing: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT id::text, email, display_name, password_hash
-         FROM users
-         WHERE lower(email) = lower($1)",
-    )
-    .bind(&email)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(from_sql)?;
-
-    let (user_id, email, display_name) =
-        if let Some((user_id, email, display_name, hash)) = existing {
-            if !password_matches(password, &hash) {
-                return Err(CommunityError::InvalidCredentials);
-            }
-            (user_id, email, display_name)
-        } else {
-            let hash = hash_password(password)?;
-            let user_id: String = sqlx::query_scalar(
-                "INSERT INTO users (email, display_name, password_hash)
-             VALUES ($1, $2, $3)
-             RETURNING id::text",
-            )
-            .bind(&email)
-            .bind(&display_name)
-            .bind(&hash)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(from_sql)?;
-            (user_id, email, display_name)
-        };
-
-    let role: String = sqlx::query_scalar("SELECT app_accept_invite($1, $2::uuid)")
-        .bind(digest.as_slice())
-        .bind(&user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(from_sql)?;
-
-    let session = new_token();
-    let session_digest = token_digest(&session);
-    sqlx::query(
-        "INSERT INTO sessions (user_id, token_hash, expires_at)
-         VALUES ($1::uuid, $2, now() + interval '30 days')",
-    )
-    .bind(&user_id)
-    .bind(session_digest.as_slice())
-    .execute(&mut *tx)
-    .await
-    .map_err(from_sql)?;
-    tx.commit().await.map_err(from_sql)?;
-
-    Ok(Accepted {
-        token: session,
-        user_id,
-        email,
-        display_name,
-        role,
-    })
 }
 
 pub async fn list_audit(
@@ -839,7 +753,8 @@ fn classify_parts(code: &str, message: &str) -> Option<CommunityError> {
         "P0002" | "22P02" => CommunityError::NotFound,
         "22023" | "23514" => CommunityError::Invalid,
         "23505" if message.contains("already a member") => CommunityError::AlreadyMember,
-        "23505" => CommunityError::EmailTaken,
+        // Two writes racing for one idempotency key.
+        "23505" if message.contains("idempotency_keys") => CommunityError::IdempotencyConflict,
         _ => return None,
     })
 }
@@ -880,9 +795,10 @@ mod tests {
             Some(CommunityError::AlreadyMember)
         ));
         assert!(matches!(
-            classify_parts("23505", "users_email_lower"),
-            Some(CommunityError::EmailTaken)
+            classify_parts("23505", "idempotency_keys_pkey"),
+            Some(CommunityError::IdempotencyConflict)
         ));
+        assert!(classify_parts("23505", "user_identities_pkey").is_none());
         assert!(classify_parts("XX000", "nope").is_none());
     }
 }

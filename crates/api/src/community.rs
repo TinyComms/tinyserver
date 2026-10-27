@@ -4,9 +4,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use db::{
-    accept_invite, create_invite, create_room, delete_room, list_audit, list_invites, list_members,
-    list_rooms, remove_member, rename_room, revoke_invite, set_member_role, Caller, CommunityError,
-    PgPool, SessionError, Wrote,
+    create_invite, create_room, delete_room, list_audit, list_invites, list_members, list_rooms,
+    remove_member, rename_room, revoke_invite, set_member_role, Caller, CommunityError, PgPool,
+    SessionError, Wrote,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -28,7 +28,6 @@ pub fn routes() -> Router<PgPool> {
         )
         .route("/v1/invites", get(invites).post(add_invite))
         .route("/v1/invites/{id}", axum::routing::delete(revoke))
-        .route("/v1/invites/accept", axum::routing::post(accept))
         .route("/v1/audit", get(audit))
 }
 
@@ -40,14 +39,6 @@ struct NameBody {
 #[derive(Deserialize, Serialize)]
 struct RoleBody {
     role: String,
-}
-
-#[derive(Deserialize)]
-struct AcceptBody {
-    token: String,
-    email: String,
-    password: String,
-    display_name: String,
 }
 
 #[derive(Deserialize)]
@@ -67,8 +58,6 @@ pub(crate) enum ApiError {
     Invalid,
     LastOwner,
     AlreadyMember,
-    EmailTaken,
-    InvalidCredentials,
     IdempotencyConflict,
     Unavailable,
 }
@@ -82,8 +71,6 @@ impl IntoResponse for ApiError {
             Self::Invalid => (StatusCode::BAD_REQUEST, "invalid"),
             Self::LastOwner => (StatusCode::CONFLICT, "last_owner"),
             Self::AlreadyMember => (StatusCode::CONFLICT, "already_member"),
-            Self::EmailTaken => (StatusCode::CONFLICT, "email_taken"),
-            Self::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
             Self::IdempotencyConflict => (StatusCode::CONFLICT, "idempotency_conflict"),
             Self::Unavailable => (StatusCode::INTERNAL_SERVER_ERROR, "unavailable"),
         };
@@ -98,8 +85,6 @@ pub(crate) fn lift(error: CommunityError) -> ApiError {
         CommunityError::LastOwner => ApiError::LastOwner,
         CommunityError::Invalid => ApiError::Invalid,
         CommunityError::AlreadyMember => ApiError::AlreadyMember,
-        CommunityError::EmailTaken => ApiError::EmailTaken,
-        CommunityError::InvalidCredentials => ApiError::InvalidCredentials,
         CommunityError::IdempotencyConflict => ApiError::IdempotencyConflict,
         CommunityError::Incomplete => ApiError::Unavailable,
         CommunityError::Database(error) => {
@@ -111,7 +96,7 @@ pub(crate) fn lift(error: CommunityError) -> ApiError {
 
 fn session_failure(error: SessionError) -> ApiError {
     match error {
-        SessionError::InvalidCredentials | SessionError::Unauthorized => ApiError::Unauthorized,
+        SessionError::Unauthorized => ApiError::Unauthorized,
         SessionError::Database(error) => {
             tracing::warn!(%error, "session query failed");
             ApiError::Unavailable
@@ -259,23 +244,6 @@ async fn revoke(
     revoke_invite(&pool, &caller, &id).await.map_err(lift)?;
     tracing::info!(user_id = %caller.user_id, invite = %id, "invite revoked");
     Ok(StatusCode::NO_CONTENT)
-}
-
-async fn accept(
-    State(pool): State<PgPool>,
-    Json(body): Json<AcceptBody>,
-) -> Result<Json<db::Accepted>, ApiError> {
-    let accepted = accept_invite(
-        &pool,
-        &body.token,
-        &body.email,
-        &body.password,
-        &body.display_name,
-    )
-    .await
-    .map_err(lift)?;
-    tracing::info!(user_id = %accepted.user_id, "invite accepted");
-    Ok(Json(accepted))
 }
 
 async fn audit(

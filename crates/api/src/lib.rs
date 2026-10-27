@@ -1,17 +1,20 @@
-//! HTTP surface. Health, session, account, rooms, people, invites, and the live socket.
+//! HTTP surface. Health, sign-in, session, account, rooms, people, invites, and the live socket.
 //! Media does not enter this crate; it talks to `sfu` over channels.
 
 mod account;
+mod auth;
 mod community;
 mod health;
 mod limit;
 mod live;
+mod oidc;
 mod session;
 
 #[cfg(feature = "fuzz")]
 pub mod fuzz;
 
 pub use live::{Limits, Live};
+pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig};
 
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, HeaderName, HeaderValue};
@@ -20,17 +23,18 @@ use axum::response::Response;
 use axum::Router;
 use db::PgPool;
 
-/// The REST routes without `GET /v1/live`.
-pub fn router(pool: PgPool) -> Router {
-    build(pool, None)
+/// The REST routes without `GET /v1/live`. Without `sign_in` there is no `/v1/auth`, so no one
+/// can sign in; tests open sessions through `db`.
+pub fn router(pool: PgPool, sign_in: Option<SignIn>) -> Router {
+    build(pool, None, sign_in)
 }
 
 /// The REST routes and `GET /v1/live`, fed by `live`.
-pub fn app(pool: PgPool, live: Live) -> Router {
-    build(pool, Some(live))
+pub fn app(pool: PgPool, live: Live, sign_in: Option<SignIn>) -> Router {
+    build(pool, Some(live), sign_in)
 }
 
-fn build(pool: PgPool, live: Option<Live>) -> Router {
+fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
     let mut routes = Router::new()
         .merge(health::routes(live.clone()))
         .merge(session::routes())
@@ -38,6 +42,9 @@ fn build(pool: PgPool, live: Option<Live>) -> Router {
         .merge(community::routes());
     if let Some(live) = live {
         routes = routes.merge(live::routes(live));
+    }
+    if let Some(sign_in) = sign_in {
+        routes = routes.merge(auth::routes(sign_in));
     }
     routes
         .layer(DefaultBodyLimit::max(8 * 1024))
