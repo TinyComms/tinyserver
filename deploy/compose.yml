@@ -1,7 +1,11 @@
-# One community. Postgres and the server share a network that has no route out.
-# cloudflared carries HTTP and the live socket; it is the only way to the server's
-# HTTP port. The one thing published on the host is the media port, UDP and the same
-# number on TCP, for call audio straight to the SFU.
+# One community. Postgres, the server, and Tinyauth share a network that has no route out.
+# cloudflared carries HTTP and the live socket for the chat hostname, and the sign-in pages for
+# the auth hostname; it is the only way in to either. The one thing published on the host is the
+# media port, UDP and the same number on TCP, for call audio straight to the SFU.
+#
+# Sign-in goes through Tinyauth, an OpenID Connect provider. Its issuer is its public auth URL.
+# tinyserver reaches it inside, at http://tinyauth:3000, for discovery, keys, and the code
+# exchange, and still checks that every token names the public issuer.
 
 name: tinyserver
 
@@ -42,14 +46,25 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      tinyauth:
+        condition: service_started
     environment:
       DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
       DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
       BIND: 0.0.0.0:8080
-      # First boot only. Remove them from the environment file once the owner exists.
-      TINYSERVER_OWNER_EMAIL: ${TINYSERVER_OWNER_EMAIL:-}
-      TINYSERVER_OWNER_NAME: ${TINYSERVER_OWNER_NAME:-}
-      TINYSERVER_OWNER_PASSWORD: ${TINYSERVER_OWNER_PASSWORD:-}
+      # The address people type into tinyclient. The sign-in callback is under it.
+      TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
+      # Tinyauth, the default provider. The issuer is exactly TINYAUTH_PUBLIC_URL.
+      TINYSERVER_OIDC_ISSUER: ${TINYAUTH_PUBLIC_URL:?set TINYAUTH_PUBLIC_URL, such as https://auth.example.org}
+      TINYSERVER_OIDC_INTERNAL_URL: http://tinyauth:3000
+      TINYSERVER_OIDC_CLIENT_ID: tinyserver
+      TINYSERVER_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      TINYSERVER_OIDC_PROVIDER_NAME: ${TINYSERVER_OIDC_PROVIDER_NAME:-Tinyauth}
+      # Optional: let groups from the provider join or become admins. Unset is invite only.
+      TINYSERVER_OIDC_MEMBER_GROUPS: ${TINYSERVER_OIDC_MEMBER_GROUPS:-}
+      TINYSERVER_OIDC_ADMIN_GROUPS: ${TINYSERVER_OIDC_ADMIN_GROUPS:-}
+      # Days a sign-in lasts before tinyclient asks for another.
+      TINYSERVER_SESSION_MAX_DAYS: ${TINYSERVER_SESSION_MAX_DAYS:-30}
       # Calls have media only when the public address is set. Members see it.
       TINYSERVER_MEDIA_PORT: ${TINYSERVER_MEDIA_PORT:-50000}
       TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}
@@ -57,6 +72,8 @@ services:
       TINYSERVER_LAN_IP: ${TINYSERVER_LAN_IP:-}
       # What media may upload to everyone, in kb/s. Optional; unset is no budget.
       TINYSERVER_MEDIA_EGRESS_KBPS: ${TINYSERVER_MEDIA_EGRESS_KBPS:-}
+    secrets:
+      - oidc_client_secret
     # The same number inside and out: the SFU advertises the port it binds. TCP is ICE-TCP,
     # for networks that block UDP.
     ports:
@@ -73,6 +90,55 @@ services:
       - media
     logging: *logging
 
+  # The sign-in provider. Local users from a file, with TOTP; one OIDC client, tinyserver.
+  # Its sessions and signing key live in the tinyauth_data volume. No published port.
+  tinyauth:
+    image: ghcr.io/tinyauthapp/tinyauth:v5.2.0-distroless@sha256:aff752a57511f9346109b4d427c132db71dfa480138698e1f42feaf335f7cda9
+    user: "65532:65532"
+    environment:
+      TINYAUTH_APPURL: ${TINYAUTH_PUBLIC_URL:?set TINYAUTH_PUBLIC_URL, such as https://auth.example.org}
+      TINYAUTH_LABELPROVIDER: none
+      TINYAUTH_ANALYTICS_ENABLED: "false"
+      TINYAUTH_RESOURCES_ENABLED: "false"
+      TINYAUTH_AUTH_USERSFILE: /run/secrets/tinyauth_users
+      TINYAUTH_AUTH_SECURECOOKIE: "true"
+      TINYAUTH_AUTH_SUBDOMAINSENABLED: "false"
+      TINYAUTH_AUTH_SESSIONEXPIRY: "43200"
+      TINYAUTH_AUTH_SESSIONMAXLIFETIME: "604800"
+      TINYAUTH_AUTH_LOGINMAXRETRIES: "3"
+      TINYAUTH_AUTH_LOGINTIMEOUT: "900"
+      # Only cloudflared may say who the client is.
+      TINYAUTH_AUTH_TRUSTEDPROXIES: ${TINYSERVER_TUNNEL_IP:-172.30.53.10}
+      TINYAUTH_AUTH_ACLS_POLICY: deny
+      TINYAUTH_OIDC_PRIVATEKEYPATH: /data/oidc/key.pem
+      TINYAUTH_OIDC_PUBLICKEYPATH: /data/oidc/key.pub
+      TINYAUTH_OIDC_CLIENTS_TINYSERVER_CLIENTID: tinyserver
+      TINYAUTH_OIDC_CLIENTS_TINYSERVER_CLIENTSECRETFILE: /run/secrets/oidc_client_secret
+      TINYAUTH_OIDC_CLIENTS_TINYSERVER_TRUSTEDREDIRECTURIS: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL}/v1/auth/callback
+      TINYAUTH_OIDC_CLIENTS_TINYSERVER_NAME: tinyserver
+      TINYAUTH_LOG_JSON: "true"
+      TINYAUTH_LOG_STREAMS_AUDIT_ENABLED: "true"
+    secrets:
+      - tinyauth_users
+      - oidc_client_secret
+    volumes:
+      - ${TINYAUTH_DATA_DIR:-tinyauth_data}:/data
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    networks:
+      - inside
+    logging: *logging
+
+  # Routes the chat hostname to http://tinyserver:8080 and the auth hostname to
+  # http://tinyauth:3000. Both public hostnames are set on the tunnel in Cloudflare.
   tunnel:
     image: cloudflare/cloudflared:2026.10.3
     command: tunnel --no-autoupdate run
@@ -80,18 +146,32 @@ services:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN}
     depends_on:
       - tinyserver
+      - tinyauth
     restart: unless-stopped
     networks:
-      - inside
-      - edge
+      inside:
+        # Fixed, so Tinyauth can trust its forwarded-for header and nothing else's.
+        ipv4_address: ${TINYSERVER_TUNNEL_IP:-172.30.53.10}
+      edge: {}
     logging: *logging
+
+secrets:
+  # Files next to this compose file, in a directory only root reads. See deploy/README.md.
+  tinyauth_users:
+    file: ${TINYSERVER_SECRETS_DIR:-./secrets}/tinyauth_users
+  oidc_client_secret:
+    file: ${TINYSERVER_SECRETS_DIR:-./secrets}/oidc_client_secret
 
 networks:
   inside:
     internal: true
+    ipam:
+      config:
+        - subnet: ${TINYSERVER_INSIDE_SUBNET:-172.30.53.0/24}
   edge:
   # Docker publishes ports only from a network that is not internal.
   media:
 
 volumes:
   tinyserver_pg:
+  tinyauth_data:

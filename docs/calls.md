@@ -47,7 +47,7 @@ Upgrade: websocket
 
 | Rule | Value |
 | --- | --- |
-| Auth | The existing session token, in the `Authorization: Bearer` header only. tinyclient's `tungstenite` sets headers on the handshake request, so there is no query-string token to leak into logs. Checked before the upgrade: no token or a bad one is a plain `401 {"error":"unauthorized"}`. Then checked again every 60 s, at once on a `session.ended` event, and on every `call.join` and `call.kick`. An expired or deleted session closes the socket with `4001 session_ended`. Sign-out, sign-out everywhere, and a password change all emit `session.ended`, so their sockets close within one event delivery. |
+| Auth | The existing session token, in the `Authorization: Bearer` header only. tinyclient's `tungstenite` sets headers on the handshake request, so there is no query-string token to leak into logs. Checked before the upgrade: no token or a bad one is a plain `401 {"error":"unauthorized"}`. Then checked again every 60 s, at once on a `session.ended` event, and on every `call.join` and `call.kick`. An expired or deleted session closes the socket with `4001 session_ended`. Sign-out, sign-out everywhere, removal, and a back-channel logout from the provider all emit `session.ended`, so their sockets close within one event delivery. |
 | Membership | Removed member: the socket gets `member.removed` about itself, then closes with `4003 removed`. Their call ends at once with `call.left {reason: "removed"}`. |
 | Query | `since=<seq>`, a non-negative integer. Anything else is `400 {"error":"invalid"}`. Other parameters are ignored. |
 | Frame size | 64 KiB, for one frame and one message. SDP with simulcast fits. Bigger closes the socket with `1009 too_big`. Binary frames close it with `1003 text_only`. |
