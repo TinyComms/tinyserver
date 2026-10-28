@@ -16,11 +16,13 @@ struct Cli {
 enum Command {
     /// Apply SQL migrations as the database owner.
     Migrate,
-    /// Print a single-use owner invite, good for 24 hours, when there is no owner yet.
-    /// Does nothing when an owner exists.
+    /// Print a single-use owner invite, good for 24 hours, when there is no owner yet. While
+    /// an earlier one still works it is kept and nothing new is printed. Does nothing when an
+    /// owner exists.
     Bootstrap {
-        /// Make the owner invite even though an owner exists. For an owner who signed in with a
-        /// password before sign-in moved to an OIDC provider.
+        /// Make a new owner invite even though an earlier one still works or an owner exists.
+        /// For a lost invite, or an owner who signed in with a password before sign-in moved to
+        /// an OIDC provider.
         #[arg(long)]
         owner_invite: bool,
     },
@@ -57,20 +59,33 @@ async fn migrate() -> anyhow::Result<()> {
 async fn bootstrap(force: bool) -> anyhow::Result<()> {
     let url = env_var("DATABASE_URL_MIGRATE")?;
     let pool = db::owner_pool(&url).await?;
-    let Some(issued) = db::owner_invite(&pool, force)
+    let issued = match db::bootstrap(&pool, force)
         .await
         .context("bootstrap failed")?
-    else {
-        tracing::info!("an owner already exists");
-        return Ok(());
+    {
+        db::Bootstrap::Created(issued) => issued,
+        db::Bootstrap::OwnerExists => {
+            tracing::info!("an owner already exists");
+            return Ok(());
+        }
+        db::Bootstrap::Pending { id, expires_at } => {
+            // Printed once when it was made; the database keeps only its hash.
+            tracing::info!(invite_id = %id, %expires_at, "no owner yet; the owner invite printed earlier still works");
+            println!();
+            println!("No owner yet. The owner invite printed earlier works until {expires_at}.");
+            println!("Lost it? Run `tinyserver bootstrap --owner-invite` for a new one.");
+            println!();
+            return Ok(());
+        }
     };
-    tracing::info!(invite_id = %issued.id, expires_at = %issued.expires_at, "owner invite created");
+    let expires_at = issued.expires_at.clone().unwrap_or_default();
+    tracing::info!(invite_id = %issued.id, %expires_at, "owner invite created");
     // Printed once, to the operator. The database keeps only its hash.
     let code = env_var("TINYSERVER_PUBLIC_URL")
         .ok()
         .and_then(|origin| join_code(&origin, &issued.token));
     println!();
-    println!("Owner invite, single use, until {}:", issued.expires_at);
+    println!("Owner invite, single use, until {expires_at}:");
     match code {
         Some(code) => println!("  {code}"),
         None => println!("  {}", issued.token),

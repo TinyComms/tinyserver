@@ -9,7 +9,11 @@ mod bootstrap;
 mod community;
 mod error;
 mod migrate;
+mod moderation;
 mod outbox;
+pub mod perm;
+mod roles;
+mod server;
 mod session;
 mod sweep;
 
@@ -19,17 +23,31 @@ pub use auth::{
     s256, save_pending, sign_in, take_pending, AuthError, Groups, Pending, PendingLogin, Profile,
     SignedIn,
 };
-pub use bootstrap::{owner_exists, owner_invite};
+pub use bootstrap::{bootstrap, owner_exists, owner_invite, Bootstrap};
 pub use community::{
-    create_invite, create_room, delete_room, end_share, kick_from_call, list_audit, list_invites,
-    list_members, list_rooms, remove_member, rename_room, revoke_invite, room_exists,
-    set_member_role, AuditRow, Caller, CommunityError, Invite, InviteIssued, Member, Room, Wrote,
+    admin_role, create_invite, create_invite_with, create_room, delete_room, list_audit,
+    list_invites, list_members, list_rooms, remove_member, rename_room, revoke_invite, room_exists,
+    set_member_role, set_member_roles, set_override, set_owner, set_timeout, update_room,
+    AuditQuery, AuditRow, Caller, CommunityError, Invite, InviteIssued, InviteOptions, Member,
+    NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
 pub use error::DbError;
 pub use migrate::migrate;
+pub use moderation::{
+    ban, call_access, end_share, kick_from_call, list_bans, moderate_call, move_in_call,
+    room_permissions, touch_seen, unban, Ban, CallAccess,
+};
 pub use outbox::{outbox_after, outbox_bounds, OutboxBounds, OutboxRow, WAKE_CHANNEL};
+pub use roles::{
+    create_role, delete_role, list_roles, order_roles, update_role, NewRole, Role, RolePatch,
+};
+pub use server::{
+    create_category, delete_category, delete_icon, get_icon, get_server, list_categories,
+    rename_category, set_icon, set_layout, sniff_image, update_server, Category, Icon, Layout,
+    LayoutBucket, ServerPatch, ServerSettings, ICON_MAX,
+};
 pub use session::{
-    close_session, current_session, open_session, Identity, OpenedSession, SessionError,
+    close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,
 };
 pub use sqlx::PgPool;
 pub use sweep::{sweep, Swept};

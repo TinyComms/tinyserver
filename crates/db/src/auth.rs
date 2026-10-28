@@ -21,6 +21,9 @@ pub enum AuthError {
     /// group came with it.
     #[error("not a member")]
     NotMember,
+    /// Banned: no invite, joining group, or membership lets them in.
+    #[error("banned")]
+    Banned,
     /// A one-time code that is unknown, used, expired, or presented with the wrong verifier.
     #[error("invalid grant")]
     InvalidGrant,
@@ -184,6 +187,13 @@ pub async fn sign_in(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(user_id) = &found {
+        let banned: bool = sqlx::query_scalar("SELECT app_banned($1::uuid)")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if banned {
+            return Err(AuthError::Banned);
+        }
         let role: Option<String> = sqlx::query_scalar("SELECT app_member_role($1::uuid)")
             .bind(user_id)
             .fetch_one(&mut *tx)
@@ -241,18 +251,25 @@ pub async fn sign_in(
             }
             // Unknown, used, or expired.
             Err(error) if sqlstate(&error) == "P0002" => attempt.rollback().await?,
+            Err(error) if banned(&error) => return Err(AuthError::Banned),
             Err(error) => return Err(error.into()),
         }
     }
     let role = match (role, groups.join) {
         (Some(role), _) => role,
         (None, Some(join)) => {
-            sqlx::query_scalar("SELECT app_join_by_groups($1::uuid, $2, $3)")
-                .bind(&user_id)
-                .bind(join)
-                .bind(&profile.issuer)
-                .fetch_one(&mut *tx)
-                .await?
+            let joined: Result<String, sqlx::Error> =
+                sqlx::query_scalar("SELECT app_join_by_groups($1::uuid, $2, $3)")
+                    .bind(&user_id)
+                    .bind(join)
+                    .bind(&profile.issuer)
+                    .fetch_one(&mut *tx)
+                    .await;
+            match joined {
+                Ok(role) => role,
+                Err(error) if banned(&error) => return Err(AuthError::Banned),
+                Err(error) => return Err(error.into()),
+            }
         }
         // The account made above rolls back with the transaction.
         (None, None) => return Err(AuthError::NotMember),
@@ -486,6 +503,12 @@ fn profile_name(profile: &Profile) -> String {
         .map(|name| name.trim().to_string())
         .find(|name| !name.is_empty())
         .unwrap_or_else(|| "Member".to_string())
+}
+
+fn banned(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|error| error.message() == "banned")
 }
 
 fn sqlstate(error: &sqlx::Error) -> String {
