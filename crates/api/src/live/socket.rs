@@ -10,8 +10,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::call::{Moves, Reason, Refused};
-use super::frame::{Audience, Event, Incoming, Me as MeFrame, Out};
-use super::hub::{Hub, Joined, Slot};
+use super::frame::{Event, Incoming, Me as MeFrame, Out};
+use super::hub::{access, Hub, Joined, Slot};
 
 /// Why the server closed a socket. The code and reason are in `docs/calls.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,18 +61,21 @@ pub(crate) struct Me {
     pub token: String,
     pub user_id: String,
     pub role: String,
+    /// Server-wide permissions, re-read with the session.
+    pub permissions: i64,
 }
 
 impl Me {
-    fn manages(&self) -> bool {
-        matches!(self.role.as_str(), "owner" | "admin")
-    }
-
     fn caller(&self) -> Caller {
         Caller {
             user_id: self.user_id.clone(),
             role: self.role.clone(),
         }
+    }
+
+    fn update(&mut self, identity: db::Identity) {
+        self.role = identity.role;
+        self.permissions = identity.permissions;
     }
 }
 
@@ -97,6 +100,7 @@ pub(crate) async fn run(
     let joined = hub.join(&me.user_id);
     let conn = joined.conn;
     tracing::info!(user_id = %me.user_id, conn, "live socket opened");
+    hub.saw(&me.user_id);
     let end = serve(&hub, &mut socket, &mut me, since, joined).await;
     let reason = match end {
         End::Close(Close::Removed) => Some(Reason::Removed),
@@ -112,6 +116,7 @@ pub(crate) async fn run(
     }
     hub.hang_up(&me.user_id, conn, reason);
     hub.leave(&me.user_id, conn);
+    hub.saw(&me.user_id);
     drop(slot);
 }
 
@@ -215,7 +220,10 @@ async fn serve(
                 receive(hub, socket, me, &mut asking, message).await
             }
             () = tokio::time::sleep_until(seen + limits.idle) => Err(End::Close(Close::Idle)),
-            _ = recheck.tick() => check(hub, me).await,
+            _ = recheck.tick() => {
+                hub.saw(&me.user_id);
+                check(hub, me).await
+            }
         };
         if let Err(end) = step {
             return end;
@@ -238,28 +246,17 @@ async fn resync(hub: &Hub, socket: &mut WebSocket) -> End {
 /// Sends one durable event if this socket may see it, and acts on events about this person.
 async fn deliver(hub: &Hub, socket: &mut WebSocket, me: &mut Me, event: &Event) -> Step {
     let mine = event.subject.as_deref() == Some(me.user_id.as_str());
-    let visible = match event.audience {
-        Audience::Everyone => true,
-        Audience::Managers => me.manages(),
-        Audience::Server => false,
-    };
-    if visible {
+    if event.audience.admits(me.permissions) {
         if let Some(frame) = &event.frame {
             send(hub, socket, frame.clone()).await?;
         }
     }
-    if !mine {
-        return Ok(());
-    }
     match event.topic.as_str() {
-        "member.removed" => Err(End::Close(Close::Removed)),
-        "member.role" => {
-            if let Some(role) = &event.role {
-                me.role.clone_from(role);
-            }
-            Ok(())
-        }
-        "session.ended" => check(hub, me).await,
+        "member.removed" | "member.banned" if mine => Err(End::Close(Close::Removed)),
+        "member.role" | "member.roles" if mine => check(hub, me).await,
+        // A role this person may hold changed what they may see.
+        "role.updated" | "role.deleted" => check(hub, me).await,
+        "session.ended" if mine => check(hub, me).await,
         _ => Ok(()),
     }
 }
@@ -268,7 +265,7 @@ async fn deliver(hub: &Hub, socket: &mut WebSocket, me: &mut Me, event: &Event) 
 async fn check(hub: &Hub, me: &mut Me) -> Step {
     match db::current_session(&hub.pool, &me.token).await {
         Ok(identity) => {
-            me.role = identity.role;
+            me.update(identity);
             Ok(())
         }
         Err(SessionError::Unauthorized) => Err(End::Close(Close::SessionEnded)),
@@ -335,9 +332,11 @@ async fn receive(
         "call.join" => call_join(hub, me, asking, room_id, sdp).await?,
         "call.leave" => call_leave(hub, me, asking),
         "call.kick" => call_kick(hub, me, room_id, incoming.user_id.as_deref()).await?,
+        "call.moderate" => call_moderate(hub, me, &incoming).await?,
+        "call.move" => call_move(hub, me, room_id, incoming.user_id.as_deref()).await?,
         "call.share_end" => call_share_end(hub, me, room_id).await?,
         "call.offer" => call_offer(hub, me, asking, sdp).await,
-        "call.state" => call_state(hub, me, incoming.muted, incoming.deafened),
+        "call.state" => call_state(hub, me, &incoming),
         "call.quality" => call_quality(hub, me, incoming.video.as_deref()),
         _ => Err("unknown_type"),
     };
@@ -358,7 +357,7 @@ async fn receive(
 async fn fresh(hub: &Hub, me: &mut Me) -> Result<Answer, End> {
     match db::current_session(&hub.pool, &me.token).await {
         Ok(identity) => {
-            me.role = identity.role;
+            me.update(identity);
             Ok(Ok(Done::Ok))
         }
         Err(SessionError::Unauthorized) => Err(End::Close(Close::SessionEnded)),
@@ -380,8 +379,24 @@ async fn room_exists(hub: &Hub, me: &Me, room_id: &str) -> Answer {
     }
 }
 
-/// Any member may join any room they can see. Leaves the person's other call first. With
-/// an SFU running the join must carry an offer, and the reply is the answer.
+/// What the person may do in the room's call. A room they cannot see is `not_found`, no
+/// connect is `forbidden`, a timeout is `timed_out`.
+async fn call_access(hub: &Hub, me: &Me, room_id: &str) -> Result<db::CallAccess, &'static str> {
+    match db::call_access(&hub.pool, &me.user_id, room_id).await {
+        Ok(Some(found)) if found.timed_out => Err("timed_out"),
+        Ok(Some(found)) if !db::perm::has(found.permissions, db::perm::CONNECT) => Err("forbidden"),
+        Ok(Some(found)) => Ok(found),
+        Ok(None) => Err("not_found"),
+        Err(error) => {
+            tracing::warn!(%error, "call access check failed");
+            Err("unavailable")
+        }
+    }
+}
+
+/// A member with connect may join a room they can see, up to its limit. Leaves the person's
+/// other call first. With an SFU running the join must carry an offer, and the reply is the
+/// answer. Without speak they join suppressed: nothing they send is forwarded.
 async fn call_join(
     hub: &Hub,
     me: &mut Me,
@@ -405,22 +420,29 @@ async fn call_join(
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }
-    if let Err(code) = room_exists(hub, me, room_id).await {
-        return Ok(Err(code));
+    let found = match call_access(hub, me, room_id).await {
+        Ok(found) => found,
+        Err(code) => return Ok(Err(code)),
+    };
+    if let Err(refused) = hub.call_check(&me.user_id, room_id, found.user_limit) {
+        return Ok(Err(refused.code()));
     }
     let answer = match media {
         None => None,
-        Some((media, sdp)) => {
-            if let Err(refused) = hub.call_check(&me.user_id, room_id) {
-                return Ok(Err(refused.code()));
-            }
-            match media.join(room_id, &me.user_id, sdp).await {
-                Ok(answer) => Some(answer),
-                Err(refused) => return Ok(Err(media_code(refused))),
-            }
-        }
+        Some((media, sdp)) => match media.join(room_id, &me.user_id, sdp).await {
+            Ok(answer) => Some(answer),
+            Err(refused) => return Ok(Err(media_code(refused))),
+        },
     };
-    if let Err(refused) = hub.call_join(&me.user_id, room_id, asking.conn, answer.as_ref()) {
+    let joined = hub.call_join(
+        &me.user_id,
+        room_id,
+        asking.conn,
+        answer.as_ref(),
+        found.user_limit,
+        access(found.permissions),
+    );
+    if let Err(refused) = joined {
         if let Some(answer) = &answer {
             hub.forget(&answer.call_id);
         }
@@ -480,12 +502,14 @@ fn call_quality(hub: &Hub, me: &Me, video: Option<&str>) -> Answer {
     Ok(Done::Ok)
 }
 
-/// Mute and deafen, shown to everyone. Not being in a call is `not_found`.
-fn call_state(hub: &Hub, me: &Me, muted: Option<bool>, deafened: Option<bool>) -> Answer {
-    let (Some(muted), Some(deafened)) = (muted, deafened) else {
+/// Mute, deafen, and priority, shown to everyone. Priority counts only with
+/// priority_speaker. Not being in a call is `not_found`.
+fn call_state(hub: &Hub, me: &Me, incoming: &Incoming) -> Answer {
+    let (Some(muted), Some(deafened)) = (incoming.muted, incoming.deafened) else {
         return Err("bad_frame");
     };
-    if !hub.call_state(&me.user_id, muted, deafened) {
+    let priority = incoming.priority.unwrap_or(false);
+    if !hub.call_state(&me.user_id, muted, deafened, priority) {
         return Err("not_found");
     }
     Ok(Done::Ok)
@@ -500,7 +524,21 @@ fn call_leave(hub: &Hub, me: &Me, asking: &mut Asking<'_>) -> Answer {
     Ok(Done::Ok)
 }
 
-/// Owners and admins may remove someone from a call. An admin may not remove an owner.
+/// The database's answer to a moderation check, as a frame error code.
+fn moderation_code(error: CommunityError, what: &str) -> &'static str {
+    match error {
+        CommunityError::Forbidden => "forbidden",
+        CommunityError::Hierarchy => "hierarchy",
+        CommunityError::NotFound => "not_found",
+        CommunityError::Invalid => "bad_frame",
+        error => {
+            tracing::warn!(%error, what, "call moderation failed");
+            "unavailable"
+        }
+    }
+}
+
+/// disconnect_members in the room and a rank above the person.
 async fn call_kick(
     hub: &Hub,
     me: &mut Me,
@@ -513,26 +551,82 @@ async fn call_kick(
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }
-    if !me.manages() {
-        return Ok(Err("forbidden"));
-    }
     if !hub.in_call(room_id, user_id) {
         return Ok(Err("not_found"));
     }
-    match db::kick_from_call(&hub.pool, &me.caller(), room_id, user_id).await {
-        Ok(()) => {}
-        Err(CommunityError::Forbidden) => return Ok(Err("forbidden")),
-        Err(CommunityError::NotFound) => return Ok(Err("not_found")),
-        Err(error) => {
-            tracing::warn!(%error, "call kick failed");
-            return Ok(Err("unavailable"));
-        }
+    if let Err(error) = db::kick_from_call(&hub.pool, &me.caller(), room_id, user_id).await {
+        return Ok(Err(moderation_code(error, "kick")));
     }
     hub.call_kick(room_id, user_id);
     Ok(Ok(Done::Ok))
 }
 
-/// Owners and admins may end the screen share in a room. An admin may not end an owner's.
+/// Server mute needs mute_members and server deafen deafen_members in the room, and a rank
+/// above the person. It lasts until undone or they leave calls altogether.
+async fn call_moderate(hub: &Hub, me: &mut Me, incoming: &Incoming) -> Result<Answer, End> {
+    let (Some(room_id), Some(user_id)) = (incoming.room_id.as_deref(), incoming.user_id.as_deref())
+    else {
+        return Ok(Err("bad_frame"));
+    };
+    let (server_muted, server_deafened) = (incoming.server_muted, incoming.server_deafened);
+    if server_muted.is_none() && server_deafened.is_none() {
+        return Ok(Err("bad_frame"));
+    }
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    if !hub.in_call(room_id, user_id) {
+        return Ok(Err("not_found"));
+    }
+    let checked = db::moderate_call(
+        &hub.pool,
+        &me.caller(),
+        room_id,
+        user_id,
+        server_muted,
+        server_deafened,
+    )
+    .await;
+    if let Err(error) = checked {
+        return Ok(Err(moderation_code(error, "moderate")));
+    }
+    if !hub.moderate(room_id, user_id, server_muted, server_deafened) {
+        return Ok(Err("not_found"));
+    }
+    Ok(Ok(Done::Ok))
+}
+
+/// move_members in both rooms and a rank above the person. The person gets `call.moved` and
+/// joins the room themselves, past its limit.
+async fn call_move(
+    hub: &Hub,
+    me: &mut Me,
+    room_id: Option<&str>,
+    user_id: Option<&str>,
+) -> Result<Answer, End> {
+    let (Some(to_room), Some(user_id)) = (room_id, user_id) else {
+        return Ok(Err("bad_frame"));
+    };
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    let Some(from_room) = hub.room_of(user_id) else {
+        return Ok(Err("not_found"));
+    };
+    if from_room == to_room {
+        return Ok(Ok(Done::Ok));
+    }
+    let checked = db::move_in_call(&hub.pool, &me.caller(), &from_room, to_room, user_id).await;
+    if let Err(error) = checked {
+        return Ok(Err(moderation_code(error, "move")));
+    }
+    if !hub.call_move(user_id, to_room) {
+        return Ok(Err("not_found"));
+    }
+    Ok(Ok(Done::Ok))
+}
+
+/// Ending the screen share in a room: disconnect_members there and a rank above the sharer.
 async fn call_share_end(hub: &Hub, me: &mut Me, room_id: Option<&str>) -> Result<Answer, End> {
     let Some(room_id) = room_id else {
         return Ok(Err("bad_frame"));
@@ -540,20 +634,11 @@ async fn call_share_end(hub: &Hub, me: &mut Me, room_id: Option<&str>) -> Result
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }
-    if !me.manages() {
-        return Ok(Err("forbidden"));
-    }
     let Some(user_id) = hub.sharer(room_id) else {
         return Ok(Err("not_found"));
     };
-    match db::end_share(&hub.pool, &me.caller(), room_id, &user_id).await {
-        Ok(()) => {}
-        Err(CommunityError::Forbidden) => return Ok(Err("forbidden")),
-        Err(CommunityError::NotFound) => return Ok(Err("not_found")),
-        Err(error) => {
-            tracing::warn!(%error, "share end failed");
-            return Ok(Err("unavailable"));
-        }
+    if let Err(error) = db::end_share(&hub.pool, &me.caller(), room_id, &user_id).await {
+        return Ok(Err(moderation_code(error, "share end")));
     }
     hub.end_share(room_id, &user_id);
     Ok(Ok(Done::Ok))
