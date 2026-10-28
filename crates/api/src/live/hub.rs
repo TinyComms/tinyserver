@@ -1,7 +1,7 @@
 //! Who is connected, who is online, who is in which call, and the one task that reads the
 //! outbox.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -11,7 +11,7 @@ use sqlx::postgres::PgListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
-use super::call::{Calls, Change, Occupancy, Reason, Refused};
+use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused};
 use super::frame::{Event, Out, SlotFrame, VideoSlotFrame};
 use super::socket::Close;
 use super::Limits;
@@ -35,6 +35,8 @@ pub(crate) struct Hub {
     stop: watch::Sender<bool>,
     dispatcher: Mutex<Option<JoinHandle<()>>>,
     pub media: Option<sfu::Media>,
+    /// People connected since `last_seen_at` was last written.
+    seen: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -125,13 +127,20 @@ impl Hub {
             stop,
             dispatcher: Mutex::new(None),
             media,
+            seen: Mutex::new(HashSet::new()),
         });
         let task = tokio::spawn(dispatch(hub.clone(), hub.stop.subscribe()));
         *lock(&hub.dispatcher) = Some(task);
         if let Some(events) = media_events {
             tokio::spawn(follow_media(hub.clone(), events, hub.stop.subscribe()));
         }
+        tokio::spawn(remember(hub.clone(), hub.stop.subscribe()));
         hub
+    }
+
+    /// `user_id` is connected now. Written to `last_seen_at` with the next batch.
+    pub fn saw(&self, user_id: &str) {
+        lock(&self.seen).insert(user_id.to_string());
     }
 
     /// Also ends every call and stops the SFU. The `1012` close is how callers learn it.
@@ -262,18 +271,27 @@ impl Hub {
         let _ = self.ephemeral.send(Arc::from(frame));
     }
 
+    /// How many people `room_id` takes for `user_id`: its own limit, else the server's, and
+    /// the server's for someone moved there. Never more than the server's.
+    fn room_limit(&self, calls: &Calls, user_id: &str, room_id: &str, user_limit: i32) -> usize {
+        let max = self.limits.call_room_max;
+        match usize::try_from(user_limit) {
+            Ok(limit) if limit > 0 && !calls.ticket(user_id, room_id) => limit.min(max),
+            _ => max,
+        }
+    }
+
     /// Whether `call_join` would seat `user_id` in `room_id` now. Checked before media is
     /// set up, because an SFU join replaces the person's media in any other room.
-    pub fn call_check(&self, user_id: &str, room_id: &str) -> Result<(), Refused> {
+    pub fn call_check(&self, user_id: &str, room_id: &str, user_limit: i32) -> Result<(), Refused> {
         if self.closing() {
             return Err(Refused::Closing);
         }
-        lock(&self.people).calls.check(
-            user_id,
-            room_id,
-            self.limits.call_room_max,
-            self.limits.call_server_max,
-        )
+        let people = lock(&self.people);
+        let limit = self.room_limit(&people.calls, user_id, room_id, user_limit);
+        people
+            .calls
+            .check(user_id, room_id, limit, self.limits.call_server_max)
     }
 
     /// Seats `user_id` in `room_id` for socket `conn`, with the SFU's answer if the join had
@@ -284,19 +302,23 @@ impl Hub {
         room_id: &str,
         conn: u64,
         answer: Option<&sfu::Answer>,
+        user_limit: i32,
+        access: Access,
     ) -> Result<(), Refused> {
         let call_id = answer.map(|answer| answer.call_id.as_str());
         let mut people = lock(&self.people);
         if self.closing() {
             return Err(Refused::Closing);
         }
+        let limit = self.room_limit(&people.calls, user_id, room_id, user_limit);
         let changes = people.calls.join(
             user_id,
             room_id,
             conn,
             call_id.map(str::to_string),
-            self.limits.call_room_max,
+            limit,
             self.limits.call_server_max,
+            access,
         )?;
         self.tell(&mut people, changes);
         if let Some(answer) = answer {
@@ -305,6 +327,12 @@ impl Hub {
                     .calls
                     .set_media(user_id, &answer.call_id, answer.camera, answer.share);
             self.tell(&mut people, change);
+        }
+        // A new SFU participant starts unmoderated.
+        if let Some(moderation) = people.calls.moderation(user_id) {
+            if moderation.silenced || moderation.hushed {
+                self.apply(Some(moderation));
+            }
         }
         // Slots the SFU sent before the seat existed. The socket reads them after its answer.
         if let Some(frame) = call_id.and_then(|call_id| people.slots.get(call_id)) {
@@ -330,18 +358,96 @@ impl Hub {
             .map(str::to_string)
     }
 
-    /// Records mute and deafen, tells everyone, and tells the SFU. False if not in a call.
-    pub fn call_state(&self, user_id: &str, muted: bool, deafened: bool) -> bool {
+    /// Records mute, deafen, and priority, tells everyone, and tells the SFU. False if not in
+    /// a call.
+    pub fn call_state(&self, user_id: &str, muted: bool, deafened: bool, priority: bool) -> bool {
         let mut people = lock(&self.people);
         if people.calls.room_of(user_id).is_none() {
             return false;
         }
-        let change = people.calls.set_state(user_id, muted, deafened);
+        let change = people.calls.set_state(user_id, muted, deafened, priority);
         if let (Some(media), Some(call_id)) = (&self.media, people.calls.call_of(user_id)) {
             media.state(call_id, muted, deafened);
         }
         self.tell(&mut people, change);
         true
+    }
+
+    /// Server mute or deafen `user_id` in `room_id`'s call, tell everyone, and tell the SFU.
+    /// False if they are not in that call.
+    pub fn moderate(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+    ) -> bool {
+        let mut people = lock(&self.people);
+        let Some((change, moderation)) =
+            people
+                .calls
+                .moderate(room_id, user_id, server_muted, server_deafened)
+        else {
+            return false;
+        };
+        self.apply(moderation);
+        self.tell(&mut people, change);
+        true
+    }
+
+    /// Tells `user_id` to move to `to_room`, whose limit they may pass for a while. False if
+    /// they are not in a call.
+    pub fn call_move(&self, user_id: &str, to_room: &str) -> bool {
+        let mut people = lock(&self.people);
+        if people.calls.room_of(user_id).is_none() {
+            return false;
+        }
+        people.calls.issue_ticket(user_id, to_room);
+        let frame: Arc<str> = Arc::from(Out::CallMoved { room_id: to_room }.text());
+        people.to_seat(user_id, frame);
+        true
+    }
+
+    /// The room whose call `user_id` is in.
+    pub fn room_of(&self, user_id: &str) -> Option<String> {
+        lock(&self.people)
+            .calls
+            .room_of(user_id)
+            .map(str::to_string)
+    }
+
+    fn apply(&self, moderation: Option<Moderation>) {
+        if let (Some(media), Some(moderation)) = (&self.media, moderation) {
+            media.moderate(&moderation.call_id, moderation.silenced, moderation.hushed);
+        }
+    }
+
+    /// Re-reads the permissions of everyone in a call, after a role or an override changed,
+    /// and suppresses or frees them and their priority to match.
+    fn refresh(self: &Arc<Self>) {
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let rooms = lock(&hub.people).calls.occupied();
+            for (room_id, people) in rooms {
+                let permissions = match db::room_permissions(&hub.pool, &room_id, &people).await {
+                    Ok(permissions) => permissions,
+                    Err(error) => {
+                        tracing::warn!(%error, "call permissions not read");
+                        continue;
+                    }
+                };
+                let mut guard = lock(&hub.people);
+                for (user_id, bits) in permissions {
+                    if let Some((change, moderation)) =
+                        guard.calls.set_access(&room_id, &user_id, access(bits))
+                    {
+                        hub.apply(moderation);
+                        hub.tell(&mut guard, Some(change));
+                    }
+                }
+                drop(guard);
+            }
+        });
     }
 
     /// Records whether `user_id`'s camera sends and whether they share after `answer`, and
@@ -426,8 +532,8 @@ impl Hub {
         });
     }
 
-    /// Acts on durable events that end calls.
-    fn follow(&self, event: &Event) {
+    /// Acts on durable events that end calls or change what people in them may do.
+    fn follow(self: &Arc<Self>, event: &Event) {
         match event.topic.as_str() {
             "room.deleted" => {
                 if let Some(room_id) = &event.room {
@@ -439,6 +545,19 @@ impl Hub {
                     self.call_leave(user_id, Reason::Removed);
                 }
             }
+            "member.banned" => {
+                if let Some(user_id) = &event.subject {
+                    self.call_leave(user_id, Reason::Banned);
+                }
+            }
+            "member.timeout" if event.timed_out => {
+                if let Some(user_id) = &event.subject {
+                    self.call_leave(user_id, Reason::TimedOut);
+                }
+            }
+            "role.updated" | "role.deleted" | "member.roles" | "member.role" | "room.updated" => {
+                self.refresh();
+            }
             _ => {}
         }
     }
@@ -448,7 +567,14 @@ impl Hub {
     fn tell(&self, people: &mut People, changes: impl IntoIterator<Item = Change>) {
         for change in changes {
             let frame = match &change {
-                Change::Joined { room_id, user_id } => Out::CallJoined { room_id, user_id }.text(),
+                Change::Joined {
+                    room_id,
+                    participant,
+                } => Out::CallJoined {
+                    room_id,
+                    participant,
+                }
+                .text(),
                 Change::Left {
                     room_id,
                     user_id,
@@ -470,18 +596,10 @@ impl Hub {
                 }
                 Change::State {
                     room_id,
-                    user_id,
-                    muted,
-                    deafened,
-                    camera,
-                    sharing,
+                    participant,
                 } => Out::CallState {
                     room_id,
-                    user_id,
-                    muted: *muted,
-                    deafened: *deafened,
-                    camera: *camera,
-                    sharing: *sharing,
+                    participant,
                 }
                 .text(),
             };
@@ -556,6 +674,26 @@ impl Hub {
             } => {
                 tracing::debug!(egress_kbps, participants, "media load");
             }
+        }
+    }
+}
+
+/// Writes who was connected to `last_seen_at` every `seen_every`, in one query, and once more
+/// when the hub closes.
+async fn remember(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
+    let mut ticks = tokio::time::interval(hub.limits.seen_every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let last = tokio::select! {
+            _ = stop.wait_for(|stopped| *stopped) => true,
+            _ = ticks.tick() => false,
+        };
+        let users: Vec<String> = lock(&hub.seen).drain().collect();
+        if let Err(error) = db::touch_seen(&hub.pool, &users).await {
+            tracing::debug!(%error, "last seen not recorded");
+        }
+        if last {
+            return;
         }
     }
 }
@@ -642,7 +780,7 @@ async fn wake(listener: Option<&mut PgListener>) -> Result<(), sqlx::Error> {
     }
 }
 
-async fn drain(hub: &Hub, mut cursor: i64) -> i64 {
+async fn drain(hub: &Arc<Hub>, mut cursor: i64) -> i64 {
     loop {
         let rows = match db::outbox_after(&hub.pool, cursor, BATCH).await {
             Ok(rows) => rows,
@@ -661,6 +799,15 @@ async fn drain(hub: &Hub, mut cursor: i64) -> i64 {
         if !full {
             return cursor;
         }
+    }
+}
+
+/// What permissions in a room mean for someone in its call.
+pub(crate) fn access(permissions: i64) -> Access {
+    use db::perm;
+    Access {
+        suppressed: !perm::has(permissions, perm::SPEAK),
+        priority_speaker: perm::has(permissions, perm::PRIORITY_SPEAKER),
     }
 }
 

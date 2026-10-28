@@ -27,7 +27,59 @@ pub struct Identity {
     /// What the provider said when the account was made. It may be missing.
     pub email: Option<String>,
     pub display_name: String,
+    /// The legacy role string.
     pub role: String,
+    pub owner: bool,
+    /// The member's roles, most senior first, without @everyone.
+    pub roles: Vec<String>,
+    /// Server-wide permissions: @everyone and the roles, or every bit for an owner.
+    pub permissions: i64,
+    /// The highest position among the roles, 0 with none; `i32::MAX` for an owner.
+    pub rank: i32,
+}
+
+/// One row of [`IDENTITY_COLUMNS`].
+pub(crate) type IdentityRow = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    bool,
+    i64,
+    i32,
+    Vec<String>,
+);
+
+/// Everything an [`Identity`] holds for the user `u`.
+pub(crate) const IDENTITY_COLUMNS: &str =
+    "u.id::text, u.email, u.display_name, app_member_role(u.id),
+     app_owner_of(u.id), app_perms_of(u.id), app_rank_of(u.id), app_roles_of(u.id)";
+
+pub(crate) fn identity_from(row: IdentityRow) -> Option<Identity> {
+    let (user_id, email, display_name, role, owner, permissions, rank, roles) = row;
+    let role = known_role(role)?;
+    Some(Identity {
+        user_id,
+        email,
+        display_name,
+        role,
+        owner,
+        roles,
+        permissions,
+        rank,
+    })
+}
+
+/// The identity of a member, without a session.
+pub async fn identity(pool: &PgPool, user_id: &str) -> Result<Identity, SessionError> {
+    let row: Option<IdentityRow> = sqlx::query_as(&format!(
+        "SELECT {IDENTITY_COLUMNS} FROM users u WHERE u.id = $1::uuid"
+    ))
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.and_then(identity_from)
+        .ok_or(SessionError::Unauthorized)
 }
 
 pub struct OpenedSession {
@@ -64,18 +116,13 @@ pub(crate) async fn open_session_in(
     user_id: &str,
     origin: Origin<'_>,
 ) -> Result<OpenedSession, SessionError> {
-    let row: Option<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
-        "SELECT id::text, email, display_name, app_member_role(id)
-         FROM users
-         WHERE id = $1::uuid",
-    )
+    let row: Option<IdentityRow> = sqlx::query_as(&format!(
+        "SELECT {IDENTITY_COLUMNS} FROM users u WHERE u.id = $1::uuid"
+    ))
     .bind(user_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((user_id, email, display_name, role)) = row else {
-        return Err(SessionError::Unauthorized);
-    };
-    let Some(role) = known_role(role) else {
+    let Some(identity) = row.and_then(identity_from) else {
         return Err(SessionError::Unauthorized);
     };
 
@@ -85,7 +132,7 @@ pub(crate) async fn open_session_in(
         "INSERT INTO sessions (user_id, token_hash, issuer, sid, expires_at)
          VALUES ($1::uuid, $2, $3, $4, now() + make_interval(days => $5))",
     )
-    .bind(&user_id)
+    .bind(&identity.user_id)
     .bind(digest.as_slice())
     .bind(origin.issuer)
     .bind(origin.sid)
@@ -93,41 +140,23 @@ pub(crate) async fn open_session_in(
     .execute(&mut **tx)
     .await?;
 
-    Ok(OpenedSession {
-        token,
-        identity: Identity {
-            user_id,
-            email,
-            display_name,
-            role,
-        },
-    })
+    Ok(OpenedSession { token, identity })
 }
 
 pub async fn current_session(pool: &PgPool, token: &str) -> Result<Identity, SessionError> {
     let digest = token_digest(token);
-    let row: Option<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
-        "SELECT u.id::text, u.email, u.display_name, app_member_role(u.id)
+    let row: Option<IdentityRow> = sqlx::query_as(&format!(
+        "SELECT {IDENTITY_COLUMNS}
          FROM sessions s
          JOIN users u ON u.id = s.user_id
          WHERE s.token_hash = $1
-           AND s.expires_at > now()",
-    )
+           AND s.expires_at > now()"
+    ))
     .bind(digest.as_slice())
     .fetch_optional(pool)
     .await?;
-    let Some((user_id, email, display_name, role)) = row else {
-        return Err(SessionError::Unauthorized);
-    };
-    let Some(role) = known_role(role) else {
-        return Err(SessionError::Unauthorized);
-    };
-    Ok(Identity {
-        user_id,
-        email,
-        display_name,
-        role,
-    })
+    row.and_then(identity_from)
+        .ok_or(SessionError::Unauthorized)
 }
 
 /// Also emits `session.ended`, so a live socket on this token closes.

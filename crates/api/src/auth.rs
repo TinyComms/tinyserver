@@ -256,6 +256,10 @@ async fn callback(
             );
             return back(Outcome::Error("not_member"));
         }
+        Err(AuthError::Banned) => {
+            tracing::info!(provider = %provider.id(), "sign-in refused: banned");
+            return back(Outcome::Error("banned"));
+        }
         Err(error) => {
             tracing::warn!(%error, "sign-in not recorded");
             return back(Outcome::Error("failed"));
@@ -301,7 +305,9 @@ async fn token(
     )
     .await
     .map_err(|error| match error {
-        AuthError::NotMember | AuthError::InvalidGrant => AuthApiError::InvalidGrant,
+        AuthError::NotMember | AuthError::Banned | AuthError::InvalidGrant => {
+            AuthApiError::InvalidGrant
+        }
         AuthError::Database(error) => {
             tracing::warn!(%error, "one-time code not redeemed");
             AuthApiError::Unavailable

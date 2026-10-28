@@ -19,6 +19,10 @@ pub(crate) enum Reason {
     MediaTimeout,
     /// Media connected, then stopped.
     MediaLost,
+    Banned,
+    TimedOut,
+    /// Someone with move_members moved them to another room.
+    Moved,
 }
 
 impl Reason {
@@ -33,7 +37,15 @@ impl Reason {
             Self::Kicked => "kicked",
             Self::MediaTimeout => "media_timeout",
             Self::MediaLost => "media_lost",
+            Self::Banned => "banned",
+            Self::TimedOut => "timed_out",
+            Self::Moved => "moved",
         }
+    }
+
+    /// The person goes on to another call, so moderation stays with them.
+    fn keeps_moderation(self) -> bool {
+        matches!(self, Self::JoinedElsewhere | Self::Moved)
     }
 }
 
@@ -42,7 +54,7 @@ impl Reason {
 pub(crate) enum Change {
     Joined {
         room_id: String,
-        user_id: String,
+        participant: Participant,
     },
     Left {
         room_id: String,
@@ -53,17 +65,14 @@ pub(crate) enum Change {
     },
     State {
         room_id: String,
-        user_id: String,
-        muted: bool,
-        deafened: bool,
-        camera: bool,
-        sharing: bool,
+        participant: Participant,
     },
 }
 
 /// Why a join was refused. The `error` code is in `docs/calls.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
+    /// The room's limit, or the server's when it has none.
     Full,
     ServerFull,
     /// The server is shutting down.
@@ -75,7 +84,7 @@ pub(crate) enum Refused {
 impl Refused {
     pub fn code(self) -> &'static str {
         match self {
-            Self::Full => "full",
+            Self::Full => "room_full",
             Self::ServerFull => "server_full",
             Self::Closing => "unavailable",
             Self::NoMedia => "media_unavailable",
@@ -90,13 +99,38 @@ pub(crate) struct Occupancy {
     pub participants: Vec<Participant>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct Participant {
     pub user_id: String,
     pub muted: bool,
     pub deafened: bool,
     pub camera: bool,
     pub sharing: bool,
+    pub server_muted: bool,
+    pub server_deafened: bool,
+    /// No speak permission in the room: nothing they send is forwarded.
+    pub suppressed: bool,
+    /// Holding priority speaker now.
+    pub priority: bool,
+}
+
+/// What a person may do in the room they join, from their permissions there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Access {
+    /// They lack speak.
+    pub suppressed: bool,
+    /// They have priority_speaker.
+    pub priority_speaker: bool,
+}
+
+/// What the SFU should do with a participant apart from their own mute and deafen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Moderation {
+    pub call_id: String,
+    /// Their audio is not forwarded.
+    pub silenced: bool,
+    /// They are sent no audio.
+    pub hushed: bool,
 }
 
 /// Where a person sits. `conn` is the socket that joined; `None` once it closed.
@@ -112,43 +146,45 @@ struct Seat {
     camera: bool,
     /// They hold the room's screen share, as the SFU's last answer said.
     sharing: bool,
+    access: Access,
+    priority: bool,
 }
 
-impl Seat {
-    fn state(&self, user_id: &str) -> Change {
-        Change::State {
-            room_id: self.room_id.clone(),
-            user_id: user_id.to_string(),
-            muted: self.muted,
-            deafened: self.deafened,
-            camera: self.camera,
-            sharing: self.sharing,
-        }
-    }
+/// A move someone with move_members made, waiting for the moved person's join.
+struct Ticket {
+    room_id: String,
+    until: Instant,
 }
+
+/// How long a moved person has to join the room they were moved to past its limit.
+const TICKET: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(crate) struct Calls {
     /// Room to participants, in join order.
     rooms: BTreeMap<String, Vec<String>>,
     seats: HashMap<String, Seat>,
+    /// Server mute and server deafen, kept while a person moves between calls and dropped once
+    /// they leave calls altogether.
+    moderated: HashMap<String, (bool, bool)>,
+    tickets: HashMap<String, Ticket>,
     epoch: u64,
 }
 
 impl Calls {
-    /// Whether `join` would seat `user_id` in `room_id` now.
+    /// Whether `join` would seat `user_id` in `room_id` now, with `limit` people in a room.
     pub fn check(
         &self,
         user_id: &str,
         room_id: &str,
-        room_max: usize,
+        limit: usize,
         server_max: usize,
     ) -> Result<(), Refused> {
         if self.room_of(user_id) == Some(room_id) {
             return Ok(());
         }
         let here = self.rooms.get(room_id).map_or(0, Vec::len);
-        if here >= room_max {
+        if here >= limit {
             return Err(Refused::Full);
         }
         if !self.seats.contains_key(user_id) && self.seats.len() >= server_max {
@@ -157,28 +193,58 @@ impl Calls {
         Ok(())
     }
 
+    /// Whether `user_id` was moved to `room_id` and may still join it past its limit.
+    pub fn ticket(&self, user_id: &str, room_id: &str) -> bool {
+        self.tickets
+            .get(user_id)
+            .is_some_and(|ticket| ticket.room_id == room_id && ticket.until > Instant::now())
+    }
+
+    /// Records that `user_id` was moved to `room_id`.
+    pub fn issue_ticket(&mut self, user_id: &str, room_id: &str) {
+        self.tickets
+            .retain(|_, ticket| ticket.until > Instant::now());
+        self.tickets.insert(
+            user_id.to_string(),
+            Ticket {
+                room_id: room_id.to_string(),
+                until: Instant::now() + TICKET,
+            },
+        );
+    }
+
     /// Seats `user_id` in `room_id` for socket `conn` with SFU participant `call_id`, leaving
     /// any other call first. Joining the room they are already in only moves the seat to
-    /// `conn` and `call_id`.
+    /// `conn` and `call_id`. A join on a move ticket leaves the other call as `moved`.
+    #[allow(clippy::too_many_arguments)]
     pub fn join(
         &mut self,
         user_id: &str,
         room_id: &str,
         conn: u64,
         call_id: Option<String>,
-        room_max: usize,
+        limit: usize,
         server_max: usize,
+        access: Access,
     ) -> Result<Vec<Change>, Refused> {
-        self.check(user_id, room_id, room_max, server_max)?;
+        self.check(user_id, room_id, limit, server_max)?;
+        let moved = self.ticket(user_id, room_id);
+        self.tickets.remove(user_id);
         if let Some(seat) = self.seats.get_mut(user_id) {
             if seat.room_id == room_id {
                 seat.conn = Some(conn);
                 seat.call_id = call_id;
+                seat.access = access;
                 return Ok(Vec::new());
             }
         }
         let mut changes = Vec::new();
-        changes.extend(self.leave(user_id, Reason::JoinedElsewhere));
+        let reason = if moved {
+            Reason::Moved
+        } else {
+            Reason::JoinedElsewhere
+        };
+        changes.extend(self.leave(user_id, reason));
         self.epoch += 1;
         self.seats.insert(
             user_id.to_string(),
@@ -191,6 +257,8 @@ impl Calls {
                 deafened: false,
                 camera: false,
                 sharing: false,
+                access,
+                priority: false,
             },
         );
         self.rooms
@@ -199,13 +267,16 @@ impl Calls {
             .push(user_id.to_string());
         changes.push(Change::Joined {
             room_id: room_id.to_string(),
-            user_id: user_id.to_string(),
+            participant: self.participant(user_id),
         });
         Ok(changes)
     }
 
     pub fn leave(&mut self, user_id: &str, reason: Reason) -> Option<Change> {
         let seat = self.seats.remove(user_id)?;
+        if !reason.keeps_moderation() {
+            self.moderated.remove(user_id);
+        }
         if let Some(people) = self.rooms.get_mut(&seat.room_id) {
             people.retain(|person| person != user_id);
             if people.is_empty() {
@@ -248,15 +319,91 @@ impl Calls {
         self.rooms.get(room_id).map_or(&[], Vec::as_slice)
     }
 
-    /// Records `user_id`'s mute and deafen. `None` if they are not in a call or nothing changed.
-    pub fn set_state(&mut self, user_id: &str, muted: bool, deafened: bool) -> Option<Change> {
+    /// Every room with a call, and who is in it.
+    pub fn occupied(&self) -> Vec<(String, Vec<String>)> {
+        self.rooms
+            .iter()
+            .map(|(room_id, people)| (room_id.clone(), people.clone()))
+            .collect()
+    }
+
+    /// Records `user_id`'s mute, deafen, and priority; priority only with priority_speaker.
+    /// `None` if they are not in a call or nothing changed.
+    pub fn set_state(
+        &mut self,
+        user_id: &str,
+        muted: bool,
+        deafened: bool,
+        priority: bool,
+    ) -> Option<Change> {
         let seat = self.seats.get_mut(user_id)?;
-        if seat.muted == muted && seat.deafened == deafened {
+        let priority = priority && seat.access.priority_speaker;
+        if seat.muted == muted && seat.deafened == deafened && seat.priority == priority {
             return None;
         }
         seat.muted = muted;
         seat.deafened = deafened;
-        Some(seat.state(user_id))
+        seat.priority = priority;
+        Some(self.state(user_id))
+    }
+
+    /// Server mute or deafen `user_id` if they are in `room_id`'s call. `None` changes nothing
+    /// there. `None` back if they are not there; else the change, if any, and what the SFU
+    /// should now do with them.
+    pub fn moderate(
+        &mut self,
+        room_id: &str,
+        user_id: &str,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+    ) -> Option<(Option<Change>, Option<Moderation>)> {
+        if self.room_of(user_id) != Some(room_id) {
+            return None;
+        }
+        let before = self.moderated.get(user_id).copied().unwrap_or_default();
+        let after = (
+            server_muted.unwrap_or(before.0),
+            server_deafened.unwrap_or(before.1),
+        );
+        if after == (false, false) {
+            self.moderated.remove(user_id);
+        } else {
+            self.moderated.insert(user_id.to_string(), after);
+        }
+        let change = (after != before).then(|| self.state(user_id));
+        Some((change, self.moderation(user_id)))
+    }
+
+    /// New permissions in the room for someone in its call. The change, if any, and what the
+    /// SFU should now do with them.
+    pub fn set_access(
+        &mut self,
+        room_id: &str,
+        user_id: &str,
+        access: Access,
+    ) -> Option<(Change, Option<Moderation>)> {
+        let seat = self.seats.get_mut(user_id)?;
+        if seat.room_id != room_id || seat.access == access {
+            return None;
+        }
+        seat.access = access;
+        if !access.priority_speaker {
+            seat.priority = false;
+        }
+        Some((self.state(user_id), self.moderation(user_id)))
+    }
+
+    /// What the SFU should do with `user_id` apart from their own mute and deafen. `None`
+    /// without media.
+    pub fn moderation(&self, user_id: &str) -> Option<Moderation> {
+        let seat = self.seats.get(user_id)?;
+        let (server_muted, server_deafened) =
+            self.moderated.get(user_id).copied().unwrap_or_default();
+        Some(Moderation {
+            call_id: seat.call_id.clone()?,
+            silenced: server_muted || seat.access.suppressed,
+            hushed: server_deafened,
+        })
     }
 
     /// Records whether `user_id`'s camera sends and whether they share, if `call_id` is still
@@ -276,7 +423,7 @@ impl Calls {
         }
         seat.camera = camera;
         seat.sharing = sharing;
-        Some(seat.state(user_id))
+        Some(self.state(user_id))
     }
 
     /// Who shares their screen in `room_id`'s call.
@@ -295,7 +442,8 @@ impl Calls {
             return None;
         }
         seat.sharing = false;
-        Some((seat.call_id.clone(), seat.state(user_id)))
+        let call_id = seat.call_id.clone();
+        Some((call_id, self.state(user_id)))
     }
 
     /// The socket `conn` closed. If it held the seat, returns an epoch for `expire`.
@@ -330,6 +478,8 @@ impl Calls {
     pub fn clear(&mut self) {
         self.rooms.clear();
         self.seats.clear();
+        self.moderated.clear();
+        self.tickets.clear();
     }
 
     pub fn snapshot(&self) -> Vec<Occupancy> {
@@ -339,19 +489,34 @@ impl Calls {
                 room_id: room_id.clone(),
                 participants: people
                     .iter()
-                    .map(|user_id| {
-                        let seat = self.seats.get(user_id);
-                        Participant {
-                            user_id: user_id.clone(),
-                            muted: seat.is_some_and(|seat| seat.muted),
-                            deafened: seat.is_some_and(|seat| seat.deafened),
-                            camera: seat.is_some_and(|seat| seat.camera),
-                            sharing: seat.is_some_and(|seat| seat.sharing),
-                        }
-                    })
+                    .map(|user_id| self.participant(user_id))
                     .collect(),
             })
             .collect()
+    }
+
+    fn participant(&self, user_id: &str) -> Participant {
+        let seat = self.seats.get(user_id);
+        let (server_muted, server_deafened) =
+            self.moderated.get(user_id).copied().unwrap_or_default();
+        Participant {
+            user_id: user_id.to_string(),
+            muted: seat.is_some_and(|seat| seat.muted),
+            deafened: seat.is_some_and(|seat| seat.deafened),
+            camera: seat.is_some_and(|seat| seat.camera),
+            sharing: seat.is_some_and(|seat| seat.sharing),
+            server_muted,
+            server_deafened,
+            suppressed: seat.is_some_and(|seat| seat.access.suppressed),
+            priority: seat.is_some_and(|seat| seat.priority),
+        }
+    }
+
+    fn state(&self, user_id: &str) -> Change {
+        Change::State {
+            room_id: self.room_of(user_id).unwrap_or_default().to_string(),
+            participant: self.participant(user_id),
+        }
     }
 }
 
@@ -391,13 +556,32 @@ impl Moves {
 
 #[cfg(test)]
 mod tests {
-    use super::{Calls, Change, Moves, Reason, Refused};
+    use super::{Access, Calls, Change, Moderation, Moves, Participant, Reason, Refused};
     use std::time::Duration;
+
+    const FREE: Access = Access {
+        suppressed: false,
+        priority_speaker: false,
+    };
+
+    fn person(user_id: &str) -> Participant {
+        Participant {
+            user_id: user_id.to_string(),
+            muted: false,
+            deafened: false,
+            camera: false,
+            sharing: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
+            priority: false,
+        }
+    }
 
     fn joined(room_id: &str, user_id: &str) -> Change {
         Change::Joined {
             room_id: room_id.to_string(),
-            user_id: user_id.to_string(),
+            participant: person(user_id),
         }
     }
 
@@ -410,15 +594,16 @@ mod tests {
         }
     }
 
+    fn join(calls: &mut Calls, user: &str, room: &str, conn: u64) -> Result<Vec<Change>, Refused> {
+        calls.join(user, room, conn, None, 12, 32, FREE)
+    }
+
     #[test]
     fn joining_another_room_leaves_the_first() {
         let mut calls = Calls::default();
+        assert_eq!(join(&mut calls, "u", "a", 1), Ok(vec![joined("a", "u")]));
         assert_eq!(
-            calls.join("u", "a", 1, None, 12, 32),
-            Ok(vec![joined("a", "u")])
-        );
-        assert_eq!(
-            calls.join("u", "b", 1, None, 12, 32),
+            join(&mut calls, "u", "b", 1),
             Ok(vec![
                 left("a", "u", Reason::JoinedElsewhere),
                 joined("b", "u")
@@ -431,11 +616,11 @@ mod tests {
     #[test]
     fn a_second_socket_in_the_same_room_takes_the_seat_without_a_change() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, None, 12, 32).is_ok());
-        assert_eq!(calls.join("u", "a", 2, None, 12, 32), Ok(Vec::new()));
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        assert_eq!(join(&mut calls, "u", "a", 2), Ok(Vec::new()));
         assert_eq!(calls.orphan("u", 1), None);
         let epoch = calls.orphan("u", 2).expect("seat held by 2");
-        assert!(calls.join("u", "a", 3, None, 12, 32).is_ok());
+        assert!(join(&mut calls, "u", "a", 3).is_ok());
         assert_eq!(calls.expire("u", epoch), None);
         assert_eq!(calls.room_of("u"), Some("a"));
     }
@@ -443,7 +628,7 @@ mod tests {
     #[test]
     fn an_orphaned_seat_expires() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, None, 12, 32).is_ok());
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
         let epoch = calls.orphan("u", 1).expect("epoch");
         assert_eq!(
             calls.expire("u", epoch),
@@ -455,15 +640,16 @@ mod tests {
     #[test]
     fn caps_count_people_not_moves() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, None, 2, 3).is_ok());
-        assert!(calls.join("v", "a", 2, None, 2, 3).is_ok());
-        assert_eq!(calls.join("w", "a", 3, None, 2, 3), Err(Refused::Full));
-        assert!(calls.join("w", "b", 3, None, 2, 3).is_ok());
-        assert_eq!(
-            calls.join("x", "b", 4, None, 2, 3),
-            Err(Refused::ServerFull)
-        );
-        assert!(calls.join("u", "b", 1, None, 2, 3).is_ok());
+        let go = |calls: &mut Calls, user: &str, room: &str, conn: u64| {
+            calls.join(user, room, conn, None, 2, 3, FREE)
+        };
+        assert!(go(&mut calls, "u", "a", 1).is_ok());
+        assert!(go(&mut calls, "v", "a", 2).is_ok());
+        assert_eq!(go(&mut calls, "w", "a", 3), Err(Refused::Full));
+        assert!(go(&mut calls, "w", "b", 3).is_ok());
+        assert_eq!(go(&mut calls, "x", "b", 4), Err(Refused::ServerFull));
+        assert!(go(&mut calls, "u", "b", 1).is_ok());
+        assert_eq!(Refused::Full.code(), "room_full");
     }
 
     #[test]
@@ -479,6 +665,7 @@ mod tests {
                 None,
                 limits.call_room_max,
                 limits.call_server_max,
+                FREE,
             );
             assert!(joined.is_ok(), "{user_id}");
         }
@@ -489,17 +676,112 @@ mod tests {
                 12,
                 None,
                 limits.call_room_max,
-                limits.call_server_max
+                limits.call_server_max,
+                FREE
             ),
             Err(Refused::Full)
         );
     }
 
     #[test]
+    fn a_move_ticket_names_the_leave_moved_and_keeps_moderation() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        assert!(calls.moderate("a", "u", Some(true), None).is_some());
+        calls.issue_ticket("u", "b");
+        assert!(calls.ticket("u", "b"));
+        assert!(!calls.ticket("u", "a"));
+        let changes = join(&mut calls, "u", "b", 1).expect("join");
+        assert_eq!(changes[0], left("a", "u", Reason::Moved));
+        let Change::Joined { participant, .. } = &changes[1] else {
+            panic!("joined");
+        };
+        assert!(participant.server_muted);
+        assert!(!calls.ticket("u", "b"), "a ticket is used once");
+        // Leaving calls altogether drops the server mute.
+        assert!(calls.leave("u", Reason::Left).is_some());
+        let changes = join(&mut calls, "u", "a", 1).expect("join");
+        let Change::Joined { participant, .. } = &changes[0] else {
+            panic!("joined");
+        };
+        assert!(!participant.server_muted);
+    }
+
+    #[test]
+    fn moderation_and_suppression_reach_the_sfu() {
+        let mut calls = Calls::default();
+        let suppressed = Access {
+            suppressed: true,
+            priority_speaker: false,
+        };
+        let changes = calls
+            .join("u", "a", 1, Some("c-1".to_string()), 12, 32, suppressed)
+            .expect("join");
+        let Change::Joined { participant, .. } = &changes[0] else {
+            panic!("joined");
+        };
+        assert!(participant.suppressed);
+        assert_eq!(
+            calls.moderation("u"),
+            Some(Moderation {
+                call_id: "c-1".to_string(),
+                silenced: true,
+                hushed: false
+            })
+        );
+        assert_eq!(
+            calls.moderate("b", "u", Some(true), None),
+            None,
+            "other room"
+        );
+        let (change, sfu) = calls
+            .moderate("a", "u", None, Some(true))
+            .expect("in the call");
+        assert!(change.is_some());
+        assert_eq!(sfu.map(|sfu| sfu.hushed), Some(true));
+        let (change, _) = calls
+            .moderate("a", "u", None, Some(true))
+            .expect("in the call");
+        assert_eq!(change, None, "nothing changed");
+        let (change, sfu) = calls.set_access("a", "u", FREE).expect("changed");
+        let Change::State { participant, .. } = change else {
+            panic!("state");
+        };
+        assert!(!participant.suppressed);
+        assert_eq!(sfu.map(|sfu| sfu.silenced), Some(false));
+    }
+
+    #[test]
+    fn priority_needs_priority_speaker() {
+        let mut calls = Calls::default();
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        assert_eq!(calls.set_state("u", false, false, true), None);
+        let speaker = Access {
+            suppressed: false,
+            priority_speaker: true,
+        };
+        assert!(calls.set_access("a", "u", speaker).is_some());
+        let Some(Change::State { participant, .. }) = calls.set_state("u", false, false, true)
+        else {
+            panic!("state");
+        };
+        assert!(participant.priority);
+        let (Change::State { participant, .. }, _) =
+            calls.set_access("a", "u", FREE).expect("changed")
+        else {
+            panic!("state");
+        };
+        assert!(
+            !participant.priority,
+            "losing the permission drops priority"
+        );
+    }
+
+    #[test]
     fn ending_a_room_empties_it() {
         let mut calls = Calls::default();
-        assert!(calls.join("u", "a", 1, None, 12, 32).is_ok());
-        assert!(calls.join("v", "a", 2, None, 12, 32).is_ok());
+        assert!(join(&mut calls, "u", "a", 1).is_ok());
+        assert!(join(&mut calls, "v", "a", 2).is_ok());
         assert_eq!(
             calls.end_room("a", Reason::RoomDeleted),
             vec![
@@ -513,18 +795,18 @@ mod tests {
     #[test]
     fn a_seat_keeps_its_call_id_and_state_until_it_leaves() {
         let mut calls = Calls::default();
-        let joined = calls.join("u", "a", 1, Some("c-1".to_string()), 12, 32);
+        let joined = calls.join("u", "a", 1, Some("c-1".to_string()), 12, 32, FREE);
         assert!(joined.is_ok());
         assert_eq!(calls.call_of("u"), Some("c-1"));
         assert_eq!(calls.holder("c-1"), Some("u"));
         assert_eq!(
-            calls.join("u", "a", 2, Some("c-2".to_string()), 12, 32),
+            calls.join("u", "a", 2, Some("c-2".to_string()), 12, 32, FREE),
             Ok(Vec::new())
         );
         assert_eq!(calls.holder("c-1"), None);
         assert_eq!(calls.conn_of("u"), Some(2));
-        assert!(calls.set_state("u", true, false).is_some());
-        assert_eq!(calls.set_state("u", true, false), None);
+        assert!(calls.set_state("u", true, false, false).is_some());
+        assert_eq!(calls.set_state("u", true, false, false), None);
         assert!(calls.snapshot()[0].participants[0].muted);
         assert_eq!(
             calls.set_media("u", "c-1", true, false),
@@ -535,11 +817,11 @@ mod tests {
             calls.set_media("u", "c-2", true, false),
             Some(Change::State {
                 room_id: "a".to_string(),
-                user_id: "u".to_string(),
-                muted: true,
-                deafened: false,
-                camera: true,
-                sharing: false,
+                participant: Participant {
+                    muted: true,
+                    camera: true,
+                    ..person("u")
+                },
             })
         );
         assert_eq!(calls.set_media("u", "c-2", true, false), None);

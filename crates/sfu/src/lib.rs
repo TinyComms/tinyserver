@@ -224,6 +224,11 @@ pub(crate) enum Command {
         muted: bool,
         deafened: bool,
     },
+    Moderate {
+        call_id: String,
+        silenced: bool,
+        hushed: bool,
+    },
     Quality {
         call_id: String,
         video: Quality,
@@ -326,6 +331,17 @@ impl Media {
             call_id: call_id.to_string(),
             muted,
             deafened,
+        });
+    }
+
+    /// Moderation, apart from the participant's own mute and deafen. A `silenced` publisher's
+    /// audio is not forwarded, for a server mute or a room where they may not speak. A
+    /// `hushed` listener is sent no audio, for a server deafen; video still flows both ways.
+    pub fn moderate(&self, call_id: &str, silenced: bool, hushed: bool) {
+        let _ = self.send(Command::Moderate {
+            call_id: call_id.to_string(),
+            silenced,
+            hushed,
         });
     }
 

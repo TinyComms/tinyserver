@@ -18,7 +18,13 @@ pub(crate) struct Current {
     user_id: String,
     email: Option<String>,
     display_name: String,
+    /// The legacy role string.
     role: String,
+    owner: bool,
+    roles: Vec<String>,
+    /// Server-wide permission bits.
+    permissions: u64,
+    rank: i32,
 }
 
 impl From<db::Identity> for Current {
@@ -28,6 +34,10 @@ impl From<db::Identity> for Current {
             email: identity.email,
             display_name: identity.display_name,
             role: identity.role,
+            owner: identity.owner,
+            roles: identity.roles,
+            permissions: u64::try_from(identity.permissions).unwrap_or(0),
+            rank: identity.rank,
         }
     }
 }

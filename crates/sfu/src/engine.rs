@@ -129,6 +129,10 @@ struct Peer {
     heard_at: Instant,
     muted: bool,
     deafened: bool,
+    /// Server muted, or without speak in the room: their audio is not forwarded.
+    silenced: bool,
+    /// Server deafened: they are sent no audio.
+    hushed: bool,
     speech: Speech,
     audio: Bucket,
     /// The client's camera m-line: the first video m-line it may send on.
@@ -156,6 +160,11 @@ struct Peer {
 }
 
 impl Peer {
+    /// Their audio is forwarded: not muted by themselves or by moderation.
+    fn audible(&self) -> bool {
+        !self.muted && !self.silenced
+    }
+
     fn camera_live(&self) -> bool {
         self.connected && self.camera_on
     }
@@ -584,6 +593,20 @@ impl Engine {
                     }
                     self.replan = true;
                 }
+                Command::Moderate {
+                    call_id,
+                    silenced,
+                    hushed,
+                } => {
+                    if let Some(peer) = self.peer_mut(&call_id) {
+                        peer.silenced = silenced;
+                        peer.hushed = hushed;
+                        if silenced {
+                            peer.speech.hush();
+                        }
+                    }
+                    self.replan = true;
+                }
                 Command::Quality { call_id, video } => {
                     if let Some(peer) = self.peer_mut(&call_id) {
                         peer.quality = video;
@@ -664,6 +687,8 @@ impl Engine {
             heard_at: now,
             muted: false,
             deafened: false,
+            silenced: false,
+            hushed: false,
             speech: Speech::new(),
             audio: Bucket::new(rate, rate, now),
             camera: None,
@@ -1177,7 +1202,7 @@ impl Engine {
                 .members
                 .iter()
                 .filter_map(|id| self.peers.get(id).map(|peer| (*id, peer)))
-                .filter(|(_, peer)| !peer.muted && peer.speech.speaking(now))
+                .filter(|(_, peer)| peer.audible() && peer.speech.speaking(now))
                 .map(|(id, peer)| (id, peer.speech.level()))
                 .collect();
             if room.floor.hear(&loud, now) {
@@ -1187,7 +1212,7 @@ impl Engine {
                 .members
                 .iter()
                 .filter_map(|id| self.peers.get(id))
-                .filter(|peer| !peer.muted && peer.speech.speaking(now))
+                .filter(|peer| peer.audible() && peer.speech.speaking(now))
                 .map(|peer| peer.user_id.clone())
                 .collect();
             if let Some(user_ids) = room.announced.due(user_ids, now) {
@@ -1236,7 +1261,7 @@ impl Engine {
                 }
                 continue;
             }
-            if publisher.muted {
+            if !publisher.audible() {
                 continue;
             }
             publisher.speech.hear(data.ext_vals.audio_level, now);
@@ -1252,7 +1277,7 @@ impl Engine {
                 let Some(peer) = self.peers.get_mut(&listener) else {
                     continue;
                 };
-                if peer.deafened || !peer.connected {
+                if peer.deafened || peer.hushed || !peer.connected {
                     continue;
                 }
                 let Some(mid) = peer.slots.mid_of(&origin).copied() else {

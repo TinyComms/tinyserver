@@ -53,6 +53,8 @@ pub struct Limits {
     /// Joins and leaves one socket may make at once, and how often it gets one more back.
     pub call_move_burst: u32,
     pub call_move_every: Duration,
+    /// How often who was connected is written to `last_seen_at`, in one batch.
+    pub seen_every: Duration,
 }
 
 impl Default for Limits {
@@ -73,6 +75,7 @@ impl Default for Limits {
             call_server_max: 32,
             call_move_burst: 5,
             call_move_every: Duration::from_secs(3),
+            seen_every: Duration::from_secs(30),
         }
     }
 }
@@ -188,6 +191,7 @@ async fn upgrade(
         token: token.to_string(),
         user_id: identity.user_id,
         role: identity.role,
+        permissions: identity.permissions,
     };
     let frame = hub.limits.frame_bytes;
     ws.max_message_size(frame)

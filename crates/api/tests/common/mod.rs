@@ -177,8 +177,10 @@ pub async fn session(db: &TestDb, user_id: &str) -> String {
 /// Invites a person and signs them in through the db functions, with `email` as their subject.
 /// Returns the caller and a session token.
 pub async fn join(db: &TestDb, by: &Caller, email: &str, role: &str) -> (Caller, String) {
-    let Ok(Wrote::Fresh(issued)) = db::create_invite(&db.runtime, by, role, None).await else {
-        panic!("invite");
+    let issued = match db::create_invite(&db.runtime, by, role, None).await {
+        Ok(Wrote::Fresh(issued)) => issued,
+        Ok(Wrote::Replay(_)) => panic!("invite: a replay"),
+        Err(error) => panic!("invite: {error:?}"),
     };
     let signed_in = db::sign_in(
         &db.runtime,
@@ -199,7 +201,7 @@ pub async fn join(db: &TestDb, by: &Caller, email: &str, role: &str) -> (Caller,
 }
 
 pub async fn owner_count(db: &TestDb) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM memberships WHERE role = 'owner'")
+    sqlx::query_scalar("SELECT count(*) FROM memberships WHERE owner")
         .fetch_one(&db.owner)
         .await
         .expect("owner count")

@@ -96,6 +96,14 @@ async fn a_room_the_owner_makes_reaches_a_member() {
                 "name": "Lobby",
                 "created_by": owner.user_id,
                 "created_at": made.created_at,
+                "category_id": null,
+                "position": 0,
+                "topic": "",
+                "user_limit": 0,
+                "bitrate_kbps": 64,
+                "ptt_only": false,
+                "video_enabled": true,
+                "overrides": [],
             })
         );
 
@@ -106,7 +114,8 @@ async fn a_room_the_owner_makes_reaches_a_member() {
         assert_eq!(event["type"], "member.renamed", "{event}");
         assert_eq!(
             event["member"],
-            json!({"user_id": member.user_id, "display_name": "Renamed", "role": "member"})
+            json!({"user_id": member.user_id, "display_name": "Renamed", "role": "member",
+                   "owner": false, "roles": []})
         );
     })
     .await;
@@ -150,7 +159,7 @@ async fn invite_events_reach_admins_and_not_members() {
         assert_eq!(event["type"], "member.joined", "{event}");
         assert_eq!(
             event["member"],
-            json!({"user_id": joined_id, "display_name": "New", "role": "member"})
+            json!({"user_id": joined_id, "display_name": "New", "role": "member", "owner": false, "roles": []})
         );
 
         let Ok(Wrote::Fresh(second)) = db::create_invite(&db.runtime, &owner, "admin", None).await
@@ -179,6 +188,9 @@ async fn invite_events_reach_admins_and_not_members() {
         let event = durable(&mut member_ws).await;
         assert_eq!(event["type"], "member.role", "{event}");
         assert_eq!(event["member"]["role"], "admin");
+        let event = durable(&mut member_ws).await;
+        assert_eq!(event["type"], "member.roles", "{event}");
+        assert_eq!(event["member"]["roles"].as_array().map(Vec::len), Some(1));
         db::create_invite(&db.runtime, &owner, "member", None)
             .await
             .expect("invite");
@@ -212,6 +224,10 @@ async fn a_socket_resumes_from_since() {
         assert_eq!(renamed["type"], "room.renamed", "{renamed}");
         assert_eq!(renamed["room"]["name"], "Second");
         assert!(since < seq(&created) && seq(&created) < seq(&renamed));
+        // Clients from before room.updated read room.renamed; newer ones refetch on either.
+        let updated = durable(&mut ws).await;
+        assert_eq!(updated["type"], "room.updated", "{updated}");
+        assert_eq!(updated["room"]["name"], "Second");
 
         // Caught up, the same socket carries what happens next.
         db::delete_room(&db.runtime, &owner, &made.id)
@@ -282,7 +298,7 @@ async fn a_removed_member_is_closed_with_4003() {
         let (mut owner_ws, _) = connect(&server, &token, None).await;
         let (mut ws, _) = connect(&server, &member_token, None).await;
 
-        db::remove_member(&db.runtime, &owner, &member.user_id)
+        db::remove_member(&db.runtime, &owner, &member.user_id, None)
             .await
             .expect("remove");
         let event = durable(&mut ws).await;
@@ -733,7 +749,10 @@ async fn caps_refuse_a_full_room_and_a_full_server() {
             json!({"type": "call.join", "ref": "x", "room_id": lobby.id}),
         )
         .await;
-        assert_eq!(reply, json!({"type": "error", "ref": "x", "code": "full"}));
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "x", "code": "room_full"})
+        );
         let reply = ask(
             third,
             json!({"type": "call.join", "ref": "y", "room_id": games.id}),
@@ -850,7 +869,7 @@ async fn a_removed_member_leaves_their_call() {
             joined(&lobby.id, &member.user_id)
         );
 
-        db::remove_member(&db.runtime, &owner, &member.user_id)
+        db::remove_member(&db.runtime, &owner, &member.user_id, None)
             .await
             .expect("remove");
         assert_eq!(close_code(&mut member_ws).await, 4003);
@@ -892,8 +911,9 @@ async fn owners_and_admins_kick_and_the_kick_is_audited() {
         };
         let reply = ask(&mut member_ws, kick(&owner.user_id, "m")).await;
         assert_eq!(reply, json!({"type": "error", "ref": "m", "code": "forbidden"}));
+        // An admin ranks below an owner.
         let reply = ask(&mut admin_ws, kick(&owner.user_id, "o")).await;
-        assert_eq!(reply, json!({"type": "error", "ref": "o", "code": "forbidden"}));
+        assert_eq!(reply, json!({"type": "error", "ref": "o", "code": "hierarchy"}));
         let reply = ask(&mut admin_ws, kick(&admin.user_id, "n")).await;
         assert_eq!(reply, json!({"type": "error", "ref": "n", "code": "not_found"}));
 
@@ -936,6 +956,279 @@ async fn closing_the_hub_ends_every_call() {
         server.live.close();
         assert_eq!(close_code(&mut ws).await, 1012);
         assert!(server.live.closed(WAIT).await);
+    })
+    .await;
+}
+
+/// The next frame of type `kind`, skipping others.
+async fn until(ws: &mut Ws, kind: &str) -> Value {
+    loop {
+        let frame = durable(ws).await;
+        if frame["type"] == kind {
+            return frame;
+        }
+    }
+}
+
+/// Joins `room_id` with other sockets' frames possibly waiting, and reads to its own
+/// `call.joined`.
+async fn sit(ws: &mut Ws, room_id: &str, user_id: &str) {
+    let reply = answer(
+        ws,
+        json!({"type": "call.join", "ref": "j", "room_id": room_id}),
+    )
+    .await;
+    assert_eq!(reply, json!({"type": "ok", "ref": "j"}));
+    loop {
+        let frame = until(ws, "call.joined").await;
+        if frame["user_id"] == user_id {
+            assert_eq!(frame, joined(room_id, user_id));
+            return;
+        }
+    }
+}
+
+/// Reads frames until one of each type in `kinds` has come, in any order.
+async fn gather(ws: &mut Ws, kinds: &[&str]) -> Vec<Value> {
+    let mut found: Vec<Option<Value>> = vec![None; kinds.len()];
+    while found.iter().any(Option::is_none) {
+        let frame = durable(ws).await;
+        if let Some(at) = kinds.iter().position(|kind| frame["type"] == *kind) {
+            if found[at].is_none() {
+                found[at] = Some(frame);
+            }
+        }
+    }
+    found.into_iter().flatten().collect()
+}
+
+#[tokio::test]
+async fn server_mute_sticks_through_a_move_past_the_room_limit() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let games = room(&db, &owner, "Games").await;
+        let limit = db::RoomPatch {
+            user_limit: Some(1),
+            ..db::RoomPatch::default()
+        };
+        db::update_room(&db.runtime, &owner, &games.id, &limit)
+            .await
+            .expect("limit");
+        let (a, a_token) = join(&db, &owner, "a@tinyserver.test", "member").await;
+        let (b, b_token) = join(&db, &owner, "b@tinyserver.test", "member").await;
+        let server = serve(&db, Limits::default()).await;
+        let (mut owner_ws, _) = connect(&server, &owner_token(&db).await, None).await;
+        let (mut a_ws, _) = connect(&server, &a_token, None).await;
+        let (mut b_ws, _) = connect(&server, &b_token, None).await;
+
+        sit(&mut b_ws, &games.id, &b.user_id).await;
+        sit(&mut a_ws, &lobby.id, &a.user_id).await;
+        // Games holds one, the owner too.
+        let reply = answer(
+            &mut owner_ws,
+            json!({"type": "call.join", "ref": "g", "room_id": games.id}),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "g", "code": "room_full"})
+        );
+
+        let mute = json!({"type": "call.moderate", "ref": "m", "room_id": lobby.id,
+                          "user_id": a.user_id, "server_muted": true});
+        let reply = answer(&mut b_ws, mute.clone()).await;
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "m", "code": "forbidden"})
+        );
+        let reply = answer(&mut owner_ws, mute).await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "m"}));
+        let state = until(&mut a_ws, "call.state").await;
+        assert_eq!(state["user_id"], a.user_id);
+        assert_eq!(state["server_muted"], true);
+        assert_eq!(state["server_deafened"], false);
+        let reply = answer(
+            &mut owner_ws,
+            json!({"type": "call.moderate", "ref": "w", "room_id": games.id,
+                   "user_id": a.user_id, "server_deafened": true}),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "w", "code": "not_found"})
+        );
+        let reply = answer(
+            &mut owner_ws,
+            json!({"type": "call.moderate", "ref": "e", "room_id": lobby.id,
+                   "user_id": a.user_id}),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "e", "code": "bad_frame"})
+        );
+
+        // A member cannot move people; the owner moves a into the full room.
+        let to_games = json!({"type": "call.move", "ref": "v", "user_id": a.user_id,
+                              "room_id": games.id});
+        let reply = answer(&mut b_ws, to_games.clone()).await;
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "v", "code": "forbidden"})
+        );
+        let reply = answer(&mut owner_ws, to_games).await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "v"}));
+        let moved = until(&mut a_ws, "call.moved").await;
+        assert_eq!(moved, json!({"type": "call.moved", "room_id": games.id}));
+        let reply = answer(
+            &mut a_ws,
+            json!({"type": "call.join", "ref": "j", "room_id": games.id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "j"}));
+        assert_eq!(
+            until(&mut owner_ws, "call.left").await,
+            left(&lobby.id, &a.user_id, "moved")
+        );
+        let arrived = until(&mut owner_ws, "call.joined").await;
+        assert_eq!(arrived["room_id"], games.id);
+        assert_eq!(arrived["user_id"], a.user_id);
+        assert_eq!(arrived["server_muted"], true, "{arrived}");
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT action, subject_user_id::text FROM audit_log
+             WHERE action IN ('call.server_mute', 'call.move') ORDER BY id",
+        )
+        .fetch_all(&db.owner)
+        .await
+        .expect("audit");
+        assert_eq!(
+            rows,
+            vec![
+                ("call.server_mute".to_string(), Some(a.user_id.clone())),
+                ("call.move".to_string(), Some(a.user_id.clone())),
+            ]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn connect_and_speak_come_from_room_permissions() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let stage = room(&db, &owner, "Stage").await;
+        let hidden = room(&db, &owner, "Hidden").await;
+        let everyone = db::list_roles(&db.runtime, &owner)
+            .await
+            .expect("roles")
+            .into_iter()
+            .find(|role| role.default)
+            .expect("@everyone")
+            .id;
+        for (room_id, deny) in [
+            (&lobby.id, db::perm::CONNECT),
+            (&stage.id, db::perm::SPEAK),
+            (&hidden.id, db::perm::VIEW_CHANNEL),
+        ] {
+            db::set_override(&db.runtime, &owner, room_id, &everyone, Some((0, deny)))
+                .await
+                .expect("override");
+        }
+        let (a, a_token) = join(&db, &owner, "a@tinyserver.test", "member").await;
+        let server = serve(&db, Limits::default()).await;
+        let (mut a_ws, _) = connect(&server, &a_token, None).await;
+
+        for (room_id, code) in [(&lobby.id, "forbidden"), (&hidden.id, "not_found")] {
+            let reply = answer(
+                &mut a_ws,
+                json!({"type": "call.join", "ref": "x", "room_id": room_id}),
+            )
+            .await;
+            assert_eq!(reply, json!({"type": "error", "ref": "x", "code": code}));
+        }
+        let reply = answer(
+            &mut a_ws,
+            json!({"type": "call.join", "ref": "s", "room_id": stage.id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "s"}));
+        let joined = until(&mut a_ws, "call.joined").await;
+        assert_eq!(joined["suppressed"], true, "{joined}");
+
+        // Speak given back while they are in the call.
+        db::set_override(&db.runtime, &owner, &stage.id, &everyone, None)
+            .await
+            .expect("clear");
+        let state = until(&mut a_ws, "call.state").await;
+        assert_eq!(state["user_id"], a.user_id);
+        assert_eq!(state["suppressed"], false, "{state}");
+        // Priority needs priority_speaker: asking for it changes nothing.
+        let reply = answer(
+            &mut a_ws,
+            json!({"type": "call.state", "ref": "p", "muted": true, "deafened": false,
+                   "priority": true}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "p"}));
+        let state = until(&mut a_ws, "call.state").await;
+        assert_eq!(state["muted"], true);
+        assert_eq!(state["priority"], false);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_timeout_and_a_ban_end_calls_and_a_ban_closes_sockets() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let (a, a_token) = join(&db, &owner, "a@tinyserver.test", "member").await;
+        let (b, b_token) = join(&db, &owner, "b@tinyserver.test", "member").await;
+        let server = serve(&db, Limits::default()).await;
+        let (mut owner_ws, _) = connect(&server, &owner_token(&db).await, None).await;
+        let (mut a_ws, _) = connect(&server, &a_token, None).await;
+        let (mut b_ws, _) = connect(&server, &b_token, None).await;
+        sit(&mut a_ws, &lobby.id, &a.user_id).await;
+        sit(&mut b_ws, &lobby.id, &b.user_id).await;
+
+        let soon = (chrono::Utc::now() + chrono::Duration::minutes(10))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        db::set_timeout(&db.runtime, &owner, &a.user_id, Some(&soon), Some("calm"))
+            .await
+            .expect("timeout");
+        let frames = gather(&mut owner_ws, &["call.left", "member.timeout"]).await;
+        assert_eq!(frames[0], left(&lobby.id, &a.user_id, "timed_out"));
+        assert_eq!(frames[1]["timeout_until"], soon);
+        let reply = answer(
+            &mut a_ws,
+            json!({"type": "call.join", "ref": "t", "room_id": lobby.id}),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "t", "code": "timed_out"})
+        );
+
+        db::ban(&db.runtime, &owner, &b.user_id, Some("bye"), None)
+            .await
+            .expect("ban");
+        let frames = gather(
+            &mut owner_ws,
+            &["call.left", "member.banned", "member.removed"],
+        )
+        .await;
+        assert_eq!(frames[0], left(&lobby.id, &b.user_id, "banned"));
+        assert_eq!(frames[1]["ban"]["reason"], "bye");
+        assert_eq!(close_code(&mut b_ws).await, 4003);
+        // A member without ban_members does not see the ban, only the removal.
+        let removed = until(&mut a_ws, "member.removed").await;
+        assert_eq!(removed["user_id"], b.user_id);
+        let refused = attempt(&server, &b_token, "").await;
+        assert!(refused.is_err(), "the banned person's session is gone");
     })
     .await;
 }

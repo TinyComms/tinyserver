@@ -56,7 +56,7 @@ There is no owner password. The first start migrates and, while there is no owne
 docker compose logs tinyserver | grep -A2 'Owner invite'
 ```
 
-It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Tinyauth; that person becomes the owner. Until someone does, every start prints a new invite and the old one stops working. After that, starts leave the owner alone.
+It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Tinyauth; that person becomes the owner. Until someone does, a start keeps that invite while it works and prints a new one only once it has expired; lost it, run `tinyserver bootstrap --owner-invite` for a new one, and the old one stops working. After that, starts leave the owner alone.
 
 A server from before sign-in moved to OIDC still has its owner, but that account has no provider identity and cannot sign in. Make an owner invite anyway, sign in with it, and remove the old account from the member list:
 
@@ -79,7 +79,7 @@ Any provider with discovery, the authorization code flow, and a confidential cli
 | `TINYSERVER_OIDC_INTERNAL_URL` | Where tinyserver reaches the provider, when not at the issuer. |
 | `TINYSERVER_OIDC_GROUPS_CLAIM` | The ID token claim with the person's groups, an array or a comma list. `groups` unless set. |
 | `TINYSERVER_OIDC_MEMBER_GROUPS` | Comma list. Someone in one of these, or in an admin group, joins without an invite, audited as `member.join` with `via` `groups`. Unset is invite only. |
-| `TINYSERVER_OIDC_ADMIN_GROUPS` | Comma list. A member in one of these becomes admin when they sign in, audited as `member.role` with `via` `groups`. Leaving the group does not demote anyone; an owner or admin does that. No claim makes an owner. |
+| `TINYSERVER_OIDC_ADMIN_GROUPS` | Comma list. A member in one of these gets the admin role (the most senior role with manage_server or manage_roles, "Admin" on an upgraded server) when they sign in, audited as `member.role` with `via` `groups`. Leaving the group does not take it away; someone with manage_roles does that. No claim makes an owner. |
 | `TINYSERVER_SESSION_MAX_DAYS` | How long a session from sign-in lasts, 1 to 365, 30 unless set. Then tinyclient signs in again. Nothing extends a session, and no provider refresh token is kept. |
 
 Several providers at once: `TINYSERVER_OIDC_PROVIDERS=tinyauth,google`, then the same variables with the id after `OIDC_`, such as `TINYSERVER_OIDC_GOOGLE_ISSUER`, `TINYSERVER_OIDC_GOOGLE_CLIENT_SECRET_FILE`, and `TINYSERVER_OIDC_GOOGLE_NAME` for the name. The first is the default. A person is the pair of issuer and subject, so the same person at two providers is two accounts. Email never links accounts.

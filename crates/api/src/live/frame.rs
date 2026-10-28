@@ -4,15 +4,31 @@ use db::OutboxRow;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::call::Occupancy;
+use super::call::{Occupancy, Participant};
 
-/// Who may see a durable event. Invites follow the `invites_all` RLS rule.
+/// Who may see a durable event. Invites follow the invite RLS rule, bans the ban one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Audience {
     Everyone,
-    Managers,
+    /// create_invites or manage_invites.
+    Invites,
+    /// ban_members.
+    Bans,
     /// Acted on by the server, never sent.
     Server,
+}
+
+impl Audience {
+    /// Whether someone with server-wide `permissions` gets the frame.
+    pub fn admits(self, permissions: i64) -> bool {
+        use db::perm;
+        match self {
+            Self::Everyone => true,
+            Self::Invites => permissions & (perm::CREATE_INVITES | perm::MANAGE_INVITES) != 0,
+            Self::Bans => perm::has(permissions, perm::BAN_MEMBERS),
+            Self::Server => false,
+        }
+    }
 }
 
 /// One outbox row, serialised once and shared by every socket.
@@ -23,10 +39,10 @@ pub(crate) struct Event {
     pub audience: Audience,
     /// The person the event is about, for `member.*` and `session.ended`.
     pub subject: Option<String>,
-    /// The new role, for `member.role`.
-    pub role: Option<String>,
     /// The room, for `room.deleted`.
     pub room: Option<String>,
+    /// For `member.timeout`: a timeout was set, not ended.
+    pub timed_out: bool,
     pub frame: Option<String>,
 }
 
@@ -42,7 +58,9 @@ struct Durable<'a> {
 impl Event {
     pub fn from_row(row: OutboxRow) -> Self {
         let audience = if row.topic.starts_with("invite.") {
-            Audience::Managers
+            Audience::Invites
+        } else if row.topic == "member.banned" {
+            Audience::Bans
         } else if row.topic.starts_with("session.") {
             Audience::Server
         } else {
@@ -54,18 +72,19 @@ impl Event {
             .or_else(|| row.payload.get("user_id"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let role = member
-            .and_then(|member| member.get("role"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let room = row
             .payload
             .get("room_id")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let timed_out = row.topic == "member.timeout"
+            && row
+                .payload
+                .get("timeout_until")
+                .is_some_and(|until| !until.is_null());
         let frame = match audience {
             Audience::Server => None,
-            Audience::Everyone | Audience::Managers => {
+            Audience::Everyone | Audience::Invites | Audience::Bans => {
                 match serde_json::to_string(&Durable {
                     kind: &row.topic,
                     seq: row.seq,
@@ -84,8 +103,8 @@ impl Event {
             topic: row.topic,
             audience,
             subject,
-            role,
             room,
+            timed_out,
             frame,
         }
     }
@@ -103,6 +122,11 @@ pub(crate) struct Incoming {
     pub sdp: Option<String>,
     pub muted: Option<bool>,
     pub deafened: Option<bool>,
+    /// `call.state`: priority speaker held, honoured only with priority_speaker.
+    pub priority: Option<bool>,
+    /// `call.moderate`.
+    pub server_muted: Option<bool>,
+    pub server_deafened: Option<bool>,
     /// `call.quality`: `high`, `low`, or `off`.
     pub video: Option<String>,
 }
@@ -146,7 +170,11 @@ pub(crate) enum Out<'a> {
     #[serde(rename = "presence")]
     Presence { user_id: &'a str, online: bool },
     #[serde(rename = "call.joined")]
-    CallJoined { room_id: &'a str, user_id: &'a str },
+    CallJoined {
+        room_id: &'a str,
+        #[serde(flatten)]
+        participant: &'a Participant,
+    },
     #[serde(rename = "call.left")]
     CallLeft {
         room_id: &'a str,
@@ -156,12 +184,12 @@ pub(crate) enum Out<'a> {
     #[serde(rename = "call.state")]
     CallState {
         room_id: &'a str,
-        user_id: &'a str,
-        muted: bool,
-        deafened: bool,
-        camera: bool,
-        sharing: bool,
+        #[serde(flatten)]
+        participant: &'a Participant,
     },
+    /// To the person moved: leave and join `room_id`.
+    #[serde(rename = "call.moved")]
+    CallMoved { room_id: &'a str },
     /// The SFU's answer to `call.join` or `call.offer`.
     #[serde(rename = "call.answer")]
     CallAnswer {
@@ -232,13 +260,38 @@ mod tests {
     }
 
     #[test]
-    fn invites_go_to_managers_and_sessions_go_nowhere() {
+    fn invites_and_bans_go_to_who_may_see_them_and_sessions_go_nowhere() {
+        use db::perm;
         let invite = Event::from_row(OutboxRow {
             seq: 1,
             topic: "invite.created".to_string(),
             payload: json!({"invite": {"id": "i"}}),
         });
-        assert_eq!(invite.audience, Audience::Managers);
+        assert_eq!(invite.audience, Audience::Invites);
+        assert!(invite.audience.admits(perm::CREATE_INVITES));
+        assert!(invite.audience.admits(perm::MANAGE_INVITES));
+        assert!(!invite.audience.admits(perm::EVERYONE));
+        let ban = Event::from_row(OutboxRow {
+            seq: 2,
+            topic: "member.banned".to_string(),
+            payload: json!({"user_id": "u", "ban": {}}),
+        });
+        assert_eq!(ban.audience, Audience::Bans);
+        assert_eq!(ban.subject.as_deref(), Some("u"));
+        assert!(ban.audience.admits(perm::BAN_MEMBERS));
+        assert!(!ban.audience.admits(perm::KICK_MEMBERS));
+        let timeout = Event::from_row(OutboxRow {
+            seq: 3,
+            topic: "member.timeout".to_string(),
+            payload: json!({"member": {"user_id": "u"}, "timeout_until": "2026-01-01T00:00:00Z"}),
+        });
+        assert!(timeout.timed_out);
+        let ended = Event::from_row(OutboxRow {
+            seq: 4,
+            topic: "member.timeout".to_string(),
+            payload: json!({"member": {"user_id": "u"}, "timeout_until": null}),
+        });
+        assert!(!ended.timed_out);
         let ended = Event::from_row(OutboxRow {
             seq: 2,
             topic: "session.ended".to_string(),
@@ -250,14 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn a_member_event_names_its_subject_and_role() {
+    fn a_member_event_names_its_subject() {
         let event = Event::from_row(OutboxRow {
             seq: 3,
             topic: "member.role".to_string(),
             payload: json!({"member": {"user_id": "u", "display_name": "A", "role": "admin"}}),
         });
         assert_eq!(event.subject.as_deref(), Some("u"));
-        assert_eq!(event.role.as_deref(), Some("admin"));
     }
 
     #[test]
@@ -305,17 +357,35 @@ mod tests {
             speaking.text(),
             r#"{"type":"call.speaking","room_id":"r","user_ids":["u"]}"#
         );
-        let state = Out::CallState {
-            room_id: "r",
-            user_id: "u",
+        let participant = Participant {
+            user_id: "u".to_string(),
             muted: true,
             deafened: false,
             camera: true,
             sharing: false,
+            server_muted: false,
+            server_deafened: true,
+            suppressed: false,
+            priority: true,
+        };
+        let state = Out::CallState {
+            room_id: "r",
+            participant: &participant,
         };
         assert_eq!(
             state.text(),
-            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false,"camera":true,"sharing":false}"#
+            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false,"camera":true,"sharing":false,"server_muted":false,"server_deafened":true,"suppressed":false,"priority":true}"#
+        );
+        let joined = Out::CallJoined {
+            room_id: "r",
+            participant: &participant,
+        };
+        assert!(joined
+            .text()
+            .starts_with(r#"{"type":"call.joined","room_id":"r","user_id":"u","#));
+        assert_eq!(
+            Out::CallMoved { room_id: "r" }.text(),
+            r#"{"type":"call.moved","room_id":"r"}"#
         );
         let slots = Out::CallSlots {
             call_id: "c-1",
@@ -350,12 +420,16 @@ mod tests {
                     deafened: true,
                     camera: false,
                     sharing: true,
+                    server_muted: false,
+                    server_deafened: false,
+                    suppressed: false,
+                    priority: false,
                 }],
             }],
         };
         assert_eq!(
             ready.text(),
-            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true,"camera":false,"sharing":true}]}]}"#
+            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true,"camera":false,"sharing":true,"server_muted":false,"server_deafened":false,"suppressed":false,"priority":false}]}]}"#
         );
         let reference = json!("7");
         let error = Out::Error {

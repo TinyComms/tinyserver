@@ -6,12 +6,15 @@ use serde_json::Value;
 
 use crate::live::frame::{Event, Incoming, Out};
 
-const TOPICS: [&str; 6] = [
+const TOPICS: [&str; 9] = [
     "room.renamed",
     "room.deleted",
     "member.role",
     "member.removed",
+    "member.banned",
+    "member.timeout",
     "invite.created",
+    "role.updated",
     "session.ended",
 ];
 

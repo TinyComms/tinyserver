@@ -103,7 +103,7 @@ async fn a_member_changes_a_name_and_signs_out_everywhere() {
 
         // Removal ends sessions, and an invite back does not revive them.
         let kept = session(&db, &guest.user_id).await;
-        remove_member(pool, &owner, &guest.user_id)
+        remove_member(pool, &owner, &guest.user_id, None)
             .await
             .expect("remove");
         assert!(current_session(pool, &kept).await.is_err());
@@ -128,7 +128,7 @@ async fn a_member_changes_a_name_and_signs_out_everywhere() {
         );
         assert!(current_session(pool, &kept).await.is_err());
 
-        let actions: Vec<String> = list_audit(pool, &owner, 50)
+        let actions: Vec<String> = list_audit(pool, &owner, &db::AuditQuery::latest(50))
             .await
             .expect("audit")
             .into_iter()
