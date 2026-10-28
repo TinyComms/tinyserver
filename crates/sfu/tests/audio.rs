@@ -67,6 +67,42 @@ async fn a_muted_publisher_is_not_forwarded() {
 }
 
 #[tokio::test]
+async fn a_server_muted_publisher_is_not_forwarded_and_a_server_deafened_listener_hears_nothing() {
+    let mut sfu = start(config());
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    let a_slots = sfu.slots_for(&a.call_id, 1).await;
+    let b_slots = sfu.slots_for(&b.call_id, 1).await;
+    a.running.sending(true);
+    b.running.sending(true);
+    hears(&b, &mid_of(&b_slots, "a"), b'A').await;
+
+    // Server mute: the client still sends and thinks it is unmuted.
+    sfu.media.moderate(&a.call_id, true, false);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let silenced = heard_over(&b, Duration::from_millis(400)).await;
+    assert!(
+        silenced.is_empty(),
+        "server muted but forwarded: {silenced:?}"
+    );
+    // a still hears b.
+    hears(&a, &mid_of(&a_slots, "b"), b'B').await;
+
+    // Server deafen on a: b's audio stops reaching a, a's own (now unmuted) audio flows.
+    sfu.media.moderate(&a.call_id, false, true);
+    hears(&b, &mid_of(&b_slots, "a"), b'A').await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let hushed = heard_over(&a, Duration::from_millis(400)).await;
+    assert!(
+        hushed.is_empty(),
+        "server deafened but sent audio: {hushed:?}"
+    );
+
+    sfu.media.moderate(&a.call_id, false, false);
+    hears(&a, &mid_of(&a_slots, "b"), b'B').await;
+}
+
+#[tokio::test]
 async fn a_killed_peer_is_dropped_after_the_consent_timeout() {
     let mut sfu = start(config());
     let a = join(&mut sfu, "r", "a", b'A').await;
