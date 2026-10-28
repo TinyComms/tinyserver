@@ -233,7 +233,7 @@ async fn an_invite_lets_a_person_in_and_they_come_back_without_it() {
                 .await
                 .expect("identity");
         assert_eq!(identity, (provider.issuer.clone(), "moss".to_string()));
-        let audit = db::list_audit(&db.runtime, &owner, 20)
+        let audit = db::list_audit(&db.runtime, &owner, &db::AuditQuery::latest(20))
             .await
             .expect("audit");
         assert!(audit.iter().any(|row| row.action == "invite.accept"
@@ -818,7 +818,7 @@ async fn groups_let_people_join_and_make_admins_but_never_owners() {
         assert_eq!(kept.role, "owner");
         assert_eq!(kept.user_id, owner.user_id);
         let owners: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM memberships WHERE role = 'owner'")
+            sqlx::query_scalar("SELECT count(*) FROM memberships WHERE owner")
                 .fetch_one(&db.owner)
                 .await
                 .expect("owners");

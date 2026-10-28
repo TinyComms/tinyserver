@@ -96,8 +96,8 @@ async fn concurrent_demotions_and_removals_leave_one_owner() {
     run(|db| async move {
         let (first, second) = two_owners(&db).await;
         let (a, b) = tokio::join!(
-            remove_member(&db.runtime, &first, &second.user_id),
-            remove_member(&db.runtime, &second, &first.user_id),
+            remove_member(&db.runtime, &first, &second.user_id, None),
+            remove_member(&db.runtime, &second, &first.user_id, None),
         );
         assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1, "{a:?} {b:?}");
         assert_eq!(owner_count(&db).await, 1);
@@ -185,17 +185,35 @@ async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
         assert_eq!(owner.role, "owner");
         let guest_email = "guest@tinyserver.test";
 
-        let Ok(Wrote::Fresh(room)) = create_room(&db.runtime, &owner, "Moss", Some("room")).await
+        let Ok(Wrote::Fresh(room)) = create_room(
+            &db.runtime,
+            &owner,
+            &db::NewRoom::named("Moss"),
+            Some("room"),
+        )
+        .await
         else {
             panic!("room");
         };
-        let Ok(Wrote::Replay(body)) = create_room(&db.runtime, &owner, "Moss", Some("room")).await
+        let Ok(Wrote::Replay(body)) = create_room(
+            &db.runtime,
+            &owner,
+            &db::NewRoom::named("Moss"),
+            Some("room"),
+        )
+        .await
         else {
             panic!("replay");
         };
         assert_eq!(body["id"].as_str(), Some(room.id.as_str()));
         assert!(matches!(
-            create_room(&db.runtime, &owner, "Other", Some("room")).await,
+            create_room(
+                &db.runtime,
+                &owner,
+                &db::NewRoom::named("Other"),
+                Some("room")
+            )
+            .await,
             Err(CommunityError::IdempotencyConflict)
         ));
         assert!(list_rooms(&db.runtime, &owner)
@@ -237,13 +255,13 @@ async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
             .expect("members")
             .iter()
             .any(|member| member.user_id == guest.user_id && member.role == "member"));
-        assert!(list_audit(&db.runtime, &owner, 20)
+        assert!(list_audit(&db.runtime, &owner, &db::AuditQuery::latest(20))
             .await
             .expect("audit")
             .iter()
             .any(|row| row.action == "invite.accept"));
 
-        remove_member(&db.runtime, &owner, &guest.user_id)
+        remove_member(&db.runtime, &owner, &guest.user_id, None)
             .await
             .expect("remove");
         assert!(db::current_session(&db.runtime, &guest_token)

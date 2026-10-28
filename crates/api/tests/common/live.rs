@@ -123,7 +123,7 @@ pub async fn ping(ws: &mut Ws) {
 
 pub async fn owner_token(db: &TestDb) -> String {
     let owner: String = sqlx::query_scalar(
-        "SELECT user_id::text FROM memberships WHERE role = 'owner' ORDER BY created_at LIMIT 1",
+        "SELECT user_id::text FROM memberships WHERE owner ORDER BY created_at LIMIT 1",
     )
     .fetch_one(&db.owner)
     .await
@@ -132,10 +132,11 @@ pub async fn owner_token(db: &TestDb) -> String {
 }
 
 pub async fn room(db: &TestDb, owner: &Caller, name: &str) -> db::Room {
-    let Ok(Wrote::Fresh(room)) = db::create_room(&db.runtime, owner, name, None).await else {
-        panic!("create room");
-    };
-    room
+    match db::create_room(&db.runtime, owner, &db::NewRoom::named(name), None).await {
+        Ok(Wrote::Fresh(room)) => room,
+        Ok(Wrote::Replay(_)) => panic!("create room: a replay"),
+        Err(error) => panic!("create room: {error:?}"),
+    }
 }
 
 pub fn seq(value: &Value) -> i64 {
@@ -170,8 +171,27 @@ pub async fn enter(ws: &mut Ws, room_id: &str, user_id: &str) {
     assert_eq!(durable(ws).await, joined(room_id, user_id));
 }
 
+/// `call.joined` for someone who just joined with no moderation and speak allowed.
 pub fn joined(room_id: &str, user_id: &str) -> Value {
-    json!({"type": "call.joined", "room_id": room_id, "user_id": user_id})
+    let mut frame = participant(user_id);
+    frame["type"] = json!("call.joined");
+    frame["room_id"] = json!(room_id);
+    frame
+}
+
+/// A participant as `ready`, `call.joined`, and `call.state` show them, all flags off.
+pub fn participant(user_id: &str) -> Value {
+    json!({
+        "user_id": user_id,
+        "muted": false,
+        "deafened": false,
+        "camera": false,
+        "sharing": false,
+        "server_muted": false,
+        "server_deafened": false,
+        "suppressed": false,
+        "priority": false,
+    })
 }
 
 pub fn left(room_id: &str, user_id: &str, reason: &str) -> Value {
@@ -181,7 +201,7 @@ pub fn left(room_id: &str, user_id: &str, reason: &str) -> Value {
 pub fn occupancy(room_id: &str, user_ids: &[&str]) -> Value {
     let participants: Vec<Value> = user_ids
         .iter()
-        .map(|user_id| json!({"user_id": user_id, "muted": false, "deafened": false, "camera": false, "sharing": false}))
+        .map(|user_id| participant(user_id))
         .collect();
     json!({"room_id": room_id, "participants": participants})
 }

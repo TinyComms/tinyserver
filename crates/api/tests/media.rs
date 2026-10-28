@@ -388,7 +388,7 @@ async fn mute_is_shown_to_everyone_and_stops_forwarding() {
         let mute = json!({"type": "call.state", "ref": "m", "muted": true, "deafened": false});
         let reply = answer(&mut a.ws, mute).await;
         assert_eq!(reply, json!({"type": "ok", "ref": "m"}));
-        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false, "camera": false, "sharing": false});
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false, "camera": false, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false});
         until(&mut b.ws, |value| (*value == shown).then_some(())).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let muted = heard_over(&b, Duration::from_millis(400)).await;
@@ -597,7 +597,7 @@ async fn a_camera_is_shown_to_everyone_and_reaches_the_other_listener() {
         slots(&mut b.ws, &b.call_id, 1).await;
 
         camera(&mut a, true).await;
-        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": true, "sharing": false});
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": true, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false});
         until(&mut b.ws, |value| (*value == shown).then_some(())).await;
         let video = video_slot(&mut b.ws, &b.call_id, Some(&a.user_id)).await;
         assert_eq!(video["kind"], "camera");
@@ -615,7 +615,7 @@ async fn a_camera_is_shown_to_everyone_and_reaches_the_other_listener() {
         assert_eq!(answer(&mut b.ws, bad).await["code"], "bad_frame");
 
         camera(&mut a, false).await;
-        let hidden = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": false, "sharing": false});
+        let hidden = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": false, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false});
         until(&mut b.ws, |value| (*value == hidden).then_some(())).await;
         video_slot(&mut b.ws, &b.call_id, None).await;
     })
@@ -696,7 +696,7 @@ async fn goes_quiet(person: &Person) {
 
 /// The `call.state` everyone sees for `user_id` with a camera and share as given.
 fn state(room_id: &str, user_id: &str, camera: bool, sharing: bool) -> Value {
-    json!({"type": "call.state", "room_id": room_id, "user_id": user_id, "muted": false, "deafened": false, "camera": camera, "sharing": sharing})
+    json!({"type": "call.state", "room_id": room_id, "user_id": user_id, "muted": false, "deafened": false, "camera": camera, "sharing": sharing, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false})
 }
 
 /// Waits for this socket's `call.slots` whose video slot carries `user_id`'s share, then for
@@ -878,7 +878,7 @@ async fn an_admin_ends_a_members_share_but_not_an_owners_and_it_is_audited() {
         sees_share(&mut m, &owner.user_id, b'O').await;
         assert_eq!(
             answer(&mut a.ws, end.clone()).await,
-            json!({"type": "error", "ref": "e", "code": "forbidden"})
+            json!({"type": "error", "ref": "e", "code": "hierarchy"})
         );
         let (_, ready) = connect(&server, &owner_token, None).await;
         assert_eq!(ready["calls"][0]["participants"][0]["sharing"], true);
@@ -947,6 +947,70 @@ async fn a_tcp_client_gets_the_share_through_the_live_socket() {
         let mut b = dial_with(ws, client, &cast.members[0].0, &cast.lobby, b'B').await;
         share(&mut a, true).await;
         sees_share(&mut b, &cast.owner.0, b'A').await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn server_mute_and_deafen_reach_the_sfu() {
+    run(|db| async move {
+        let cast = cast(&db).await;
+        let ws = socket(&cast, &cast.owner).await;
+        let mut o = dial(ws, &cast.owner.0, &cast.lobby, b'O').await;
+        let ws = socket(&cast, &cast.members[0]).await;
+        let mut m = dial(ws, &cast.members[0].0, &cast.lobby, b'M').await;
+        let o_slots = slots(&mut o.ws, &o.call_id, 1).await;
+        let m_slots = slots(&mut m.ws, &m.call_id, 1).await;
+        o.running.sending(true);
+        m.running.sending(true);
+        hears(&o, &mid_for(&o_slots, &m.user_id), b'M').await;
+        hears(&m, &mid_for(&m_slots, &o.user_id), b'O').await;
+
+        // Server mute: the member still sends, and the owner stops hearing them.
+        let mute = json!({"type": "call.moderate", "ref": "s", "room_id": cast.lobby,
+                          "user_id": m.user_id, "server_muted": true});
+        assert_eq!(
+            answer(&mut o.ws, mute).await,
+            json!({"type": "ok", "ref": "s"})
+        );
+        until(&mut m.ws, |value| {
+            (value["type"] == "call.state" && value["server_muted"] == true).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let silenced = heard_over(&o, Duration::from_millis(400)).await;
+        assert!(
+            silenced.is_empty(),
+            "server muted but forwarded: {silenced:?}"
+        );
+        hears(&m, &mid_for(&m_slots, &o.user_id), b'O').await;
+
+        // Server deafen, mute undone: the member is heard again and hears nothing.
+        let deafen = json!({"type": "call.moderate", "ref": "d", "room_id": cast.lobby,
+                            "user_id": m.user_id, "server_muted": false,
+                            "server_deafened": true});
+        assert_eq!(
+            answer(&mut o.ws, deafen).await,
+            json!({"type": "ok", "ref": "d"})
+        );
+        hears(&o, &mid_for(&o_slots, &m.user_id), b'M').await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let hushed = heard_over(&m, Duration::from_millis(400)).await;
+        assert!(
+            hushed.is_empty(),
+            "server deafened but sent audio: {hushed:?}"
+        );
+
+        let (_, ready) = connect(&cast.server, &cast.owner.1, None).await;
+        let member = ready["calls"][0]["participants"]
+            .as_array()
+            .expect("participants")
+            .iter()
+            .find(|person| person["user_id"] == m.user_id)
+            .cloned()
+            .expect("member");
+        assert_eq!(member["server_deafened"], true);
+        assert_eq!(member["server_muted"], false);
     })
     .await;
 }

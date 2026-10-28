@@ -138,7 +138,7 @@ async fn a_member_cannot_make_rooms_or_invites_or_read_the_audit() {
         assert_eq!(sqlstate(&error), "42501");
         drop(tx);
 
-        let audit = db::list_audit(&db.runtime, &owner, 50).await.expect("audit");
+        let audit = db::list_audit(&db.runtime, &owner, &db::AuditQuery::latest(50)).await.expect("audit");
         assert!(audit.iter().any(|row| row.action == "invite.accept"));
     })
     .await;
@@ -175,11 +175,12 @@ async fn an_admin_cannot_change_or_remove_an_owner() {
             .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
-        let roles: Vec<String> =
-            sqlx::query_scalar("SELECT role FROM memberships ORDER BY created_at")
-                .fetch_all(&db.owner)
-                .await
-                .expect("roles");
+        let roles: Vec<String> = sqlx::query_scalar(
+            "SELECT app_member_role(user_id) FROM memberships ORDER BY created_at",
+        )
+        .fetch_all(&db.owner)
+        .await
+        .expect("roles");
         assert_eq!(roles, ["owner", "admin"]);
     })
     .await;
