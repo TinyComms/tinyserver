@@ -864,11 +864,14 @@ impl Provider {
         let name = claims
             .name()
             .and_then(|name| name.get(None))
-            .map(|name| name.as_str().to_string())
+            .map(|name| name.as_str().trim().to_string())
+            // Pocket ID sends an empty name when someone left first and last name blank.
+            .filter(|name| !name.is_empty())
             .or_else(|| {
                 claims
                     .preferred_username()
-                    .map(|name| name.as_str().to_string())
+                    .map(|name| name.as_str().trim().to_string())
+                    .filter(|name| !name.is_empty())
             });
         let extra = &claims.additional_claims().claims;
         let sid = extra
