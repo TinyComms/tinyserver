@@ -103,6 +103,7 @@ async fn a_room_the_owner_makes_reaches_a_member() {
                 "bitrate_kbps": 64,
                 "ptt_only": false,
                 "video_enabled": true,
+                "e2ee_required": false,
                 "overrides": [],
             })
         );

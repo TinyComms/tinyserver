@@ -748,7 +748,7 @@ async fn overrides_shape_room_permissions_and_visibility() {
             Method::PATCH,
             &format!("/v1/rooms/{}", stage.id),
             json!({"topic": "Shows", "user_limit": 5, "bitrate_kbps": 96, "ptt_only": true,
-                   "video_enabled": false}),
+                   "video_enabled": false, "e2ee_required": true}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{room}");
@@ -757,6 +757,7 @@ async fn overrides_shape_room_permissions_and_visibility() {
         assert_eq!(room["bitrate_kbps"], 96);
         assert_eq!(room["ptt_only"], true);
         assert_eq!(room["video_enabled"], false);
+        assert_eq!(room["e2ee_required"], true);
         assert_eq!(room["name"], "Stage");
         for bad in [json!({"bitrate_kbps": 8}), json!({"user_limit": 100})] {
             let (status, _) = send(

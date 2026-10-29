@@ -79,6 +79,8 @@ pub struct Room {
     pub bitrate_kbps: i32,
     pub ptt_only: bool,
     pub video_enabled: bool,
+    /// Only apps that encrypt end to end may join its call.
+    pub e2ee_required: bool,
     pub overrides: Vec<Override>,
     /// What the caller may do in this room.
     pub my_permissions: i64,
@@ -94,6 +96,7 @@ pub struct NewRoom {
     pub bitrate_kbps: Option<i32>,
     pub ptt_only: Option<bool>,
     pub video_enabled: Option<bool>,
+    pub e2ee_required: Option<bool>,
 }
 
 impl NewRoom {
@@ -118,6 +121,7 @@ pub struct RoomPatch {
     pub bitrate_kbps: Option<i32>,
     pub ptt_only: Option<bool>,
     pub video_enabled: Option<bool>,
+    pub e2ee_required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -242,7 +246,7 @@ fn room_select(filter: &str) -> String {
                                      'role_id', o.role_id::text, 'allow', o.allow,
                                      'deny', o.deny) ORDER BY o.role_id)
                           FROM room_overrides o WHERE o.room_id = r.id), '[]'::jsonb),
-                app_room_perms_of(r.id, app_uid())
+                app_room_perms_of(r.id, app_uid()), r.e2ee_required
          FROM rooms r
          LEFT JOIN categories c ON c.id = r.category_id
          {filter}
@@ -308,12 +312,12 @@ pub async fn create_room(
     }
     let id: String = sqlx::query_scalar(
         "INSERT INTO rooms (name, created_by, category_id, position, topic, user_limit,
-                            bitrate_kbps, ptt_only, video_enabled)
+                            bitrate_kbps, ptt_only, video_enabled, e2ee_required)
          VALUES ($1, $2::uuid, $3::uuid,
                  (SELECT coalesce(max(position) + 1, 0) FROM rooms
                   WHERE category_id IS NOT DISTINCT FROM $3::uuid),
                  coalesce($4, ''), coalesce($5, 0), coalesce($6, 64), coalesce($7, false),
-                 coalesce($8, true))
+                 coalesce($8, true), coalesce($9, false))
          RETURNING id::text",
     )
     .bind(&name)
@@ -324,6 +328,7 @@ pub async fn create_room(
     .bind(input.bitrate_kbps)
     .bind(input.ptt_only)
     .bind(input.video_enabled)
+    .bind(input.e2ee_required)
     .fetch_one(&mut *tx)
     .await
     .map_err(from_sql)?;
@@ -398,7 +403,8 @@ pub async fn update_room(
              ptt_only = coalesce($6, ptt_only),
              video_enabled = coalesce($7, video_enabled),
              category_id = CASE WHEN $8 THEN $9::uuid ELSE category_id END,
-             position = coalesce($10, position)
+             position = coalesce($10, position),
+             e2ee_required = coalesce($11, e2ee_required)
          WHERE id = $1::uuid",
     )
     .bind(id)
@@ -411,6 +417,7 @@ pub async fn update_room(
     .bind(move_category)
     .bind(category.as_deref())
     .bind(position)
+    .bind(patch.e2ee_required)
     .execute(&mut *tx)
     .await
     .map_err(from_sql)?;
@@ -477,6 +484,9 @@ fn patch_value(patch: &RoomPatch) -> Value {
     }
     if let Some(video) = patch.video_enabled {
         changes.insert("video_enabled".into(), Value::from(video));
+    }
+    if let Some(required) = patch.e2ee_required {
+        changes.insert("e2ee_required".into(), Value::from(required));
     }
     Value::Object(changes)
 }
@@ -1339,6 +1349,7 @@ pub(crate) fn room_event(room: &Room) -> Value {
         "bitrate_kbps": room.bitrate_kbps,
         "ptt_only": room.ptt_only,
         "video_enabled": room.video_enabled,
+        "e2ee_required": room.e2ee_required,
         "overrides": room.overrides,
     }})
 }
@@ -1373,6 +1384,7 @@ fn room_from(row: &PgRow) -> Result<Room, CommunityError> {
         bitrate_kbps: row.try_get(8).map_err(from_sql)?,
         ptt_only: row.try_get(9).map_err(from_sql)?,
         video_enabled: row.try_get(10).map_err(from_sql)?,
+        e2ee_required: row.try_get(13).map_err(from_sql)?,
         overrides: serde_json::from_value(overrides).map_err(|_| CommunityError::Invalid)?,
         my_permissions: row.try_get(12).map_err(from_sql)?,
     })

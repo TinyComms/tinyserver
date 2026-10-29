@@ -60,6 +60,8 @@ struct RoomBody {
     ptt_only: Option<bool>,
     #[serde(default)]
     video_enabled: Option<bool>,
+    #[serde(default)]
+    e2ee_required: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +82,8 @@ struct RoomPatchBody {
     ptt_only: Option<bool>,
     #[serde(default)]
     video_enabled: Option<bool>,
+    #[serde(default)]
+    e2ee_required: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -271,6 +275,7 @@ async fn add_room(
         bitrate_kbps: body.bitrate_kbps,
         ptt_only: body.ptt_only,
         video_enabled: body.video_enabled,
+        e2ee_required: body.e2ee_required,
     };
     let wrote = create_room(&pool, &caller, &input, idempotency_key(&headers))
         .await
@@ -297,6 +302,7 @@ async fn edit_room(
         bitrate_kbps: body.bitrate_kbps,
         ptt_only: body.ptt_only,
         video_enabled: body.video_enabled,
+        e2ee_required: body.e2ee_required,
     };
     update_room(&pool, &caller, &id, &patch)
         .await
