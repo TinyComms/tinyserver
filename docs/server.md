@@ -65,7 +65,7 @@ Every route needs a session. "Any member" means any signed-in member.
 
 ### Capabilities and me
 
-`GET /v1/capabilities` (any member) → `{"version": "0.1.0", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation"]}`.
+`GET /v1/capabilities` (any member) → `{"version": "0.1.0", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls"]}`. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`.
 
 `GET /v1/me` and `PATCH /v1/me` add `owner`, `roles [id]` (most senior first), `permissions` (base), and `rank`.
 
@@ -122,11 +122,11 @@ Every route needs a session. "Any member" means any signed-in member.
 
 ### Rooms
 
-`GET /v1/rooms` rows add `category_id`, `position`, `topic`, `user_limit` (0 is the server's room cap), `bitrate_kbps` (16 to 128, default 64), `ptt_only`, `video_enabled`, `overrides [{role_id, allow, deny}]`, and `my_permissions`. Rooms the caller cannot view are left out; owners see all. Rooms come uncategorized first, then by category, each by `position`.
+`GET /v1/rooms` rows add `category_id`, `position`, `topic`, `user_limit` (0 is the server's room cap), `bitrate_kbps` (16 to 128, default 64), `ptt_only`, `video_enabled`, `e2ee_required` (default false), `overrides [{role_id, allow, deny}]`, and `my_permissions`. Rooms the caller cannot view are left out; owners see all. Rooms come uncategorized first, then by category, each by `position`.
 
-`POST /v1/rooms` takes `{name, category_id?, topic?, user_limit?, bitrate_kbps?, ptt_only?, video_enabled?}` (manage_channels); `PATCH /v1/rooms/{id}` any of those and `position` (manage_channels in that room). `PUT /v1/rooms/{id}/overrides/{role_id}` `{allow, deny}` and `DELETE` set and clear one role's override; they need manage_roles and manage_channels in the room, and the role below the caller. Bits outside the room set are dropped; a bit in both is allowed. Audited `room.update` and `room.override`.
+`POST /v1/rooms` takes `{name, category_id?, topic?, user_limit?, bitrate_kbps?, ptt_only?, video_enabled?, e2ee_required?}` (manage_channels); `PATCH /v1/rooms/{id}` any of those and `position` (manage_channels in that room). `PUT /v1/rooms/{id}/overrides/{role_id}` `{allow, deny}` and `DELETE` set and clear one role's override; they need manage_roles and manage_channels in the room, and the role below the caller. Bits outside the room set are dropped; a bit in both is allowed. Audited `room.update` and `room.override`.
 
-Clients encode at `bitrate_kbps`; `ptt_only` and `voice_activity` are honoured by the client. The SFU is unchanged by them.
+Clients encode at `bitrate_kbps`; `ptt_only` and `voice_activity` are honoured by the client. The SFU is unchanged by them. `e2ee_required` is the server's: while media runs, a `call.join` without `e2ee` to that room gets `e2ee_required` and takes no seat. People already in the call when it is turned on stay; the call is transport only until they leave. It is a promise the server makes, not one the apps can check: see the threat model in [`calls.md`](calls.md#what-it-protects-and-what-it-does-not). Migration [`0007_e2ee.sql`](../crates/db/migrations/0007_e2ee.sql) adds the column and makes `app_call_access` return it; nothing else about end-to-end encryption is stored.
 
 ### Invites
 

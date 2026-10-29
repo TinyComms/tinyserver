@@ -1,6 +1,6 @@
 # Calls
 
-Design for voice and video in tinyserver. Slices 1 to 6, the live socket, call occupancy, audio through the SFU over UDP, ICE-TCP with hardening, camera video, and screen share, are built; relay mode is not. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
+Design for voice and video in tinyserver. Slices 1 to 6, the live socket, call occupancy, audio through the SFU over UDP, ICE-TCP with hardening, camera video, and screen share, are built, and so is end-to-end encryption for audio; relay mode is not. Read it with [`README.md`](../README.md), [`deploy/README.md`](../deploy/README.md), and [`crates/sfu/src/lib.rs`](../crates/sfu/src/lib.rs).
 
 ## Recommendation
 
@@ -12,6 +12,7 @@ A room is a voice channel. People drop in and out; nobody rings anyone. Signalin
 | Durable fan-out | `outbox` row in the same transaction as the change, `LISTEN app_wake`, one in-process broadcast |
 | Ephemeral state | Presence, occupancy, speaking, signaling. Memory only |
 | Media | WebRTC through str0m 0.24 in `crates/sfu`, ICE-lite, DTLS-SRTP |
+| End to end | MLS between the apps (DAVE's design), the server only relaying it, when every app in the call can |
 | Audio | Opus, mono, 32 kb/s, in-band FEC, DTX |
 | Video | H.264 constrained baseline. Camera simulcast in two layers. One share per room, in one layer |
 | What each listener receives | Every speaker's audio, and one video: the share if there is one, otherwise the active speaker |
@@ -105,7 +106,7 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 
 | `type` | Fields | When |
 | --- | --- | --- |
-| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants [participant]}]` | First frame after connect. Snapshot of everything ephemeral. `online` is sorted and includes the caller. `calls` lists rooms with anyone in them, sorted by `room_id`, participants in join order. A participant is `{user_id, muted, deafened, camera, sharing, server_muted, server_deafened, suppressed, priority}`; later versions may add fields. |
+| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants [participant]}]` | First frame after connect. Snapshot of everything ephemeral. `online` is sorted and includes the caller. `calls` lists rooms with anyone in them, sorted by `room_id`, participants in join order. A participant is `{user_id, muted, deafened, camera, sharing, server_muted, server_deafened, suppressed, priority, e2ee}`; later versions may add fields. `e2ee` is whether they joined able to encrypt end to end. |
 | `server.updated` | `seq`, `server` | Durable. `server` is `GET /v1/server`. |
 | `role.created`, `role.updated` | `seq`, `role` | Durable. `role` is a `GET /v1/roles` row. |
 | `role.deleted` | `seq`, `role_id` | Durable |
@@ -130,6 +131,7 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `call.answer` | `ref`, `call_id`, `sdp` | Reply to a `call.join` with an offer, in place of `ok`, and to `call.offer`. Sent before the `call.joined` or `call.state` it caused. `call_id` names this media session; a rejoin gets a new one. |
 | `call.slots` | `call_id`, `audio [{mid, user_id}]`, `video` | Which receive slot carries whom. The whole map, sent to the socket in the call whenever it changes, and once after `call.answer`. `video` is `{mid, user_id, kind}` while the video slot carries someone, else `null`. `kind` is `camera` or `share`. It changes when the SFU writes the new source's first keyframe, so reset the video decoder then. |
 | `call.speaking` | `room_id`, `user_ids` | Who is speaking, in join order. Sent when it changes, at most 4 a second, to the sockets in that room's call only |
+| `call.e2ee` | `room_id`, `op`, and the op's fields | End-to-end encryption for the call this socket holds a seat in: `start`, `off`, `proposals`, `commit`, `welcome`. See [End-to-end encryption](#end-to-end-encryption). |
 | `resync` | none | The server closes with `4002` next. Client refetches rooms and members, then reconnects with no `since`. |
 | `error` | `ref`, `code` | A client request failed. `ref` is echoed when the request had one. |
 | `pong` | none | Reply to `ping` |
@@ -139,7 +141,8 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `ping` | none | Keepalive |
-| `call.join` | `ref`, `room_id`, `sdp` | Join the room's call. Leaves any other call first. `sdp` is the offer. While media runs it is required; without media, a join with it gets `media_unavailable` and a join without it takes a seat with no audio, as in slice 2. |
+| `call.join` | `ref`, `room_id`, `sdp`, `e2ee` | Join the room's call. Leaves any other call first. `sdp` is the offer. While media runs it is required; without media, a join with it gets `media_unavailable` and a join without it takes a seat with no audio, as in slice 2. `e2ee` is optional: the highest end-to-end encryption version the app speaks, `1` today. |
+| `call.e2ee` | `op`, and the op's fields | MLS for the caller's call: `key_package`, `commit`, `invalid`. No `ok`: the frames that follow answer it. See [End-to-end encryption](#end-to-end-encryption). |
 | `call.leave` | `ref` | Hang up. Not being in a call is not an error. Closing the socket that joined does the same after a 10 s grace. |
 | `call.kick` | `ref`, `room_id`, `user_id` | disconnect_members in that room, and a rank above the person. Removes them from that room's call. Audited. |
 | `call.share_end` | `ref`, `room_id` | disconnect_members in that room, and a rank above the sharer. Ends the screen share in that room's call. Audited. The sharer's m-line keeps sending until they renegotiate; the SFU drops it, and the share stays ended until an offer sets that m-line `inactive` and a later one starts it again. |
@@ -167,6 +170,8 @@ Error codes:
 | `bad_frame` | Not a JSON object with a `type`, or a request without a field it needs. A `call.moderate` with neither `server_muted` nor `server_deafened`. A `call.join` without `sdp` while media runs. A `call.quality` whose `video` is not `high`, `low`, or `off`. A `call.share_end` without `room_id`. |
 | `bad_sdp` | The SFU could not parse or accept the offer, or the offer is over the caps: 32 KiB, more audio m-lines than the room cap, more than 3 video m-lines, or any other kind of m-line |
 | `media_unavailable` | A `call.join` or `call.offer` with an offer on a server without media, or with the SFU stopped |
+| `e2ee_required` | A `call.join` without `e2ee` to a room whose `e2ee_required` is on, while media runs. No seat is taken. |
+| `bad_e2ee` | A `call.e2ee` key package or commit that is not what it must be. See [End-to-end encryption](#end-to-end-encryption). |
 | `share_taken` | A `call.join` or `call.offer` whose offer starts a share while someone else in the room holds it. Nothing changes: no seat for a join, and the caller's media as it was for an offer. str0m flips an m-line when it makes the offer, so the client sets the share m-line back to `inactive` locally and does not send that offer again. |
 
 `call.left` reasons:
@@ -379,6 +384,7 @@ Removal, room deletion, and a deleted session all reach the API as outbox events
 | Server upload budget | Unset means no budget. When set, the SFU plans with 50 kb/s for each audio stream it forwards, then 2,500 kb/s for each listener with a share to watch, then 1,200 or 350 kb/s for each listener with only a camera to watch: shares if they fit after audio, else no share; then every camera listener on `h` if that fits, else on `l`, else audio only. Shares come first because text on a screen matters more than a face. A plan, not a measurement. | `TINYSERVER_MEDIA_EGRESS_KBPS`, `sfu::Config::egress_kbps` |
 | Bandwidth estimate | Starts at 1,000 kb/s for each listener. `None` turns TWCC off; layers then follow REMB, `call.quality`, and the budget. | `sfu::Config::bwe_start_kbps` |
 | Join without media | `Connected` must arrive within 15 s or the seat is freed with `media_timeout` | `sfu::Config::connect_timeout` |
+| End-to-end encryption | Key packages and `invalid`s: 5 at once, then one every 2 s, per socket. MLS payloads up to 32 KiB. A batch of proposals with no commit in 10 s builds the group again. | `Limits::e2ee_rekey_burst`, `e2ee_rekey_every` |
 
 What a host uploads, roughly. With 8 people and cameras on, each listener gets 7 audio streams (about 50 kb/s each with headers) and one 1.2 Mb/s video: about 1.55 Mb/s each, 12.5 Mb/s in all. The same call with audio only is about 2.8 Mb/s. With one person sharing, seven listeners get the share at 2.5 Mb/s and the sharer a camera: about 20.5 Mb/s. Home upload is usually the first limit, which is why the budget setting exists.
 
@@ -392,6 +398,95 @@ Calls live in memory and end on restart. That is the trade for keeping RTP out o
 | Crash | Sockets drop. Nothing in Postgres needs cleaning. |
 | Client | Reconnects `/v1/live` with backoff (0.5 s, 1, 2, 4, cap 10). If it was in a call and the user did not hang up, `mediad` sends a fresh `call.join` to the same room. Target: back in the call within 5 s of the server answering. |
 | Durable events | Replayed from `since`. Nothing is lost. |
+
+## End-to-end encryption
+
+Built. DTLS-SRTP protects media between each app and the SFU, and the SFU decrypts it there: transport encryption to a server the community runs. A call is also end-to-end encrypted when every app in it can do it. The apps make one MLS group (RFC 9420) per room's call and encrypt each Opus frame with keys only the group holds; the SFU forwards ciphertext it cannot read. The design is Discord's DAVE protocol, version 1, and tinyclient runs it with the same `davey` crate it uses for Discord calls. tinyserver plays the part Discord's voice gateway plays: MLS delivery service and external sender. It relays and orders the group's messages and proposes who joins and leaves; it never holds a group secret.
+
+### Design
+
+| Piece | Choice |
+| --- | --- |
+| Group | MLS, ciphersuite `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, plaintext handshake messages, ratchet tree in the Welcome. One group per room's call, made by the apps. |
+| Identities | A member's credential is an MLS basic credential holding 8 bytes, their **MLS id**: the first 8 bytes, big-endian, of SHA-256 over `tiny-e2ee-v1 user ` and their user id. The group id is the same over `tiny-e2ee-v1 room ` and the room id. Each app signs with a long-term P-256 identity key it makes and keeps itself, so the key a person shows in one call is the key they show in the next. |
+| External sender | tinyserver's own P-256 key, made at start, kept in memory, never written or logged; credential `tinyserver`. It signs Add and Remove proposals and nothing else. A restart makes a new one; calls end with a restart anyway. |
+| Frame encryption | DAVE's: per-sender keys from the MLS exporter, a hash ratchet, AES-128-GCM with an 8-byte tag, a nonce and a `0xFAFA` marker at the end of each frame. RTP headers and the RFC 6464 audio level extension stay in the clear, so the SFU still forwards each frame and still finds who speaks. Opus silence frames are sent as they are. |
+| Rekey | Every join and every leave is a commit and a new epoch. Who left cannot read what is said after; who joined cannot read what was said before. |
+| Call code | DAVE's voice privacy code: 30 digits from the epoch authenticator. Everyone in the call sees the same one; it changes with every epoch. A server that put itself in the middle would show the two halves different codes. |
+| Safety numbers | DAVE's pairwise verification code: 45 digits from both members' identity keys and MLS ids. tinyclient lets a person mark someone verified and warns loudly when a verified person's key changes. |
+| Who decides | The room's call is end-to-end encrypted only if every app with media in it joined with `e2ee`. One that cannot turns it to transport only for everyone, and everyone is told who. `e2ee_required` on a room refuses apps that cannot. |
+
+### Frames
+
+`call.join` takes `e2ee`, the highest version the app speaks (`1`); absent or `0` is none. Participant objects in `ready`, `call.joined` and `call.state` carry `e2ee`, whether that person joined with it. Every other frame is `call.e2ee`, sent to and from the socket that holds the person's seat only, in order. All payloads are standard base64 of TLS-serialised MLS structures, at most 32 KiB decoded.
+
+Server to client, each `{"type": "call.e2ee", "room_id", "op", ...}`:
+
+| `op` | Fields | Meaning |
+| --- | --- | --- |
+| `start` | `version` (1), `external_sender` | Drop any group state, make a fresh session with this external sender, and answer `key_package`. A joiner with `e2ee` in a room that is encrypted gets it right after `call.answer`; everyone gets it when the room turns encrypted again, and when the server builds the group again. |
+| `off` | `user_ids` | Transport only now: drop any group state. `user_ids` are the people in the call who cannot encrypt. A joiner with `e2ee` in a room that is transport only gets it right after `call.answer`; everyone with `e2ee` gets it when someone who cannot joins, and again with the new list when the list changes. |
+| `proposals` | `epoch`, `data` | DAVE's opcode 27 payload: one byte, `0` for append, then a TLS vector of external proposal messages, removes first, then adds. Commit to them and send `commit`. Sent to every member that stays. |
+| `commit` | `epoch`, `data` | The commit that won for that batch, from `epoch` to `epoch + 1`. Sent to every member that stays, the committer included. |
+| `welcome` | `epoch`, `data` | You were added; the group is at `epoch` now. Sent to each person the commit added. |
+
+A joiner with `e2ee` always gets exactly one of `start` and `off` after its `call.answer`; it may come before or after the `call.joined` frames. An app without `e2ee` never gets `call.e2ee`.
+
+Client to server, each `{"type": "call.e2ee", "op", ...}`, with an optional `ref`. Nothing answers success; the frames that follow are the answer. A failure is `error {ref, code}`.
+
+| `op` | Fields | Meaning |
+| --- | --- | --- |
+| `key_package` | `data` | After `start`, or to start again. It must validate, be for the ciphersuite above, and hold the sender's own MLS id: otherwise `bad_e2ee`. A member that sends one has started again: its old leaf is removed and it is added anew. |
+| `commit` | `epoch`, `data`, `welcome` | The answer to `proposals`. Taken from a member the batch went to, for that batch's epoch, if it is a commit in the clear for this room's group at that epoch from the sender's own leaf, and carries a Welcome when the batch adds anyone: otherwise `bad_e2ee`. The first one wins. Later ones for that epoch, and any for another epoch, are dropped without a word. |
+| `invalid` | none | The app could not apply a commit or a welcome. Its leaf is removed, and it sends a fresh `key_package`. |
+
+Error codes: `e2ee_required` (a `call.join` without `e2ee` in a room that requires it, while media runs; no seat is taken); `bad_e2ee` (above); `not_found` (`call.e2ee` from a socket that does not hold a seat with media, or while the call is transport only); `bad_frame` (no `op`, an unknown `op`, no `data`, a `commit` without `epoch`, or over 32 KiB); `slow_down` (key packages and `invalid`s: 5 at once, then one every 2 s, per socket).
+
+```json
+{"type":"call.join","ref":"7","room_id":"0b6f…","sdp":"v=0…","e2ee":1}
+{"type":"call.answer","ref":"7","call_id":"c-3f2a…","sdp":"v=0…"}
+{"type":"call.e2ee","room_id":"0b6f…","op":"start","version":1,"external_sender":"AEEE…"}
+{"type":"call.e2ee","op":"key_package","data":"AAEAAkBB…"}
+{"type":"call.e2ee","room_id":"0b6f…","op":"proposals","epoch":0,"data":"AP0B…"}
+{"type":"call.e2ee","op":"commit","epoch":0,"data":"AAEAAQgr…","welcome":"AAJAQQSq…"}
+{"type":"call.e2ee","room_id":"0b6f…","op":"commit","epoch":0,"data":"AAEAAQgr…"}
+```
+
+### The delivery service
+
+[`crates/api/src/live/e2ee.rs`](../crates/api/src/live/e2ee.rs), under the same lock as the call registry, so its frames go out in the order the registry changed. Memory only; it is dropped when the room's call empties.
+
+| Rule | Behaviour |
+| --- | --- |
+| Mode | Encrypted while everyone with media in the call joined with `e2ee`, else transport only. Each change sends `start` or `off` to everyone with `e2ee` and drops the group. |
+| The tree | The server keeps who sits in which leaf. Removes blank a leaf; adds take the leftmost blank leaf in the order of the batch, else a new one at the end; blank leaves at the end are trimmed. That is how openmls applies a commit, and the tests check it against real groups. |
+| The first group | With no group yet, the first person in join order with a key package holds it: the pending group of one their app made at epoch 0. As soon as anyone else's key package waits, the proposals to add them go to that person only, and its commit makes the group, at epoch 1. If that person leaves first, the next one holds it. |
+| Batches | With a group, whenever no batch is out and there is work, one batch goes to every member that stays: Remove proposals for leaves of people who left or sent `invalid`, then Add proposals for every waiting key package. The first valid commit wins; members get `commit`, the people added get `welcome`, and the next batch goes out if more work came meanwhile. |
+| Leaving | Any way out of the call (leave, kick, move, ban, timeout, `media_lost`, a deleted room, a rejoin with a new offer) removes the person: a waiting key package is dropped, a leaf is removed with the next batch, and someone being added when they left is removed right after. When nobody who holds the group is left, it is gone, and the people waiting make a new one. |
+| Stuck | A batch with no winning commit after 10 s builds the group again: `start` to everyone. Calls never wait on it; the apps hold their microphone back until they have keys again. |
+
+### What it protects, and what it does not
+
+| The server, or someone who controls it, | |
+| --- | --- |
+| cannot | Hear or decode audio in an encrypted call. It forwards ciphertext; it has no group secret, and its own key signs proposals only. |
+| cannot | Join a call unseen. Anyone it adds is a member every app lists, with an identity key and a safety number. |
+| cannot | Impersonate someone a person verified without the warning that their key changed. |
+| can | See everything around the audio: who is in which call and when, who speaks and how loudly (the RFC 6464 level is in the clear, so the SFU can pick the speaker), packet sizes and timing (Opus is variable rate, so these say something about the speech), and every IP address. |
+| can | Add a ghost member, or give someone a key that is not theirs, while nobody has verified that person: the external sender proposes members, as Discord's gateway does. The member list and the safety numbers are how a person finds out; the call code catches a server in the middle of two halves of a call. |
+| can | Turn a call to transport only by claiming someone cannot encrypt, or ignore `e2ee_required`. tinyclient says so loudly and names who; it never shows a lock it does not have. |
+| can | Stop calls, drop frames, and refuse or delay any of the above. Availability is not protected. |
+
+Also: a member of the group can do anything the group can, including disrupt it with bad commits and make frames that look like another member's, since every member derives every sender's key, as in DAVE. Within one epoch the hash ratchet gives each frame generation its own key, but a member who holds the epoch's secret can derive them all; forward secrecy is per epoch. MLS ids are 64-bit hashes of user ids: two people whose ids collided would share one, which the server could only arrange by brute force on the order of 2^64 for one chosen person, and an app refuses a proposal to add anyone the call's roster does not name. Video and shares are not end-to-end encrypted yet: tinyclient does not send them, and an encrypted call is audio. Nothing of any of this is written: no key, no payload, no group state reaches Postgres or a log line the server writes. At `trace` the WebSocket library itself prints whole frames; MLS handshake messages are public by design and hold no secret, but run the server at `debug` or above.
+
+### Compatibility
+
+| Pair | Result |
+| --- | --- |
+| New app, new server, everyone new | End-to-end encrypted. |
+| New app, new server, someone older in the call | Transport only, for everyone, and each new app names who cannot. Once they leave, the call is encrypted again. In a room with `e2ee_required` the older app is refused with `e2ee_required`. |
+| Older app, new server | Unchanged. It never sends `e2ee` and never gets `call.e2ee`; participant objects and rooms have one more field it ignores. |
+| New app, older server | `e2ee_calls` is missing from `GET /v1/capabilities`, so the app does not offer it; an older server ignores the field anyway. Transport only, shown as such. |
 
 ## Network exposure
 
@@ -537,7 +632,7 @@ Cost, budgeted as if every byte both ways is billed: a 6-person camera call is a
 | Ringing and 1:1 calls? | No. Drop-in rooms only. A two-person room covers a 1:1. |
 | Screen share? | Yes, built in slice 6. One share per room, H.264, replaces the speaker video while on. |
 | Recording? | None. The SFU never writes media to disk. Revisit only with a per-call consent prompt. |
-| E2EE? | Off for now. DTLS-SRTP to a server the community runs. Keep the SFU from reading payloads beyond what simulcast and keyframes need, so SFrame, or DAVE-style MLS (tinyclient already ships `davey`), can come later. |
+| E2EE? | Built for audio, DAVE-style MLS with the server as delivery service and external sender: see [End-to-end encryption](#end-to-end-encryption). Video and shares when tinyclient sends them; DAVE already defines how H.264 frames are encrypted around the NAL headers the SFU reads. |
 | Per-room permissions (who may join, speak, share)? | Decided and built: roles with permission bits and per-room overrides, in [`server.md`](server.md). @everyone may view, connect, speak, use video and share, and use voice activation in every room until an override says otherwise. |
 | Room size? | 12 per room, 32 per server. Raise after load testing. |
 | Port or relay? | Publish one port (A). Offer relay mode (B) for CGNAT and hidden-origin hosts. |
