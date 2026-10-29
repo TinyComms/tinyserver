@@ -13,7 +13,7 @@ A room is a voice channel. People drop in and out; nobody rings anyone. Signalin
 | Ephemeral state | Presence, occupancy, speaking, signaling. Memory only |
 | Media | WebRTC through str0m 0.24 in `crates/sfu`, ICE-lite, DTLS-SRTP |
 | End to end | MLS between the apps (DAVE's design), the server only relaying it, when every app in the call can |
-| Audio | Opus, mono, 32 kb/s, in-band FEC, DTX |
+| Audio | Opus, mono, 32 kb/s, in-band FEC. No DTX: the client's speech gate ends a spurt. A missing audio packet is forwarded at once, not held to reorder |
 | Video | H.264 constrained baseline. Camera simulcast in two layers. One share per room, in one layer |
 | What each listener receives | Every speaker's audio, and one video: the share if there is one, otherwise the active speaker |
 | Network | Publish one UDP port and the same TCP port. HTTP stays behind the tunnel |
@@ -258,7 +258,7 @@ The client is always the offerer. The server never sends an offer, so there is n
 
 | Offer contents | Why |
 | --- | --- |
-| One `sendonly` audio m-line | The client's microphone. Opus, `useinbandfec=1`, `usedtx=1`, RFC 6464 audio level extension. If there are several, the SFU takes the first. |
+| One `sendonly` audio m-line | The client's microphone. Opus, `useinbandfec=1`, `usedtx=0`. DTX is off; the speech gate ends a spurt. RFC 6464 audio level extension. If there are several, the SFU takes the first. |
 | One video m-line for the camera, `inactive` until the camera starts | H.264 simulcast: `a=rid:h send`, `a=rid:l send`, `a=simulcast:send h;l`. `sendonly` while the camera runs. The first video m-line that is not `recvonly` is the camera. A camera without rids is taken as one `h` layer. |
 | One video m-line for the share, `inactive` until a share starts | The second video m-line that is not `recvonly`. H.264, one layer, no rids. `sendonly` while sharing. |
 | `N - 1` `recvonly` audio m-lines, where `N` is the room cap | One per possible other speaker. Mapped by `call.slots`. With the default cap, 11. The SFU uses as many as are offered; others in a bigger room are not heard until a slot frees. |
@@ -577,8 +577,8 @@ Cost, budgeted as if every byte both ways is billed: a 6-person camera call is a
 | chatd call lifecycle: deadlines, `Joined` only on `Connected`, failure always sends `CallLeave` | `chatd` `media.rs` | Unchanged |
 | `Call`, `CallState`, `Participant`, meters, devices, cues | `crates/protocol/src/call.rs` | Unchanged |
 | cpal capture and playback, device hot-swap, resample to 48 kHz | `mediad` `audio.rs` | Unchanged |
-| Opus encode and decode, FEC, PLC | `mediad` `opus.rs` | Switch to mono 32 kb/s VOIP and turn on DTX for Tiny |
-| Jitter buffer on RTP sequence numbers | `mediad` `jitter.rs` | Fed by str0m frames or RTP |
+| Opus encode and decode, FEC, PLC | `mediad` `opus.rs` | Switch to mono 32 kb/s VOIP. DTX stays off (`usedtx=0`); the speech gate ends the spurt |
+| Jitter buffer | `mediad` `jitter.rs` | Tiny inserts by RTP timestamp, because the SFU rewrites sequence numbers. A 400 ms gap does not end the spurt |
 | 20 ms loop, one UDP socket, no async runtime | `mediad` `media.rs` | Same loop, with str0m driving it |
 | `tungstenite` | `mediad` | Reused in `chatd` for `/v1/live` |
 
@@ -614,7 +614,7 @@ Cost, budgeted as if every byte both ways is billed: a 6-person camera call is a
 | Mute | Send `call.state` and stop writing frames. The SFU drops a muted publisher's frames anyway. |
 | Leave | Send `call.leave`. A client that just stops is dropped after 30 s with `media_lost`. |
 
-`mediad` swaps the synthetic frames for its libopus encoder (mono, 32 kb/s, VOIP, FEC, DTX) and the real RFC 6464 level, and feeds received frames into its existing jitter buffer. For video it swaps the fixture for its camera and two H.264 encoders, and adds a decoder and one render surface.
+`mediad` swaps the synthetic frames for its libopus encoder (mono, 32 kb/s, VOIP, FEC, DTX off, `usedtx=0`; the speech gate ends the spurt) and the real RFC 6464 level, and feeds received frames into its existing jitter buffer. For video it swaps the fixture for its camera and two H.264 encoders, and adds a decoder and one render surface.
 
 ### Change
 

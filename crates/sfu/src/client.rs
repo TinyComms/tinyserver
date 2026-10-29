@@ -210,7 +210,9 @@ impl Client {
         candidate: Result<Candidate, str0m::error::IceError>,
         slots: usize,
     ) -> io::Result<Self> {
-        let mut config = RtcConfig::new().clear_codecs().enable_opus(true, false);
+        let mut config = crate::engine::release_audio_promptly(
+            RtcConfig::new().clear_codecs().enable_opus(true, false),
+        );
         config.codec_config().add_h264(
             H264_PT.into(),
             Some(H264_RTX_PT.into()),

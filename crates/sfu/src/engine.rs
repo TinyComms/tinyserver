@@ -1679,6 +1679,15 @@ fn bind(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, u16)> {
     }
 }
 
+/// A missing audio packet is released at once. str0m's default holds it until 15 later
+/// packets arrive or a second passes, and every listener has gone silent by then. Video is
+/// left to its own, larger, hold.
+pub(crate) fn release_audio_promptly(config: RtcConfig) -> RtcConfig {
+    config
+        .set_reordering_size_audio(0)
+        .set_reordering_timeout_audio(Some(Duration::from_millis(40)))
+}
+
 /// ICE-lite, the process's DTLS certificate, Opus, and H.264 constrained baseline in
 /// packetization mode 1 with RTX. TWCC bandwidth estimation starts at `bwe_kbps`, for
 /// choosing layers; `None` leaves it off.
@@ -1687,13 +1696,15 @@ pub(crate) fn rtc_config(
     cert: &DtlsCert,
     bwe_kbps: Option<u32>,
 ) -> RtcConfig {
-    let mut config = RtcConfig::new()
-        .set_ice_lite(true)
-        .set_crypto_provider(crypto.clone())
-        .set_dtls_cert(cert.clone())
-        .clear_codecs()
-        .enable_opus(true, false)
-        .enable_bwe(bwe_kbps.map(|kbps| Bitrate::kbps(u64::from(kbps))));
+    let mut config = release_audio_promptly(
+        RtcConfig::new()
+            .set_ice_lite(true)
+            .set_crypto_provider(crypto.clone())
+            .set_dtls_cert(cert.clone())
+            .clear_codecs()
+            .enable_opus(true, false)
+            .enable_bwe(bwe_kbps.map(|kbps| Bitrate::kbps(u64::from(kbps)))),
+    );
     config
         .codec_config()
         .add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
@@ -1752,4 +1763,19 @@ fn tell(events: &async_mpsc::Sender<Event>, event: Event) {
 /// Events that may be dropped when the queue is full.
 fn hint(events: &async_mpsc::Sender<Event>, event: Event) {
     let _ = events.try_send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_audio_packet_is_not_held_for_fifteen_later_ones() {
+        let config = release_audio_promptly(RtcConfig::new());
+        assert_eq!(config.reordering_size_audio(), 0);
+        assert_eq!(
+            config.reordering_timeout_audio(),
+            Some(Duration::from_millis(40))
+        );
+    }
 }
