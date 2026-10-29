@@ -254,7 +254,7 @@ async fn sign_in() -> anyhow::Result<api::SignIn> {
 const DISCOVERY_TRIES: u32 = 12;
 const DISCOVERY_PAUSE: Duration = Duration::from_secs(5);
 
-/// `TINYSERVER_OIDC_PROVIDERS=tinyauth,google` reads `TINYSERVER_OIDC_TINYAUTH_*` and
+/// `TINYSERVER_OIDC_PROVIDERS=pocket-id,google` reads `TINYSERVER_OIDC_POCKET_ID_*` and
 /// `TINYSERVER_OIDC_GOOGLE_*`, first one the default. Without it, the single provider in
 /// `TINYSERVER_OIDC_*` has the id `default`.
 fn providers_from_env() -> anyhow::Result<Vec<api::ProviderConfig>> {

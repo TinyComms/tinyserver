@@ -5,7 +5,7 @@
 //! Each provider's keys are read at start and kept. A token signed with a key id they do not
 //! have makes one fresh read, at most every 10 seconds, so a key rotation needs no restart.
 //!
-//! A provider may have an internal URL, such as `http://tinyauth:3000` on the compose network.
+//! A provider may have an internal URL, such as `http://pocket-id:1411` on the compose network.
 //! Discovery, keys, and the code exchange then go there, with the discovered endpoints moved to
 //! the internal origin, while the issuer in discovery and in every token must still be exactly
 //! the public issuer. The browser always goes to the public authorization endpoint.
