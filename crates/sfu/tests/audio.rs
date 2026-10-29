@@ -188,3 +188,54 @@ async fn an_offer_that_is_not_sdp_is_refused() {
     assert!(sfu.media.addr().port() != 0);
     assert!(sfu.media.running());
 }
+
+/// An app that encrypts end to end sends a frame the SFU cannot read: AES-GCM ciphertext with a
+/// truncated tag, a nonce, and DAVE's 0xFAFA marker, in place of Opus. The SFU forwards it byte
+/// for byte, and still finds the speaker from the RFC 6464 level, which stays in the clear.
+#[tokio::test]
+async fn an_end_to_end_encrypted_frame_is_forwarded_byte_for_byte() {
+    let mut sfu = start(config());
+    let a = join(&mut sfu, "r", "a", b'A').await;
+    let b = join(&mut sfu, "r", "b", b'B').await;
+    let b_slots = sfu.slots_for(&b.call_id, 1).await;
+    let mid = mid_of(&b_slots, "a");
+
+    // What only the apps could read. It never leaves them.
+    let plain: &[u8] = b"opus: the words only the people in the call hear";
+    // What goes on the wire: bytes that look random, then the tag, nonce and marker.
+    let mut sealed: Vec<u8> = (0..plain.len() as u32)
+        .map(|n| (n.wrapping_mul(2_654_435_761) >> 13) as u8 ^ 0x5a)
+        .collect();
+    sealed.extend_from_slice(&[0x9c, 0x31, 0x7e, 0x02, 0xd4, 0x88, 0x1b, 0x6f]);
+    sealed.extend_from_slice(&[0x07, 0x0b, 0xfa, 0xfa]);
+    assert!(!sealed.windows(plain.len()).any(|window| window == plain));
+
+    a.running.send_payload(Some(sealed.clone()));
+    a.running.sending(true);
+    sfu.wait_for(|event| match event {
+        Event::Speaking { room_id, user_ids } if room_id == "r" && user_ids == &["a"] => Some(()),
+        _ => None,
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut heard = Vec::new();
+    while heard.len() < 10 {
+        assert!(
+            Instant::now() < deadline,
+            "only {} frames came",
+            heard.len()
+        );
+        heard.extend(
+            b.running
+                .take_payloads()
+                .into_iter()
+                .filter(|(on, _)| *on == mid)
+                .map(|(_, payload)| payload),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for payload in &heard {
+        assert_eq!(payload, &sealed, "forwarded as it was sent");
+        assert!(!payload.windows(plain.len()).any(|window| window == plain));
+    }
+}

@@ -54,6 +54,8 @@ use str0m::{Candidate, Event, Input, Output, Rtc, RtcConfig};
 
 use crate::tcp::{Conn, Readout};
 
+/// Received audio payloads kept for [`Running::take_payloads`]: 20 s of one speaker.
+const PAYLOADS_KEPT: usize = 1000;
 /// One Opus frame: 20 ms at 48 kHz.
 const FRAME: Duration = Duration::from_millis(20);
 const SAMPLES_PER_FRAME: u64 = 960;
@@ -328,7 +330,8 @@ impl Client {
             let now = Instant::now();
             let connected = shared.connected.load(Ordering::Acquire);
             if connected && shared.sending.load(Ordering::Acquire) && now >= next_frame {
-                self.send_frame(marker, sent, now);
+                let sealed = lock(&shared.sealed).clone();
+                self.send_frame(marker, sent, now, sealed);
                 sent += 1;
                 next_frame += FRAME;
                 continue;
@@ -556,6 +559,12 @@ impl Client {
                     lock(&shared.video).push(frame);
                 }
                 Output::Event(Event::MediaData(data)) => {
+                    let mut payloads = lock(&shared.payloads);
+                    if payloads.len() >= PAYLOADS_KEPT {
+                        payloads.remove(0);
+                    }
+                    payloads.push((data.mid.to_string(), data.data.to_vec()));
+                    drop(payloads);
                     let marker = data.data.get(1).copied().unwrap_or_default();
                     let frame = Frame {
                         mid: data.mid.to_string(),
@@ -596,7 +605,8 @@ impl Client {
         }
     }
 
-    fn send_frame(&mut self, marker: u8, sent: u64, now: Instant) {
+    /// One audio frame: the marker frame, or `sealed` as it is when set.
+    fn send_frame(&mut self, marker: u8, sent: u64, now: Instant, sealed: Option<Vec<u8>>) {
         let Some(writer) = self.rtc.writer(self.microphone) else {
             return;
         };
@@ -604,8 +614,11 @@ impl Client {
             return;
         };
         // TOC byte 0x78: SILK wideband, 20 ms, one frame.
-        let mut payload = vec![0x78, marker];
-        payload.extend_from_slice(&sent.to_be_bytes());
+        let payload = sealed.unwrap_or_else(|| {
+            let mut payload = vec![0x78, marker];
+            payload.extend_from_slice(&sent.to_be_bytes());
+            payload
+        });
         let time = MediaTime::new(sent * SAMPLES_PER_FRAME, Frequency::FORTY_EIGHT_KHZ);
         let _ = writer
             .audio_level(LEVEL, true)
@@ -838,6 +851,10 @@ struct Shared {
     share_kbps: AtomicU64,
     frames: Mutex<Vec<Frame>>,
     video: Mutex<Vec<VideoFrame>>,
+    /// Sent as every audio frame in place of the marker frame, while set.
+    sealed: Mutex<Option<Vec<u8>>>,
+    /// Every audio frame received, byte for byte, with its m-line.
+    payloads: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl Default for Shared {
@@ -852,6 +869,8 @@ impl Default for Shared {
             share_kbps: AtomicU64::new(SHARE_KBPS),
             frames: Mutex::default(),
             video: Mutex::default(),
+            sealed: Mutex::default(),
+            payloads: Mutex::default(),
         }
     }
 }
@@ -873,6 +892,17 @@ impl Running {
     /// Starts or stops the microphone. It starts stopped.
     pub fn sending(&self, on: bool) {
         self.shared.sending.store(on, Ordering::Release);
+    }
+
+    /// Sends `payload` as every audio frame from now on, byte for byte, as an app that
+    /// encrypts end to end would; `None` goes back to the marker frames.
+    pub fn send_payload(&self, payload: Option<Vec<u8>>) {
+        *lock(&self.shared.sealed) = payload;
+    }
+
+    /// Audio payloads received since the last call, byte for byte, with their m-line.
+    pub fn take_payloads(&self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut *lock(&self.shared.payloads))
     }
 
     /// Audio frames received since the last call.
