@@ -256,7 +256,46 @@ fn provider_from_env(
         groups_claim: env_var(&key("GROUPS_CLAIM")).ok(),
         admin_groups: list("ADMIN_GROUPS"),
         member_groups: list("MEMBER_GROUPS"),
+        signup: signup_from_env(prefix)?,
     })
+}
+
+/// `<prefix>SIGNUP=pocket-id` lets someone with an invite make their account at the provider.
+/// It needs `<prefix>POCKETID_API_KEY_FILE` (or `<prefix>POCKETID_API_KEY`); Pocket ID's API is
+/// reached at `<prefix>POCKETID_INTERNAL_URL`, else the provider's internal URL, else its issuer.
+/// `<prefix>POCKETID_GROUP_IDS` lists Pocket ID groups a new account joins.
+fn signup_from_env(prefix: &str) -> anyhow::Result<Option<api::SignupConfig>> {
+    let key = |suffix: &str| format!("{prefix}{suffix}");
+    let Ok(kind) = env_var(&key("SIGNUP")) else {
+        return Ok(None);
+    };
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => return Ok(None),
+        "pocket-id" | "pocketid" => {}
+        other => bail!("{} is {other}; the only kind is pocket-id", key("SIGNUP")),
+    }
+    let api_key = secret_from_env(&key("POCKETID_API_KEY"))?.with_context(|| {
+        format!(
+            "{} is pocket-id but {} is not set",
+            key("SIGNUP"),
+            key("POCKETID_API_KEY_FILE")
+        )
+    })?;
+    let group_ids = env_var(&key("POCKETID_GROUP_IDS"))
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(api::SignupConfig {
+        api_url: env_var(&key("POCKETID_INTERNAL_URL")).ok(),
+        api_key,
+        group_ids,
+    }))
 }
 
 /// `<name>_FILE`, preferred, or `<name>`. Not both. `None` when neither is set.

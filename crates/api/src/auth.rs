@@ -6,8 +6,16 @@
 //! browser on to tinyclient with a one-time code that lives 60 seconds. `token` trades that code
 //! and the client's verifier for a session. A provider ends sessions it started through
 //! `backchannel-logout`. Codes, tokens, and secrets are never logged.
+//!
+//! When the provider makes accounts (Pocket ID) and the sign-in carries an invite, `start` sends
+//! the browser to `join` first, a page here that asks whether the person is new. Someone with an
+//! account goes on to the provider as usual. Someone new gets one single-use sign-up link at the
+//! provider, made only while the invite could still be accepted and only once per sign-in; they
+//! make their account and passkey there in a new tab, then come back and continue into the
+//! provider's sign-in, where their new session signs them straight in.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use axum::extract::rejection::{FormRejection, JsonRejection, QueryRejection};
 use axum::extract::{Form, Query, State};
@@ -15,16 +23,20 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use db::{AuthError, PgPool};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use db::{AuthError, PgPool, SignupClaim};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::oidc::SignIn;
+use crate::oidc::{Provider, SignIn};
 
 pub fn routes(sign_in: SignIn) -> Router<PgPool> {
     Router::new()
         .route("/v1/auth/config", get(config))
         .route("/v1/auth/start", post(start))
+        .route("/v1/auth/join", get(join).post(join_new))
         .route("/v1/auth/callback", get(callback))
         .route("/v1/auth/token", post(token))
         .route("/v1/auth/backchannel-logout", post(backchannel_logout))
@@ -68,6 +80,12 @@ struct CallbackQuery {
     error: Option<String>,
     /// RFC 9207. When the provider sends it, it must be the provider the sign-in went to.
     iss: Option<String>,
+}
+
+/// `GET` and `POST /v1/auth/join`: the pending sign-in, by the state sent to the provider.
+#[derive(Deserialize)]
+struct JoinForm {
+    state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,10 +181,145 @@ async fn start(
         tracing::warn!(%error, "pending sign-in not saved");
         AuthApiError::Unavailable
     })?;
-    tracing::info!(provider = %provider.id(), invite = invite.is_some(), "sign-in started");
-    Ok(Json(Started {
-        authorize_url: begun.authorize_url,
-    }))
+    // Someone with an invite may have no account at the provider yet. A provider that makes
+    // accounts gets the question first, here.
+    let ask = invite.is_some() && provider.makes_accounts();
+    tracing::info!(provider = %provider.id(), invite = invite.is_some(), ask, "sign-in started");
+    let authorize_url = if ask {
+        join_url(sign_in.public_url(), &begun.state)
+    } else {
+        begun.authorize_url
+    };
+    Ok(Json(Started { authorize_url }))
+}
+
+fn join_url(public_url: &str, state: &str) -> String {
+    let mut url = format!("{public_url}/v1/auth/join");
+    if let Ok(mut parsed) = Url::parse(&url) {
+        parsed.query_pairs_mut().append_pair("state", state);
+        url = parsed.to_string();
+    }
+    url
+}
+
+/// The state from a join request, if it is shaped like one this server made.
+fn join_state(form: Option<JoinForm>) -> Option<String> {
+    form?.state.filter(|state| {
+        (1..=256).contains(&state.len())
+            && state
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
+/// The provider a pending sign-in went to, when it still makes accounts.
+fn account_maker<'a>(sign_in: &'a SignIn, leg: &db::ProviderLeg) -> Option<&'a Provider> {
+    sign_in
+        .provider(Some(&leg.provider))
+        .filter(|provider| provider.makes_accounts())
+}
+
+/// `GET /v1/auth/join`: new here, or already have an account? Nothing is spent or made.
+async fn join(
+    State(pool): State<PgPool>,
+    Extension(sign_in): Extension<SignIn>,
+    query: Result<Query<JoinForm>, QueryRejection>,
+) -> Response {
+    let Some(state) = join_state(query.ok().map(|Query(form)| form)) else {
+        return expired();
+    };
+    let leg = match db::invited_pending(&pool, &state).await {
+        Ok(Some(leg)) => leg,
+        Ok(None) => return expired(),
+        Err(error) => {
+            tracing::warn!(%error, "pending sign-in not read");
+            return server_trouble();
+        }
+    };
+    let Some(provider) = account_maker(&sign_in, &leg) else {
+        return expired();
+    };
+    let authorize_url = provider.authorize_url(&state, &leg.nonce, &leg.verifier);
+    choice_page(
+        StatusCode::OK,
+        provider.name(),
+        &state,
+        &authorize_url,
+        None,
+    )
+}
+
+/// `POST /v1/auth/join`: someone new. One sign-up link at the provider, for a sign-in whose
+/// invite could still be accepted, and never a second for the same sign-in.
+async fn join_new(
+    State(pool): State<PgPool>,
+    Extension(sign_in): Extension<SignIn>,
+    form: Result<Form<JoinForm>, FormRejection>,
+) -> Response {
+    let Some(state) = join_state(form.ok().map(|Form(form)| form)) else {
+        return expired();
+    };
+    let leg = match db::claim_signup(&pool, &state).await {
+        Ok(SignupClaim::Claimed(leg)) => leg,
+        Ok(SignupClaim::AlreadyMade(leg)) => {
+            let Some(provider) = account_maker(&sign_in, &leg) else {
+                return expired();
+            };
+            let authorize_url = provider.authorize_url(&state, &leg.nonce, &leg.verifier);
+            return already_made_page(provider.name(), &authorize_url);
+        }
+        Ok(SignupClaim::InviteUnusable) => return invite_unusable(&pool, &state).await,
+        Ok(SignupClaim::Gone) => return expired(),
+        Err(error) => {
+            tracing::warn!(%error, "sign-up not claimed");
+            return server_trouble();
+        }
+    };
+    let Some(provider) = account_maker(&sign_in, &leg) else {
+        release(&pool, &state).await;
+        return expired();
+    };
+    let authorize_url = provider.authorize_url(&state, &leg.nonce, &leg.verifier);
+    match provider.signup_link().await {
+        Ok(link) => {
+            tracing::info!(provider = %provider.id(), "sign-up link made for an invite");
+            signup_page(provider.name(), &link.0, &authorize_url)
+        }
+        Err(failure) => {
+            tracing::warn!(provider = %provider.id(), %failure, "sign-up link not made");
+            release(&pool, &state).await;
+            choice_page(
+                StatusCode::BAD_GATEWAY,
+                provider.name(),
+                &state,
+                &authorize_url,
+                Some("The sign-up link could not be made just now. Try again in a moment."),
+            )
+        }
+    }
+}
+
+async fn release(pool: &PgPool, state: &str) {
+    if let Err(error) = db::release_signup(pool, state).await {
+        tracing::warn!(%error, "sign-up claim not released");
+    }
+}
+
+/// The invite cannot be accepted any more: the sign-in ends, and tinyclient hears why.
+async fn invite_unusable(pool: &PgPool, state: &str) -> Response {
+    tracing::info!("sign-up refused: the invite is unknown, expired, or used up");
+    match db::take_pending(pool, state).await {
+        Ok(Some(pending)) => back_to_client(
+            &pending.client_redirect,
+            &pending.client_state,
+            Outcome::Error("not_member"),
+        ),
+        Ok(None) => expired(),
+        Err(error) => {
+            tracing::warn!(%error, "pending sign-in not read");
+            server_trouble()
+        }
+    }
 }
 
 async fn callback(
@@ -188,11 +341,7 @@ async fn callback(
         Ok(None) => return expired(),
         Err(error) => {
             tracing::warn!(%error, "pending sign-in not read");
-            return page(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Sign-in failed",
-                "Something went wrong on the server. Start again from tinyclient.",
-            );
+            return server_trouble();
         }
     };
     let back =
@@ -387,14 +536,56 @@ fn expired() -> Response {
     )
 }
 
+fn server_trouble() -> Response {
+    page(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Sign-in failed",
+        "Something went wrong on the server. Start again from tinyclient.",
+    )
+}
+
+/// The one stylesheet every page here carries, inline. The policy allows exactly it.
+const STYLE: &str = "body{margin:0;font:16px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;\
+color:#1d1d1f;background:#f5f5f7;display:flex;justify-content:center}\
+main{max-width:28rem;margin:4rem 1.25rem;padding:2rem;background:#fff;border-radius:12px;\
+box-shadow:0 1px 3px rgba(0,0,0,.12)}\
+h1{font-size:1.4rem;margin:0 0 .75rem}p{margin:.5rem 0 1rem}\
+.choice{display:flex;flex-direction:column;gap:.75rem;margin-top:1.5rem}\
+form{margin:0}\
+.button{display:block;box-sizing:border-box;width:100%;padding:.75rem 1rem;border-radius:8px;\
+border:1px solid #0a66d8;background:#0a66d8;color:#fff;font:inherit;font-weight:600;\
+text-align:center;text-decoration:none;cursor:pointer}\
+.button.quiet{background:#fff;color:#0a66d8}\
+.step{font-weight:600;margin-top:1.5rem}.note{color:#6e6e73;font-size:.875rem}\
+.alert{color:#b3261e}\
+@media (prefers-color-scheme:dark){body{color:#f5f5f7;background:#1d1d1f}\
+main{background:#2c2c2e;box-shadow:none}.button.quiet{background:#2c2c2e;color:#6cb0ff}\
+.note{color:#a1a1a6}.alert{color:#ff8a80}}";
+
+/// No script, nothing loaded, only the stylesheet above, forms only to here, no framing.
+static POLICY: LazyLock<HeaderValue> = LazyLock::new(|| {
+    let hash = STANDARD.encode(Sha256::digest(STYLE.as_bytes()));
+    HeaderValue::from_str(&format!(
+        "default-src 'none'; style-src 'sha256-{hash}'; form-action 'self'; \
+         base-uri 'none'; frame-ancestors 'none'"
+    ))
+    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"))
+});
+
 /// A small page for the browser. Every piece of text is escaped, and it may load nothing.
 fn page(status: StatusCode, title: &str, message: &str) -> Response {
+    html(status, title, &format!("<p>{}</p>", escape(message)))
+}
+
+/// A page around `body`, which the caller has escaped.
+fn html(status: StatusCode, title: &str, body: &str) -> Response {
     let title = escape(title);
-    let message = escape(message);
-    let body = format!(
+    let page = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{title}</title>\n</head>\n<body>\n<h1>{title}</h1>\n<p>{message}</p>\n</body>\n</html>\n"
+         <meta name=\"referrer\" content=\"no-referrer\">\n\
+         <title>{title}</title>\n<style>{STYLE}</style>\n</head>\n<body>\n<main>\n\
+         <h1>{title}</h1>\n{body}\n</main>\n</body>\n</html>\n"
     );
     (
         status,
@@ -403,14 +594,79 @@ fn page(status: StatusCode, title: &str, message: &str) -> Response {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/html; charset=utf-8"),
             ),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
-            ),
+            (header::CONTENT_SECURITY_POLICY, POLICY.clone()),
         ],
-        body,
+        page,
     )
         .into_response()
+}
+
+/// New here, or already have an account at `provider`?
+fn choice_page(
+    status: StatusCode,
+    provider: &str,
+    state: &str,
+    authorize_url: &str,
+    alert: Option<&str>,
+) -> Response {
+    let provider = escape(provider);
+    let alert = alert
+        .map(|alert| format!("<p class=\"alert\">{}</p>\n", escape(alert)))
+        .unwrap_or_default();
+    let body = format!(
+        "{alert}<p>You have an invite. This server signs people in with {provider}.</p>\n\
+         <div class=\"choice\">\n\
+         <form method=\"post\" action=\"/v1/auth/join\">\n\
+         <input type=\"hidden\" name=\"state\" value=\"{state}\">\n\
+         <button class=\"button\" type=\"submit\">I'm new here</button>\n\
+         </form>\n\
+         <a class=\"button quiet\" href=\"{authorize}\">I already have an account</a>\n\
+         </div>\n\
+         <p class=\"note\">New here: you make a {provider} account with a passkey, then come \
+         back to this page.</p>",
+        state = escape(state),
+        authorize = escape(authorize_url),
+    );
+    html(status, "Join with your invite", &body)
+}
+
+/// The sign-up link, then the way on into sign-in.
+fn signup_page(provider: &str, signup_url: &str, authorize_url: &str) -> Response {
+    let provider = escape(provider);
+    let body = format!(
+        "<p class=\"step\">1. Make your account</p>\n\
+         <p>Make your {provider} account and its passkey. It opens in a new tab; keep this one.</p>\n\
+         <a class=\"button\" href=\"{signup}\" target=\"_blank\" rel=\"noopener noreferrer\">\
+         Make my account</a>\n\
+         <p class=\"step\">2. Come back and continue</p>\n\
+         <p>Once your passkey is made, continue here to finish joining.</p>\n\
+         <a class=\"button quiet\" href=\"{authorize}\">Continue</a>\n\
+         <p class=\"note\">The sign-up link works once, for 15 minutes.</p>",
+        signup = escape(signup_url),
+        authorize = escape(authorize_url),
+    );
+    html(StatusCode::OK, "Make your account", &body)
+}
+
+/// A second "I'm new here" on the same sign-in: no second link.
+fn already_made_page(provider: &str, authorize_url: &str) -> Response {
+    let body = format!(
+        "<p>A sign-up link was already made for this sign-in. If you made your {provider} \
+         account, continue. If not, start again from tinyclient.</p>\n\
+         <a class=\"button\" href=\"{authorize}\">Continue</a>",
+        provider = escape(provider),
+        authorize = escape(authorize_url),
+    );
+    html(StatusCode::OK, "Sign-up link already made", &body)
+}
+
+/// `429` for the join form, as a page.
+pub(crate) fn slow_down_page() -> Response {
+    page(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many tries",
+        "Wait a minute, then go back and try again.",
+    )
 }
 
 fn escape(text: &str) -> String {

@@ -19,9 +19,9 @@ mod sweep;
 
 pub use account::{close_all_sessions, rename_me};
 pub use auth::{
-    end_provider_sessions, issue_code, pkce_challenge_shaped, pkce_verifier_shaped, redeem_code,
-    s256, save_pending, sign_in, take_pending, AuthError, Groups, Pending, PendingLogin, Profile,
-    SignedIn,
+    claim_signup, end_provider_sessions, invited_pending, issue_code, pkce_challenge_shaped,
+    pkce_verifier_shaped, redeem_code, release_signup, s256, save_pending, sign_in, take_pending,
+    AuthError, Groups, Pending, PendingLogin, Profile, ProviderLeg, SignedIn, SignupClaim,
 };
 pub use bootstrap::{bootstrap, owner_exists, owner_invite, Bootstrap};
 pub use community::{

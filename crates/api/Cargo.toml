@@ -18,6 +18,8 @@ reqwest.workspace = true
 sfu = { path = "../sfu" }
 serde.workspace = true
 serde_json.workspace = true
+# The hash of the sign-in pages' stylesheet, for their Content-Security-Policy.
+sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 # The version axum's `ws` feature uses. Only its error type is read, to tell an oversized frame.
@@ -30,10 +32,11 @@ url.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 http-body-util = "0.1"
-sha2.workspace = true
 sfu = { path = "../sfu", features = ["headless"] }
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
+# Catches what sign-in logs, to show no secret is in it.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

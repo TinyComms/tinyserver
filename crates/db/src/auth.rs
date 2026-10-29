@@ -162,6 +162,91 @@ pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>,
     }))
 }
 
+/// The provider leg of a pending sign-in, enough to build its authorization URL again.
+pub struct ProviderLeg {
+    pub provider: String,
+    pub verifier: String,
+    pub nonce: String,
+}
+
+/// What a pending sign-in with an invite may do about a sign-up link at the provider.
+pub enum SignupClaim {
+    /// Claimed now. Ask the provider for one link, and only one.
+    Claimed(ProviderLeg),
+    /// A link was already asked for on this sign-in. No second one.
+    AlreadyMade(ProviderLeg),
+    /// The invite is unknown, expired, used up, or revoked.
+    InviteUnusable,
+    /// No such pending sign-in, it expired, or it carries no invite.
+    Gone,
+}
+
+/// The provider leg of a fresh pending sign-in that carries an invite, without spending it.
+pub async fn invited_pending(pool: &PgPool, state: &str) -> Result<Option<ProviderLeg>, DbError> {
+    let state_hash = token_digest(state);
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT provider, verifier, nonce FROM auth_pending
+         WHERE state_hash = $1 AND expires_at > now() AND invite_hash IS NOT NULL",
+    )
+    .bind(state_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(provider, verifier, nonce)| ProviderLeg {
+        provider,
+        verifier,
+        nonce,
+    }))
+}
+
+/// Marks the pending sign-in for `state` as having asked for a sign-up link, when it is fresh,
+/// carries an invite that could still be accepted, and has not asked before. Two tries at once
+/// claim it once.
+pub async fn claim_signup(pool: &PgPool, state: &str) -> Result<SignupClaim, DbError> {
+    let state_hash = token_digest(state);
+    let claimed: Option<(String, String, String)> = sqlx::query_as(
+        "UPDATE auth_pending SET signup_at = now()
+         WHERE state_hash = $1 AND expires_at > now() AND invite_hash IS NOT NULL
+           AND signup_at IS NULL AND app_invite_usable(invite_hash)
+         RETURNING provider, verifier, nonce",
+    )
+    .bind(state_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    if let Some((provider, verifier, nonce)) = claimed {
+        return Ok(SignupClaim::Claimed(ProviderLeg {
+            provider,
+            verifier,
+            nonce,
+        }));
+    }
+    let row: Option<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT provider, verifier, nonce, signup_at IS NOT NULL FROM auth_pending
+         WHERE state_hash = $1 AND expires_at > now() AND invite_hash IS NOT NULL",
+    )
+    .bind(state_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        None => SignupClaim::Gone,
+        Some((provider, verifier, nonce, true)) => SignupClaim::AlreadyMade(ProviderLeg {
+            provider,
+            verifier,
+            nonce,
+        }),
+        Some((_, _, _, false)) => SignupClaim::InviteUnusable,
+    })
+}
+
+/// Gives the claim back when the provider made no link, so the person can try again.
+pub async fn release_signup(pool: &PgPool, state: &str) -> Result<(), DbError> {
+    let state_hash = token_digest(state);
+    sqlx::query("UPDATE auth_pending SET signup_at = NULL WHERE state_hash = $1")
+        .bind(state_hash.as_slice())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Finds the person by `(issuer, subject)`. A member signs in. Anyone else needs the invite
 /// whose hash came with the pending sign-in, audited as `invite.accept`, or a joining group,
 /// audited as `member.join`. Either makes the account if there is none. An admin group then

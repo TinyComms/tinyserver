@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
 use common::oidc::{self, ClientAuth, Person, Provider, Tamper, CLIENT_ID, CLIENT_KEY};
+use common::pocket::{self, PocketId};
 use common::{first_owner, run, Call, TestDb};
 use http_body_util::BodyExt;
 use openidconnect::{CsrfToken, PkceCodeChallenge};
@@ -1140,6 +1141,282 @@ async fn a_session_from_sign_in_ends_after_the_configured_days() {
         assert!((1.99..=2.0).contains(&days), "{days}");
         assert_eq!(issuer.as_deref(), Some(provider.issuer.as_str()));
         assert_eq!(sid.as_deref(), Some("sid-short"));
+    })
+    .await;
+}
+
+// Pocket ID sign-up: an invite can make the person's account at the provider.
+
+/// A provider that makes accounts through `pocket`, as `default`.
+async fn account_making(provider: &Provider, pocket: &PocketId, groups: &[&str]) -> api::SignIn {
+    let mut config = provider.provider_config("default");
+    config.signup = Some(pocket.signup(groups));
+    api::SignIn::discover(oidc::config(vec![config]))
+        .await
+        .expect("discover")
+}
+
+/// `POST /v1/auth/join` as the browser's form sends it.
+async fn post_join(app: &Router, state: &str, address: &str) -> (StatusCode, HeaderMap, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/auth/join")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("cf-connecting-ip", address)
+                .body(Body::from(format!("state={state}")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        headers,
+        String::from_utf8(bytes.to_vec()).expect("utf-8"),
+    )
+}
+
+/// The state in the join URL `start` handed tinyclient, or `None` for any other URL.
+fn join_state(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).expect("url");
+    if format!("{}://{}{}", url.scheme(), url.authority(), url.path())
+        != format!("{}/v1/auth/join", oidc::PUBLIC_URL)
+    {
+        return None;
+    }
+    url.query_pairs()
+        .find(|(name, _)| name == "state")
+        .map(|(_, state)| state.into_owned())
+}
+
+/// The `href` of the link whose text is `text`, unescaped.
+fn link(html: &str, text: &str) -> String {
+    let end = html
+        .find(&format!(">{text}</a>"))
+        .unwrap_or_else(|| panic!("no link {text:?} in {html}"));
+    let start = html[..end].rfind("href=\"").expect("href") + "href=\"".len();
+    let close = start + html[start..].find('"').expect("quote");
+    html[start..close].replace("&amp;", "&")
+}
+
+fn html_page(status: StatusCode, headers: &HeaderMap) {
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "text/html; charset=utf-8");
+    let policy = headers[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .expect("csp");
+    assert!(policy.starts_with("default-src 'none'"), "{policy}");
+    assert!(policy.contains("style-src 'sha256-"), "{policy}");
+    assert!(policy.contains("form-action 'self'"), "{policy}");
+    assert!(!policy.contains("unsafe"), "{policy}");
+}
+
+#[tokio::test]
+async fn someone_new_with_an_invite_gets_one_single_use_signup_link_and_joins() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let provider = Provider::start().await;
+        let pocket = PocketId::start().await;
+        let app = api::router(
+            db.runtime.clone(),
+            Some(account_making(&provider, &pocket, &["group-friends"]).await),
+        );
+        let invite = invite(&db, &owner, "member").await;
+        let client = Client::new();
+
+        // tinyclient opens the join page here, not the provider.
+        let opened = start(&app, &client, json!({"invite": invite})).await;
+        let state = join_state(&opened).expect("start sends the browser to the join page");
+        let (status, headers, choice) = get(&app, &opened).await;
+        html_page(status, &headers);
+        assert!(choice.contains("I'm new here"), "{choice}");
+        let existing = link(&choice, "I already have an account");
+        assert!(existing.starts_with(&format!("{}/authorize?", provider.issuer)));
+        assert!(pocket.asked().is_empty(), "looking makes no link");
+
+        // New here: exactly one token, single use, with the configured groups.
+        let address = common::fresh_address();
+        let (status, headers, made) = post_join(&app, &state, &address).await;
+        html_page(status, &headers);
+        let asked = pocket.asked();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].api_key.as_deref(), Some(pocket::API_KEY));
+        assert_eq!(
+            asked[0].body,
+            json!({"ttl": "15m", "usageLimit": 1, "userGroupIds": ["group-friends"]})
+        );
+        let signup_token = pocket.issued()[0].clone();
+        let signup = link(&made, "Make my account");
+        assert_eq!(
+            signup,
+            format!("{}/signup?token={signup_token}", provider.issuer)
+        );
+        assert!(made.contains("target=\"_blank\" rel=\"noopener noreferrer\""));
+        let onward = link(&made, "Continue");
+        assert_eq!(
+            onward, existing,
+            "the way on is the same authorization request"
+        );
+
+        // Asking again on the same sign-in makes nothing more.
+        let (status, headers, again) = post_join(&app, &state, &address).await;
+        html_page(status, &headers);
+        assert!(again.contains("already made"), "{again}");
+        assert!(!again.contains(signup_token.as_str()));
+        assert_eq!(link(&again, "Continue"), existing);
+        assert_eq!(pocket.asked().len(), 1);
+
+        // Their account made at Pocket ID, the browser goes on and the invite is accepted.
+        let (code, provider_state) =
+            provider.authorize(&onward, Person::new("newcomer"), Tamper::default());
+        assert_eq!(provider_state, state);
+        let (status, headers, _) = callback(&app, &code, &provider_state).await;
+        let back = back_at_client(status, &headers);
+        assert_eq!(back["state"], client.state);
+        let (status, body) = token(&app, &back["code"], &client.verifier).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["role"], "member");
+
+        // The sign-in is spent: the join page and form are gone with it.
+        let (status, _, _) = get(&app, &opened).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = post_join(&app, &state, &common::fresh_address()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(pocket.asked().len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unknown_used_expired_or_revoked_invite_never_makes_a_signup_link() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let provider = Provider::start().await;
+        let pocket = PocketId::start().await;
+        let app = api::router(
+            db.runtime.clone(),
+            Some(account_making(&provider, &pocket, &[]).await),
+        );
+
+        let used = invite(&db, &owner, "member").await;
+        db::sign_in(
+            &db.runtime,
+            &common::profile("first@example.org"),
+            Some(&common::invite_hash(&used)),
+            db::Groups::default(),
+        )
+        .await
+        .expect("someone else uses it up");
+        let expired = invite(&db, &owner, "member").await;
+        sqlx::query(
+            "UPDATE invites SET expires_at = now() - interval '1 second' WHERE token_hash = $1",
+        )
+        .bind(common::invite_hash(&expired))
+        .execute(&db.owner)
+        .await
+        .expect("expire");
+        let revoked = invite(&db, &owner, "member").await;
+        sqlx::query("DELETE FROM invites WHERE token_hash = $1")
+            .bind(common::invite_hash(&revoked))
+            .execute(&db.owner)
+            .await
+            .expect("revoke");
+
+        for invite in [
+            "never-issued-invite-token".to_string(),
+            used,
+            expired,
+            revoked,
+        ] {
+            let client = Client::new();
+            let opened = start(&app, &client, json!({"invite": invite})).await;
+            let state = join_state(&opened).expect("join page");
+            let (status, headers, _) = post_join(&app, &state, &common::fresh_address()).await;
+            let back = back_at_client(status, &headers);
+            assert_eq!(back["error"], "not_member", "{invite}");
+            assert_eq!(back["state"], client.state);
+            // The sign-in ended with it.
+            let (status, _, _) = get(&app, &opened).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        assert!(pocket.asked().is_empty(), "{:?}", pocket.asked());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn someone_with_an_account_goes_on_to_the_provider_and_nothing_is_made() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let provider = Provider::start().await;
+        let pocket = PocketId::start().await;
+        let app = api::router(
+            db.runtime.clone(),
+            Some(account_making(&provider, &pocket, &[]).await),
+        );
+        let invite = invite(&db, &owner, "admin").await;
+        let client = Client::new();
+        let opened = start(&app, &client, json!({"invite": invite})).await;
+        let (_, _, choice) = get(&app, &opened).await;
+        let existing = link(&choice, "I already have an account");
+        let (code, state) = provider.authorize(&existing, Person::new("known"), Tamper::default());
+        let (status, headers, _) = callback(&app, &code, &state).await;
+        let back = back_at_client(status, &headers);
+        let (status, body) = token(&app, &back["code"], &client.verifier).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["role"], "admin");
+        assert!(pocket.asked().is_empty());
+
+        // Without an invite there is no question: straight to the provider, as always.
+        let body = sign_in(&app, &provider, json!({}), Person::new("known")).await;
+        assert_eq!(body["role"], "admin");
+        let plain = start(&app, &Client::new(), json!({})).await;
+        assert!(plain.starts_with(&format!("{}/authorize?", provider.issuer)));
+        assert!(join_state(&plain).is_none());
+        assert!(pocket.asked().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_provider_that_makes_no_accounts_never_asks() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let provider = Provider::start().await;
+        let app = api::router(db.runtime.clone(), Some(provider.sign_in().await));
+        let invite = invite(&db, &owner, "member").await;
+        let client = Client::new();
+        let opened = start(&app, &client, json!({"invite": invite})).await;
+        assert!(opened.starts_with(&format!("{}/authorize?", provider.issuer)));
+        assert!(join_state(&opened).is_none());
+
+        // Its state does not open a join page, and the form makes nothing.
+        let url = url::Url::parse(&opened).expect("url");
+        let state = url
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .map(|(_, state)| state.into_owned())
+            .expect("state");
+        let (status, _, _) = get(&app, &format!("/v1/auth/join?state={state}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = post_join(&app, &state, &common::fresh_address()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // And the sign-in still works as it always did.
+        let (code, state) = provider.authorize(&opened, Person::new("plain"), Tamper::default());
+        let (status, headers, _) = callback(&app, &code, &state).await;
+        let back = back_at_client(status, &headers);
+        let (status, body) = token(&app, &back["code"], &client.verifier).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["role"], "member");
     })
     .await;
 }
