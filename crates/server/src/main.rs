@@ -28,6 +28,22 @@ enum Command {
     },
     /// Serve HTTP and the live socket, and media when `TINYSERVER_PUBLIC_IP` is set.
     Serve,
+    /// List every account's sign-in identities: user id, display name, issuer, subject.
+    Identities,
+    /// Point an account's identity at an issuer to a new subject, for a provider whose subjects
+    /// changed, such as a move from Tinyauth to Pocket ID at the same address. The person then
+    /// signs in as that subject and keeps their account.
+    RelinkIdentity {
+        /// The tinyserver account, from `tinyserver identities`.
+        #[arg(long)]
+        user_id: String,
+        /// The person's subject at the provider now, such as their Pocket ID user id.
+        #[arg(long)]
+        subject: String,
+        /// The provider's issuer. `TINYSERVER_OIDC_ISSUER` when unset.
+        #[arg(long)]
+        issuer: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -44,6 +60,55 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => migrate().await?,
         Command::Bootstrap { owner_invite } => bootstrap(owner_invite).await?,
         Command::Serve => serve().await?,
+        Command::Identities => identities().await?,
+        Command::RelinkIdentity {
+            user_id,
+            subject,
+            issuer,
+        } => relink_identity(&user_id, &subject, issuer).await?,
+    }
+    Ok(())
+}
+
+async fn identities() -> anyhow::Result<()> {
+    let pool = db::owner_pool(&env_var("DATABASE_URL_MIGRATE")?).await?;
+    let rows = db::list_identities(&pool).await?;
+    if rows.is_empty() {
+        println!("No identities.");
+    }
+    for (user_id, name, issuer, subject) in rows {
+        println!("{user_id}  {name}\n    issuer  {issuer}\n    subject {subject}");
+    }
+    Ok(())
+}
+
+async fn relink_identity(
+    user_id: &str,
+    subject: &str,
+    issuer: Option<String>,
+) -> anyhow::Result<()> {
+    let issuer = match issuer {
+        Some(issuer) => issuer,
+        None => env_var("TINYSERVER_OIDC_ISSUER").context("pass --issuer")?,
+    };
+    if !(1..=255).contains(&subject.len()) || subject.trim() != subject {
+        bail!("the subject must be 1 to 255 characters with no space around it");
+    }
+    let pool = db::owner_pool(&env_var("DATABASE_URL_MIGRATE")?).await?;
+    match db::relink_identity(&pool, user_id, &issuer, subject).await? {
+        db::Relinked::Moved { previous } => {
+            tracing::info!(%user_id, %issuer, "identity relinked");
+            match previous {
+                Some(previous) => println!("{user_id} at {issuer}: {previous} -> {subject}"),
+                None => println!("{user_id} at {issuer}: now {subject}"),
+            }
+        }
+        db::Relinked::Unchanged => println!("{user_id} at {issuer} is already {subject}."),
+        db::Relinked::Taken { user_id: other } => bail!(
+            "account {other} already signs in as {subject} at {issuer}; remove that account \
+             first or pick another"
+        ),
+        db::Relinked::NoSuchUser => bail!("no account {user_id}"),
     }
     Ok(())
 }

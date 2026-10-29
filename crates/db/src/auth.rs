@@ -247,6 +247,96 @@ pub async fn release_signup(pool: &PgPool, state: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Points the identity `user_id` has at `issuer` to `subject`, or gives them one there. For a
+/// provider whose subjects changed, such as a move from Tinyauth to Pocket ID at the same
+/// issuer. Runs as `app_owner`. Returns false when that user does not exist.
+pub async fn relink_identity(
+    pool: &PgPool,
+    user_id: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<Relinked, DbError> {
+    let mut tx = pool.begin().await?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1::uuid)")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !exists {
+        return Ok(Relinked::NoSuchUser);
+    }
+    let taken: Option<String> = sqlx::query_scalar(
+        "SELECT user_id::text FROM user_identities WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(issuer)
+    .bind(subject)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match taken {
+        Some(owner) if owner == user_id => return Ok(Relinked::Unchanged),
+        Some(owner) => return Ok(Relinked::Taken { user_id: owner }),
+        None => {}
+    }
+    let previous: Option<String> = sqlx::query_scalar(
+        "DELETE FROM user_identities WHERE user_id = $1::uuid AND issuer = $2 RETURNING subject",
+    )
+    .bind(user_id)
+    .bind(issuer)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO user_identities (user_id, issuer, subject) VALUES ($1::uuid, $2, $3)")
+        .bind(user_id)
+        .bind(issuer)
+        .bind(subject)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO audit_log (actor_id, action, subject, detail, subject_user_id)
+         VALUES (NULL, 'identity.relink', 'user',
+                 jsonb_build_object('issuer', $2::text, 'subject', $3::text,
+                                    'previous_subject', $4::text),
+                 $1::uuid)",
+    )
+    .bind(user_id)
+    .bind(issuer)
+    .bind(subject)
+    .bind(previous.as_deref())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Relinked::Moved { previous })
+}
+
+/// What `relink_identity` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Relinked {
+    /// The identity now names the new subject. `previous` is the subject it had, if any.
+    Moved {
+        previous: Option<String>,
+    },
+    /// It already did.
+    Unchanged,
+    /// Another account has that identity: someone signed in with it already.
+    Taken {
+        user_id: String,
+    },
+    NoSuchUser,
+}
+
+/// Every identity, for the operator: user id, display name, issuer, subject.
+pub async fn list_identities(
+    pool: &PgPool,
+) -> Result<Vec<(String, String, String, String)>, DbError> {
+    let rows = sqlx::query_as(
+        "SELECT u.id::text, u.display_name, i.issuer, i.subject
+         FROM user_identities i JOIN users u ON u.id = i.user_id
+         ORDER BY u.created_at, i.issuer",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Finds the person by `(issuer, subject)`. A member signs in. Anyone else needs the invite
 /// whose hash came with the pending sign-in, audited as `invite.accept`, or a joining group,
 /// audited as `member.join`. Either makes the account if there is none. An admin group then

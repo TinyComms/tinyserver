@@ -1420,3 +1420,79 @@ async fn a_provider_that_makes_no_accounts_never_asks() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_relinked_identity_keeps_the_account_under_the_new_subject() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let provider = Provider::start().await;
+        let app = api::router(db.runtime.clone(), Some(provider.sign_in().await));
+        let invite = invite(&db, &owner, "member").await;
+        let before = sign_in(
+            &app,
+            &provider,
+            json!({"invite": invite}),
+            Person::new("tinyauth-sub"),
+        )
+        .await;
+        let user_id = before["user_id"].as_str().expect("user id").to_string();
+
+        // The provider moved (Tinyauth to Pocket ID at the same issuer): new subjects.
+        let moved = db::relink_identity(&db.owner, &user_id, &provider.issuer, "pocket-id-uuid")
+            .await
+            .expect("relink");
+        assert_eq!(
+            moved,
+            db::Relinked::Moved {
+                previous: Some("tinyauth-sub".to_string())
+            }
+        );
+        assert_eq!(
+            db::relink_identity(&db.owner, &user_id, &provider.issuer, "pocket-id-uuid")
+                .await
+                .expect("again"),
+            db::Relinked::Unchanged
+        );
+        let after = sign_in(&app, &provider, json!({}), Person::new("pocket-id-uuid")).await;
+        assert_eq!(after["user_id"], user_id);
+        assert_eq!(after["role"], "member");
+
+        // The old subject is nobody now, and another account cannot take the new one.
+        let client = Client::new();
+        let back = through_provider(
+            &app,
+            &provider,
+            &client,
+            json!({}),
+            Person::new("tinyauth-sub"),
+            Tamper::default(),
+        )
+        .await;
+        assert_eq!(back["error"], "not_member");
+        assert_eq!(
+            db::relink_identity(
+                &db.owner,
+                &owner.user_id,
+                &provider.issuer,
+                "pocket-id-uuid"
+            )
+            .await
+            .expect("taken"),
+            db::Relinked::Taken {
+                user_id: user_id.clone()
+            }
+        );
+        assert_eq!(
+            db::relink_identity(
+                &db.owner,
+                "00000000-0000-0000-0000-000000000001",
+                &provider.issuer,
+                "x"
+            )
+            .await
+            .expect("nobody"),
+            db::Relinked::NoSuchUser
+        );
+    })
+    .await;
+}
