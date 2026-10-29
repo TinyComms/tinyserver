@@ -388,7 +388,7 @@ async fn mute_is_shown_to_everyone_and_stops_forwarding() {
         let mute = json!({"type": "call.state", "ref": "m", "muted": true, "deafened": false});
         let reply = answer(&mut a.ws, mute).await;
         assert_eq!(reply, json!({"type": "ok", "ref": "m"}));
-        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false, "camera": false, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false});
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": true, "deafened": false, "camera": false, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false, "e2ee": false});
         until(&mut b.ws, |value| (*value == shown).then_some(())).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let muted = heard_over(&b, Duration::from_millis(400)).await;
@@ -597,7 +597,7 @@ async fn a_camera_is_shown_to_everyone_and_reaches_the_other_listener() {
         slots(&mut b.ws, &b.call_id, 1).await;
 
         camera(&mut a, true).await;
-        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": true, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false});
+        let shown = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": true, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false, "e2ee": false});
         until(&mut b.ws, |value| (*value == shown).then_some(())).await;
         let video = video_slot(&mut b.ws, &b.call_id, Some(&a.user_id)).await;
         assert_eq!(video["kind"], "camera");
@@ -615,7 +615,7 @@ async fn a_camera_is_shown_to_everyone_and_reaches_the_other_listener() {
         assert_eq!(answer(&mut b.ws, bad).await["code"], "bad_frame");
 
         camera(&mut a, false).await;
-        let hidden = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": false, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false});
+        let hidden = json!({"type": "call.state", "room_id": cast.lobby, "user_id": a.user_id, "muted": false, "deafened": false, "camera": false, "sharing": false, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false, "e2ee": false});
         until(&mut b.ws, |value| (*value == hidden).then_some(())).await;
         video_slot(&mut b.ws, &b.call_id, None).await;
     })
@@ -696,7 +696,7 @@ async fn goes_quiet(person: &Person) {
 
 /// The `call.state` everyone sees for `user_id` with a camera and share as given.
 fn state(room_id: &str, user_id: &str, camera: bool, sharing: bool) -> Value {
-    json!({"type": "call.state", "room_id": room_id, "user_id": user_id, "muted": false, "deafened": false, "camera": camera, "sharing": sharing, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false})
+    json!({"type": "call.state", "room_id": room_id, "user_id": user_id, "muted": false, "deafened": false, "camera": camera, "sharing": sharing, "server_muted": false, "server_deafened": false, "suppressed": false, "priority": false, "e2ee": false})
 }
 
 /// Waits for this socket's `call.slots` whose video slot carries `user_id`'s share, then for

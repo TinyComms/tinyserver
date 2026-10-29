@@ -129,6 +129,23 @@ pub(crate) struct Incoming {
     pub server_deafened: Option<bool>,
     /// `call.quality`: `high`, `low`, or `off`.
     pub video: Option<String>,
+    /// `call.join`: the highest end-to-end encryption version the client speaks. Read
+    /// leniently: a number of 1 or more, anything else is none.
+    pub e2ee: Option<Value>,
+    /// `call.e2ee`: `key_package`, `commit`, or `invalid`.
+    pub op: Option<String>,
+    /// `call.e2ee` `commit`: the epoch it moves the group from.
+    pub epoch: Option<u64>,
+    /// `call.e2ee`: base64 key package or commit, and a commit's welcome.
+    pub data: Option<String>,
+    pub welcome: Option<String>,
+}
+
+impl Incoming {
+    /// The end-to-end encryption version a `call.join` offers. 0 is none.
+    pub fn e2ee_version(&self) -> u64 {
+        self.e2ee.as_ref().and_then(Value::as_u64).unwrap_or(0)
+    }
 }
 
 impl Incoming {
@@ -367,6 +384,7 @@ mod tests {
             server_deafened: true,
             suppressed: false,
             priority: true,
+            e2ee: true,
         };
         let state = Out::CallState {
             room_id: "r",
@@ -374,7 +392,7 @@ mod tests {
         };
         assert_eq!(
             state.text(),
-            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false,"camera":true,"sharing":false,"server_muted":false,"server_deafened":true,"suppressed":false,"priority":true}"#
+            r#"{"type":"call.state","room_id":"r","user_id":"u","muted":true,"deafened":false,"camera":true,"sharing":false,"server_muted":false,"server_deafened":true,"suppressed":false,"priority":true,"e2ee":true}"#
         );
         let joined = Out::CallJoined {
             room_id: "r",
@@ -424,12 +442,13 @@ mod tests {
                     server_deafened: false,
                     suppressed: false,
                     priority: false,
+                    e2ee: false,
                 }],
             }],
         };
         assert_eq!(
             ready.text(),
-            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true,"camera":false,"sharing":true,"server_muted":false,"server_deafened":false,"suppressed":false,"priority":false}]}]}"#
+            r#"{"type":"ready","seq":4,"me":{"user_id":"u","role":"owner"},"online":["u"],"calls":[{"room_id":"r","participants":[{"user_id":"u","muted":false,"deafened":true,"camera":false,"sharing":true,"server_muted":false,"server_deafened":false,"suppressed":false,"priority":false,"e2ee":false}]}]}"#
         );
         let reference = json!("7");
         let error = Out::Error {

@@ -190,10 +190,12 @@ async fn serve(
     recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut bucket = Bucket::new(limits.messages_per_second, limits.message_burst);
     let mut moves = Moves::new(limits.call_move_burst, limits.call_move_every);
+    let mut rekeys = Moves::new(limits.e2ee_rekey_burst, limits.e2ee_rekey_every);
     let mut asking = Asking {
         conn,
         bucket: &mut bucket,
         moves: &mut moves,
+        rekeys: &mut rekeys,
     };
 
     loop {
@@ -281,6 +283,8 @@ struct Asking<'a> {
     conn: u64,
     bucket: &'a mut Bucket,
     moves: &'a mut Moves,
+    /// End-to-end encryption key packages and `invalid`s.
+    rekeys: &'a mut Moves,
 }
 
 async fn receive(
@@ -327,9 +331,15 @@ async fn receive(
     };
     let room_id = incoming.room_id.as_deref();
     let sdp = incoming.sdp.as_deref();
+    let e2ee = incoming.e2ee_version() >= u64::from(super::e2ee::VERSION);
     let answer = match incoming.kind.as_str() {
         "ping" => return send(hub, socket, Out::Pong.text()).await,
-        "call.join" => call_join(hub, me, asking, room_id, sdp).await?,
+        // Answered only when refused: the frames it causes are the answer.
+        "call.e2ee" => match call_e2ee(hub, me, asking, &incoming) {
+            Ok(()) => return Ok(()),
+            Err(code) => Err(code),
+        },
+        "call.join" => call_join(hub, me, asking, room_id, sdp, e2ee).await?,
         "call.leave" => call_leave(hub, me, asking),
         "call.kick" => call_kick(hub, me, room_id, incoming.user_id.as_deref()).await?,
         "call.moderate" => call_moderate(hub, me, &incoming).await?,
@@ -403,6 +413,7 @@ async fn call_join(
     asking: &mut Asking<'_>,
     room_id: Option<&str>,
     sdp: Option<&str>,
+    e2ee: bool,
 ) -> Result<Answer, End> {
     let Some(room_id) = room_id else {
         return Ok(Err("bad_frame"));
@@ -424,6 +435,11 @@ async fn call_join(
         Ok(found) => found,
         Err(code) => return Ok(Err(code)),
     };
+    // A room that requires end-to-end encryption takes only apps that can do it. Without
+    // media there is nothing to encrypt.
+    if media.is_some() && found.e2ee_required && !e2ee {
+        return Ok(Err("e2ee_required"));
+    }
     if let Err(refused) = hub.call_check(&me.user_id, room_id, found.user_limit) {
         return Ok(Err(refused.code()));
     }
@@ -441,6 +457,7 @@ async fn call_join(
         answer.as_ref(),
         found.user_limit,
         access(found.permissions),
+        e2ee && answer.is_some(),
     );
     if let Err(refused) = joined {
         if let Some(answer) = &answer {
@@ -454,6 +471,30 @@ async fn call_join(
         return Ok(Err("not_found"));
     }
     Ok(Ok(answer.map_or(Done::Ok, Done::Answer)))
+}
+
+/// MLS for the caller's call: a key package, a commit, or `invalid`. Only from the socket that
+/// holds their seat with media. Key packages and `invalid`s share a small rate of their own.
+fn call_e2ee(
+    hub: &Hub,
+    me: &Me,
+    asking: &mut Asking<'_>,
+    incoming: &Incoming,
+) -> Result<(), &'static str> {
+    let Some(op) = incoming.op.as_deref() else {
+        return Err("bad_frame");
+    };
+    if matches!(op, "key_package" | "invalid") && !asking.rekeys.take() {
+        return Err("slow_down");
+    }
+    hub.call_e2ee(
+        &me.user_id,
+        asking.conn,
+        op,
+        incoming.epoch,
+        incoming.data.as_deref(),
+        incoming.welcome.as_deref(),
+    )
 }
 
 fn media_code(refused: sfu::Refused) -> &'static str {
