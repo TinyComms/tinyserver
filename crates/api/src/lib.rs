@@ -16,7 +16,7 @@ mod session;
 pub mod fuzz;
 
 pub use live::{Limits, Live};
-pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig};
+pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};
 
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, HeaderName, HeaderValue};

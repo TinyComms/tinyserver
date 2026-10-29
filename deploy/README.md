@@ -1,52 +1,84 @@
 # Running a community
 
-Postgres, tinyserver, and Tinyauth sit on a Docker network that has no route to the internet. cloudflared is on that network and on a second network that can reach Cloudflare, and it carries HTTP and the live socket for the chat hostname and the sign-in pages for the auth hostname. The one published port is the media port, UDP and the same number on TCP, for call audio and video. Starting a sign-in and trading its code are limited to a few tries a minute per address.
+Postgres, tinyserver, and Pocket ID sit on a Docker network that has no route to the internet. cloudflared is on that network and on a second network that can reach Cloudflare, and it carries HTTP and the live socket for the chat hostname and the sign-in pages for the auth hostname. The one published port is the media port, UDP and the same number on TCP, for call audio and video. Starting a sign-in, trading its code, and asking for a sign-up link are limited to a few tries a minute per address.
 
-tinyserver keeps no passwords. People sign in at an OpenID Connect provider; Tinyauth comes set up as the default one. Signing in proves who someone is to the server. It never grants decryption.
+tinyserver keeps no passwords. People sign in at an OpenID Connect provider; Pocket ID comes set up as the default one, and people sign in there with a passkey. Signing in proves who someone is to the server. It never grants decryption.
 
 The environment file next to the compose file holds the database passwords, the tunnel token, and the two public URLs. The sign-in secrets are files in `deploy/secrets`. Neither is committed.
 
-`deploy/compose.yml` reads them. `TINYSERVER_PG_DIR` and `TINYAUTH_DATA_DIR` can be host directories. Left unset, Docker keeps named volumes.
+`deploy/compose.yml` reads them. `TINYSERVER_PG_DIR` and `POCKETID_DATA_DIR` can be host directories. Left unset, Docker keeps named volumes.
 
 ## Two hostnames
 
 | Variable | Example | What it is |
 | --- | --- | --- |
 | `TINYSERVER_PUBLIC_URL` | `https://chat.example.org` | The address people type into tinyclient. The tunnel sends it to `http://tinyserver:8080`. |
-| `TINYAUTH_PUBLIC_URL` | `https://auth.example.org` | Tinyauth's sign-in pages and its OIDC issuer. The tunnel sends it to `http://tinyauth:3000`. |
+| `AUTH_PUBLIC_URL` | `https://auth.example.org` | Pocket ID's pages and its OIDC issuer (`APP_URL`). The tunnel sends it to `http://pocket-id:1411`. `TINYAUTH_PUBLIC_URL`, its name before Pocket ID, still works when `AUTH_PUBLIC_URL` is unset. |
 
-Add both as public hostnames on the tunnel in Cloudflare. Tinyauth needs https; Cloudflare provides it. The issuer is `TINYAUTH_PUBLIC_URL` exactly, with no trailing slash, because that is what Tinyauth puts in its tokens.
+Add both as public hostnames on the tunnel in Cloudflare. Passkeys need https; Cloudflare provides it. The issuer is `AUTH_PUBLIC_URL` exactly, with no trailing slash and no path, because that is what Pocket ID puts in its tokens.
 
-tinyserver has no route out, so it reaches Tinyauth inside, at `http://tinyauth:3000` (`TINYSERVER_OIDC_INTERNAL_URL`). Discovery, the keys, and the code exchange go there, with the endpoints Tinyauth names moved to that address. The issuer in discovery and in every ID token must still be the public one. The browser always goes to the public auth hostname.
+tinyserver has no route out, so it reaches Pocket ID inside, at `http://pocket-id:1411` (`TINYSERVER_OIDC_INTERNAL_URL`). Discovery, the keys, the code exchange, and the sign-up API go there, with the endpoints Pocket ID names moved to that address. The issuer in discovery and in every ID token must still be the public one. The browser always goes to the public auth hostname.
 
 The other way is to give tinyserver a route out and leave `TINYSERVER_OIDC_INTERNAL_URL` unset; it then reads everything at the public issuer, through Cloudflare. That is the only way for a provider outside this compose file, such as Google; tinyserver is already on the `media` network, which has a route out.
 
-## Tinyauth
+## Pocket ID
 
-Tinyauth (AGPL-3.0, OpenID Certified) runs as `ghcr.io/tinyauthapp/tinyauth:v5.2.0-distroless`, pinned by digest, as user 65532, with a read-only root, no capabilities, `no-new-privileges`, a small `/tmp`, and process and memory limits. It has no published port and only the internal network. It keeps its sessions and its signing key in the `tinyauth_data` volume; the key is made on first start.
+Pocket ID (BSD-2-Clause) is a small OpenID Connect provider where people sign in with passkeys only. It runs as `ghcr.io/pocket-id/pocket-id:v2.19.1-distroless`, pinned by digest, as user 65532, with a read-only root, no capabilities, `no-new-privileges`, a small `/tmp`, and process and memory limits. It has no published port and only the internal network. It keeps its SQLite database, signing key, and uploads in the `pocketid_data` volume at `/app/data`; a one-shot `pocket-id-data` container gives that volume to user 65532 before each start, because the image has no shell.
 
-It is configured for this server alone: local users from a file, with TOTP; no Docker labels, no analytics, no resources server; secure cookies; 12-hour sessions and 7 days at most; three tries, then 15 minutes locked; ACLs deny by default; JSON logs with the audit stream on; and one OIDC client, `tinyserver`, whose only redirect URI is `${TINYSERVER_PUBLIC_URL}/v1/auth/callback`. It trusts the forwarded-for header only from cloudflared, which has the fixed address `TINYSERVER_TUNNEL_IP` (172.30.53.10) on `TINYSERVER_INSIDE_SUBNET` (172.30.53.0/24). Change both if that range is taken on the host.
+It is configured from the environment, not its admin pages (`UI_CONFIG_DISABLED`): accounts only with a sign-up token (`ALLOW_USER_SIGNUPS=withToken`), email optional and never trusted as verified, no client secret made on its own, https callback URLs only, no analytics, no version check, no icon library, JSON logs. It trusts the forwarded-for header only from cloudflared, which has the fixed address `TINYSERVER_TUNNEL_IP` (172.30.53.10) on `TINYSERVER_INSIDE_SUBNET` (172.30.53.0/24) (`TRUST_PROXY`). Change both if that range is taken on the host. `AUTH_APP_NAME` names it on its pages, `tinyserver` unless set.
 
-Before the first start, make the secrets, from `deploy/`:
+Three secrets: `oidc_client_secret`, tinyserver's secret at Pocket ID; `pocketid_encryption_key`, which encrypts Pocket ID's private data (`ENCRYPTION_KEY_FILE`); and `pocketid_api_key`, Pocket ID's static API key (`STATIC_API_KEY_FILE`). The API key acts as an admin and cannot sign in; tinyserver uses it only to make sign-up tokens, and the setup script to make the client and the first admin. Keep it as close as the database passwords.
 
-```sh
-sh tinyauth/setup.sh
-```
-
-It writes `secrets/oidc_client_secret`, 32 random bytes in hex that Tinyauth and tinyserver share, and walks through `tinyauth user create` and `tinyauth totp generate` in the pinned image, then adds the `username:bcrypt-hash:totp-secret` line to `secrets/tinyauth_users`. Run it again for each person who should have a Tinyauth account, then `docker compose up -d` so Tinyauth reads the file again. The directory is 0700 and the files 0444, because the containers read them as their own users.
-
-By hand, it is the same:
+Set up, from `deploy/`, with the environment file in place:
 
 ```sh
-mkdir -p secrets && chmod 700 secrets
-openssl rand -hex 32 > secrets/oidc_client_secret
-docker run --rm -it ghcr.io/tinyauthapp/tinyauth:v5.2.0-distroless user create --interactive
-docker run --rm -it ghcr.io/tinyauthapp/tinyauth:v5.2.0-distroless totp generate --interactive
-# put the final username:hash:secret line in secrets/tinyauth_users
-chmod 444 secrets/oidc_client_secret secrets/tinyauth_users
+sh pocket-id/setup.sh moss
 ```
 
-A Tinyauth account is not a membership. People still need an invite, or a group the owner allows, to join.
+It writes the three secrets unless they are there (the directory 0700, the files 0444, because the containers read them as their own users), starts Pocket ID and waits for it, and then, through Pocket ID's API from a `curlimages/curl` container pinned by digest that shares Pocket ID's network:
+
+1. Makes the OIDC client `tinyserver`, or brings it up to date: confidential (`client_secret_basic`), PKCE, callback `${TINYSERVER_PUBLIC_URL}/v1/auth/callback`, back-channel logout to `http://tinyserver:8080/v1/auth/backchannel-logout`, and no consent screen. Its secret is `secrets/oidc_client_secret`, registered once.
+2. With a username, here `moss`: makes that admin unless they exist and prints a one-time login link, `${AUTH_PUBLIC_URL}/lc/<token>`, good for an hour. Open it, and Pocket ID asks for a passkey. Run it again for a fresh link. It also prints their Pocket ID user id, which is the subject tinyserver sees.
+
+Run it again any time; every step is skipped when already done. Compose options go in `COMPOSE`, such as `COMPOSE="docker compose -p tinyserver --env-file ../../.env" sh pocket-id/setup.sh`. The API key and the client secret reach curl on its standard input, never in a command line. Then `docker compose up -d`.
+
+A Pocket ID account is not a membership, and a membership needs no Pocket ID account made by hand. People still need an invite, or a group the owner allows, to join.
+
+### An invite makes the account
+
+tinyserver runs with `TINYSERVER_OIDC_SIGNUP=pocket-id` and `TINYSERVER_OIDC_POCKETID_API_KEY_FILE`. When someone pastes an invite into tinyclient, the browser opens a page at tinyserver first: "I'm new here" or "I already have an account".
+
+- Already have one: a link straight to Pocket ID's sign-in, as without an invite.
+- New: tinyserver checks that the invite could still be accepted (known, not expired, not used up), then asks Pocket ID for one sign-up token, `POST /api/signup-tokens` with `{"ttl":"15m","usageLimit":1}` and the `X-API-Key` header. The page then has two steps: "Make my account" opens `${AUTH_PUBLIC_URL}/signup?token=<token>` in a new tab, where they pick a username and make a passkey; "Continue" in the first tab goes on to Pocket ID's sign-in, where their new session signs them straight in, and back to tinyclient with the invite accepted.
+
+Pocket ID's sign-up page ignores any redirect and ends at its own account page, so the way back is the first tab. One sign-in gets at most one token; asking again shows "Continue" and makes none. An unknown, expired, or used-up invite makes no token and sends tinyclient `not_member`. The form allows 3 tries a minute per address and 30 a minute in all. Neither the key nor any token is logged. tinyclient waits 5 minutes for the browser to come back, so a person who takes longer starts again from the invite; the sign-up token they did not use expires on its own.
+
+`TINYSERVER_OIDC_POCKETID_GROUP_IDS` lists Pocket ID group ids a new account joins. `TINYSERVER_OIDC_SIGNUP=none` turns sign-up off; then invites only work for people who already have an account.
+
+### Moving from Tinyauth
+
+The auth hostname stays, so the issuer stays and tinyclient notices nothing. Every subject changes: Tinyauth's subject is not Pocket ID's user id. So each existing tinyserver account is moved by hand to the person's new Pocket ID account; until then they sign in as a stranger and are turned away as `not_member`, and nothing is kept.
+
+1. Back up the database: `docker compose exec -T postgres pg_dump -U postgres tinyserver > backups/before-pocket-id.sql`.
+2. Deploy this version. In the environment file, rename `TINYAUTH_PUBLIC_URL` to `AUTH_PUBLIC_URL` (or leave it; it still works).
+3. In Cloudflare, point the tunnel's auth hostname at `http://pocket-id:1411` instead of `http://tinyauth:3000`.
+4. `sh pocket-id/setup.sh <username>` for each person who already has a tinyserver account. It keeps `secrets/oidc_client_secret` and registers it on the new client, and prints each one's login link and Pocket ID user id. Send each person their link; they add a passkey.
+5. `docker compose up -d --remove-orphans` starts everything and removes the Tinyauth container. `secrets/tinyauth_users` and the `tinyauth_data` volume can go once all is well.
+6. List the accounts and their old subjects, then move each one to its new subject:
+
+   ```sh
+   docker compose exec tinyserver tinyserver identities
+   docker compose exec tinyserver tinyserver relink-identity --user-id <tinyserver user id> --subject <Pocket ID user id>
+   ```
+
+   `--issuer` defaults to `TINYSERVER_OIDC_ISSUER`. It refuses a subject another account already has, and writes an `identity.relink` audit row. The same in SQL, as `app_owner` (`docker compose exec -T postgres psql -U app_owner tinyserver`):
+
+   ```sql
+   UPDATE user_identities SET subject = '<Pocket ID user id>'
+   WHERE user_id = '<tinyserver user id>' AND issuer = '<AUTH_PUBLIC_URL>';
+   ```
+
+Sessions already open keep working until they expire.
 
 ## The first owner
 
@@ -56,7 +88,7 @@ There is no owner password. The first start migrates and, while there is no owne
 docker compose logs tinyserver | grep -A2 'Owner invite'
 ```
 
-It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Tinyauth; that person becomes the owner. Until someone does, a start keeps that invite while it works and prints a new one only once it has expired; lost it, run `tinyserver bootstrap --owner-invite` for a new one, and the old one stops working. After that, starts leave the owner alone.
+It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. Until someone does, a start keeps that invite while it works and prints a new one only once it has expired; lost it, run `tinyserver bootstrap --owner-invite` for a new one, and the old one stops working. After that, starts leave the owner alone.
 
 A server from before sign-in moved to OIDC still has its owner, but that account has no provider identity and cannot sign in. Make an owner invite anyway, sign in with it, and remove the old account from the member list:
 
@@ -80,6 +112,10 @@ Any provider with discovery, the authorization code flow, and a confidential cli
 | `TINYSERVER_OIDC_GROUPS_CLAIM` | The ID token claim with the person's groups, an array or a comma list. `groups` unless set. |
 | `TINYSERVER_OIDC_MEMBER_GROUPS` | Comma list. Someone in one of these, or in an admin group, joins without an invite, audited as `member.join` with `via` `groups`. Unset is invite only. |
 | `TINYSERVER_OIDC_ADMIN_GROUPS` | Comma list. A member in one of these gets the admin role (the most senior role with manage_server or manage_roles, "Admin" on an upgraded server) when they sign in, audited as `member.role` with `via` `groups`. Leaving the group does not take it away; someone with manage_roles does that. No claim makes an owner. |
+| `TINYSERVER_OIDC_SIGNUP` | `pocket-id` lets an invite make the person's account at Pocket ID ([above](#an-invite-makes-the-account)). Unset or `none` for every other provider. |
+| `TINYSERVER_OIDC_POCKETID_API_KEY_FILE` or `TINYSERVER_OIDC_POCKETID_API_KEY` | With `pocket-id`: a Pocket ID API key that may create users (the static API key, or an admin's), at least 16 characters, sent as `X-API-Key`. Required. |
+| `TINYSERVER_OIDC_POCKETID_INTERNAL_URL` | Where tinyserver reaches Pocket ID's API. `TINYSERVER_OIDC_INTERNAL_URL` unless set, else the issuer. |
+| `TINYSERVER_OIDC_POCKETID_GROUP_IDS` | Comma list of Pocket ID group ids a new account joins. |
 | `TINYSERVER_SESSION_MAX_DAYS` | How long a session from sign-in lasts, 1 to 365, 30 unless set. Then tinyclient signs in again. Nothing extends a session, and no provider refresh token is kept. |
 
 Several providers at once: `TINYSERVER_OIDC_PROVIDERS=tinyauth,google`, then the same variables with the id after `OIDC_`, such as `TINYSERVER_OIDC_GOOGLE_ISSUER`, `TINYSERVER_OIDC_GOOGLE_CLIENT_SECRET_FILE`, and `TINYSERVER_OIDC_GOOGLE_NAME` for the name. The first is the default. A person is the pair of issuer and subject, so the same person at two providers is two accounts. Email never links accounts.
@@ -94,7 +130,7 @@ A provider that supports OpenID Connect Back-Channel Logout 1.0 can end the sess
 ${TINYSERVER_PUBLIC_URL}/v1/auth/backchannel-logout
 ```
 
-The logout token is checked like an ID token: signature, issuer, audience, `iat`, the logout event, no `nonce`. A `sid` ends the sessions from that provider session; a `sub` ends that person's sessions from that provider; both together end the ones that match both. Their live sockets close at once. Sessions are audited as `session.logout`. Tinyauth 5.2 does not send these; signing out in tinyclient ends its own session, and "Sign out everywhere" ends all of them.
+The logout token is checked like an ID token: signature, issuer, audience, `iat`, the logout event, no `nonce`. A `sid` ends the sessions from that provider session; a `sub` ends that person's sessions from that provider; both together end the ones that match both. Their live sockets close at once. Sessions are audited as `session.logout`. Pocket ID supports this, by `sub` (it sends no `sid`); the setup script registers `http://tinyserver:8080/v1/auth/backchannel-logout`, inside the compose network. Signing out in tinyclient ends its own session, and "Sign out everywhere" ends all of them.
 
 ## Calls and the media port
 
@@ -124,4 +160,4 @@ Every ten minutes the server deletes expired sessions, expired invites nobody us
 
 ## Images
 
-`cloudflare/cloudflared` is pinned to a release tag and Tinyauth to a release tag and digest. Raise them on purpose, after reading the release notes.
+`cloudflare/cloudflared` is pinned to a release tag, and Pocket ID and the setup script's `curlimages/curl` to a release tag and digest. Raise them on purpose, after reading the release notes.

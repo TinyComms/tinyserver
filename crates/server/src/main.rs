@@ -28,6 +28,22 @@ enum Command {
     },
     /// Serve HTTP and the live socket, and media when `TINYSERVER_PUBLIC_IP` is set.
     Serve,
+    /// List every account's sign-in identities: user id, display name, issuer, subject.
+    Identities,
+    /// Point an account's identity at an issuer to a new subject, for a provider whose subjects
+    /// changed, such as a move from Tinyauth to Pocket ID at the same address. The person then
+    /// signs in as that subject and keeps their account.
+    RelinkIdentity {
+        /// The tinyserver account, from `tinyserver identities`.
+        #[arg(long)]
+        user_id: String,
+        /// The person's subject at the provider now, such as their Pocket ID user id.
+        #[arg(long)]
+        subject: String,
+        /// The provider's issuer. `TINYSERVER_OIDC_ISSUER` when unset.
+        #[arg(long)]
+        issuer: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -44,6 +60,55 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => migrate().await?,
         Command::Bootstrap { owner_invite } => bootstrap(owner_invite).await?,
         Command::Serve => serve().await?,
+        Command::Identities => identities().await?,
+        Command::RelinkIdentity {
+            user_id,
+            subject,
+            issuer,
+        } => relink_identity(&user_id, &subject, issuer).await?,
+    }
+    Ok(())
+}
+
+async fn identities() -> anyhow::Result<()> {
+    let pool = db::owner_pool(&env_var("DATABASE_URL_MIGRATE")?).await?;
+    let rows = db::list_identities(&pool).await?;
+    if rows.is_empty() {
+        println!("No identities.");
+    }
+    for (user_id, name, issuer, subject) in rows {
+        println!("{user_id}  {name}\n    issuer  {issuer}\n    subject {subject}");
+    }
+    Ok(())
+}
+
+async fn relink_identity(
+    user_id: &str,
+    subject: &str,
+    issuer: Option<String>,
+) -> anyhow::Result<()> {
+    let issuer = match issuer {
+        Some(issuer) => issuer,
+        None => env_var("TINYSERVER_OIDC_ISSUER").context("pass --issuer")?,
+    };
+    if !(1..=255).contains(&subject.len()) || subject.trim() != subject {
+        bail!("the subject must be 1 to 255 characters with no space around it");
+    }
+    let pool = db::owner_pool(&env_var("DATABASE_URL_MIGRATE")?).await?;
+    match db::relink_identity(&pool, user_id, &issuer, subject).await? {
+        db::Relinked::Moved { previous } => {
+            tracing::info!(%user_id, %issuer, "identity relinked");
+            match previous {
+                Some(previous) => println!("{user_id} at {issuer}: {previous} -> {subject}"),
+                None => println!("{user_id} at {issuer}: now {subject}"),
+            }
+        }
+        db::Relinked::Unchanged => println!("{user_id} at {issuer} is already {subject}."),
+        db::Relinked::Taken { user_id: other } => bail!(
+            "account {other} already signs in as {subject} at {issuer}; remove that account \
+             first or pick another"
+        ),
+        db::Relinked::NoSuchUser => bail!("no account {user_id}"),
     }
     Ok(())
 }
@@ -189,7 +254,7 @@ async fn sign_in() -> anyhow::Result<api::SignIn> {
 const DISCOVERY_TRIES: u32 = 12;
 const DISCOVERY_PAUSE: Duration = Duration::from_secs(5);
 
-/// `TINYSERVER_OIDC_PROVIDERS=tinyauth,google` reads `TINYSERVER_OIDC_TINYAUTH_*` and
+/// `TINYSERVER_OIDC_PROVIDERS=pocket-id,google` reads `TINYSERVER_OIDC_POCKET_ID_*` and
 /// `TINYSERVER_OIDC_GOOGLE_*`, first one the default. Without it, the single provider in
 /// `TINYSERVER_OIDC_*` has the id `default`.
 fn providers_from_env() -> anyhow::Result<Vec<api::ProviderConfig>> {
@@ -256,7 +321,46 @@ fn provider_from_env(
         groups_claim: env_var(&key("GROUPS_CLAIM")).ok(),
         admin_groups: list("ADMIN_GROUPS"),
         member_groups: list("MEMBER_GROUPS"),
+        signup: signup_from_env(prefix)?,
     })
+}
+
+/// `<prefix>SIGNUP=pocket-id` lets someone with an invite make their account at the provider.
+/// It needs `<prefix>POCKETID_API_KEY_FILE` (or `<prefix>POCKETID_API_KEY`); Pocket ID's API is
+/// reached at `<prefix>POCKETID_INTERNAL_URL`, else the provider's internal URL, else its issuer.
+/// `<prefix>POCKETID_GROUP_IDS` lists Pocket ID groups a new account joins.
+fn signup_from_env(prefix: &str) -> anyhow::Result<Option<api::SignupConfig>> {
+    let key = |suffix: &str| format!("{prefix}{suffix}");
+    let Ok(kind) = env_var(&key("SIGNUP")) else {
+        return Ok(None);
+    };
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => return Ok(None),
+        "pocket-id" | "pocketid" => {}
+        other => bail!("{} is {other}; the only kind is pocket-id", key("SIGNUP")),
+    }
+    let api_key = secret_from_env(&key("POCKETID_API_KEY"))?.with_context(|| {
+        format!(
+            "{} is pocket-id but {} is not set",
+            key("SIGNUP"),
+            key("POCKETID_API_KEY_FILE")
+        )
+    })?;
+    let group_ids = env_var(&key("POCKETID_GROUP_IDS"))
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(api::SignupConfig {
+        api_url: env_var(&key("POCKETID_INTERNAL_URL")).ok(),
+        api_key,
+        group_ids,
+    }))
 }
 
 /// `<name>_FILE`, preferred, or `<name>`. Not both. `None` when neither is set.

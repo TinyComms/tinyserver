@@ -1,11 +1,12 @@
-# One community. Postgres, the server, and Tinyauth share a network that has no route out.
+# One community. Postgres, the server, and Pocket ID share a network that has no route out.
 # cloudflared carries HTTP and the live socket for the chat hostname, and the sign-in pages for
 # the auth hostname; it is the only way in to either. The one thing published on the host is the
 # media port, UDP and the same number on TCP, for call audio straight to the SFU.
 #
-# Sign-in goes through Tinyauth, an OpenID Connect provider. Its issuer is its public auth URL.
-# tinyserver reaches it inside, at http://tinyauth:3000, for discovery, keys, and the code
-# exchange, and still checks that every token names the public issuer.
+# Sign-in goes through Pocket ID, an OpenID Connect provider that signs people in with passkeys.
+# Its issuer is its public auth URL. tinyserver reaches it inside, at http://pocket-id:1411, for
+# discovery, keys, the code exchange, and the single-use sign-up links an invite gets, and still
+# checks that every token names the public issuer.
 
 name: tinyserver
 
@@ -46,20 +47,27 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      tinyauth:
-        condition: service_started
+      pocket-id:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
       DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
       BIND: 0.0.0.0:8080
       # The address people type into tinyclient. The sign-in callback is under it.
       TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
-      # Tinyauth, the default provider. The issuer is exactly TINYAUTH_PUBLIC_URL.
-      TINYSERVER_OIDC_ISSUER: ${TINYAUTH_PUBLIC_URL:?set TINYAUTH_PUBLIC_URL, such as https://auth.example.org}
-      TINYSERVER_OIDC_INTERNAL_URL: http://tinyauth:3000
+      # Pocket ID, the default provider. The issuer is exactly AUTH_PUBLIC_URL (TINYAUTH_PUBLIC_URL
+      # from before the move to Pocket ID still works).
+      TINYSERVER_OIDC_ISSUER: ${AUTH_PUBLIC_URL:-${TINYAUTH_PUBLIC_URL:?set AUTH_PUBLIC_URL, such as https://auth.example.org}}
+      TINYSERVER_OIDC_INTERNAL_URL: http://pocket-id:1411
       TINYSERVER_OIDC_CLIENT_ID: tinyserver
       TINYSERVER_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
-      TINYSERVER_OIDC_PROVIDER_NAME: ${TINYSERVER_OIDC_PROVIDER_NAME:-Tinyauth}
+      TINYSERVER_OIDC_PROVIDER_NAME: ${TINYSERVER_OIDC_PROVIDER_NAME:-Pocket ID}
+      # Someone with an invite and no account makes one at Pocket ID, with a single-use sign-up
+      # link tinyserver asks for through the API. Set to none to turn it off.
+      TINYSERVER_OIDC_SIGNUP: ${TINYSERVER_OIDC_SIGNUP:-pocket-id}
+      TINYSERVER_OIDC_POCKETID_API_KEY_FILE: /run/secrets/pocketid_api_key
+      # Pocket ID groups a new account joins, by id. Optional.
+      TINYSERVER_OIDC_POCKETID_GROUP_IDS: ${TINYSERVER_OIDC_POCKETID_GROUP_IDS:-}
       # Optional: let groups from the provider join or become admins. Unset is invite only.
       TINYSERVER_OIDC_MEMBER_GROUPS: ${TINYSERVER_OIDC_MEMBER_GROUPS:-}
       TINYSERVER_OIDC_ADMIN_GROUPS: ${TINYSERVER_OIDC_ADMIN_GROUPS:-}
@@ -74,6 +82,7 @@ services:
       TINYSERVER_MEDIA_EGRESS_KBPS: ${TINYSERVER_MEDIA_EGRESS_KBPS:-}
     secrets:
       - oidc_client_secret
+      - pocketid_api_key
     # The same number inside and out: the SFU advertises the port it binds. TCP is ICE-TCP,
     # for networks that block UDP.
     ports:
@@ -90,41 +99,70 @@ services:
       - media
     logging: *logging
 
-  # The sign-in provider. Local users from a file, with TOTP; one OIDC client, tinyserver.
-  # Its sessions and signing key live in the tinyauth_data volume. No published port.
-  tinyauth:
-    image: ghcr.io/tinyauthapp/tinyauth:v5.2.0-distroless@sha256:aff752a57511f9346109b4d427c132db71dfa480138698e1f42feaf335f7cda9
-    user: "65532:65532"
-    environment:
-      TINYAUTH_APPURL: ${TINYAUTH_PUBLIC_URL:?set TINYAUTH_PUBLIC_URL, such as https://auth.example.org}
-      TINYAUTH_LABELPROVIDER: none
-      TINYAUTH_ANALYTICS_ENABLED: "false"
-      TINYAUTH_RESOURCES_ENABLED: "false"
-      TINYAUTH_AUTH_USERSFILE: /run/secrets/tinyauth_users
-      TINYAUTH_AUTH_SECURECOOKIE: "true"
-      TINYAUTH_AUTH_SUBDOMAINSENABLED: "false"
-      TINYAUTH_AUTH_SESSIONEXPIRY: "43200"
-      TINYAUTH_AUTH_SESSIONMAXLIFETIME: "604800"
-      TINYAUTH_AUTH_LOGINMAXRETRIES: "3"
-      TINYAUTH_AUTH_LOGINTIMEOUT: "900"
-      # Only cloudflared may say who the client is.
-      TINYAUTH_AUTH_TRUSTEDPROXIES: ${TINYSERVER_TUNNEL_IP:-172.30.53.10}
-      TINYAUTH_AUTH_ACLS_POLICY: deny
-      TINYAUTH_OIDC_PRIVATEKEYPATH: /data/oidc/key.pem
-      TINYAUTH_OIDC_PUBLICKEYPATH: /data/oidc/key.pub
-      TINYAUTH_OIDC_CLIENTS_TINYSERVER_CLIENTID: tinyserver
-      TINYAUTH_OIDC_CLIENTS_TINYSERVER_CLIENTSECRETFILE: /run/secrets/oidc_client_secret
-      TINYAUTH_OIDC_CLIENTS_TINYSERVER_TRUSTEDREDIRECTURIS: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL}/v1/auth/callback
-      TINYAUTH_OIDC_CLIENTS_TINYSERVER_NAME: tinyserver
-      TINYAUTH_LOG_JSON: "true"
-      TINYAUTH_LOG_STREAMS_AUDIT_ENABLED: "true"
-    secrets:
-      - tinyauth_users
-      - oidc_client_secret
+  # Gives Pocket ID's data volume to its user, 65532, once. The image has no shell to do it.
+  pocket-id-data:
+    image: postgres:17-alpine
+    user: "0:0"
+    entrypoint: ["chown", "65532:65532", "/app/data"]
     volumes:
-      - ${TINYAUTH_DATA_DIR:-tinyauth_data}:/data
+      - ${POCKETID_DATA_DIR:-pocketid_data}:/app/data
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    logging: *logging
+
+  # The sign-in provider. Passkeys only; accounts come from the first admin's one-time login
+  # link and from the single-use sign-up links invites get. One OIDC client, tinyserver, made by
+  # deploy/pocket-id/setup.sh. Its database, signing key, and uploads live in the pocketid_data
+  # volume. No published port.
+  pocket-id:
+    image: ghcr.io/pocket-id/pocket-id:v2.19.1-distroless@sha256:d035c9c229304cfd25f97a79b2da00bde9cf942abbd70430d452a95420e2836b
+    user: "65532:65532"
+    depends_on:
+      pocket-id-data:
+        condition: service_completed_successfully
+    environment:
+      APP_URL: ${AUTH_PUBLIC_URL:-${TINYAUTH_PUBLIC_URL:?set AUTH_PUBLIC_URL, such as https://auth.example.org}}
+      # Only cloudflared may say who the client is.
+      TRUST_PROXY: ${TINYSERVER_TUNNEL_IP:-172.30.53.10}
+      ENCRYPTION_KEY_FILE: /run/secrets/pocketid_encryption_key
+      # An admin key for tinyserver's sign-up links and for setup.sh. Not a user, no login.
+      STATIC_API_KEY_FILE: /run/secrets/pocketid_api_key
+      # Settings come from here, not the admin pages.
+      UI_CONFIG_DISABLED: "true"
+      APP_NAME: ${AUTH_APP_NAME:-tinyserver}
+      # New accounts only with a sign-up link: an invite's, or one an admin makes.
+      ALLOW_USER_SIGNUPS: withToken
+      # No mail is sent, so an email is optional and never counts as verified.
+      REQUIRE_USER_EMAIL: "false"
+      EMAILS_VERIFIED: "false"
+      ALLOW_OWN_ACCOUNT_EDIT: "true"
+      # setup.sh registers the client secret tinyserver already has; none is made here.
+      AUTO_CREATE_OIDC_CLIENT_SECRET: "false"
+      ALLOW_INSECURE_CALLBACK_URLS: "false"
+      ANALYTICS_DISABLED: "true"
+      VERSION_CHECK_DISABLED: "true"
+      ICON_LIBRARY_URL: disabled
+      LOG_JSON: "true"
+    secrets:
+      - pocketid_encryption_key
+      - pocketid_api_key
+    volumes:
+      - ${POCKETID_DATA_DIR:-pocketid_data}:/app/data
     tmpfs:
       - /tmp:size=16m,mode=1777
+    healthcheck:
+      test: ["CMD", "/app/pocket-id", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
     read_only: true
     cap_drop:
@@ -138,7 +176,7 @@ services:
     logging: *logging
 
   # Routes the chat hostname to http://tinyserver:8080 and the auth hostname to
-  # http://tinyauth:3000. Both public hostnames are set on the tunnel in Cloudflare.
+  # http://pocket-id:1411. Both public hostnames are set on the tunnel in Cloudflare.
   tunnel:
     image: cloudflare/cloudflared:2026.10.3
     command: tunnel --no-autoupdate run
@@ -146,21 +184,23 @@ services:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN}
     depends_on:
       - tinyserver
-      - tinyauth
+      - pocket-id
     restart: unless-stopped
     networks:
       inside:
-        # Fixed, so Tinyauth can trust its forwarded-for header and nothing else's.
+        # Fixed, so Pocket ID can trust its forwarded-for header and nothing else's.
         ipv4_address: ${TINYSERVER_TUNNEL_IP:-172.30.53.10}
       edge: {}
     logging: *logging
 
 secrets:
   # Files next to this compose file, in a directory only root reads. See deploy/README.md.
-  tinyauth_users:
-    file: ${TINYSERVER_SECRETS_DIR:-./secrets}/tinyauth_users
   oidc_client_secret:
     file: ${TINYSERVER_SECRETS_DIR:-./secrets}/oidc_client_secret
+  pocketid_api_key:
+    file: ${TINYSERVER_SECRETS_DIR:-./secrets}/pocketid_api_key
+  pocketid_encryption_key:
+    file: ${TINYSERVER_SECRETS_DIR:-./secrets}/pocketid_encryption_key
 
 networks:
   inside:
@@ -174,4 +214,4 @@ networks:
 
 volumes:
   tinyserver_pg:
-  tinyauth_data:
+  pocketid_data:

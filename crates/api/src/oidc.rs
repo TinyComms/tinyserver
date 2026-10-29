@@ -5,10 +5,14 @@
 //! Each provider's keys are read at start and kept. A token signed with a key id they do not
 //! have makes one fresh read, at most every 10 seconds, so a key rotation needs no restart.
 //!
-//! A provider may have an internal URL, such as `http://tinyauth:3000` on the compose network.
+//! A provider may have an internal URL, such as `http://pocket-id:1411` on the compose network.
 //! Discovery, keys, and the code exchange then go there, with the discovered endpoints moved to
 //! the internal origin, while the issuer in discovery and in every token must still be exactly
 //! the public issuer. The browser always goes to the public authorization endpoint.
+//!
+//! A provider may also make accounts: with Pocket ID's sign-up configured, tinyserver can ask it
+//! for a single-use sign-up link for someone who arrives with an invite. The API key for that is
+//! never logged, and neither is a link it returns.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -93,6 +97,8 @@ const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
 const ASSERTION_SECONDS: i64 = 60;
 /// The event a back-channel logout token carries.
 const LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
+/// How long a sign-up link works: a little past the pending sign-in it was made for.
+const SIGNUP_TTL: &str = "15m";
 
 /// Sign-in settings, from the environment in `tinyserver serve`.
 #[derive(Clone, Debug)]
@@ -131,6 +137,31 @@ pub struct ProviderConfig {
     /// In one of these, or an admin group, a person may join without an invite. Empty means
     /// invite only.
     pub member_groups: Vec<String>,
+    /// The provider makes accounts for people who arrive with an invite. Unset is a provider
+    /// that only signs people in.
+    pub signup: Option<SignupConfig>,
+}
+
+/// Pocket ID sign-up links (`POST /api/signup-tokens`), for people who arrive with an invite.
+#[derive(Clone)]
+pub struct SignupConfig {
+    /// Where this server reaches Pocket ID's API. The provider's internal URL, else its issuer,
+    /// when unset.
+    pub api_url: Option<String>,
+    /// Sent as `X-API-Key`. An admin key: it may create users, so it lives in a secret file.
+    pub api_key: String,
+    /// Pocket ID groups a new account joins.
+    pub group_ids: Vec<String>,
+}
+
+impl fmt::Debug for SignupConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignupConfig")
+            .field("api_url", &self.api_url)
+            .field("api_key", &"[redacted]")
+            .field("group_ids", &self.group_ids)
+            .finish()
+    }
 }
 
 impl fmt::Debug for ProviderConfig {
@@ -154,6 +185,7 @@ impl fmt::Debug for ProviderConfig {
             .field("groups_claim", &self.groups_claim)
             .field("admin_groups", &self.admin_groups)
             .field("member_groups", &self.member_groups)
+            .field("signup", &self.signup)
             .finish()
     }
 }
@@ -193,6 +225,8 @@ pub struct SignIn {
 struct Shared {
     providers: Vec<Provider>,
     session_days: u32,
+    /// `TINYSERVER_PUBLIC_URL`, without a trailing slash.
+    public_url: String,
 }
 
 pub(crate) struct Provider {
@@ -212,6 +246,44 @@ pub(crate) struct Provider {
     groups_claim: String,
     admin_groups: Vec<String>,
     member_groups: Vec<String>,
+    signup: Option<Signup>,
+}
+
+/// Where and how to ask Pocket ID for a sign-up link.
+struct Signup {
+    /// `.../api/signup-tokens`, inside when there is an internal URL.
+    tokens_url: Url,
+    api_key: String,
+    group_ids: Vec<String>,
+    /// The public issuer: the browser goes to its sign-up page.
+    page_base: Url,
+}
+
+/// A single-use sign-up page at the provider. The token in it is a secret: never logged.
+pub(crate) struct SignupLink(pub String);
+
+/// Why no sign-up link was made. Logged; no token or key in it.
+#[derive(Debug)]
+pub(crate) enum SignupFailure {
+    /// This provider makes no accounts.
+    NotConfigured,
+    /// The API could not be reached.
+    Unreachable,
+    /// The API answered with this status.
+    Status(u16),
+    /// The answer had no usable token.
+    Unreadable,
+}
+
+impl fmt::Display for SignupFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("the provider makes no accounts"),
+            Self::Unreachable => f.write_str("sign-up API not reached"),
+            Self::Status(status) => write!(f, "sign-up API answered HTTP {status}"),
+            Self::Unreadable => f.write_str("sign-up API answer had no token"),
+        }
+    }
 }
 
 /// `private_key_jwt` (RFC 7523): a JWT signed with the client's key replaces the secret.
@@ -330,6 +402,7 @@ impl SignIn {
             inner: Arc::new(Shared {
                 providers,
                 session_days: config.session_days,
+                public_url: public_url.as_str().trim_end_matches('/').to_string(),
             }),
         })
     }
@@ -361,6 +434,11 @@ impl SignIn {
 
     pub(crate) fn session_days(&self) -> u32 {
         self.inner.session_days
+    }
+
+    /// `TINYSERVER_PUBLIC_URL`, without a trailing slash.
+    pub(crate) fn public_url(&self) -> &str {
+        &self.inner.public_url
     }
 
     /// Checks a back-channel logout token from whichever provider its `iss` names.
@@ -535,6 +613,45 @@ impl Provider {
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| issuer_url.host_str().unwrap_or("your provider").to_string());
+        let signup = match config.signup {
+            None => None,
+            Some(signup) => {
+                let api_key = signup.api_key.trim().to_string();
+                if api_key.len() < 16 {
+                    return Err(fatal(
+                        "the sign-up API key is shorter than 16 characters".into(),
+                    ));
+                }
+                let api_base = match &signup.api_url {
+                    Some(api_url) => {
+                        let url = Url::parse(api_url)
+                            .map_err(|_| fatal("the sign-up API URL is not a URL".into()))?;
+                        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                            return Err(fatal("the sign-up API URL must be http or https".into()));
+                        }
+                        url
+                    }
+                    None => internal.clone().unwrap_or_else(|| issuer_url.clone()),
+                };
+                let tokens_url = Url::parse(&format!(
+                    "{}/api/signup-tokens",
+                    api_base.as_str().trim_end_matches('/')
+                ))
+                .map_err(|_| fatal("the sign-up API URL is not a URL".into()))?;
+                let group_ids = signup
+                    .group_ids
+                    .into_iter()
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                Some(Signup {
+                    tokens_url,
+                    api_key,
+                    group_ids,
+                    page_base: issuer_url.clone(),
+                })
+            }
+        };
         let scopes = config
             .scopes
             .into_iter()
@@ -559,6 +676,7 @@ impl Provider {
                 .unwrap_or_else(|| "groups".to_string()),
             admin_groups: config.admin_groups,
             member_groups: config.member_groups,
+            signup,
         })
     }
 
@@ -576,25 +694,88 @@ impl Provider {
 
     /// A fresh state, nonce, and PKCE pair (S256), and the authorization URL that carries them.
     pub(crate) fn begin(&self) -> Begun {
-        let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+        let state = CsrfToken::new_random_len(32).secret().clone();
+        let nonce = Nonce::new_random_len(32).secret().clone();
+        let (_, verifier) = PkceCodeChallenge::new_random_sha256();
+        let verifier = verifier.secret().clone();
+        Begun {
+            authorize_url: self.authorize_url(&state, &nonce, &verifier),
+            state,
+            verifier,
+            nonce,
+        }
+    }
+
+    /// The authorization URL for a pending sign-in's state, nonce, and verifier. The same each
+    /// time for the same three.
+    pub(crate) fn authorize_url(&self, state: &str, nonce: &str, verifier: &str) -> String {
+        let state = CsrfToken::new(state.to_string());
+        let nonce = Nonce::new(nonce.to_string());
+        let challenge = PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(
+            verifier.to_string(),
+        ));
         let mut request = self
             .client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
-                || CsrfToken::new_random_len(32),
-                || Nonce::new_random_len(32),
+                move || state,
+                move || nonce,
             )
             .set_pkce_challenge(challenge);
         for scope in &self.scopes {
             request = request.add_scope(Scope::new(scope.clone()));
         }
-        let (url, state, nonce) = request.url();
-        Begun {
-            authorize_url: url.to_string(),
-            state: state.secret().clone(),
-            verifier: verifier.secret().clone(),
-            nonce: nonce.secret().clone(),
+        request.url().0.to_string()
+    }
+
+    /// Whether this provider makes accounts for people who arrive with an invite.
+    pub(crate) fn makes_accounts(&self) -> bool {
+        self.signup.is_some()
+    }
+
+    /// Asks Pocket ID for one sign-up token, good once and for a short while, and returns the
+    /// page the browser opens to use it. Neither the key nor the token is logged.
+    pub(crate) async fn signup_link(&self) -> Result<SignupLink, SignupFailure> {
+        let signup = self.signup.as_ref().ok_or(SignupFailure::NotConfigured)?;
+        let mut body = serde_json::json!({ "ttl": SIGNUP_TTL, "usageLimit": 1 });
+        if !signup.group_ids.is_empty() {
+            body["userGroupIds"] = Value::from(signup.group_ids.clone());
         }
+        let response = self
+            .http
+            .post(signup.tokens_url.clone())
+            .header("X-API-Key", &signup.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|_| SignupFailure::Unreachable)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SignupFailure::Status(status.as_u16()));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| SignupFailure::Unreadable)?;
+        let answer: Value =
+            serde_json::from_slice(&bytes).map_err(|_| SignupFailure::Unreadable)?;
+        let token = answer
+            .get("token")
+            .and_then(Value::as_str)
+            .filter(|token| {
+                (1..=128).contains(&token.len())
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+            .ok_or(SignupFailure::Unreadable)?;
+        let mut page = signup.page_base.clone();
+        page.set_path("/signup");
+        page.set_query(None);
+        page.query_pairs_mut().append_pair("token", token);
+        Ok(SignupLink(page.to_string()))
     }
 
     /// Exchanges the code with the client's credentials and `verifier`, then checks the ID

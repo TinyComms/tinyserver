@@ -195,6 +195,7 @@ impl Provider {
             groups_claim: None,
             admin_groups: Vec::new(),
             member_groups: Vec::new(),
+            signup: None,
         }
     }
 

@@ -1,5 +1,5 @@
-//! Caps the sign-in posts one client can make: each `start` stores a pending sign-in, and each
-//! `token` tries a one-time code.
+//! Caps the sign-in posts one client can make: each `start` stores a pending sign-in, each
+//! `token` tries a one-time code, and each `join` may ask the provider for a sign-up link.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -21,6 +21,10 @@ const WINDOW: Duration = Duration::from_secs(60);
 
 static START: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
 static TOKEN: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDOW));
+/// Tighter: each try that gets through may make a sign-up link at the provider.
+static JOIN: LazyLock<Gate> = LazyLock::new(|| Gate::new(JOIN_PER_KEY, JOIN_GLOBAL, WINDOW));
+const JOIN_PER_KEY: usize = 3;
+const JOIN_GLOBAL: usize = 30;
 
 struct Gate {
     per_key: usize,
@@ -70,10 +74,14 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
     let gate = match (request.method(), request.uri().path()) {
         (&Method::POST, "/v1/auth/start") => Some(&*START),
         (&Method::POST, "/v1/auth/token") => Some(&*TOKEN),
+        (&Method::POST, "/v1/auth/join") => Some(&*JOIN),
         _ => None,
     };
     if let Some(gate) = gate {
         if !gate.allow(&client_key(request.headers())) {
+            if request.uri().path() == "/v1/auth/join" {
+                return crate::auth::slow_down_page();
+            }
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(SlowDown { error: "slow_down" }),

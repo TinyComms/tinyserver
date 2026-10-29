@@ -9,7 +9,7 @@ The project is early. People sign in through an OpenID Connect provider. An owne
 | | |
 | --- | --- |
 | **Owner** | While there is no owner, `bootstrap` prints a single-use owner invite good for 24 hours; whoever signs in with it is the owner. While that invite still works a later `bootstrap` keeps it and prints nothing new. With an owner it does nothing. `bootstrap --owner-invite` makes a new one anyway. |
-| **Sign-in** | No passwords. tinyclient opens the browser at an OpenID Connect provider, Tinyauth by default, and gets a one-time code back on a loopback redirect; see [Sign-in](#sign-in). `GET /v1/me` reads the session. `DELETE /v1/session` ends it. `DELETE /v1/sessions` ends every session you have. |
+| **Sign-in** | No passwords. tinyclient opens the browser at an OpenID Connect provider, Pocket ID with passkeys by default, and gets a one-time code back on a loopback redirect; see [Sign-in](#sign-in). With Pocket ID, an invite also makes the person's account there. `GET /v1/me` reads the session. `DELETE /v1/session` ends it. `DELETE /v1/sessions` ends every session you have. |
 | **Account** | `PATCH /v1/me` changes your display name. Email comes from the provider and may be `null`. |
 | **Server** | `GET /v1/server` has the name, description, welcome text, icon, default and AFK rooms. `manage_server` changes them and uploads the icon. `GET /v1/capabilities` lists what this server supports. |
 | **Roles** | Roles carry permission bits and a position; owners are a flag above them. Each room can allow or deny bits per role. You act only on people and roles below your rank. Details in [`docs/server.md`](docs/server.md). |
@@ -29,13 +29,15 @@ tinyserver is a confidential client of one or more OpenID Connect providers. A p
 
 | Route | |
 | --- | --- |
-| `GET /v1/auth/config` | `{"methods":["oidc"],"provider_name":"Tinyauth","providers":[{"id","name"}]}` |
-| `POST /v1/auth/start` | `{redirect_uri, code_challenge, code_challenge_method, state, invite?, provider?}`. The redirect must be `http://127.0.0.1:<port>/callback` or `http://[::1]:<port>/callback`, the method `S256`. Returns `{authorize_url}`; anything wrong is `400 {"error":"bad_request"}`. The pending sign-in lasts 10 minutes. |
+| `GET /v1/auth/config` | `{"methods":["oidc"],"provider_name":"Pocket ID","providers":[{"id","name"}]}` |
+| `POST /v1/auth/start` | `{redirect_uri, code_challenge, code_challenge_method, state, invite?, provider?}`. The redirect must be `http://127.0.0.1:<port>/callback` or `http://[::1]:<port>/callback`, the method `S256`. Returns `{authorize_url}`; anything wrong is `400 {"error":"bad_request"}`. The pending sign-in lasts 10 minutes. With an invite and a provider that makes accounts, `authorize_url` is the join page below instead of the provider. |
+| `GET /v1/auth/join?state=` | A page: "I'm new here" or "I already have an account". The second is a link to the provider's sign-in, the same one `start` would have returned. |
+| `POST /v1/auth/join` | The "I'm new here" form. While the invite could still be accepted, the server asks Pocket ID for one sign-up token (single use, 15 minutes) and shows two steps: make the account and passkey at Pocket ID in a new tab, then continue to sign-in here. Once per sign-in; a second try shows the way on and no second token. An unknown, expired, or used-up invite ends the sign-in with `error=not_member` and makes nothing. 3 tries a minute per address. |
 | `GET /v1/auth/callback` | Where the provider sends the browser. The server makes the code exchange with its secret and its own PKCE verifier, checks the ID token, and applies the invite or checks membership. Then `302` to tinyclient with `code` and `state`, or `error` of `not_member`, `denied`, or `failed`. An expired or used state gets a small page and no redirect. |
 | `POST /v1/auth/token` | `{code, code_verifier}`. The one-time code lasts 60 seconds and works once. Returns `{token, user_id, email, display_name, role}`, else `400 {"error":"invalid_grant"}`. |
 | `POST /v1/auth/backchannel-logout` | OpenID Connect Back-Channel Logout 1.0, for providers that send it. |
 
-`start` and `token` allow 5 tries a minute per address. Groups from the provider can let people join or give them the admin role when the owner sets that up; never owner. A banned person is sent back with `error=banned`. Configuration is in [`deploy/README.md`](deploy/README.md#other-providers).
+`start` and `token` allow 5 tries a minute per address. Groups from the provider can let people join or give them the admin role when the owner sets that up; never owner. A banned person is sent back with `error=banned`. The pages the browser sees here load nothing and run no script; their one stylesheet is allowed by its hash. Configuration is in [`deploy/README.md`](deploy/README.md#pocket-id) and [`deploy/README.md`](deploy/README.md#other-providers).
 
 ## Run
 
@@ -71,6 +73,6 @@ Each test creates its own database as `app_owner`, migrates it, serves it as `ap
 | --- | --- |
 | [`crates/db`](crates/db) | Migrations, the owner invite, sign-in, sessions, accounts, server settings, roles and permissions, rooms, categories, invites, bans, and the outbox |
 | [`crates/api`](crates/api) | Health, sign-in through OpenID Connect, your account, server settings, roles, rooms, people, invites, bans, the audit log, the live socket, and who is in each call |
-| [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve` |
+| [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve`, and `identities` and `relink-identity` for a provider whose subjects changed |
 | [`crates/sfu`](crates/sfu) | The SFU: one thread, one UDP socket and an ICE-TCP listener on the same port, str0m. Also the headless test client that tinyclient's `mediad` follows, and its canned H.264 clips in [`fixtures`](crates/sfu/fixtures) |
 | [`fuzz`](fuzz) | cargo-fuzz targets for live-socket frames, SDP offers, ICE-TCP framing, packets into str0m, and video routing. Outside the workspace; `cargo +nightly fuzz run sdp_offer` |

@@ -8,6 +8,7 @@
 
 pub mod live;
 pub mod oidc;
+pub mod pocket;
 
 use std::future::Future;
 use std::str::FromStr;
