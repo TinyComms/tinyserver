@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
 use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused};
+use super::e2ee;
 use super::frame::{Event, Out, SlotFrame, VideoSlotFrame};
 use super::socket::Close;
 use super::Limits;
@@ -46,6 +47,8 @@ struct People {
     calls: Calls,
     /// The latest `call.slots` frame for each SFU participant, seated or not yet.
     slots: HashMap<String, Arc<str>>,
+    /// End-to-end encryption: the MLS delivery service for each room's call.
+    e2ee: e2ee::Rooms,
 }
 
 impl People {
@@ -63,6 +66,13 @@ impl People {
     fn to_seat(&self, user_id: &str, frame: Arc<str>) {
         if let Some(conn) = self.calls.conn_of(user_id) {
             self.direct(user_id, conn, frame);
+        }
+    }
+
+    /// Sends `call.e2ee` frames, each to the socket holding its person's seat.
+    fn e2ee(&self, frames: Vec<e2ee::Outgoing>) {
+        for outgoing in frames {
+            self.to_seat(&outgoing.user_id, Arc::from(outgoing.frame));
         }
     }
 }
@@ -135,6 +145,7 @@ impl Hub {
             tokio::spawn(follow_media(hub.clone(), events, hub.stop.subscribe()));
         }
         tokio::spawn(remember(hub.clone(), hub.stop.subscribe()));
+        tokio::spawn(rekey(hub.clone(), hub.stop.subscribe()));
         hub
     }
 
@@ -149,6 +160,7 @@ impl Hub {
         let mut people = lock(&self.people);
         people.calls.clear();
         people.slots.clear();
+        people.e2ee.clear();
         if let Some(media) = &self.media {
             media.shutdown();
         }
@@ -295,7 +307,8 @@ impl Hub {
     }
 
     /// Seats `user_id` in `room_id` for socket `conn`, with the SFU's answer if the join had
-    /// media. Refused once the hub is closing.
+    /// media. `e2ee`: their app can encrypt end to end. Refused once the hub is closing.
+    #[allow(clippy::too_many_arguments)]
     pub fn call_join(
         &self,
         user_id: &str,
@@ -304,6 +317,7 @@ impl Hub {
         answer: Option<&sfu::Answer>,
         user_limit: i32,
         access: Access,
+        e2ee: bool,
     ) -> Result<(), Refused> {
         let call_id = answer.map(|answer| answer.call_id.as_str());
         let mut people = lock(&self.people);
@@ -311,6 +325,7 @@ impl Hub {
             return Err(Refused::Closing);
         }
         let limit = self.room_limit(&people.calls, user_id, room_id, user_limit);
+        let again = people.calls.room_of(user_id) == Some(room_id);
         let changes = people.calls.join(
             user_id,
             room_id,
@@ -319,8 +334,21 @@ impl Hub {
             limit,
             self.limits.call_server_max,
             access,
+            e2ee,
         )?;
         self.tell(&mut people, changes);
+        // A seat with media is in the room's group, or is why the room has none. Taking the
+        // same seat again with new media is a leave and a join: the old keys went with it.
+        if answer.is_some() {
+            if again {
+                let frames = people
+                    .e2ee
+                    .leave(room_id, user_id, std::time::Instant::now());
+                people.e2ee(frames);
+            }
+            let frames = people.e2ee.join(room_id, user_id, e2ee);
+            people.e2ee(frames);
+        }
         if let Some(answer) = answer {
             let change =
                 people
@@ -587,6 +615,10 @@ impl Hub {
                             media.leave(call_id);
                         }
                     }
+                    let frames = people
+                        .e2ee
+                        .leave(room_id, user_id, std::time::Instant::now());
+                    people.e2ee(frames);
                     Out::CallLeft {
                         room_id,
                         user_id,
@@ -605,6 +637,56 @@ impl Hub {
             };
             let _ = self.ephemeral.send(Arc::from(frame));
         }
+    }
+
+    /// One `call.e2ee` from socket `conn` of `user_id`. Only the socket holding a seat with
+    /// media may send one.
+    pub fn call_e2ee(
+        &self,
+        user_id: &str,
+        conn: u64,
+        op: &str,
+        epoch: Option<u64>,
+        data: Option<&str>,
+        welcome: Option<&str>,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let room_id = match people.calls.room_of(user_id) {
+            Some(room_id)
+                if people.calls.conn_of(user_id) == Some(conn)
+                    && people.calls.call_of(user_id).is_some() =>
+            {
+                room_id.to_string()
+            }
+            _ => return Err(e2ee::Refused::NotFound.code()),
+        };
+        let now = std::time::Instant::now();
+        let sent = match op {
+            "key_package" => {
+                let data = e2ee::decode(data).map_err(e2ee::Refused::code)?;
+                people.e2ee.key_package(&room_id, user_id, &data, now)
+            }
+            "commit" => {
+                let Some(epoch) = epoch else {
+                    return Err(e2ee::Refused::BadFrame.code());
+                };
+                let data = e2ee::decode(data).map_err(e2ee::Refused::code)?;
+                let welcome = match welcome {
+                    Some(welcome) => {
+                        Some(e2ee::decode(Some(welcome)).map_err(e2ee::Refused::code)?)
+                    }
+                    None => None,
+                };
+                people
+                    .e2ee
+                    .commit(&room_id, user_id, epoch, &data, welcome.as_deref(), now)
+            }
+            "invalid" => people.e2ee.invalid(&room_id, user_id, now),
+            _ => return Err(e2ee::Refused::BadFrame.code()),
+        };
+        let frames = sent.map_err(e2ee::Refused::code)?;
+        people.e2ee(frames);
+        Ok(())
     }
 
     /// Acts on what the SFU reports.
@@ -695,6 +777,21 @@ async fn remember(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
         if last {
             return;
         }
+    }
+}
+
+/// Builds again any E2EE group whose batch of proposals got no commit in time.
+async fn rekey(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stop.wait_for(|stopped| *stopped) => return,
+            _ = ticks.tick() => {}
+        }
+        let people = &mut *lock(&hub.people);
+        let frames = people.e2ee.tick(std::time::Instant::now());
+        people.e2ee(frames);
     }
 }
 

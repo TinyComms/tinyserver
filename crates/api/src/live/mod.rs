@@ -3,6 +3,7 @@
 //! `docs/calls.md`.
 
 mod call;
+mod e2ee;
 pub(crate) mod frame;
 mod hub;
 mod socket;
@@ -55,6 +56,10 @@ pub struct Limits {
     pub call_move_every: Duration,
     /// How often who was connected is written to `last_seen_at`, in one batch.
     pub seen_every: Duration,
+    /// End-to-end encryption key packages and `invalid`s one socket may send at once, and how
+    /// often it gets one more back.
+    pub e2ee_rekey_burst: u32,
+    pub e2ee_rekey_every: Duration,
 }
 
 impl Default for Limits {
@@ -76,6 +81,8 @@ impl Default for Limits {
             call_move_burst: 5,
             call_move_every: Duration::from_secs(3),
             seen_every: Duration::from_secs(30),
+            e2ee_rekey_burst: 5,
+            e2ee_rekey_every: Duration::from_secs(2),
         }
     }
 }

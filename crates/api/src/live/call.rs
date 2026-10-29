@@ -112,6 +112,8 @@ pub(crate) struct Participant {
     pub suppressed: bool,
     /// Holding priority speaker now.
     pub priority: bool,
+    /// Joined able to encrypt end to end.
+    pub e2ee: bool,
 }
 
 /// What a person may do in the room they join, from their permissions there.
@@ -148,6 +150,8 @@ struct Seat {
     sharing: bool,
     access: Access,
     priority: bool,
+    /// Joined with `e2ee`: their app can encrypt end to end.
+    e2ee: bool,
 }
 
 /// A move someone with move_members made, waiting for the moved person's join.
@@ -226,6 +230,7 @@ impl Calls {
         limit: usize,
         server_max: usize,
         access: Access,
+        e2ee: bool,
     ) -> Result<Vec<Change>, Refused> {
         self.check(user_id, room_id, limit, server_max)?;
         let moved = self.ticket(user_id, room_id);
@@ -235,6 +240,10 @@ impl Calls {
                 seat.conn = Some(conn);
                 seat.call_id = call_id;
                 seat.access = access;
+                if seat.e2ee != e2ee {
+                    seat.e2ee = e2ee;
+                    return Ok(vec![self.state(user_id)]);
+                }
                 return Ok(Vec::new());
             }
         }
@@ -259,6 +268,7 @@ impl Calls {
                 sharing: false,
                 access,
                 priority: false,
+                e2ee,
             },
         );
         self.rooms
@@ -509,6 +519,7 @@ impl Calls {
             server_deafened,
             suppressed: seat.is_some_and(|seat| seat.access.suppressed),
             priority: seat.is_some_and(|seat| seat.priority),
+            e2ee: seat.is_some_and(|seat| seat.e2ee),
         }
     }
 
@@ -575,6 +586,7 @@ mod tests {
             server_deafened: false,
             suppressed: false,
             priority: false,
+            e2ee: false,
         }
     }
 
@@ -595,7 +607,7 @@ mod tests {
     }
 
     fn join(calls: &mut Calls, user: &str, room: &str, conn: u64) -> Result<Vec<Change>, Refused> {
-        calls.join(user, room, conn, None, 12, 32, FREE)
+        calls.join(user, room, conn, None, 12, 32, FREE, false)
     }
 
     #[test]
@@ -641,7 +653,7 @@ mod tests {
     fn caps_count_people_not_moves() {
         let mut calls = Calls::default();
         let go = |calls: &mut Calls, user: &str, room: &str, conn: u64| {
-            calls.join(user, room, conn, None, 2, 3, FREE)
+            calls.join(user, room, conn, None, 2, 3, FREE, false)
         };
         assert!(go(&mut calls, "u", "a", 1).is_ok());
         assert!(go(&mut calls, "v", "a", 2).is_ok());
@@ -666,6 +678,7 @@ mod tests {
                 limits.call_room_max,
                 limits.call_server_max,
                 FREE,
+                false,
             );
             assert!(joined.is_ok(), "{user_id}");
         }
@@ -677,7 +690,8 @@ mod tests {
                 None,
                 limits.call_room_max,
                 limits.call_server_max,
-                FREE
+                FREE,
+                false
             ),
             Err(Refused::Full)
         );
@@ -715,7 +729,16 @@ mod tests {
             priority_speaker: false,
         };
         let changes = calls
-            .join("u", "a", 1, Some("c-1".to_string()), 12, 32, suppressed)
+            .join(
+                "u",
+                "a",
+                1,
+                Some("c-1".to_string()),
+                12,
+                32,
+                suppressed,
+                false,
+            )
             .expect("join");
         let Change::Joined { participant, .. } = &changes[0] else {
             panic!("joined");
@@ -795,12 +818,12 @@ mod tests {
     #[test]
     fn a_seat_keeps_its_call_id_and_state_until_it_leaves() {
         let mut calls = Calls::default();
-        let joined = calls.join("u", "a", 1, Some("c-1".to_string()), 12, 32, FREE);
+        let joined = calls.join("u", "a", 1, Some("c-1".to_string()), 12, 32, FREE, false);
         assert!(joined.is_ok());
         assert_eq!(calls.call_of("u"), Some("c-1"));
         assert_eq!(calls.holder("c-1"), Some("u"));
         assert_eq!(
-            calls.join("u", "a", 2, Some("c-2".to_string()), 12, 32, FREE),
+            calls.join("u", "a", 2, Some("c-2".to_string()), 12, 32, FREE, false),
             Ok(Vec::new())
         );
         assert_eq!(calls.holder("c-1"), None);

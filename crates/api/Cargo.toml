@@ -14,6 +14,12 @@ axum = { workspace = true, features = ["ws"] }
 base64.workspace = true
 db = { path = "../db" }
 openidconnect.workspace = true
+# End-to-end encrypted calls: the server is the MLS external sender and delivery service. It
+# signs Add and Remove proposals and reads the outer frame of commits; it never holds a group
+# secret. The versions tinyclient's `davey` (DAVE) links, so both sides speak the same MLS.
+openmls = "0.8.1"
+openmls_basic_credential = "0.5.0"
+openmls_rust_crypto = "0.5.1"
 reqwest.workspace = true
 sfu = { path = "../sfu" }
 serde.workspace = true
@@ -28,6 +34,8 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# Discord's DAVE, as tinyclient runs it: the e2ee tests drive real clients through the server.
+davey = "=0.1.5"
 # The fake provider in tests/common/oidc.rs signs ID tokens with openidconnect itself.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

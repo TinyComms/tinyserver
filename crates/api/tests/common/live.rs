@@ -191,6 +191,7 @@ pub fn participant(user_id: &str) -> Value {
         "server_deafened": false,
         "suppressed": false,
         "priority": false,
+        "e2ee": false,
     })
 }
 

@@ -111,6 +111,8 @@ pub struct CallAccess {
     /// The room's own limit, 0 for the server's.
     pub user_limit: i32,
     pub timed_out: bool,
+    /// Only apps that encrypt end to end may join.
+    pub e2ee_required: bool,
 }
 
 /// `None` when the room is missing or the member cannot see it.
@@ -122,19 +124,23 @@ pub async fn call_access(
     let Ok(room_id) = uuid(room_id) else {
         return Ok(None);
     };
-    let row: Option<(i64, i32, bool)> = sqlx::query_as(
-        "SELECT perms, user_limit, timed_out FROM app_call_access($1::uuid, $2::uuid)",
+    let row: Option<(i64, i32, bool, bool)> = sqlx::query_as(
+        "SELECT perms, user_limit, timed_out, e2ee_required
+         FROM app_call_access($1::uuid, $2::uuid)",
     )
     .bind(&room_id)
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .map(|(permissions, user_limit, timed_out)| CallAccess {
-            permissions,
-            user_limit,
-            timed_out,
-        })
+        .map(
+            |(permissions, user_limit, timed_out, e2ee_required)| CallAccess {
+                permissions,
+                user_limit,
+                timed_out,
+                e2ee_required,
+            },
+        )
         .filter(|access| perm::has(access.permissions, perm::VIEW_CHANNEL)))
 }
 
