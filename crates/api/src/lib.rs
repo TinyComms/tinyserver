@@ -1,6 +1,6 @@
 //! HTTP surface. Health, sign-in, session, account, server settings, roles, rooms, people,
-//! invites, bans, the audit log, and the live socket.
-//! Media does not enter this crate; it talks to `sfu` over channels.
+//! invites, bans, messages, the audit log, and the live socket.
+//! Call media does not enter this crate; it talks to `sfu` over channels.
 
 mod account;
 mod admin;
@@ -9,6 +9,7 @@ mod community;
 mod health;
 mod limit;
 mod live;
+mod messages;
 mod oidc;
 mod session;
 
@@ -42,7 +43,8 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(session::routes())
         .merge(account::routes())
         .merge(community::routes())
-        .merge(admin::routes());
+        .merge(admin::routes())
+        .merge(messages::routes());
     if let Some(live) = live {
         routes = routes.merge(live::routes(live));
     }

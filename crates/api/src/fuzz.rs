@@ -39,6 +39,7 @@ pub fn live_frame(data: &[u8]) {
             seq: i64::from(pick),
             topic: topic.to_string(),
             payload,
+            users: vec![],
         });
         // Valid JSON. Not read back as a `Value`: serde_json takes an object whose first key
         // is its private raw-value token as a raw value, and the payload may have that key.

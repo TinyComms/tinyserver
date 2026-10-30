@@ -15,6 +15,8 @@ pub struct OutboxRow {
     pub seq: i64,
     pub topic: String,
     pub payload: Value,
+    /// Empty means every member socket. Otherwise only these user ids.
+    pub users: Vec<String>,
 }
 
 /// The newest seq, and the highest seq the sweep has deleted.
@@ -38,24 +40,49 @@ pub(crate) async fn emit(
     Ok(())
 }
 
+/// Like `emit`, for an event only `users` should see. An empty list is nobody, not everyone.
+#[allow(dead_code)] // Message writes call `app_emit_to` in SQL. This is the same function.
+pub(crate) async fn emit_to(
+    tx: &mut Transaction<'_, Postgres>,
+    topic: &str,
+    payload: Value,
+    users: &[String],
+) -> Result<(), CommunityError> {
+    sqlx::query(
+        "SELECT app_emit_to($1, $2, (
+            SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($3::text[]) AS item
+        ))",
+    )
+    .bind(topic)
+    .bind(payload)
+    .bind(users)
+    .execute(&mut **tx)
+    .await
+    .map_err(from_sql)?;
+    Ok(())
+}
+
 /// Events with a seq above `after`, oldest first, at most `limit`.
 pub async fn outbox_after(
     pool: &PgPool,
     after: i64,
     limit: i64,
 ) -> Result<Vec<OutboxRow>, DbError> {
-    let rows: Vec<(i64, String, Value)> =
-        sqlx::query_as("SELECT id, topic, payload FROM outbox WHERE id > $1 ORDER BY id LIMIT $2")
-            .bind(after)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(i64, String, Value, Vec<String>)> = sqlx::query_as(
+        "SELECT id, topic, payload, coalesce(audience::text[], '{}')
+         FROM outbox WHERE id > $1 ORDER BY id LIMIT $2",
+    )
+    .bind(after)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
-        .map(|(seq, topic, payload)| OutboxRow {
+        .map(|(seq, topic, payload, users)| OutboxRow {
             seq,
             topic,
             payload,
+            users,
         })
         .collect())
 }

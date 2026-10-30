@@ -14,6 +14,8 @@ pub(crate) enum Audience {
     Invites,
     /// ban_members.
     Bans,
+    /// Only the user ids on the event. Direct messages and their reads use this.
+    Users,
     /// Acted on by the server, never sent.
     Server,
 }
@@ -26,7 +28,7 @@ impl Audience {
             Self::Everyone => true,
             Self::Invites => permissions & (perm::CREATE_INVITES | perm::MANAGE_INVITES) != 0,
             Self::Bans => perm::has(permissions, perm::BAN_MEMBERS),
-            Self::Server => false,
+            Self::Users | Self::Server => false,
         }
     }
 }
@@ -43,6 +45,8 @@ pub(crate) struct Event {
     pub room: Option<String>,
     /// For `member.timeout`: a timeout was set, not ended.
     pub timed_out: bool,
+    /// Set when `audience` is `Users`.
+    pub users: Vec<String>,
     pub frame: Option<String>,
 }
 
@@ -57,7 +61,9 @@ struct Durable<'a> {
 
 impl Event {
     pub fn from_row(row: OutboxRow) -> Self {
-        let audience = if row.topic.starts_with("invite.") {
+        let audience = if !row.users.is_empty() {
+            Audience::Users
+        } else if row.topic.starts_with("invite.") {
             Audience::Invites
         } else if row.topic == "member.banned" {
             Audience::Bans
@@ -84,7 +90,7 @@ impl Event {
                 .is_some_and(|until| !until.is_null());
         let frame = match audience {
             Audience::Server => None,
-            Audience::Everyone | Audience::Invites | Audience::Bans => {
+            Audience::Everyone | Audience::Invites | Audience::Bans | Audience::Users => {
                 match serde_json::to_string(&Durable {
                     kind: &row.topic,
                     seq: row.seq,
@@ -105,6 +111,7 @@ impl Event {
             subject,
             room,
             timed_out,
+            users: row.users,
             frame,
         }
     }
@@ -118,6 +125,8 @@ pub(crate) struct Incoming {
     #[serde(rename = "ref")]
     pub reference: Option<Value>,
     pub room_id: Option<String>,
+    /// `typing`: the channel or direct conversation.
+    pub conversation_id: Option<String>,
     pub user_id: Option<String>,
     pub sdp: Option<String>,
     pub muted: Option<bool>,
@@ -265,6 +274,7 @@ mod tests {
             seq: 7,
             topic: "room.renamed".to_string(),
             payload: json!({"room": {"id": "r", "name": "Lobby"}}),
+            users: vec![],
         });
         assert_eq!(event.audience, Audience::Everyone);
         let frame = event.frame.expect("frame");
@@ -283,6 +293,7 @@ mod tests {
             seq: 1,
             topic: "invite.created".to_string(),
             payload: json!({"invite": {"id": "i"}}),
+            users: vec![],
         });
         assert_eq!(invite.audience, Audience::Invites);
         assert!(invite.audience.admits(perm::CREATE_INVITES));
@@ -292,6 +303,7 @@ mod tests {
             seq: 2,
             topic: "member.banned".to_string(),
             payload: json!({"user_id": "u", "ban": {}}),
+            users: vec![],
         });
         assert_eq!(ban.audience, Audience::Bans);
         assert_eq!(ban.subject.as_deref(), Some("u"));
@@ -301,18 +313,21 @@ mod tests {
             seq: 3,
             topic: "member.timeout".to_string(),
             payload: json!({"member": {"user_id": "u"}, "timeout_until": "2026-01-01T00:00:00Z"}),
+            users: vec![],
         });
         assert!(timeout.timed_out);
         let ended = Event::from_row(OutboxRow {
             seq: 4,
             topic: "member.timeout".to_string(),
             payload: json!({"member": {"user_id": "u"}, "timeout_until": null}),
+            users: vec![],
         });
         assert!(!ended.timed_out);
         let ended = Event::from_row(OutboxRow {
             seq: 2,
             topic: "session.ended".to_string(),
             payload: json!({"user_id": "u"}),
+            users: vec![],
         });
         assert_eq!(ended.audience, Audience::Server);
         assert_eq!(ended.subject.as_deref(), Some("u"));
@@ -325,8 +340,23 @@ mod tests {
             seq: 3,
             topic: "member.role".to_string(),
             payload: json!({"member": {"user_id": "u", "display_name": "A", "role": "admin"}}),
+            users: vec![],
         });
         assert_eq!(event.subject.as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn a_direct_event_names_its_audience() {
+        let event = Event::from_row(OutboxRow {
+            seq: 9,
+            topic: "message.created".to_string(),
+            payload: json!({"message": {"id": "m"}}),
+            users: vec!["a".to_string(), "b".to_string()],
+        });
+        assert_eq!(event.audience, Audience::Users);
+        assert_eq!(event.users, ["a", "b"]);
+        let frame = event.frame.expect("frame");
+        assert!(frame.contains("message.created"), "{frame}");
     }
 
     #[test]

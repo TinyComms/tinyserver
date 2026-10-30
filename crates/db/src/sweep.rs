@@ -15,11 +15,18 @@ pub struct Swept {
     pub events: i64,
     /// Sign-ins never finished and one-time codes never redeemed.
     pub logins: i64,
+    /// Uploads nobody attached within an hour.
+    pub attachments: i64,
 }
 
 impl Swept {
     pub fn total(&self) -> i64 {
-        self.sessions + self.invites + self.idempotency_keys + self.events + self.logins
+        self.sessions
+            + self.invites
+            + self.idempotency_keys
+            + self.events
+            + self.logins
+            + self.attachments
     }
 }
 
@@ -32,11 +39,15 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
         )
         .fetch_one(pool)
         .await?;
+    let orphans = crate::messages::expire_orphans(pool).await?;
+    crate::messages::remove_files(&orphans);
+    let attachments = i64::try_from(orphans.len()).unwrap_or(i64::MAX);
     Ok(Swept {
         sessions,
         invites,
         idempotency_keys,
         events,
         logins,
+        attachments,
     })
 }

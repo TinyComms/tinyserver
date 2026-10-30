@@ -8,6 +8,7 @@ mod auth;
 mod bootstrap;
 mod community;
 mod error;
+mod messages;
 mod migrate;
 mod moderation;
 mod outbox;
@@ -33,6 +34,12 @@ pub use community::{
     NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
 pub use error::DbError;
+pub use messages::{
+    clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
+    list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
+    save_attachment, set_channel_override, toggle_reaction, typing_recipients, update_channel,
+    AttachmentFile, MessageError, NewAttachment,
+};
 pub use migrate::migrate;
 pub use moderation::{
     ban, call_access, end_share, kick_from_call, list_bans, moderate_call, move_in_call,
