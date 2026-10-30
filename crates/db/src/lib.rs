@@ -8,6 +8,7 @@ mod auth;
 mod bootstrap;
 mod community;
 mod error;
+mod messages;
 mod migrate;
 mod moderation;
 mod outbox;
@@ -33,6 +34,12 @@ pub use community::{
     NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
 pub use error::DbError;
+pub use messages::{
+    clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
+    list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
+    save_attachment, set_channel_override, toggle_reaction, typing_recipients, update_channel,
+    AttachmentFile, MessageError, NewAttachment,
+};
 pub use migrate::migrate;
 pub use moderation::{
     ban, call_access, end_share, kick_from_call, list_bans, moderate_call, move_in_call,
@@ -45,7 +52,8 @@ pub use roles::{
 pub use server::{
     create_category, delete_category, delete_icon, get_icon, get_server, list_categories,
     rename_category, set_icon, set_layout, sniff_image, update_server, Category, Icon, Layout,
-    LayoutBucket, ServerPatch, ServerSettings, ICON_MAX,
+    LayoutBucket, ServerPatch, ServerSettings, FILE_MAX_DEFAULT, ICON_MAX, IMAGE_MAX_DEFAULT,
+    UPLOAD_MAX,
 };
 pub use session::{
     close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,

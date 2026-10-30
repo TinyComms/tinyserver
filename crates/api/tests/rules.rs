@@ -145,6 +145,7 @@ async fn the_sweep_deletes_expired_rows_and_keeps_accepted_invites() {
                 idempotency_keys: 1,
                 events: 0,
                 logins: 2,
+                attachments: 0,
             }
         );
         let left: (i64, i64, i64, i64, i64) = sqlx::query_as(

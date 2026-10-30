@@ -144,6 +144,7 @@ async fn capabilities_and_me_describe_what_the_caller_may_do() {
             "invite_options",
             "audit_query",
             "voice_moderation",
+            "upload_limits",
         ] {
             assert!(
                 body["features"]
@@ -185,6 +186,8 @@ async fn the_server_has_settings_and_an_icon_that_only_manage_server_changes() {
         assert_eq!(server["name"], "Tiny server");
         assert_eq!(server["icon"], Value::Null);
         assert_eq!(server["afk_timeout_secs"], 0);
+        assert_eq!(server["image_max_bytes"], 8 * 1024 * 1024);
+        assert_eq!(server["file_max_bytes"], 25 * 1024 * 1024);
         assert!(server["created_at"].is_string());
 
         let (status, body) = send(
@@ -203,7 +206,8 @@ async fn the_server_has_settings_and_an_icon_that_only_manage_server_changes() {
             Method::PATCH,
             "/v1/server",
             json!({"name": " Atomic ", "welcome": "Hi", "default_room_id": lobby.id,
-                   "afk_room_id": lobby.id, "afk_timeout_secs": 300}),
+                   "afk_room_id": lobby.id, "afk_timeout_secs": 300,
+                   "image_max_bytes": 1024 * 1024, "file_max_bytes": 50 * 1024 * 1024}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{server}");
@@ -212,6 +216,8 @@ async fn the_server_has_settings_and_an_icon_that_only_manage_server_changes() {
         assert_eq!(server["description"], "");
         assert_eq!(server["default_room_id"], lobby.id);
         assert_eq!(server["afk_timeout_secs"], 300);
+        assert_eq!(server["image_max_bytes"], 1024 * 1024);
+        assert_eq!(server["file_max_bytes"], 50 * 1024 * 1024);
 
         let (status, server) = send(
             &app,
@@ -229,6 +235,8 @@ async fn the_server_has_settings_and_an_icon_that_only_manage_server_changes() {
             json!({"name": ""}),
             json!({"welcome": "w".repeat(2001)}),
             json!({"afk_timeout_secs": -1}),
+            json!({"image_max_bytes": 0}),
+            json!({"file_max_bytes": 100 * 1024 * 1024 + 1}),
             json!({"default_room_id": "00000000-0000-0000-0000-000000000000"}),
         ] {
             let (status, body) =
