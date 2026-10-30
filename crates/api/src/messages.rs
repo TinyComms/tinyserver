@@ -19,8 +19,8 @@ use serde_json::Value;
 
 use crate::community::{caller, ApiError};
 
-/// A file plus its multipart headers. A little over the 25 MiB file cap.
-const UPLOAD_BODY: usize = 26 * 1024 * 1024;
+/// A file plus its multipart headers. A little over the largest cap an admin may set.
+const UPLOAD_BODY: usize = db::UPLOAD_MAX as usize + 1024 * 1024;
 
 pub fn routes() -> Router<PgPool> {
     let media = Router::new()

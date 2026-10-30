@@ -360,6 +360,44 @@ async fn a_direct_message_is_not_delivered_to_a_third_member() {
     .await;
 }
 
+#[tokio::test]
+async fn an_admin_can_lower_the_image_cap() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let gif = b"GIF89a...";
+
+        let (status, server) = Call::new(Method::PATCH, "/v1/server")
+            .token(&token)
+            .json(json!({"image_max_bytes": 8}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(server["image_max_bytes"], 8);
+
+        let (status, denied) = upload(&app, &token, "wave.gif", "image/gif", gif, &[]).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{denied}");
+        assert_eq!(denied["error"], "too_large");
+
+        let (status, server) = Call::new(Method::PATCH, "/v1/server")
+            .token(&token)
+            .json(json!({"image_max_bytes": 8 * 1024 * 1024}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        let (status, saved) = upload(&app, &token, "wave.gif", "image/gif", gif, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "gif");
+    })
+    .await;
+}
+
 async fn send_message(
     app: &Router,
     token: &str,

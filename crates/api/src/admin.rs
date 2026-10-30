@@ -24,6 +24,7 @@ pub const FEATURES: &[&str] = &[
     "audit_query",
     "voice_moderation",
     "e2ee_calls",
+    "upload_limits",
 ];
 
 pub fn routes() -> Router<PgPool> {
@@ -82,6 +83,10 @@ struct ServerBody {
     afk_room_id: Option<Option<String>>,
     #[serde(default)]
     afk_timeout_secs: Option<i32>,
+    #[serde(default)]
+    image_max_bytes: Option<i64>,
+    #[serde(default)]
+    file_max_bytes: Option<i64>,
 }
 
 async fn server(
@@ -105,6 +110,8 @@ async fn edit_server(
         default_room_id: body.default_room_id,
         afk_room_id: body.afk_room_id,
         afk_timeout_secs: body.afk_timeout_secs,
+        image_max_bytes: body.image_max_bytes,
+        file_max_bytes: body.file_max_bytes,
     };
     let settings = db::update_server(&pool, &caller, &patch)
         .await

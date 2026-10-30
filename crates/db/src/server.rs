@@ -14,6 +14,12 @@ use crate::{Caller, CommunityError};
 
 /// The largest icon, in bytes.
 pub const ICON_MAX: usize = 256 * 1024;
+/// Images and GIFs, until an admin changes it.
+pub const IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
+/// Video and every other file, until an admin changes it.
+pub const FILE_MAX_DEFAULT: i64 = 25 * 1024 * 1024;
+/// The most an admin may allow for either kind of upload.
+pub const UPLOAD_MAX: i64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerSettings {
@@ -26,6 +32,10 @@ pub struct ServerSettings {
     pub afk_room_id: Option<String>,
     /// 0 is off.
     pub afk_timeout_secs: i32,
+    /// Images and GIFs, in bytes.
+    pub image_max_bytes: i64,
+    /// Video and every other file, in bytes.
+    pub file_max_bytes: i64,
     pub created_at: String,
 }
 
@@ -38,6 +48,8 @@ pub struct ServerPatch {
     pub default_room_id: Option<Option<String>>,
     pub afk_room_id: Option<Option<String>>,
     pub afk_timeout_secs: Option<i32>,
+    pub image_max_bytes: Option<i64>,
+    pub file_max_bytes: Option<i64>,
 }
 
 pub struct Icon {
@@ -69,7 +81,8 @@ pub struct Layout {
 fn settings_select() -> String {
     format!(
         "SELECT name, description, welcome, icon_sha, default_room_id::text, afk_room_id::text,
-                afk_timeout_secs, to_char(created_at AT TIME ZONE 'UTC', '{STAMP}')
+                afk_timeout_secs, image_max_bytes, file_max_bytes,
+                to_char(created_at AT TIME ZONE 'UTC', '{STAMP}')
          FROM server_settings"
     )
 }
@@ -113,6 +126,8 @@ pub async fn update_server(
     }
     let default_room = room_choice(&patch.default_room_id)?;
     let afk_room = room_choice(&patch.afk_room_id)?;
+    let image_max = upload_limit(patch.image_max_bytes)?;
+    let file_max = upload_limit(patch.file_max_bytes)?;
     let mut tx = scope(pool, caller).await?;
     require(&mut tx, perm::MANAGE_SERVER).await?;
     sqlx::query(
@@ -122,7 +137,9 @@ pub async fn update_server(
              welcome = coalesce($3, welcome),
              default_room_id = CASE WHEN $4 THEN $5::uuid ELSE default_room_id END,
              afk_room_id = CASE WHEN $6 THEN $7::uuid ELSE afk_room_id END,
-             afk_timeout_secs = coalesce($8, afk_timeout_secs)",
+             afk_timeout_secs = coalesce($8, afk_timeout_secs),
+             image_max_bytes = coalesce($9, image_max_bytes),
+             file_max_bytes = coalesce($10, file_max_bytes)",
     )
     .bind(name.as_deref())
     .bind(description.as_deref())
@@ -132,6 +149,8 @@ pub async fn update_server(
     .bind(afk_room.0)
     .bind(afk_room.1.as_deref())
     .bind(patch.afk_timeout_secs)
+    .bind(image_max)
+    .bind(file_max)
     .execute(&mut *tx)
     .await
     .map_err(from_sql)?;
@@ -146,6 +165,8 @@ pub async fn update_server(
         ("default_room_id", default_room.0),
         ("afk_room_id", afk_room.0),
         ("afk_timeout_secs", patch.afk_timeout_secs.is_some()),
+        ("image_max_bytes", image_max.is_some()),
+        ("file_max_bytes", file_max.is_some()),
     ] {
         if set {
             changed.insert(key.into(), Value::Bool(true));
@@ -160,6 +181,14 @@ pub async fn update_server(
     .await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(settings)
+}
+
+fn upload_limit(value: Option<i64>) -> Result<Option<i64>, CommunityError> {
+    match value {
+        None => Ok(None),
+        Some(value) if (1..=UPLOAD_MAX).contains(&value) => Ok(Some(value)),
+        Some(_) => Err(CommunityError::Invalid),
+    }
 }
 
 fn bounded(text: Option<&str>, max: usize) -> Result<Option<String>, CommunityError> {
@@ -519,7 +548,9 @@ fn settings_from(row: &PgRow) -> Result<ServerSettings, CommunityError> {
         default_room_id: row.try_get(4).map_err(from_sql)?,
         afk_room_id: row.try_get(5).map_err(from_sql)?,
         afk_timeout_secs: row.try_get(6).map_err(from_sql)?,
-        created_at: row.try_get(7).map_err(from_sql)?,
+        image_max_bytes: row.try_get(7).map_err(from_sql)?,
+        file_max_bytes: row.try_get(8).map_err(from_sql)?,
+        created_at: row.try_get(9).map_err(from_sql)?,
     })
 }
 

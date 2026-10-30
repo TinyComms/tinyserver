@@ -7,14 +7,31 @@
 use std::path::PathBuf;
 
 use serde_json::{Map, Value};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
 use crate::community::{scope, Caller, CommunityError};
 use crate::DbError;
 
-const IMAGE_MAX: usize = 8 * 1024 * 1024;
-const FILE_MAX: usize = 25 * 1024 * 1024;
+#[cfg(test)]
+use crate::server::{FILE_MAX_DEFAULT, IMAGE_MAX_DEFAULT};
+
+/// The caps `server_settings` holds for this upload.
+#[derive(Clone, Copy)]
+struct UploadLimits {
+    image: i64,
+    file: i64,
+}
+
+#[cfg(test)]
+impl UploadLimits {
+    fn defaults() -> Self {
+        Self {
+            image: IMAGE_MAX_DEFAULT,
+            file: FILE_MAX_DEFAULT,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum MessageError {
@@ -337,8 +354,9 @@ pub async fn save_attachment(
     upload: &NewAttachment,
 ) -> Result<Value, MessageError> {
     person(caller)?;
-    let prepared = prepare(upload)?;
     let mut tx = scope(pool, caller).await.map_err(from_community)?;
+    let limits = upload_limits(&mut tx).await?;
+    let prepared = prepare(upload, limits)?;
     let row: Value = sqlx::query_scalar("SELECT app_save_attachment($1, $2, $3, $4, $5, $6, $7)")
         .bind(&prepared.name)
         .bind(&prepared.mime)
@@ -539,7 +557,21 @@ fn is_uuid(value: &str) -> bool {
     })
 }
 
-fn prepare(upload: &NewAttachment) -> Result<Prepared, MessageError> {
+async fn upload_limits(tx: &mut Transaction<'_, Postgres>) -> Result<UploadLimits, MessageError> {
+    let row = sqlx::query("SELECT image_max_bytes, file_max_bytes FROM server_settings")
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(message_sql)?;
+    let Some(row) = row else {
+        return Err(MessageError::Forbidden);
+    };
+    Ok(UploadLimits {
+        image: row.try_get(0).map_err(message_sql)?,
+        file: row.try_get(1).map_err(message_sql)?,
+    })
+}
+
+fn prepare(upload: &NewAttachment, limits: UploadLimits) -> Result<Prepared, MessageError> {
     let name = clean_name(&upload.name)?;
     let mime = normalize_mime(&upload.mime)?;
     for value in [upload.width, upload.height, upload.duration] {
@@ -547,7 +579,7 @@ fn prepare(upload: &NewAttachment) -> Result<Prepared, MessageError> {
             return Err(MessageError::Invalid);
         }
     }
-    let kind = kind_of(&mime, &upload.bytes)?;
+    let kind = kind_of(&mime, &upload.bytes, limits)?;
     Ok(Prepared { name, mime, kind })
 }
 
@@ -580,29 +612,33 @@ fn normalize_mime(mime: &str) -> Result<String, MessageError> {
     }
 }
 
-fn kind_of(mime: &str, bytes: &[u8]) -> Result<&'static str, MessageError> {
+fn kind_of(mime: &str, bytes: &[u8], limits: UploadLimits) -> Result<&'static str, MessageError> {
     if bytes.is_empty() {
         return Err(MessageError::Invalid);
     }
     let (kind, limit, sniffed) = match mime {
-        "image/png" => ("image", IMAGE_MAX, Some(sniff_png(bytes))),
-        "image/jpeg" => ("image", IMAGE_MAX, Some(sniff_jpeg(bytes))),
-        "image/webp" => ("image", IMAGE_MAX, Some(sniff_webp(bytes))),
-        "image/gif" => ("gif", IMAGE_MAX, Some(sniff_gif(bytes))),
-        "video/mp4" => ("video", FILE_MAX, Some(sniff_mp4(bytes))),
-        "video/webm" => ("video", FILE_MAX, Some(sniff_webm(bytes))),
+        "image/png" => ("image", limits.image, Some(sniff_png(bytes))),
+        "image/jpeg" => ("image", limits.image, Some(sniff_jpeg(bytes))),
+        "image/webp" => ("image", limits.image, Some(sniff_webp(bytes))),
+        "image/gif" => ("gif", limits.image, Some(sniff_gif(bytes))),
+        "video/mp4" => ("video", limits.file, Some(sniff_mp4(bytes))),
+        "video/webm" => ("video", limits.file, Some(sniff_webm(bytes))),
         other if other.starts_with("image/") || other.starts_with("video/") => {
             return Err(MessageError::UnsupportedMedia);
         }
-        _ => ("file", FILE_MAX, None),
+        _ => ("file", limits.file, None),
     };
-    if bytes.len() > limit {
+    if !within(bytes.len(), limit) {
         return Err(MessageError::TooLarge);
     }
     if sniffed == Some(false) {
         return Err(MessageError::UnsupportedMedia);
     }
     Ok(kind)
+}
+
+fn within(len: usize, limit: i64) -> bool {
+    i64::try_from(len).is_ok_and(|len| len <= limit)
 }
 
 fn sniff_png(bytes: &[u8]) -> bool {
@@ -724,7 +760,11 @@ fn is_extend(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_of, one_emoji, MessageError};
+    use super::{kind_of as classify, one_emoji, MessageError, UploadLimits};
+
+    fn kind_of(mime: &str, bytes: &[u8]) -> Result<&'static str, MessageError> {
+        classify(mime, bytes, UploadLimits::defaults())
+    }
 
     #[test]
     fn an_emoji_is_one_grapheme() {
@@ -783,5 +823,5 @@ mod tests {
         ));
     }
 
-    const FILE_MAX_PLUS: usize = super::FILE_MAX + 1;
+    const FILE_MAX_PLUS: usize = super::FILE_MAX_DEFAULT as usize + 1;
 }
