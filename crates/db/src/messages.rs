@@ -354,9 +354,7 @@ pub async fn save_attachment(
         return Err(MessageError::Invalid);
     };
     let id = id.to_string();
-    if let Err(error) = write_upload(&id, &upload.bytes) {
-        return Err(error);
-    }
+    write_upload(&id, &upload.bytes)?;
     if let Err(error) = tx.commit().await {
         remove_files(std::slice::from_ref(&id));
         return Err(message_sql(error));
