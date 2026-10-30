@@ -241,6 +241,7 @@ async fn deliver(hub: &Hub, socket: &mut WebSocket, me: &mut Me, event: &Event) 
     let visible = match event.audience {
         Audience::Everyone => true,
         Audience::Managers => me.manages(),
+        Audience::Users => event.users.iter().any(|id| id == &me.user_id),
         Audience::Server => false,
     };
     if visible {
@@ -339,6 +340,7 @@ async fn receive(
         "call.offer" => call_offer(hub, me, asking, sdp).await,
         "call.state" => call_state(hub, me, incoming.muted, incoming.deafened),
         "call.quality" => call_quality(hub, me, incoming.video.as_deref()),
+        "typing" => typing(hub, me, incoming.conversation_id.as_deref()).await,
         _ => Err("unknown_type"),
     };
     let reference = incoming.reference.as_ref();
@@ -352,6 +354,44 @@ async fn receive(
         Err(code) => Out::Error { reference, code },
     };
     send(hub, socket, reply.text()).await
+}
+
+/// Relays typing to the other people in the conversation. The frame is not stored.
+async fn typing(hub: &Hub, me: &Me, conversation_id: Option<&str>) -> Answer {
+    let Some(conversation_id) = conversation_id else {
+        return Err("bad_frame");
+    };
+    match db::typing_recipients(&hub.pool, &me.caller(), conversation_id).await {
+        Ok(ids) => {
+            let frame = serde_json::json!({
+                "type": "typing",
+                "conversation_id": conversation_id,
+                "user_id": &me.user_id,
+            });
+            hub.relay(&ids, &frame.to_string());
+            Ok(Done::Ok)
+        }
+        Err(error) => Err(typing_code(&error)),
+    }
+}
+
+fn typing_code(error: &db::MessageError) -> &'static str {
+    match error {
+        db::MessageError::NotFound => "not_found",
+        db::MessageError::Forbidden | db::MessageError::Banned | db::MessageError::Hierarchy => {
+            "forbidden"
+        }
+        db::MessageError::Invalid => "bad_frame",
+        db::MessageError::TooLarge | db::MessageError::UnsupportedMedia => "bad_frame",
+        db::MessageError::Store(error) => {
+            tracing::warn!(%error, "typing check failed");
+            "unavailable"
+        }
+        db::MessageError::Database(error) => {
+            tracing::warn!(%error, "typing check failed");
+            "unavailable"
+        }
+    }
 }
 
 /// Re-reads the session before a call request. An ended session closes the socket.

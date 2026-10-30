@@ -230,6 +230,12 @@ A share starts the same way, with the share m-line `sendonly`. A second sharer i
 {"type":"call.state","room_id":"0b6f…","user_id":"9d1e…","muted":false,"deafened":false,"camera":true,"sharing":false}
 ```
 
+### Messages
+
+Text channels and direct messages use the same socket. Durable topics are `channel.created`, `channel.updated`, `channel.deleted`, `direct.created`, `message.created`, `message.edited`, `message.deleted`, `reaction.updated`, and `read.updated`. Channel events go to every member socket. Direct events go only to the two people in the conversation. `read.updated` is sent for a direct conversation, to both people. A channel read is stored and is not broadcast.
+
+A client may send `{"type":"typing","conversation_id":"…"}`. The server relays `{"type":"typing","conversation_id":"…","user_id":"…"}` to the other people who can see that conversation. It is not stored. It uses the same per-socket rate limit as other client frames. File bytes never ride in a frame, and the 64 KiB frame cap stays.
+
 ## Signaling and SDP
 
 The client is always the offerer. The server never sends an offer, so there is no glare and no rollback.

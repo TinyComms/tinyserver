@@ -57,6 +57,16 @@ impl People {
         }
     }
 
+    /// Every socket of `user_id`. A socket that is behind misses the frame.
+    fn fanout(&self, user_id: &str, frame: Arc<str>) {
+        let Some(person) = self.users.get(user_id) else {
+            return;
+        };
+        for conn in &person.conns {
+            let _ = conn.direct.try_send(Arc::clone(&frame));
+        }
+    }
+
     /// Sends `frame` to the socket holding `user_id`'s seat.
     fn to_seat(&self, user_id: &str, frame: Arc<str>) {
         if let Some(conn) = self.calls.conn_of(user_id) {
@@ -660,6 +670,17 @@ async fn drain(hub: &Hub, mut cursor: i64) -> i64 {
         }
         if !full {
             return cursor;
+        }
+    }
+}
+
+impl Hub {
+    /// Sends one ephemeral frame to every socket of each user.
+    pub(crate) fn relay(&self, user_ids: &[String], frame: &str) {
+        let frame: Arc<str> = Arc::from(frame);
+        let people = lock(&self.people);
+        for user_id in user_ids {
+            people.fanout(user_id, Arc::clone(&frame));
         }
     }
 }
