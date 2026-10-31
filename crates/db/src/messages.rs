@@ -5,7 +5,7 @@
 //! here, before SQL, because a bot is not a member.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -364,7 +364,7 @@ pub async fn save_attachment(
     pool: &PgPool,
     caller: &Caller,
     upload: &NewAttachment,
-    engine: &dyn ScanEngine,
+    engine: &Arc<dyn ScanEngine>,
 ) -> Result<Value, MessageError> {
     person(caller)?;
     let mut tx = scope(pool, caller).await.map_err(from_community)?;
@@ -749,12 +749,32 @@ async fn abort_upload(tx: Transaction<'_, Postgres>, id: &str) {
     let _ = tx.rollback().await;
 }
 
-async fn scan_bytes(engine: &dyn ScanEngine, bytes: &[u8], mime: &str, kind: &str) -> ScanVerdict {
+async fn scan_bytes(
+    engine: &Arc<dyn ScanEngine>,
+    bytes: &[u8],
+    mime: &str,
+    kind: &str,
+) -> ScanVerdict {
     let timed = tokio::time::timeout(scan_timeout(), async {
-        let Ok(_permit) = scan_slots().acquire().await else {
+        let Ok(permit) = Arc::clone(scan_slots()).acquire_owned().await else {
             return ScanVerdict::Unavailable;
         };
-        engine.scan(bytes, mime, kind)
+        // clamd and yara block the worker. The slot stays taken until that call returns,
+        // including when the outer timeout has already answered Unavailable.
+        let engine = Arc::clone(engine);
+        let bytes = bytes.to_vec();
+        let mime = mime.to_owned();
+        let kind = kind.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            let verdict = engine.scan(&bytes, &mime, &kind);
+            drop(permit);
+            verdict
+        })
+        .await
+        {
+            Ok(verdict) => verdict,
+            Err(_) => ScanVerdict::Unavailable,
+        }
     })
     .await;
     timed.unwrap_or(ScanVerdict::Unavailable)
@@ -771,9 +791,9 @@ fn scan_timeout() -> Duration {
     Duration::from_millis(ms)
 }
 
-fn scan_slots() -> &'static Semaphore {
-    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
-    SLOTS.get_or_init(|| Semaphore::new(3))
+fn scan_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(3)))
 }
 
 /// One unicode grapheme, 1 to 16 scalars, with no ASCII control.

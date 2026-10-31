@@ -417,7 +417,7 @@ async fn upload(
         .await
         .map_err(|_| Error::TooLarge)?;
     let upload = parse_upload(content_type, &body).map_err(lift)?;
-    let saved = save_attachment(&pool, &caller, &upload, engine.as_ref())
+    let saved = save_attachment(&pool, &caller, &upload, &engine)
         .await
         .map_err(lift)?;
     Ok((StatusCode::CREATED, signed(saved)))

@@ -56,6 +56,9 @@ where
         return;
     };
     std::env::set_var("TINYSERVER_MEDIA_HMAC_SECRET", MEDIA_HMAC_SECRET);
+    std::env::set_var("TINYSERVER_ALLOW_FAKE_SCAN", "1");
+    // A developer shell may export a socket. This suite stays on FakeEngine.
+    std::env::remove_var("TINYSERVER_CLAMD_SOCKET");
     let admin = PgConnectOptions::from_str(&migrate_url).expect("TEST_DATABASE_URL_MIGRATE");
     let base_runtime = PgConnectOptions::from_str(&runtime_url).expect("TEST_DATABASE_URL");
 

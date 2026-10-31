@@ -13,6 +13,7 @@ mod live;
 pub mod media_sign;
 mod messages;
 mod oidc;
+mod scan_clamd;
 mod session;
 
 #[cfg(feature = "fuzz")]
@@ -20,6 +21,7 @@ pub mod fuzz;
 
 pub use live::{Limits, Live};
 pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};
+pub use scan_clamd::{engine_from_env, ScanBootError};
 
 use std::sync::Arc;
 
@@ -29,7 +31,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::Extension;
 use axum::Router;
-use db::{FakeEngine, PgPool, ScanEngine};
+use db::{PgPool, ScanEngine};
 
 /// The REST routes without `GET /v1/live`. Without `sign_in` there is no `/v1/auth`, so no one
 /// can sign in; tests open sessions through `db`.
@@ -61,8 +63,15 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(middleware::from_fn(limit::guard))
         .layer(middleware::from_fn(harden))
-        .layer(Extension(Arc::new(FakeEngine) as Arc<dyn ScanEngine>))
+        .layer(Extension(installed_engine()))
         .with_state(pool)
+}
+
+fn installed_engine() -> Arc<dyn ScanEngine> {
+    match engine_from_env() {
+        Ok(engine) => engine,
+        Err(error) => panic!("scan engine: {error}"),
+    }
 }
 
 async fn harden(request: Request, next: Next) -> Response {

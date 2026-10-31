@@ -1,4 +1,5 @@
-//! Scan verdicts for chat uploads. Tests use FakeEngine; production uses clamd later.
+//! Scan verdicts for chat uploads. Tests use FakeEngine. Production uses clamd and yara
+//! when `TINYSERVER_CLAMD_SOCKET` is set.
 
 pub enum ScanVerdict {
     Clean,
