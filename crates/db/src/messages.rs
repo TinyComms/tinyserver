@@ -755,32 +755,40 @@ async fn scan_bytes(
     mime: &str,
     kind: &str,
 ) -> ScanVerdict {
-    let timed = tokio::time::timeout(scan_timeout(), async {
-        let Ok(permit) = Arc::clone(scan_slots()).acquire_owned().await else {
+    scan_with(engine, bytes, mime, kind, scan_slots(), scan_timeout()).await
+}
+
+async fn scan_with(
+    engine: &Arc<dyn ScanEngine>,
+    bytes: &[u8],
+    mime: &str,
+    kind: &str,
+    slots: &Arc<Semaphore>,
+    limit: Duration,
+) -> ScanVerdict {
+    let timed = tokio::time::timeout(limit, async {
+        let Ok(permit) = Arc::clone(slots).acquire_owned().await else {
             return ScanVerdict::Unavailable;
         };
-        // clamd and yara block the worker. The slot stays taken until that call returns,
-        // including when the outer timeout has already answered Unavailable.
+        // The slot lives in this task. Dropping the task on timeout frees it
+        // even when the blocking scan is still running.
         let engine = Arc::clone(engine);
         let bytes = bytes.to_vec();
         let mime = mime.to_owned();
         let kind = kind.to_owned();
-        match tokio::task::spawn_blocking(move || {
-            let verdict = engine.scan(&bytes, &mime, &kind);
-            drop(permit);
-            verdict
-        })
-        .await
-        {
-            Ok(verdict) => verdict,
-            Err(_) => ScanVerdict::Unavailable,
-        }
+        let verdict =
+            match tokio::task::spawn_blocking(move || engine.scan(&bytes, &mime, &kind)).await {
+                Ok(verdict) => verdict,
+                Err(_) => ScanVerdict::Unavailable,
+            };
+        drop(permit);
+        verdict
     })
     .await;
     timed.unwrap_or(ScanVerdict::Unavailable)
 }
 
-fn scan_timeout() -> Duration {
+pub fn scan_timeout() -> Duration {
     let parsed = std::env::var("TINYSERVER_SCAN_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
@@ -867,7 +875,84 @@ fn is_extend(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{one_emoji, MessageError, NewAttachment, UploadLimits};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::Semaphore;
+
+    use super::{one_emoji, scan_with, MessageError, NewAttachment, UploadLimits};
+    use crate::scan::{ScanEngine, ScanVerdict};
+
+    struct Stall {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl ScanEngine for Stall {
+        fn scan(&self, _bytes: &[u8], _mime: &str, _kind: &str) -> ScanVerdict {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ScanVerdict::Clean
+        }
+    }
+
+    struct LetGo(Arc<AtomicBool>);
+
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_bytes_releases_its_slot_when_scan_outlives_the_timeout() {
+        let slots = Arc::new(Semaphore::new(1));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let _let_go = LetGo(Arc::clone(&release));
+        let engine: Arc<dyn ScanEngine> = Arc::new(Stall {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let task = tokio::spawn({
+            let slots = Arc::clone(&slots);
+            async move {
+                scan_with(
+                    &engine,
+                    b"hello",
+                    "text/plain",
+                    "file",
+                    &slots,
+                    Duration::from_millis(80),
+                )
+                .await
+            }
+        });
+
+        let started = std::time::Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("scan did not start");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let verdict = match task.await {
+            Ok(verdict) => verdict,
+            Err(error) => panic!("scan task: {error}"),
+        };
+        assert!(matches!(verdict, ScanVerdict::Unavailable));
+
+        let freed = tokio::time::timeout(
+            Duration::from_millis(200),
+            Arc::clone(&slots).acquire_owned(),
+        )
+        .await;
+        assert!(freed.is_ok(), "scan slot still held after the timeout");
+    }
 
     #[test]
     fn an_emoji_is_one_grapheme() {

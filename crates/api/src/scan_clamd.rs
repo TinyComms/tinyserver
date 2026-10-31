@@ -4,9 +4,15 @@
 //! compile once. A yara hit is blocked before clamd is asked. clamd down, a socket timeout, or
 //! any IO error is unavailable, including when yara is clean.
 
+use std::io;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use db::{FakeEngine, ScanEngine, ScanVerdict};
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 const RULES: &str = r#"
 rule lnk_header {
@@ -74,22 +80,82 @@ impl ClamdEngine {
         Ok(Self { endpoint })
     }
 
-    fn query(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    fn query(&self, bytes: &[u8]) -> io::Result<Vec<u8>> {
+        // The third `scan_buffer` argument is a chunk size. The deadline is the
+        // socket timeout below, the same limit the upload request uses.
+        let deadline = db::scan_timeout();
         match &self.endpoint {
             Endpoint::Tcp(addr) => {
-                let tcp = clamav_client::Tcp {
-                    host_address: addr.as_str(),
+                let tcp = TimedTcp {
+                    host: addr.as_str(),
+                    deadline,
                 };
                 clamav_client::scan_buffer(bytes, tcp, None)
             }
             #[cfg(unix)]
             Endpoint::Unix(path) => {
-                let socket = clamav_client::Socket {
-                    socket_path: path.as_str(),
+                let socket = TimedUnix {
+                    path: path.as_str(),
+                    deadline,
                 };
                 clamav_client::scan_buffer(bytes, socket, None)
             }
         }
+    }
+}
+
+/// Read and write deadline for one clamd connection. Never open-ended.
+fn socket_timeout(limit: Duration) -> Option<Duration> {
+    Some(limit)
+}
+
+struct TimedTcp<'a> {
+    host: &'a str,
+    deadline: Duration,
+}
+
+impl clamav_client::TransportProtocol for TimedTcp<'_> {
+    type Stream = TcpStream;
+
+    fn connect(&self) -> io::Result<TcpStream> {
+        connect_tcp(self.host, self.deadline)
+    }
+}
+
+fn connect_tcp(host: &str, deadline: Duration) -> io::Result<TcpStream> {
+    let mut last_error = None;
+    for addr in host.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, deadline) {
+            Ok(stream) => {
+                let timeout = socket_timeout(deadline);
+                stream.set_read_timeout(timeout)?;
+                stream.set_write_timeout(timeout)?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "clamd address did not resolve")
+    }))
+}
+
+#[cfg(unix)]
+struct TimedUnix<'a> {
+    path: &'a str,
+    deadline: Duration,
+}
+
+#[cfg(unix)]
+impl clamav_client::TransportProtocol for TimedUnix<'_> {
+    type Stream = UnixStream;
+
+    fn connect(&self) -> io::Result<UnixStream> {
+        let stream = UnixStream::connect(self.path)?;
+        let timeout = socket_timeout(self.deadline);
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        Ok(stream)
     }
 }
 
@@ -219,6 +285,14 @@ fn tcp_port(value: &str) -> Option<u16> {
 mod tests {
     use super::{clamd_verdict, scan_engine, ScanBootError};
     use db::ScanVerdict;
+
+    #[test]
+    fn the_socket_deadline_is_the_scan_timeout_and_not_open() {
+        let limit = db::scan_timeout();
+        assert!(limit <= std::time::Duration::from_millis(15_000));
+        assert_ne!(limit, std::time::Duration::ZERO);
+        assert_eq!(super::socket_timeout(limit), Some(limit));
+    }
 
     #[test]
     fn no_socket_without_the_fake_flag_is_an_error() {
