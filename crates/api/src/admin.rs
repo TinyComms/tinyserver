@@ -25,6 +25,7 @@ pub const FEATURES: &[&str] = &[
     "voice_moderation",
     "e2ee_calls",
     "upload_limits",
+    "file_scan",
 ];
 
 pub fn routes() -> Router<PgPool> {

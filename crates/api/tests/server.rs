@@ -145,6 +145,7 @@ async fn capabilities_and_me_describe_what_the_caller_may_do() {
             "audit_query",
             "voice_moderation",
             "upload_limits",
+            "file_scan",
         ] {
             assert!(
                 body["features"]
