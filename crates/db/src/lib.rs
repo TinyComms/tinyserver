@@ -6,6 +6,7 @@
 mod account;
 mod auth;
 mod bootstrap;
+mod bot;
 mod community;
 mod error;
 mod messages;
@@ -26,6 +27,7 @@ pub use auth::{
     ProviderLeg, Relinked, SignedIn, SignupClaim,
 };
 pub use bootstrap::{bootstrap, owner_exists, owner_invite, Bootstrap};
+pub use bot::{authenticate_bot, create_bot, list_bots, revoke_bot, Bot, BotIssued, BotSession};
 pub use community::{
     admin_role, create_invite, create_invite_with, create_room, delete_room, list_audit,
     list_invites, list_members, list_rooms, remove_member, rename_room, revoke_invite, room_exists,

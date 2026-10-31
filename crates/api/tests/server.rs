@@ -1516,6 +1516,7 @@ async fn bootstrap_keeps_a_working_owner_invite() {
             db::Bootstrap::OwnerExists
         );
         let owner = Caller {
+            scopes: Vec::new(),
             user_id: owner.user_id,
             role: owner.role,
         };

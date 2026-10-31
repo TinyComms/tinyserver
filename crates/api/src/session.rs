@@ -25,6 +25,9 @@ pub(crate) struct Current {
     /// Server-wide permission bits.
     permissions: u64,
     rank: i32,
+    /// Present for a bot. A person's session omits it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<String>,
 }
 
 impl From<db::Identity> for Current {
@@ -38,6 +41,7 @@ impl From<db::Identity> for Current {
             roles: identity.roles,
             permissions: u64::try_from(identity.permissions).unwrap_or(0),
             rank: identity.rank,
+            scopes: Vec::new(),
         }
     }
 }
@@ -76,12 +80,33 @@ async fn current(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<Current>, ApiError> {
-    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
-    let identity = db::current_session(&pool, token)
-        .await
-        .map_err(|error| failure(error, ApiError::Unauthorized))?;
-    tracing::info!(user_id = %identity.user_id, "session read");
-    Ok(Json(Current::from(identity)))
+    match presented(&headers) {
+        Some(Presented::Bearer(token)) => {
+            let identity = db::current_session(&pool, token)
+                .await
+                .map_err(|error| failure(error, ApiError::Unauthorized))?;
+            tracing::info!(user_id = %identity.user_id, "session read");
+            Ok(Json(Current::from(identity)))
+        }
+        Some(Presented::Bot(token)) => {
+            let bot = db::authenticate_bot(&pool, token)
+                .await
+                .map_err(|error| failure(error, ApiError::Unauthorized))?;
+            tracing::info!(bot_id = %bot.id, "bot read");
+            Ok(Json(Current {
+                user_id: bot.id,
+                email: None,
+                display_name: bot.name,
+                role: "bot".to_string(),
+                owner: false,
+                roles: Vec::new(),
+                permissions: 0,
+                rank: -1,
+                scopes: bot.scopes,
+            }))
+        }
+        None => Err(ApiError::Unauthorized),
+    }
 }
 
 async fn close(State(pool): State<PgPool>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
@@ -94,13 +119,27 @@ async fn close(State(pool): State<PgPool>, headers: HeaderMap) -> Result<StatusC
 }
 
 pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let token = value.strip_prefix("Bearer ")?;
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
+    match presented(headers) {
+        Some(Presented::Bearer(token)) => Some(token),
+        _ => None,
     }
+}
+
+pub(crate) enum Presented<'a> {
+    Bearer(&'a str),
+    Bot(&'a str),
+}
+
+/// `Bearer` is a person's session. `Bot` is an application token. The prefix is exact.
+pub(crate) fn presented(headers: &HeaderMap) -> Option<Presented<'_>> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    if let Some(token) = value.strip_prefix("Bearer ") {
+        return (!token.is_empty()).then_some(Presented::Bearer(token));
+    }
+    if let Some(token) = value.strip_prefix("Bot ") {
+        return (!token.is_empty()).then_some(Presented::Bot(token));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -131,5 +170,21 @@ mod tests {
             HeaderValue::from_static("Basic token-value"),
         );
         assert_eq!(bearer(&headers), None);
+    }
+
+    #[test]
+    fn bot_is_its_own_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bot bot-token"),
+        );
+        assert!(matches!(
+            super::presented(&headers),
+            Some(super::Presented::Bot("bot-token"))
+        ));
+        assert_eq!(bearer(&headers), None);
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bot "));
+        assert!(super::presented(&headers).is_none());
     }
 }

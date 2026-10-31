@@ -32,6 +32,7 @@ async fn a_member_changes_a_name_and_signs_out_everywhere() {
         let guest = Caller {
             user_id: signed_in.user_id.clone(),
             role: signed_in.role.clone(),
+            scopes: Vec::new(),
         };
         let first = session(&db, &guest.user_id).await;
 
@@ -53,6 +54,7 @@ async fn a_member_changes_a_name_and_signs_out_everywhere() {
         let admin = Caller {
             user_id: guest.user_id.clone(),
             role: "admin".to_string(),
+            scopes: Vec::new(),
         };
         revoke_invite(pool, &admin, &spare.id)
             .await

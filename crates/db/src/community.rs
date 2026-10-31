@@ -56,6 +56,8 @@ pub struct Caller {
     pub user_id: String,
     /// The legacy role string. Permissions are read from the database, not from this.
     pub role: String,
+    /// Empty for a person. A bot carries the scopes it was granted, such as `rooms.read`.
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +260,9 @@ fn room_select(filter: &str) -> String {
 
 /// The rooms the caller may see, in layout order: uncategorized first, then each category.
 pub async fn list_rooms(pool: &PgPool, caller: &Caller) -> Result<Vec<Room>, CommunityError> {
+    if caller.role == "bot" && !caller.allows("rooms.read") {
+        return Err(CommunityError::Forbidden);
+    }
     let mut tx = scope(pool, caller).await?;
     let rooms = rooms_in(&mut tx).await?;
     tx.commit().await.map_err(from_sql)?;
@@ -298,7 +303,13 @@ pub async fn create_room(
     let name = normalize_name(&input.name).map_err(|_| CommunityError::Invalid)?;
     let topic = topic(input.topic.as_deref())?;
     let mut tx = scope(pool, caller).await?;
-    require(&mut tx, perm::MANAGE_CHANNELS).await?;
+    if caller.role == "bot" {
+        if !caller.allows("rooms.write") {
+            return Err(CommunityError::Forbidden);
+        }
+    } else {
+        require(&mut tx, perm::MANAGE_CHANNELS).await?;
+    }
     let shape = serde_json::to_string(input).map_err(|_| CommunityError::Invalid)?;
     let claim = claim(
         &mut tx,
@@ -376,7 +387,13 @@ pub async fn update_room(
     let topic = topic(patch.topic.as_deref())?;
     let mut tx = scope(pool, caller).await?;
     let before = room_in(&mut tx, id).await?;
-    require_room(&mut tx, id, perm::MANAGE_CHANNELS).await?;
+    if caller.role == "bot" {
+        if !caller.allows("rooms.write") {
+            return Err(CommunityError::Forbidden);
+        }
+    } else {
+        require_room(&mut tx, id, perm::MANAGE_CHANNELS).await?;
+    }
     let (move_category, category) = match &patch.category_id {
         Some(category) => (true, category.clone()),
         None => (false, None),
@@ -496,7 +513,13 @@ fn patch_value(patch: &RoomPatch) -> Value {
 pub async fn delete_room(pool: &PgPool, caller: &Caller, id: &str) -> Result<(), CommunityError> {
     let mut tx = scope(pool, caller).await?;
     room_in(&mut tx, id).await?;
-    require_room(&mut tx, id, perm::MANAGE_CHANNELS).await?;
+    if caller.role == "bot" {
+        if !caller.allows("rooms.write") {
+            return Err(CommunityError::Forbidden);
+        }
+    } else {
+        require_room(&mut tx, id, perm::MANAGE_CHANNELS).await?;
+    }
     let gone: Option<String> =
         sqlx::query_scalar("DELETE FROM rooms WHERE id = $1::uuid RETURNING id::text")
             .bind(id)
@@ -599,6 +622,9 @@ fn member_select(filter: &str) -> String {
 }
 
 pub async fn list_members(pool: &PgPool, caller: &Caller) -> Result<Vec<Member>, CommunityError> {
+    if caller.role == "bot" && !caller.allows("members.read") {
+        return Err(CommunityError::Forbidden);
+    }
     let mut tx = scope(pool, caller).await?;
     let rows = sqlx::query(&member_select(""))
         .fetch_all(&mut *tx)
@@ -1171,6 +1197,11 @@ pub(crate) async fn scope<'a>(
         .execute(&mut *tx)
         .await
         .map_err(from_sql)?;
+    sqlx::query("SELECT set_config('app.scopes', $1, true)")
+        .bind(scope_list(&caller.scopes))
+        .execute(&mut *tx)
+        .await
+        .map_err(from_sql)?;
     Ok(tx)
 }
 
@@ -1469,6 +1500,20 @@ fn classify_parts(code: &str, message: &str) -> Option<CommunityError> {
         "23505" if message.contains("idempotency_keys") => CommunityError::IdempotencyConflict,
         _ => return None,
     })
+}
+
+/// Comma-delimited grants match only whole scope names.
+pub(crate) fn scope_list(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        String::new()
+    } else {
+        format!(",{},", scopes.join(","))
+    }
+}
+impl Caller {
+    pub fn allows(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|have| have == scope)
+    }
 }
 
 #[cfg(test)]
