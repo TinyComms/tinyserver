@@ -14,6 +14,7 @@ axum = { workspace = true, features = ["ws"] }
 base64.workspace = true
 clamav-client = "2"
 db = { path = "../db" }
+getrandom.workspace = true
 openidconnect.workspace = true
 # End-to-end encrypted calls: the server is the MLS external sender and delivery service. It
 # signs Add and Remove proposals and reads the outer frame of commits; it never holds a group

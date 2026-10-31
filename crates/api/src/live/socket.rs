@@ -392,6 +392,7 @@ async fn receive(
         Some(Ok(message)) => message,
         Some(Err(error)) => {
             if is_too_big(&error) {
+                frame_refused(&me.user_id, asking.conn, "bad_frame");
                 return Err(End::Close(Close::TooBig));
             }
             return Err(End::Gone);
@@ -413,9 +414,13 @@ async fn receive(
             return send(hub, socket, warning.text()).await;
         }
         Take::Dropped => return Ok(()),
-        Take::Exceeded => return Err(End::Close(Close::SlowDown)),
+        Take::Exceeded => {
+            frame_refused(&me.user_id, asking.conn, "slow_down");
+            return Err(End::Close(Close::SlowDown));
+        }
     }
     let Some(incoming) = Incoming::parse(text.as_str()) else {
+        frame_refused(&me.user_id, asking.conn, "bad_frame");
         let reply = Out::Error {
             reference: None,
             code: "bad_frame",
@@ -423,6 +428,7 @@ async fn receive(
         return send(hub, socket, reply.text()).await;
     };
     if me.is_bot() && changes_call(&incoming.kind) {
+        frame_refused(&me.user_id, asking.conn, "forbidden");
         let reply = Out::Error {
             reference: incoming.reference.as_ref(),
             code: "forbidden",
@@ -459,9 +465,43 @@ async fn receive(
             call_id: &answer.call_id,
             sdp: &answer.sdp,
         },
-        Err(code) => Out::Error { reference, code },
+        Err(code) => {
+            note_refusal(
+                me,
+                asking.conn,
+                &incoming.kind,
+                hub.call_of(&me.user_id).as_deref(),
+                code,
+            );
+            Out::Error { reference, code }
+        }
     };
     send(hub, socket, reply.text()).await
+}
+
+fn frame_refused(user_id: &str, conn: u64, reason: &'static str) {
+    tracing::warn!(user_id, conn, reason, "frame refused");
+}
+
+fn note_refusal(me: &Me, conn: u64, kind: &str, call_id: Option<&str>, code: &'static str) {
+    const CALL: &[&str] = &[
+        "bad_sdp",
+        "share_taken",
+        "not_found",
+        "slow_down",
+        "media_unavailable",
+    ];
+    if kind.starts_with("call.") && CALL.contains(&code) {
+        let call_id = call_id.unwrap_or("");
+        tracing::warn!(call_id, reason = code, "call refused");
+        return;
+    }
+    if matches!(
+        code,
+        "bad_frame" | "forbidden" | "unknown_type" | "slow_down"
+    ) {
+        frame_refused(&me.user_id, conn, code);
+    }
 }
 
 /// Relays typing to the other people in the conversation. The frame is not stored.

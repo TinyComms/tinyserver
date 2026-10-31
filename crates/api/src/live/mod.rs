@@ -197,26 +197,29 @@ async fn upgrade(
                 scopes: bot.scopes,
             }
         }
-        None => return refuse(StatusCode::UNAUTHORIZED, "unauthorized"),
+        None => return live_refused("unauthorized"),
     };
     let Ok(since) = parse_since(query.as_deref()) else {
-        return refuse(StatusCode::BAD_REQUEST, "invalid");
+        return live_refused("invalid");
     };
     let ws = match ws {
         Ok(ws) => ws,
-        Err(rejection) => return rejection.into_response(),
+        Err(rejection) => {
+            tracing::warn!(reason = "invalid", "live refused");
+            return rejection.into_response();
+        }
     };
     if hub.closing() {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "restarting");
+        return live_refused("restarting");
     }
     if tokio::time::timeout(Duration::from_secs(5), hub.ready())
         .await
         .is_err()
     {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        return live_refused("unavailable");
     }
     let Some(slot) = hub.reserve() else {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "busy");
+        return live_refused("busy");
     };
     let frame = hub.limits.frame_bytes;
     ws.max_message_size(frame)
@@ -224,9 +227,19 @@ async fn upgrade(
         .on_upgrade(move |socket| socket::run(hub, socket, slot, me, since))
 }
 
+fn live_refused(reason: &'static str) -> Response {
+    tracing::warn!(reason, "live refused");
+    let status = match reason {
+        "unauthorized" => StatusCode::UNAUTHORIZED,
+        "invalid" => StatusCode::BAD_REQUEST,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    refuse(status, reason)
+}
+
 fn session_unavailable(error: SessionError) -> Response {
     match error {
-        SessionError::Unauthorized => refuse(StatusCode::UNAUTHORIZED, "unauthorized"),
+        SessionError::Unauthorized => live_refused("unauthorized"),
         SessionError::Database(error) => {
             tracing::warn!(%error, "live session check failed");
             refuse(StatusCode::INTERNAL_SERVER_ERROR, "unavailable")

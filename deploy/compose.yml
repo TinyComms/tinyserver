@@ -91,6 +91,10 @@ services:
       TINYSERVER_UPLOAD_DIR: /data/uploads
       # Signed media paths. 32 bytes of hex the operator generates. Required; unset will not start.
       TINYSERVER_MEDIA_HMAC_SECRET: ${TINYSERVER_MEDIA_HMAC_SECRET:?set TINYSERVER_MEDIA_HMAC_SECRET to 64 hex characters (openssl rand -hex 32)}
+      # Invite file and debug bundles. The image is read-only, so this is a tmpfs.
+      TINYSERVER_DATA_DIR: /var/lib/tinyserver
+    tmpfs:
+      - /var/lib/tinyserver:uid=10001,gid=10001,mode=0700
     secrets:
       - oidc_client_secret
       - pocketid_api_key

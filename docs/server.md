@@ -313,6 +313,6 @@ The bot calls the API with `Authorization: Bot <token>`. The prefix is exact. `B
 
 ## Bootstrap
 
-While there is no owner, `tinyserver bootstrap` keeps an unexpired unused owner invite. It prints a reminder with that invite's expiry and does not print the token again. Once the invite has expired it makes a new one, good for 24 hours, single use, and prints the link and the `tc1.` code (or the raw token when `TINYSERVER_PUBLIC_URL` cannot form a link). When an owner already exists it prints nothing and writes nothing.
+While there is no owner, `tinyserver bootstrap` keeps an unexpired unused owner invite. The first time, it writes the link and the `tc1.` code (or the raw token when `TINYSERVER_PUBLIC_URL` cannot form a link) to `{TINYSERVER_DATA_DIR}/owner-invite` and prints only that path. A later start prints a reminder with that invite's expiry and does not write the token again. Once the invite has expired it makes a new one, good for 24 hours, single use. When an owner already exists it removes that file and writes nothing else.
 
 `--owner-invite` makes a new 24-hour single-use owner invite even when one is still valid or an owner exists. Unused earlier owner invites stop working. Each of those writes `invite.revoke`. The new invite writes `bootstrap`. A repeat with no `--owner-invite`, while the current owner invite is still valid, writes no audit row.

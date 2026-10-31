@@ -215,7 +215,10 @@ pub(crate) fn lift(error: CommunityError) -> ApiError {
 
 fn session_failure(error: SessionError) -> ApiError {
     match error {
-        SessionError::Unauthorized => ApiError::Unauthorized,
+        SessionError::Unauthorized => {
+            tracing::debug!(reason = "unauthorized", "session rejected");
+            ApiError::Unauthorized
+        }
         SessionError::Database(error) => {
             tracing::warn!(%error, "session query failed");
             ApiError::Unavailable
@@ -326,10 +329,14 @@ async fn edit_room(
         video_enabled: body.video_enabled,
         e2ee_required: body.e2ee_required,
     };
-    update_room(&pool, &caller, &id, &patch)
+    let renamed = patch.name.is_some();
+    let room = update_room(&pool, &caller, &id, &patch)
         .await
-        .map(Json)
-        .map_err(lift)
+        .map_err(lift)?;
+    if renamed {
+        tracing::info!(user_id = %caller.user_id, room_id = %id, "room renamed");
+    }
+    Ok(Json(room))
 }
 
 async fn remove_room(
@@ -339,6 +346,7 @@ async fn remove_room(
 ) -> Result<StatusCode, ApiError> {
     let caller = caller(&pool, &headers).await?;
     delete_room(&pool, &caller, &id).await.map_err(lift)?;
+    tracing::info!(user_id = %caller.user_id, room_id = %id, "room deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 

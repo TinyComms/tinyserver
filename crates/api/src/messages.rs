@@ -153,6 +153,32 @@ impl IntoResponse for Error {
     }
 }
 
+fn message_reason(error: &Error) -> &'static str {
+    match error {
+        Error::Unauthorized => "unauthorized",
+        Error::Forbidden => "forbidden",
+        Error::Banned => "banned",
+        Error::Hierarchy => "hierarchy",
+        Error::NotFound => "not_found",
+        Error::Invalid => "invalid",
+        Error::TooLarge => "too_large",
+        Error::UnsupportedMedia => "unsupported_media",
+        Error::Scanning => "scanning",
+        Error::Blocked => "blocked",
+        Error::Unavailable | Error::ServiceUnavailable => "unavailable",
+    }
+}
+
+fn message_failed(user_id: &str, room_id: &str, error: &Error) {
+    let reason = message_reason(error);
+    tracing::warn!(user_id, room_id, reason, "message failed");
+}
+
+fn upload_failed(user_id: &str, error: &Error, bytes: usize) {
+    let reason = message_reason(error);
+    tracing::warn!(user_id, reason, bytes, "upload failed");
+}
+
 fn lift(error: MessageError) -> Error {
     match error {
         MessageError::Forbidden => Error::Forbidden,
@@ -315,7 +341,11 @@ async fn messages(
     )
     .await
     .map(signed)
-    .map_err(lift)
+    .map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, &id, &error);
+        error
+    })
 }
 
 async fn add_message(
@@ -336,7 +366,11 @@ async fn add_message(
         &attachments,
     )
     .await
-    .map_err(lift)?;
+    .map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, &id, &error);
+        error
+    })?;
     Ok((StatusCode::CREATED, signed(message)))
 }
 
@@ -350,7 +384,11 @@ async fn edit(
     edit_message(&pool, &caller, &id, &body.body)
         .await
         .map(signed)
-        .map_err(lift)
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, "", &error);
+            error
+        })
 }
 
 async fn remove_message(
@@ -373,7 +411,11 @@ async fn react(
     toggle_reaction(&pool, &caller, &id, &body.emoji)
         .await
         .map(Json)
-        .map_err(lift)
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, "", &error);
+            error
+        })
 }
 
 async fn unreact(
@@ -385,7 +427,11 @@ async fn unreact(
     let caller = member(&pool, &headers).await?;
     clear_reaction(&pool, &caller, &id, &body.emoji)
         .await
-        .map_err(lift)?;
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, "", &error);
+            error
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -398,7 +444,11 @@ async fn read(
     let caller = member(&pool, &headers).await?;
     mark_read(&pool, &caller, &id, &body.message_id)
         .await
-        .map_err(lift)?;
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, "", &error);
+            error
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -409,17 +459,38 @@ async fn upload(
     request: Request,
 ) -> Result<(StatusCode, Json<Value>), Error> {
     let caller = member(&pool, &headers).await?;
-    let content_type = headers
+    let content_type = match headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .ok_or(Error::Invalid)?;
-    let body = to_bytes(request.into_body(), UPLOAD_BODY)
-        .await
-        .map_err(|_| Error::TooLarge)?;
-    let upload = parse_upload(content_type, &body).map_err(lift)?;
+    {
+        Some(content_type) => content_type,
+        None => {
+            let error = Error::Invalid;
+            upload_failed(&caller.user_id, &error, 0);
+            return Err(error);
+        }
+    };
+    let body = match to_bytes(request.into_body(), UPLOAD_BODY).await {
+        Ok(body) => body,
+        Err(_) => {
+            let error = Error::TooLarge;
+            upload_failed(&caller.user_id, &error, UPLOAD_BODY);
+            return Err(error);
+        }
+    };
+    let bytes = body.len();
+    let upload = parse_upload(content_type, &body).map_err(|error| {
+        let error = lift(error);
+        upload_failed(&caller.user_id, &error, bytes);
+        error
+    })?;
     let saved = save_attachment(&pool, &caller, &upload, &engine)
         .await
-        .map_err(lift)?;
+        .map_err(|error| {
+            let error = lift(error);
+            upload_failed(&caller.user_id, &error, bytes);
+            error
+        })?;
     Ok((StatusCode::CREATED, signed(saved)))
 }
 

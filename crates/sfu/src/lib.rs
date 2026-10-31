@@ -30,6 +30,42 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 pub use video::Quality;
 
+static PEER_IPS: AtomicBool = AtomicBool::new(false);
+
+/// When set, debug media lines may include a client address. The operator sink still drops it.
+pub fn set_peer_ips(on: bool) {
+    PEER_IPS.store(on, Ordering::Relaxed);
+}
+
+pub fn peer_ips_enabled() -> bool {
+    PEER_IPS.load(Ordering::Relaxed)
+}
+
+/// A stable name for a media error. The SDP text inside `RemoteSdp` is not returned.
+pub fn rtc_reason(error: &str0m::RtcError) -> &'static str {
+    match error {
+        str0m::RtcError::NoSenderSource => "no_sender",
+        str0m::RtcError::WriteWithoutPoll => "write_without_poll",
+        str0m::RtcError::Dtls(_) => "dtls",
+        str0m::RtcError::Ice(_) => "ice",
+        str0m::RtcError::RemoteSdp(_) | str0m::RtcError::Sdp(_) => "remote_sdp",
+        str0m::RtcError::Io(_) | str0m::RtcError::Net(_) => "io",
+        _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod rtc_reason_tests {
+    use super::rtc_reason;
+
+    #[test]
+    fn remote_sdp_is_a_reason_not_the_sdp() {
+        let reason = rtc_reason(&str0m::RtcError::RemoteSdp("a=ice-pwd:secret".to_string()));
+        assert_eq!(reason, "remote_sdp");
+        assert!(!reason.contains("ice-pwd"));
+    }
+}
+
 /// Commands waiting for the media thread. A full queue refuses the next one.
 const COMMANDS: usize = 1024;
 /// Events waiting for the API. A full queue drops `Speaking` and `Load`.

@@ -26,9 +26,19 @@ pub enum AuthError {
     Banned,
     /// A one-time code that is unknown, used, expired, or presented with the wrong verifier.
     #[error("invalid grant")]
-    InvalidGrant,
+    InvalidGrant(GrantReason),
     #[error(transparent)]
     Database(#[from] DbError),
+}
+
+/// Why a one-time code was refused. A missing row is `Used`: the row is deleted on the first
+/// try, so a replay and a code that never existed look the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantReason {
+    Unknown,
+    Used,
+    Expired,
+    Verifier,
 }
 
 impl From<sqlx::Error> for AuthError {
@@ -510,8 +520,11 @@ pub async fn redeem_code(
     verifier: &str,
     session_days: u32,
 ) -> Result<OpenedSession, AuthError> {
-    if code.is_empty() || code.len() > 128 || !pkce_verifier_shaped(verifier) {
-        return Err(AuthError::InvalidGrant);
+    if code.is_empty() || code.len() > 128 {
+        return Err(AuthError::InvalidGrant(GrantReason::Unknown));
+    }
+    if !pkce_verifier_shaped(verifier) {
+        return Err(AuthError::InvalidGrant(GrantReason::Verifier));
     }
     let digest = token_digest(code);
     let mut tx = pool.begin().await?;
@@ -524,11 +537,15 @@ pub async fn redeem_code(
     .fetch_optional(&mut *tx)
     .await?;
     let Some((user_id, challenge, issuer, sid, fresh)) = row else {
-        return Err(AuthError::InvalidGrant);
+        return Err(AuthError::InvalidGrant(GrantReason::Used));
     };
-    if !fresh || !challenge_matches(verifier, &challenge) {
+    if !fresh {
         tx.commit().await?;
-        return Err(AuthError::InvalidGrant);
+        return Err(AuthError::InvalidGrant(GrantReason::Expired));
+    }
+    if !challenge_matches(verifier, &challenge) {
+        tx.commit().await?;
+        return Err(AuthError::InvalidGrant(GrantReason::Verifier));
     }
     let origin = Origin {
         issuer: Some(&issuer),
@@ -540,7 +557,7 @@ pub async fn redeem_code(
         // Removed between the callback and now.
         Err(SessionError::Unauthorized) => {
             tx.commit().await?;
-            return Err(AuthError::InvalidGrant);
+            return Err(AuthError::InvalidGrant(GrantReason::Unknown));
         }
         Err(SessionError::Database(error)) => return Err(AuthError::Database(error)),
     };
