@@ -534,13 +534,28 @@ async fn an_app_that_cannot_encrypt_turns_the_call_to_transport_only_unless_requ
             .await
             .expect("b");
         let b_id = cast.members[0].0.clone();
-        settle(&mut [&mut a], |apps| apps[0].off.is_some()).await;
+        // `call.joined` is broadcast and `off` is sent only to the seat. The socket
+        // forwards whichever is ready, so `off` can arrive first. Keep reading until both
+        // are in: stopping at `off` drops a join that is still queued.
+        let roster = [mls_user(&a.user_id)];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let saw_b = |app: &App| {
+            app.joined
+                .iter()
+                .any(|joined| joined["user_id"] == b_id.as_str() && joined["e2ee"] == false)
+        };
+        while a.off.is_none() || !saw_b(&a) {
+            assert!(
+                Instant::now() < deadline,
+                "off={:?} joined={:?}",
+                a.off,
+                a.joined
+            );
+            a.turn(&roster).await;
+        }
         assert_eq!(a.off.as_deref(), Some(&[b_id.clone()][..]));
         assert!(a.session.is_none());
-        assert!(a
-            .joined
-            .iter()
-            .any(|joined| joined["user_id"] == b_id.as_str() && joined["e2ee"] == false));
+        assert!(saw_b(&a), "joined {:?}", a.joined);
 
         // b leaves: everyone left can encrypt, so the group is made again.
         let reply = answer(&mut b.ws, json!({"type": "call.leave", "ref": "l"})).await;
