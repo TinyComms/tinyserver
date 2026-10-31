@@ -9,12 +9,14 @@ mod bootstrap;
 mod bot;
 mod community;
 mod error;
+mod media;
 mod messages;
 mod migrate;
 mod moderation;
 mod outbox;
 pub mod perm;
 mod roles;
+mod scan;
 mod server;
 mod session;
 mod sweep;
@@ -36,11 +38,12 @@ pub use community::{
     NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
 pub use error::DbError;
+pub use media::prepare_icon;
 pub use messages::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
     list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
-    save_attachment, set_channel_override, toggle_reaction, typing_recipients, update_channel,
-    AttachmentFile, MessageError, NewAttachment,
+    save_attachment, scan_timeout, set_channel_override, toggle_reaction, typing_recipients,
+    update_channel, AttachmentFile, MessageError, NewAttachment,
 };
 pub use migrate::migrate;
 pub use moderation::{
@@ -51,11 +54,12 @@ pub use outbox::{outbox_after, outbox_bounds, OutboxBounds, OutboxRow, WAKE_CHAN
 pub use roles::{
     create_role, delete_role, list_roles, order_roles, update_role, NewRole, Role, RolePatch,
 };
+pub use scan::{FakeEngine, ScanEngine, ScanVerdict};
 pub use server::{
-    create_category, delete_category, delete_icon, get_icon, get_server, list_categories,
-    rename_category, set_icon, set_layout, sniff_image, update_server, Category, Icon, Layout,
-    LayoutBucket, ServerPatch, ServerSettings, FILE_MAX_DEFAULT, ICON_MAX, IMAGE_MAX_DEFAULT,
-    UPLOAD_MAX,
+    create_category, delete_category, delete_icon, ensure_manage_server, get_icon, get_server,
+    list_categories, rename_category, set_icon, set_layout, sniff_image, update_server, Category,
+    Icon, Layout, LayoutBucket, ServerPatch, ServerSettings, FILE_MAX_DEFAULT, ICON_MAX,
+    IMAGE_MAX_DEFAULT, UPLOAD_MAX,
 };
 pub use session::{
     close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,

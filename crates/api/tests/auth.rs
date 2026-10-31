@@ -217,7 +217,9 @@ async fn an_invite_lets_a_person_in_and_they_come_back_without_it() {
         assert_eq!(provider.client_auth(), Some(ClientAuth::Basic));
         let (status, body) = token(&app, &back["code"], &client.verifier).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let keys: Vec<&String> = body.as_object().expect("object").keys().collect();
+        // yara-x enables serde_json's preserve_order, so keys follow the struct, not a BTree.
+        let mut keys: Vec<&String> = body.as_object().expect("object").keys().collect();
+        keys.sort();
         assert_eq!(keys, ["display_name", "email", "role", "token", "user_id"]);
         assert_eq!(body["role"], "member");
         assert_eq!(body["email"], "moss@provider.test");

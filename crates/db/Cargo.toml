@@ -8,12 +8,17 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 getrandom.workspace = true
+infer.workspace = true
+image.workspace = true
+gif = "0.14"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+zip = { version = "9.2.0", default-features = false }
 
 [lints]
 workspace = true

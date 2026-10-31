@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use db::{close_all_sessions, delete_avatar, get_avatar, rename_me, set_avatar, PgPool};
 use serde::{Deserialize, Serialize};
 
-use crate::community::{caller, lift, ApiError};
+use crate::community::{caller, icon_failure, lift, ApiError};
 use crate::session::Current;
 
 pub fn routes() -> Router<PgPool> {
@@ -64,11 +64,11 @@ async fn put_avatar(
     if bytes.len() > db::ICON_MAX {
         return Err(ApiError::TooLarge);
     }
-    let content_type = db::sniff_image(&bytes).ok_or(ApiError::UnsupportedMedia)?;
-    let avatar = set_avatar(&pool, &caller, &bytes, content_type)
+    let stored = db::prepare_icon(&bytes).map_err(icon_failure)?;
+    let avatar = set_avatar(&pool, &caller, &stored.bytes, &stored.mime)
         .await
         .map_err(lift)?;
-    tracing::info!(user_id = %caller.user_id, bytes = bytes.len(), "avatar set");
+    tracing::info!(user_id = %caller.user_id, bytes = stored.bytes.len(), "avatar set");
     Ok(Json(AvatarBody { avatar }))
 }
 
@@ -130,6 +130,9 @@ async fn sign_out_everywhere(
 mod tests {
     #[tokio::test]
     async fn account_routes_share_paths_without_overlap() {
+        // Lib tests share a process. Leave the flag set. Selector tests pass
+        // the socket and allow_fake in arguments and do not read this variable.
+        std::env::set_var("TINYSERVER_ALLOW_FAKE_SCAN", "1");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .expect("lazy pool");

@@ -212,6 +212,7 @@ fn join_code(origin: &str, token: &str) -> Option<String> {
 }
 
 async fn serve() -> anyhow::Result<()> {
+    api::engine_from_env().context("refusing to serve without a scan engine")?;
     let url = env_var("DATABASE_URL")?;
     let bind: SocketAddr = env_var("BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())

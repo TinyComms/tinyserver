@@ -5,12 +5,16 @@
 //! here, before SQL, because a bot is not a member.
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 use crate::community::{scope, Caller, CommunityError};
+use crate::scan::{ScanEngine, ScanVerdict};
 use crate::DbError;
 
 #[cfg(test)]
@@ -21,6 +25,7 @@ use crate::server::{FILE_MAX_DEFAULT, IMAGE_MAX_DEFAULT};
 struct UploadLimits {
     image: i64,
     file: i64,
+    archives: crate::media::Archives,
 }
 
 #[cfg(test)]
@@ -29,6 +34,7 @@ impl UploadLimits {
         Self {
             image: IMAGE_MAX_DEFAULT,
             file: FILE_MAX_DEFAULT,
+            archives: crate::media::Archives::Denied,
         }
     }
 }
@@ -49,6 +55,12 @@ pub enum MessageError {
     TooLarge,
     #[error("unsupported media")]
     UnsupportedMedia,
+    #[error("scanning")]
+    Scanning,
+    #[error("blocked")]
+    Blocked,
+    #[error("unavailable")]
+    Unavailable,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -352,27 +364,85 @@ pub async fn save_attachment(
     pool: &PgPool,
     caller: &Caller,
     upload: &NewAttachment,
+    engine: &Arc<dyn ScanEngine>,
 ) -> Result<Value, MessageError> {
     person(caller)?;
     let mut tx = scope(pool, caller).await.map_err(from_community)?;
     let limits = upload_limits(&mut tx).await?;
     let prepared = prepare(upload, limits)?;
-    let row: Value = sqlx::query_scalar("SELECT app_save_attachment($1, $2, $3, $4, $5, $6, $7)")
-        .bind(&prepared.name)
-        .bind(&prepared.mime)
-        .bind(prepared.kind)
-        .bind(i32::try_from(upload.bytes.len()).map_err(|_| MessageError::TooLarge)?)
-        .bind(upload.width)
-        .bind(upload.height)
-        .bind(upload.duration)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(message_sql)?;
+    let rewritten = if matches!(prepared.kind, "image" | "gif") {
+        Some(crate::media::rewrite_raster(&upload.bytes, &prepared.mime)?)
+    } else {
+        None
+    };
+    if rewritten
+        .as_ref()
+        .is_some_and(|raster| !within(raster.bytes.len(), limits.image))
+    {
+        return Err(MessageError::TooLarge);
+    }
+    let bytes = rewritten
+        .as_ref()
+        .map(|raster| raster.bytes.as_slice())
+        .unwrap_or(&upload.bytes);
+    let mime = rewritten
+        .as_ref()
+        .map(|raster| raster.mime.as_str())
+        .unwrap_or(&prepared.mime);
+    let kind = rewritten
+        .as_ref()
+        .map(|raster| raster.kind)
+        .unwrap_or(prepared.kind);
+    let width = rewritten
+        .as_ref()
+        .map(|raster| Some(raster.width))
+        .unwrap_or(upload.width);
+    let height = rewritten
+        .as_ref()
+        .map(|raster| Some(raster.height))
+        .unwrap_or(upload.height);
+    let mut row: Value =
+        sqlx::query_scalar("SELECT app_save_attachment($1, $2, $3, $4, $5, $6, $7)")
+            .bind(&prepared.name)
+            .bind(mime)
+            .bind(kind)
+            .bind(i32::try_from(bytes.len()).map_err(|_| MessageError::TooLarge)?)
+            .bind(width)
+            .bind(height)
+            .bind(upload.duration)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(message_sql)?;
     let Some(id) = row.get("id").and_then(Value::as_str) else {
         return Err(MessageError::Invalid);
     };
     let id = id.to_string();
-    write_upload(&id, &upload.bytes)?;
+    if let Err(error) = write_upload(&id, bytes) {
+        abort_upload(tx, &id).await;
+        return Err(error);
+    }
+    if let Err(error) = set_scan(&mut tx, &id, "scanning").await {
+        abort_upload(tx, &id).await;
+        return Err(error);
+    }
+    match scan_bytes(engine, bytes, mime, kind).await {
+        ScanVerdict::Clean => {}
+        ScanVerdict::Blocked { .. } => {
+            abort_upload(tx, &id).await;
+            return Err(MessageError::Blocked);
+        }
+        ScanVerdict::Unavailable => {
+            abort_upload(tx, &id).await;
+            return Err(MessageError::Unavailable);
+        }
+    }
+    if let Err(error) = set_scan(&mut tx, &id, "clean").await {
+        abort_upload(tx, &id).await;
+        return Err(error);
+    }
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("scan_status".into(), Value::from("clean"));
+    }
     if let Err(error) = tx.commit().await {
         remove_files(std::slice::from_ref(&id));
         return Err(message_sql(error));
@@ -484,6 +554,9 @@ fn message_sql(error: sqlx::Error) -> MessageError {
         "42501" => MessageError::Forbidden,
         "22023" if message.contains("too large") => MessageError::TooLarge,
         "22023" if message.contains("unsupported media") => MessageError::UnsupportedMedia,
+        "P0423" => MessageError::Scanning,
+        "P0403" => MessageError::Blocked,
+        "P0503" => MessageError::Unavailable,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
@@ -558,16 +631,23 @@ fn is_uuid(value: &str) -> bool {
 }
 
 async fn upload_limits(tx: &mut Transaction<'_, Postgres>) -> Result<UploadLimits, MessageError> {
-    let row = sqlx::query("SELECT image_max_bytes, file_max_bytes FROM server_settings")
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(message_sql)?;
+    let row =
+        sqlx::query("SELECT image_max_bytes, file_max_bytes, allow_archives FROM server_settings")
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(message_sql)?;
     let Some(row) = row else {
         return Err(MessageError::Forbidden);
     };
+    let allow_archives: bool = row.try_get(2).map_err(message_sql)?;
     Ok(UploadLimits {
         image: row.try_get(0).map_err(message_sql)?,
         file: row.try_get(1).map_err(message_sql)?,
+        archives: if allow_archives {
+            crate::media::Archives::Allowed
+        } else {
+            crate::media::Archives::Denied
+        },
     })
 }
 
@@ -579,8 +659,19 @@ fn prepare(upload: &NewAttachment, limits: UploadLimits) -> Result<Prepared, Mes
             return Err(MessageError::Invalid);
         }
     }
-    let kind = kind_of(&mime, &upload.bytes, limits)?;
-    Ok(Prepared { name, mime, kind })
+    let classified = crate::media::classify(&name, &mime, &upload.bytes, limits.archives)?;
+    let limit = match classified.kind {
+        "image" | "gif" => limits.image,
+        _ => limits.file,
+    };
+    if !within(upload.bytes.len(), limit) {
+        return Err(MessageError::TooLarge);
+    }
+    Ok(Prepared {
+        name: classified.name,
+        mime: classified.mime,
+        kind: classified.kind,
+    })
 }
 
 fn clean_name(name: &str) -> Result<String, MessageError> {
@@ -612,58 +703,8 @@ fn normalize_mime(mime: &str) -> Result<String, MessageError> {
     }
 }
 
-fn kind_of(mime: &str, bytes: &[u8], limits: UploadLimits) -> Result<&'static str, MessageError> {
-    if bytes.is_empty() {
-        return Err(MessageError::Invalid);
-    }
-    let (kind, limit, sniffed) = match mime {
-        "image/png" => ("image", limits.image, Some(sniff_png(bytes))),
-        "image/jpeg" => ("image", limits.image, Some(sniff_jpeg(bytes))),
-        "image/webp" => ("image", limits.image, Some(sniff_webp(bytes))),
-        "image/gif" => ("gif", limits.image, Some(sniff_gif(bytes))),
-        "video/mp4" => ("video", limits.file, Some(sniff_mp4(bytes))),
-        "video/webm" => ("video", limits.file, Some(sniff_webm(bytes))),
-        other if other.starts_with("image/") || other.starts_with("video/") => {
-            return Err(MessageError::UnsupportedMedia);
-        }
-        _ => ("file", limits.file, None),
-    };
-    if !within(bytes.len(), limit) {
-        return Err(MessageError::TooLarge);
-    }
-    if sniffed == Some(false) {
-        return Err(MessageError::UnsupportedMedia);
-    }
-    Ok(kind)
-}
-
 fn within(len: usize, limit: i64) -> bool {
     i64::try_from(len).is_ok_and(|len| len <= limit)
-}
-
-fn sniff_png(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-}
-
-fn sniff_jpeg(bytes: &[u8]) -> bool {
-    bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
-}
-
-fn sniff_webp(bytes: &[u8]) -> bool {
-    bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
-}
-
-fn sniff_gif(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
-}
-
-fn sniff_mp4(bytes: &[u8]) -> bool {
-    let window = &bytes[..bytes.len().min(32)];
-    window.windows(4).any(|chunk| chunk == b"ftyp")
-}
-
-fn sniff_webm(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3])
 }
 
 fn upload_dir() -> String {
@@ -687,6 +728,82 @@ fn write_upload(id: &str, bytes: &[u8]) -> Result<(), MessageError> {
         return Err(MessageError::Store(error));
     }
     Ok(())
+}
+
+async fn set_scan(
+    tx: &mut Transaction<'_, Postgres>,
+    id: &str,
+    status: &str,
+) -> Result<(), MessageError> {
+    sqlx::query("SELECT app_set_attachment_scan($1::uuid, $2)")
+        .bind(id)
+        .bind(status)
+        .execute(&mut **tx)
+        .await
+        .map_err(message_sql)?;
+    Ok(())
+}
+
+async fn abort_upload(tx: Transaction<'_, Postgres>, id: &str) {
+    remove_files(&[id.to_string()]);
+    let _ = tx.rollback().await;
+}
+
+async fn scan_bytes(
+    engine: &Arc<dyn ScanEngine>,
+    bytes: &[u8],
+    mime: &str,
+    kind: &str,
+) -> ScanVerdict {
+    scan_with(engine, bytes, mime, kind, scan_slots(), scan_timeout()).await
+}
+
+async fn scan_with(
+    engine: &Arc<dyn ScanEngine>,
+    bytes: &[u8],
+    mime: &str,
+    kind: &str,
+    slots: &Arc<Semaphore>,
+    limit: Duration,
+) -> ScanVerdict {
+    let deadline = tokio::time::Instant::now() + limit;
+    // Waiting for a slot shares the request deadline. Timing out here does not start a scan.
+    let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, Arc::clone(slots).acquire_owned()).await
+    else {
+        return ScanVerdict::Unavailable;
+    };
+    let engine = Arc::clone(engine);
+    let bytes = bytes.to_vec();
+    let mime = mime.to_owned();
+    let kind = kind.to_owned();
+    // The permit stays in the blocking task. The request can return Unavailable when `deadline`
+    // passes; the slot is not free until `scan` returns. The clamd socket has its own deadline,
+    // so the thread ends and drops the permit.
+    let scan = tokio::task::spawn_blocking(move || {
+        let verdict = engine.scan(&bytes, &mime, &kind);
+        drop(permit);
+        verdict
+    });
+    match tokio::time::timeout_at(deadline, scan).await {
+        Ok(Ok(verdict)) => verdict,
+        _ => ScanVerdict::Unavailable,
+    }
+}
+
+pub fn scan_timeout() -> Duration {
+    let parsed = std::env::var("TINYSERVER_SCAN_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let ms = match parsed {
+        Some(0) | None => 8_000,
+        Some(ms) => ms.min(15_000),
+    };
+    Duration::from_millis(ms)
+}
+
+fn scan_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(3)))
 }
 
 /// One unicode grapheme, 1 to 16 scalars, with no ASCII control.
@@ -760,10 +877,140 @@ fn is_extend(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_of as classify, one_emoji, MessageError, UploadLimits};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    fn kind_of(mime: &str, bytes: &[u8]) -> Result<&'static str, MessageError> {
-        classify(mime, bytes, UploadLimits::defaults())
+    use tokio::sync::Semaphore;
+
+    use super::{one_emoji, scan_with, MessageError, NewAttachment, UploadLimits};
+    use crate::scan::{ScanEngine, ScanVerdict};
+
+    struct Stall {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl ScanEngine for Stall {
+        fn scan(&self, _bytes: &[u8], _mime: &str, _kind: &str) -> ScanVerdict {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ScanVerdict::Clean
+        }
+    }
+
+    struct LetGo(Arc<AtomicBool>);
+
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_slot_stays_taken_until_the_scan_returns() {
+        let slots = Arc::new(Semaphore::new(3));
+        let release = Arc::new(AtomicBool::new(false));
+        let _let_go = LetGo(Arc::clone(&release));
+        let mut entered = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let flag = Arc::new(AtomicBool::new(false));
+            entered.push(Arc::clone(&flag));
+            let engine: Arc<dyn ScanEngine> = Arc::new(Stall {
+                entered: flag,
+                release: Arc::clone(&release),
+            });
+            let slots = Arc::clone(&slots);
+            tasks.push(tokio::spawn(async move {
+                scan_with(
+                    &engine,
+                    b"hello",
+                    "text/plain",
+                    "file",
+                    &slots,
+                    Duration::from_millis(80),
+                )
+                .await
+            }));
+        }
+
+        let started = std::time::Instant::now();
+        while entered.iter().any(|flag| !flag.load(Ordering::SeqCst)) {
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("scans did not start");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let fourth_entered = Arc::new(AtomicBool::new(false));
+        let fourth_engine: Arc<dyn ScanEngine> = Arc::new(Stall {
+            entered: Arc::clone(&fourth_entered),
+            release: Arc::clone(&release),
+        });
+        let fourth_slots = Arc::clone(&slots);
+        let fourth = tokio::spawn(async move {
+            scan_with(
+                &fourth_engine,
+                b"hello",
+                "text/plain",
+                "file",
+                &fourth_slots,
+                Duration::from_millis(200),
+            )
+            .await
+        });
+
+        let fourth_verdict = match fourth.await {
+            Ok(verdict) => verdict,
+            Err(error) => panic!("fourth scan task: {error}"),
+        };
+        assert!(matches!(fourth_verdict, ScanVerdict::Unavailable));
+        assert!(
+            !fourth_entered.load(Ordering::SeqCst),
+            "a fourth scan must not start while three are outstanding"
+        );
+
+        for task in tasks {
+            let verdict = match task.await {
+                Ok(verdict) => verdict,
+                Err(error) => panic!("scan task: {error}"),
+            };
+            assert!(matches!(verdict, ScanVerdict::Unavailable));
+        }
+
+        let still_held = tokio::time::timeout(
+            Duration::from_millis(50),
+            Arc::clone(&slots).acquire_owned(),
+        )
+        .await;
+        assert!(
+            still_held.is_err(),
+            "the slot stays taken until the scan returns"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        let mut freed = 0;
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while freed < 3 {
+                let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
+                    break;
+                };
+                drop(permit);
+                freed += 1;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok() && freed == 3,
+            "slots return once the scans finish"
+        );
+        assert!(
+            !fourth_entered.load(Ordering::SeqCst),
+            "the fourth scan already returned and must not start later"
+        );
     }
 
     #[test]
@@ -783,42 +1030,17 @@ mod tests {
     }
 
     #[test]
-    fn uploads_match_their_declared_type() {
-        assert_eq!(kind_of("image/gif", b"GIF89a").expect("gif"), "gif");
-        assert_eq!(
-            kind_of("image/png", b"\x89PNG\r\n\x1a\n").expect("png"),
-            "image"
-        );
-        assert_eq!(
-            kind_of("image/jpeg", b"\xFF\xD8\xFF").expect("jpeg"),
-            "image"
-        );
-        let mut webp = vec![0_u8; 12];
-        webp[0..4].copy_from_slice(b"RIFF");
-        webp[8..12].copy_from_slice(b"WEBP");
-        assert_eq!(kind_of("image/webp", &webp).expect("webp"), "image");
-        let mut mp4 = vec![0_u8; 16];
-        mp4[4..8].copy_from_slice(b"ftyp");
-        assert_eq!(kind_of("video/mp4", &mp4).expect("mp4"), "video");
-        assert_eq!(
-            kind_of("video/webm", &[0x1A, 0x45, 0xDF, 0xA3]).expect("webm"),
-            "video"
-        );
-        assert_eq!(kind_of("application/pdf", b"%PDF").expect("file"), "file");
+    fn an_oversized_file_is_too_large() {
+        let upload = NewAttachment {
+            name: "notes.txt".to_string(),
+            mime: "text/plain".to_string(),
+            bytes: vec![0_u8; FILE_MAX_PLUS],
+            width: None,
+            height: None,
+            duration: None,
+        };
         assert!(matches!(
-            kind_of("image/png", b"GIF89a"),
-            Err(MessageError::UnsupportedMedia)
-        ));
-        assert!(matches!(
-            kind_of("image/bmp", b"BM"),
-            Err(MessageError::UnsupportedMedia)
-        ));
-        assert!(matches!(
-            kind_of("image/gif", b""),
-            Err(MessageError::Invalid)
-        ));
-        assert!(matches!(
-            kind_of("text/plain", &vec![0_u8; FILE_MAX_PLUS]),
+            super::prepare(&upload, UploadLimits::defaults()),
             Err(MessageError::TooLarge)
         ));
     }

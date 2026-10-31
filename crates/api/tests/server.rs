@@ -145,6 +145,7 @@ async fn capabilities_and_me_describe_what_the_caller_may_do() {
             "audit_query",
             "voice_moderation",
             "upload_limits",
+            "file_scan",
         ] {
             assert!(
                 body["features"]
@@ -248,24 +249,26 @@ async fn the_server_has_settings_and_an_icon_that_only_manage_server_changes() {
             );
         }
 
-        // The icon.
-        let png = [b"\x89PNG\r\n\x1a\n".to_vec(), vec![7; 100]].concat();
+        // The icon. A member is refused before the bytes are decoded.
+        let stub = [b"\x89PNG\r\n\x1a\n".to_vec(), vec![7; 100]].concat();
         let (status, _, _) = raw(
             &app,
             &member_token,
             Method::PUT,
             "/v1/server/icon",
-            png.clone(),
+            stub,
             None,
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut png = tiny_png();
+        png.extend_from_slice(b"%PDF-1.4");
         let (status, _, body) = raw(
             &app,
             &owner_token,
             Method::PUT,
             "/v1/server/icon",
-            png.clone(),
+            png,
             None,
         )
         .await;
@@ -286,7 +289,11 @@ async fn the_server_has_settings_and_an_icon_that_only_manage_server_changes() {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(bytes, png);
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(
+            !bytes.windows(4).any(|chunk| chunk == b"%PDF"),
+            "the stored icon kept the upload trailer"
+        );
         assert_eq!(headers[header::CONTENT_TYPE], "image/png");
         let etag = format!("\"{sha}\"");
         assert_eq!(headers[header::ETAG], etag.as_str());
@@ -1537,7 +1544,7 @@ async fn a_member_sets_their_own_picture() {
         let owner = first_owner(&db).await;
         let app = app(&db);
         let (member, token) = join(&db, &owner, "face@tinyserver.test", "member").await;
-        let png = [b"\x89PNG\r\n\x1a\n".to_vec(), vec![7; 80]].concat();
+        let png = tiny_png();
         let (status, _, _) = raw(
             &app,
             &token,
@@ -1565,14 +1572,14 @@ async fn a_member_sets_their_own_picture() {
         let (status, headers, bytes) =
             raw(&app, &token, Method::GET, &path, Vec::new(), None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(bytes, png);
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(headers[header::CONTENT_TYPE], "image/png");
         let row = member_row(&app, &token, &member.user_id).await;
         assert_eq!(row["avatar"], sha);
         let owner_token = session(&db, &owner.user_id).await;
-        let (status, _, bytes) =
+        let (status, _, owner_bytes) =
             raw(&app, &owner_token, Method::GET, &path, Vec::new(), None).await;
-        assert_eq!((status, bytes), (StatusCode::OK, png));
+        assert_eq!((status, owner_bytes), (StatusCode::OK, bytes));
         let (status, _, _) = raw(
             &app,
             &token,
@@ -1602,4 +1609,15 @@ async fn a_member_sets_their_own_picture() {
         assert!(row["avatar"].is_null());
     })
     .await;
+}
+
+/// 1×1 RGB PNG. The same bytes `rewrite_raster` accepts in the db tests.
+fn tiny_png() -> Vec<u8> {
+    vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ]
 }

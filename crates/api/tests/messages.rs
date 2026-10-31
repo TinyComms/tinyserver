@@ -250,14 +250,19 @@ async fn a_gif_and_a_video_can_be_uploaded_and_downloaded() {
         assert_eq!(status, StatusCode::CREATED, "{channel}");
         let channel_id = channel["id"].as_str().expect("channel id").to_string();
 
-        let gif = b"GIF89a...";
+        let gif = include_bytes!("fixtures/tiny.gif").as_slice();
         let (status, saved) = upload(&app, &owner_token, "wave.gif", "image/gif", gif, &[]).await;
         assert_eq!(status, StatusCode::CREATED, "{saved}");
         assert_eq!(saved["kind"], "gif");
+        assert_eq!(saved["width"], 1);
+        assert_eq!(saved["height"], 1);
         let gif_id = saved["id"].as_str().expect("gif id").to_string();
         let (status, bytes) = download(&app, &owner_token, &gif_id).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(bytes, gif);
+        assert!(
+            bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            "downloaded gif must still be a GIF after rewrite"
+        );
         let (status, _) = download(&app, &member_token, &gif_id).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
@@ -273,7 +278,10 @@ async fn a_gif_and_a_video_can_be_uploaded_and_downloaded() {
         assert_eq!(message["attachments"][0]["name"], "wave.gif");
         let (status, bytes) = download(&app, &member_token, &gif_id).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(bytes, gif);
+        assert!(
+            bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            "linked gif must still be a GIF after rewrite"
+        );
 
         let mut video = vec![0_u8; 16];
         video[4..8].copy_from_slice(b"ftyp");
@@ -294,6 +302,54 @@ async fn a_gif_and_a_video_can_be_uploaded_and_downloaded() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(bytes, video);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_html_upload_is_unsupported_media() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-html-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let (status, denied) = upload(
+            &app,
+            &token,
+            "page.html",
+            "text/html",
+            b"<html>hi</html>",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{denied}");
+        assert_eq!(denied["error"], "unsupported_media");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_pe_named_as_png_is_unsupported_media() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-pe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let mut bytes = b"MZ".to_vec();
+        bytes.extend_from_slice(&[0; 64]);
+        let (status, denied) = upload(&app, &token, "photo.png", "image/png", &bytes, &[]).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{denied}");
+        assert_eq!(denied["error"], "unsupported_media");
         let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
@@ -371,7 +427,7 @@ async fn an_admin_can_lower_the_image_cap() {
         let owner = first_owner(&db).await;
         let token = session(&db, &owner.user_id).await;
         let app = api::router(db.runtime.clone(), None);
-        let gif = b"GIF89a...";
+        let gif = include_bytes!("fixtures/tiny.gif").as_slice();
 
         let (status, server) = Call::new(Method::PATCH, "/v1/server")
             .token(&token)
@@ -394,6 +450,351 @@ async fn an_admin_can_lower_the_image_cap() {
         let (status, saved) = upload(&app, &token, "wave.gif", "image/gif", gif, &[]).await;
         assert_eq!(status, StatusCode::CREATED, "{saved}");
         assert_eq!(saved["kind"], "gif");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_zip_is_unsupported_until_the_server_allows_archives() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let zip = stored_text_zip("hello.txt", b"hello");
+
+        let (status, denied) =
+            upload(&app, &token, "notes.zip", "application/zip", &zip, &[]).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{denied}");
+        assert_eq!(denied["error"], "unsupported_media");
+
+        let (status, server) = Call::new(Method::GET, "/v1/server")
+            .token(&token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(server["allow_archives"], false);
+
+        let (status, server) = Call::new(Method::PATCH, "/v1/server")
+            .token(&token)
+            .json(json!({"allow_archives": true}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(server["allow_archives"], true);
+
+        let (status, saved) = upload(&app, &token, "notes.zip", "application/zip", &zip, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_eicar_upload_is_blocked() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-eicar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let (status, denied) =
+            upload(&app, &owner_token, "eicar.txt", "text/plain", eicar, &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert_eq!(denied["error"], "blocked");
+
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id::text FROM attachments")
+            .fetch_all(&db.owner)
+            .await
+            .expect("attachment ids");
+        assert!(
+            ids.is_empty(),
+            "blocked upload must not commit a row: {ids:?}"
+        );
+        if let Some(id) = denied["id"].as_str() {
+            let (status, _) = download(&app, &member_token, id).await;
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "member GET of blocked id must never be 200"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_message_cannot_name_an_unscanned_attachment() {
+    run(|db| async move {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyserver-uploads-unscanned-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&token)
+            .json(json!({"name": "files"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("attachment id").to_string();
+
+        sqlx::query("UPDATE attachments SET scan_status = 'scanning' WHERE id = $1::uuid")
+            .bind(&id)
+            .execute(&db.owner)
+            .await
+            .expect("mark scanning");
+
+        let (status, denied) = send_message(
+            &app,
+            &token,
+            &channel_id,
+            json!({"body": "", "attachment_ids": [id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+        assert_eq!(denied["error"], "invalid");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_scanning_attachment_download_is_locked() {
+    run(|db| async move {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyserver-uploads-scanning-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("attachment id").to_string();
+
+        sqlx::query("UPDATE attachments SET scan_status = 'scanning' WHERE id = $1::uuid")
+            .bind(&id)
+            .execute(&db.owner)
+            .await
+            .expect("mark scanning");
+
+        let (status, bytes) = download(&app, &token, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::LOCKED,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(body["error"], "scanning");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn download_sends_attachment_disposition_for_files() {
+    run(|db| async move {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyserver-uploads-disposition-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let pdf = b"%PDF-1.4\n";
+        let (status, saved) = upload(&app, &token, "doc.pdf", "application/pdf", pdf, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "file");
+        assert_eq!(saved["mime"], "application/pdf");
+        let pdf_id = saved["id"].as_str().expect("pdf id").to_string();
+
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{pdf_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("attachment"),
+            "pdf disposition: {disposition}"
+        );
+        assert_eq!(
+            header_str(&headers, header::CONTENT_TYPE),
+            "application/pdf"
+        );
+
+        let pdf_url = saved["url"].as_str().expect("signed url");
+        assert!(
+            pdf_url.starts_with(&format!("/v1/media/{pdf_id}?")),
+            "{pdf_url}"
+        );
+        assert!(pdf_url.contains("ex="), "{pdf_url}");
+        assert!(pdf_url.contains("is="), "{pdf_url}");
+        assert!(pdf_url.contains("hm="), "{pdf_url}");
+
+        let notes = b"hello notes";
+        let (status, saved) = upload(&app, &token, "notes.txt", "text/plain", notes, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let notes_id = saved["id"].as_str().expect("notes id");
+        let (status, headers, _) =
+            download_at(&app, &token, &format!("/v1/media/{notes_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("attachment"),
+            "file disposition: {disposition}"
+        );
+
+        let gif = include_bytes!("fixtures/tiny.gif").as_slice();
+        let (status, saved) = upload(&app, &token, "wave.gif", "image/gif", gif, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "gif");
+        let gif_id = saved["id"].as_str().expect("gif id");
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{gif_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("inline"),
+            "gif disposition: {disposition}"
+        );
+        assert_eq!(header_str(&headers, header::CONTENT_TYPE), "image/gif");
+
+        let png = include_bytes!("fixtures/tiny.png").as_slice();
+        let (status, saved) = upload(&app, &token, "dot.png", "image/png", png, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "image");
+        let png_id = saved["id"].as_str().expect("png id");
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{png_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("inline"),
+            "png disposition: {disposition}"
+        );
+        assert_eq!(header_str(&headers, header::CONTENT_TYPE), "image/png");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn download_keeps_nosniff_and_no_store() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-nosniff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("id");
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header_str(&headers, header::X_CONTENT_TYPE_OPTIONS),
+            "nosniff"
+        );
+        assert_eq!(header_str(&headers, header::CACHE_CONTROL), "no-store");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_bad_hmac_is_refused() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-hmac-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("id").to_string();
+
+        let (status, _, bytes) = download_at(
+            &app,
+            &token,
+            &format!("/v1/media/{id}?ex=2000000000&is=1&hm=00"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "invalid hm must 401: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let (status, _, bytes) = download_at(&app, &token, &format!("/v1/media/{id}?ex=1")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "partial hmac params must 401: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let (status, _) = download(&app, &token, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "missing hmac params stay Bearer-compat"
+        );
+
+        let url = saved["url"].as_str().expect("signed url");
+        let (status, _, _) = download_at(&app, &token, url).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a minted url still downloads with Bearer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -442,6 +843,72 @@ async fn next_type(ws: &mut Ws, kind: &str) -> Value {
     }
 }
 
+/// One stored text file, built in memory. CRC-32 matches the ZIP spec.
+fn stored_text_zip(name: &str, data: &[u8]) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                if crc & 1 == 1 {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
+    }
+
+    let name_bytes = name.as_bytes();
+    let crc = crc32(data);
+    let size = u32::try_from(data.len()).expect("zip size");
+    let name_len = u16::try_from(name_bytes.len()).expect("zip name");
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(data);
+    let cd_offset = u32::try_from(out.len()).expect("cd offset");
+    out.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(name_bytes);
+    let cd_size = u32::try_from(out.len()).expect("cd size") - cd_offset;
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
 fn multipart(filename: &str, mime: &str, bytes: &[u8], fields: &[(&str, &str)]) -> Vec<u8> {
     let boundary = "TinyBoundary";
     let mut body = Vec::new();
@@ -487,7 +954,7 @@ async fn upload(
 
 async fn download(app: &Router, token: &str, id: &str) -> (StatusCode, Vec<u8>) {
     let path = format!("/v1/media/{id}");
-    let (status, headers, bytes) = exchange(app, Method::GET, &path, token, "", Vec::new()).await;
+    let (status, headers, bytes) = download_at(app, token, &path).await;
     if status == StatusCode::OK {
         let mime = headers
             .get(header::CONTENT_TYPE)
@@ -496,6 +963,21 @@ async fn download(app: &Router, token: &str, id: &str) -> (StatusCode, Vec<u8>) 
         assert!(!mime.is_empty(), "download content type");
     }
     (status, bytes)
+}
+
+async fn download_at(
+    app: &Router,
+    token: &str,
+    path: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    exchange(app, Method::GET, path, token, "", Vec::new()).await
+}
+
+fn header_str(headers: &axum::http::HeaderMap, name: axum::http::HeaderName) -> &str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
 }
 
 async fn exchange(

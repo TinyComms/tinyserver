@@ -187,6 +187,13 @@ impl IntoResponse for ApiError {
     }
 }
 
+pub(crate) fn icon_failure(error: db::MessageError) -> ApiError {
+    match error {
+        db::MessageError::TooLarge => ApiError::TooLarge,
+        _ => ApiError::UnsupportedMedia,
+    }
+}
+
 pub(crate) fn lift(error: CommunityError) -> ApiError {
     match error {
         CommunityError::Forbidden => ApiError::Forbidden,

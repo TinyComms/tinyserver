@@ -1,4 +1,6 @@
 # One community. Postgres, the server, and Pocket ID share a network that has no route out.
+# clamd is on the media network, which has a route out, so freshclam can fetch signatures.
+# tinyserver reaches it there at clamd:3310. That port is not published.
 # cloudflared carries HTTP and the live socket for the chat hostname, and the sign-in pages for
 # the auth hostname; it is the only way in to either. The one thing published on the host is the
 # media port, UDP and the same number on TCP, for call audio straight to the SFU.
@@ -49,6 +51,10 @@ services:
         condition: service_healthy
       pocket-id:
         condition: service_healthy
+      tinyserver-uploads:
+        condition: service_completed_successfully
+      clamd:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
       DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
@@ -80,9 +86,16 @@ services:
       TINYSERVER_LAN_IP: ${TINYSERVER_LAN_IP:-}
       # What media may upload to everyone, in kb/s. Optional; unset is no budget.
       TINYSERVER_MEDIA_EGRESS_KBPS: ${TINYSERVER_MEDIA_EGRESS_KBPS:-}
+      # clamd over TCP on the Docker network. Port 3310 is not published on the host.
+      TINYSERVER_CLAMD_SOCKET: clamd:3310
+      TINYSERVER_UPLOAD_DIR: /data/uploads
+      # Signed media paths. 32 bytes of hex the operator generates. Required; unset will not start.
+      TINYSERVER_MEDIA_HMAC_SECRET: ${TINYSERVER_MEDIA_HMAC_SECRET:?set TINYSERVER_MEDIA_HMAC_SECRET to 64 hex characters (openssl rand -hex 32)}
     secrets:
       - oidc_client_secret
       - pocketid_api_key
+    volumes:
+      - tinyserver_uploads:/data/uploads
     # The same number inside and out: the SFU advertises the port it binds. TCP is ICE-TCP,
     # for networks that block UDP.
     ports:
@@ -96,6 +109,39 @@ services:
       - no-new-privileges:true
     networks:
       - inside
+      - media
+    logging: *logging
+
+  # Gives the upload volume to tinyserver's user, 10001, once. The image has no shell to do it.
+  tinyserver-uploads:
+    image: postgres:17-alpine
+    user: "0:0"
+    entrypoint: ["chown", "10001:10001", "/data/uploads"]
+    volumes:
+      - tinyserver_uploads:/data/uploads
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    logging: *logging
+
+  # Scans uploads. TCP 3310 stays on the media network; it is not published. A clamav-owned
+  # socket file would refuse uid 10001, so tinyserver uses host:port instead.
+  clamd:
+    image: clamav/clamav:1.4
+    environment:
+      CLAMD_CONF_TCPSocket: "3310"
+      CLAMD_CONF_TCPAddr: 0.0.0.0
+    volumes:
+      - clamav_db:/var/lib/clamav
+    restart: unless-stopped
+    # media, not the internal network: freshclam needs a route out, and tinyserver is already here.
+    networks:
       - media
     logging: *logging
 
@@ -215,3 +261,5 @@ networks:
 volumes:
   tinyserver_pg:
   pocketid_data:
+  tinyserver_uploads:
+  clamav_db:

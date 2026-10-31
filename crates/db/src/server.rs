@@ -36,6 +36,8 @@ pub struct ServerSettings {
     pub image_max_bytes: i64,
     /// Video and every other file, in bytes.
     pub file_max_bytes: i64,
+    /// Zip and other archives may be stored when this is true. Default false.
+    pub allow_archives: bool,
     pub created_at: String,
 }
 
@@ -50,6 +52,7 @@ pub struct ServerPatch {
     pub afk_timeout_secs: Option<i32>,
     pub image_max_bytes: Option<i64>,
     pub file_max_bytes: Option<i64>,
+    pub allow_archives: Option<bool>,
 }
 
 pub struct Icon {
@@ -81,7 +84,7 @@ pub struct Layout {
 fn settings_select() -> String {
     format!(
         "SELECT name, description, welcome, icon_sha, default_room_id::text, afk_room_id::text,
-                afk_timeout_secs, image_max_bytes, file_max_bytes,
+                afk_timeout_secs, image_max_bytes, file_max_bytes, allow_archives,
                 to_char(created_at AT TIME ZONE 'UTC', '{STAMP}')
          FROM server_settings"
     )
@@ -139,7 +142,8 @@ pub async fn update_server(
              afk_room_id = CASE WHEN $6 THEN $7::uuid ELSE afk_room_id END,
              afk_timeout_secs = coalesce($8, afk_timeout_secs),
              image_max_bytes = coalesce($9, image_max_bytes),
-             file_max_bytes = coalesce($10, file_max_bytes)",
+             file_max_bytes = coalesce($10, file_max_bytes),
+             allow_archives = coalesce($11, allow_archives)",
     )
     .bind(name.as_deref())
     .bind(description.as_deref())
@@ -151,6 +155,7 @@ pub async fn update_server(
     .bind(patch.afk_timeout_secs)
     .bind(image_max)
     .bind(file_max)
+    .bind(patch.allow_archives)
     .execute(&mut *tx)
     .await
     .map_err(from_sql)?;
@@ -167,6 +172,7 @@ pub async fn update_server(
         ("afk_timeout_secs", patch.afk_timeout_secs.is_some()),
         ("image_max_bytes", image_max.is_some()),
         ("file_max_bytes", file_max.is_some()),
+        ("allow_archives", patch.allow_archives.is_some()),
     ] {
         if set {
             changed.insert(key.into(), Value::Bool(true));
@@ -244,6 +250,15 @@ pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Needs manage_server. Checked before the icon is decoded, so someone who may not change it
+/// gets forbidden rather than a media error.
+pub async fn ensure_manage_server(pool: &PgPool, caller: &Caller) -> Result<(), CommunityError> {
+    let mut tx = scope(pool, caller).await?;
+    require(&mut tx, perm::MANAGE_SERVER).await?;
+    tx.commit().await.map_err(from_sql)?;
+    Ok(())
 }
 
 /// Needs manage_server. Returns the new icon's SHA-256 in hex. The caller checks the type and
@@ -550,7 +565,8 @@ fn settings_from(row: &PgRow) -> Result<ServerSettings, CommunityError> {
         afk_timeout_secs: row.try_get(6).map_err(from_sql)?,
         image_max_bytes: row.try_get(7).map_err(from_sql)?,
         file_max_bytes: row.try_get(8).map_err(from_sql)?,
-        created_at: row.try_get(9).map_err(from_sql)?,
+        allow_archives: row.try_get(9).map_err(from_sql)?,
+        created_at: row.try_get(10).map_err(from_sql)?,
     })
 }
 
