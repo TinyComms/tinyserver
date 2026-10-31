@@ -2,6 +2,7 @@
 //! Raster uploads are re-encoded so polyglot trailers never hit disk.
 
 use std::io::Cursor;
+use std::num::NonZeroU64;
 
 use image::codecs::gif::{GifDecoder, GifEncoder, Repeat};
 use image::codecs::jpeg::JpegDecoder;
@@ -98,17 +99,13 @@ pub fn classify(
 /// Post-rewrite byte size is checked by `save_attachment` against `image_max_bytes`.
 pub fn rewrite_raster(bytes: &[u8], mime: &str) -> Result<Rewritten, MessageError> {
     let format = format_of(mime)?;
-    let (width, height) = header_dimensions(bytes, format)?;
-    let frames = if format == ImageFormat::Gif {
-        gif_frame_count(bytes)?
-    } else {
-        1
-    };
-    reject_caps(width, height, frames)?;
     let kind = kind_of_raster(mime)?;
     if format == ImageFormat::Gif {
+        let (width, height) = gif_check_caps(bytes)?;
         rewrite_gif(bytes, width, height, kind)
     } else {
+        let (width, height) = header_dimensions(bytes, format)?;
+        reject_caps(width, height, 1)?;
         rewrite_still(bytes, format, mime, kind)
     }
 }
@@ -141,9 +138,6 @@ fn header_dimensions(bytes: &[u8], format: ImageFormat) -> Result<(u32, u32), Me
             .map_err(|_| MessageError::UnsupportedMedia)?
             .dimensions(),
         ImageFormat::WebP => WebPDecoder::new(cursor)
-            .map_err(|_| MessageError::UnsupportedMedia)?
-            .dimensions(),
-        ImageFormat::Gif => GifDecoder::new(cursor)
             .map_err(|_| MessageError::UnsupportedMedia)?
             .dimensions(),
         _ => return Err(MessageError::UnsupportedMedia),
@@ -179,73 +173,39 @@ fn reject_caps(width: u32, height: u32, frames: u32) -> Result<(), MessageError>
     Ok(())
 }
 
-fn gif_frame_count(bytes: &[u8]) -> Result<u32, MessageError> {
-    if bytes.len() < 13 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        return Err(MessageError::UnsupportedMedia);
-    }
-    let packed = bytes[10];
-    let mut i = 13usize;
-    if packed & 0x80 != 0 {
-        let table = 3usize.saturating_mul(1usize << ((packed & 0x07) + 1));
-        i = i.checked_add(table).ok_or(MessageError::UnsupportedMedia)?;
-        if i > bytes.len() {
-            return Err(MessageError::UnsupportedMedia);
-        }
-    }
+/// Header/metadata only: `skip_frame_decoding` so a 1×1 screen with huge frames
+/// cannot spend the bomb budget on `collect_frames`.
+fn gif_check_caps(bytes: &[u8]) -> Result<(u32, u32), MessageError> {
+    let mut options = gif::DecodeOptions::new();
+    options.skip_frame_decoding(true);
+    options.set_memory_limit(match NonZeroU64::new(MAX_RGBA) {
+        Some(limit) => gif::MemoryLimit::Bytes(limit),
+        None => gif::MemoryLimit::Unlimited,
+    });
+    let mut decoder = options
+        .read_info(Cursor::new(bytes))
+        .map_err(|_| MessageError::UnsupportedMedia)?;
+    let screen_w = u32::from(decoder.width());
+    let screen_h = u32::from(decoder.height());
+    let mut max_w = screen_w;
+    let mut max_h = screen_h;
     let mut frames = 0u32;
-    while let Some(&marker) = bytes.get(i) {
-        i += 1;
-        match marker {
-            0x3B => break,
-            0x21 => {
-                i = i.checked_add(1).ok_or(MessageError::UnsupportedMedia)?;
-                i = skip_gif_subblocks(bytes, i)?;
-            }
-            0x2C => {
-                i = i.checked_add(9).ok_or(MessageError::UnsupportedMedia)?;
-                if i > bytes.len() {
-                    return Err(MessageError::UnsupportedMedia);
-                }
-                let packed = bytes[i - 1];
-                if packed & 0x80 != 0 {
-                    let table = 3usize.saturating_mul(1usize << ((packed & 0x07) + 1));
-                    i = i.checked_add(table).ok_or(MessageError::UnsupportedMedia)?;
-                    if i > bytes.len() {
-                        return Err(MessageError::UnsupportedMedia);
-                    }
-                }
-                i = i.checked_add(1).ok_or(MessageError::UnsupportedMedia)?;
-                i = skip_gif_subblocks(bytes, i)?;
+    loop {
+        match decoder.next_frame_info() {
+            Ok(Some(frame)) => {
+                max_w = max_w.max(u32::from(frame.width));
+                max_h = max_h.max(u32::from(frame.height));
                 frames = frames.saturating_add(1);
-                if u64::from(frames) > MAX_GIF_FRAMES {
-                    return Err(MessageError::UnsupportedMedia);
-                }
+                reject_caps(max_w, max_h, frames)?;
             }
-            _ => return Err(MessageError::UnsupportedMedia),
+            Ok(None) => break,
+            Err(_) => return Err(MessageError::UnsupportedMedia),
         }
     }
     if frames == 0 {
         return Err(MessageError::UnsupportedMedia);
     }
-    Ok(frames)
-}
-
-fn skip_gif_subblocks(bytes: &[u8], mut i: usize) -> Result<usize, MessageError> {
-    loop {
-        let Some(&len) = bytes.get(i) else {
-            return Err(MessageError::UnsupportedMedia);
-        };
-        i += 1;
-        if len == 0 {
-            return Ok(i);
-        }
-        i = i
-            .checked_add(usize::from(len))
-            .ok_or(MessageError::UnsupportedMedia)?;
-        if i > bytes.len() {
-            return Err(MessageError::UnsupportedMedia);
-        }
-    }
+    Ok((screen_w, screen_h))
 }
 
 fn rewrite_still(
@@ -636,6 +596,42 @@ mod tests {
                 Err(MessageError::UnsupportedMedia | MessageError::TooLarge)
             ),
             "pixel bomb from IHDR must fail before a full decode"
+        );
+    }
+
+    /// 1×1 logical screen, four 3200×3200 frames. Screen budget is 1×1×4; spec budget is
+    /// 3200×3200×4 = 40.96e6 > 40e6. Each frame is under the gif crate's 50 MiB RGBA limit,
+    /// so a screen-only cap would decode instead of refusing from the image descriptor.
+    fn gif_1x1_screen_with_large_frames() -> Vec<u8> {
+        let mut out = Vec::new();
+        let palette = [0, 0, 0, 0xFF, 0xFF, 0xFF];
+        {
+            let mut encoder = gif::Encoder::new(&mut out, 1, 1, &palette).expect("1×1 GIF screen");
+            let pixels = vec![0_u8; 3200 * 3200];
+            for _ in 0..4 {
+                let frame = gif::Frame::from_indexed_pixels(3200, 3200, pixels.clone(), None);
+                encoder.write_frame(&frame).expect("oversized frame");
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rewrite_rejects_gif_frame_larger_than_logical_screen() {
+        let bytes = gif_1x1_screen_with_large_frames();
+        let started = std::time::Instant::now();
+        let result = rewrite_raster(&bytes, "image/gif");
+        assert!(
+            started.elapsed().as_millis() < 200,
+            "must refuse from GIF image-descriptor metadata, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                result,
+                Err(MessageError::UnsupportedMedia | MessageError::TooLarge)
+            ),
+            "GIF frame pixels must count toward the bomb budget, not only the 1×1 screen"
         );
     }
 
