@@ -130,6 +130,9 @@ async fn sign_out_everywhere(
 mod tests {
     #[tokio::test]
     async fn account_routes_share_paths_without_overlap() {
+        // Lib tests share a process. Leave the flag set. Selector tests pass
+        // the socket and allow_fake in arguments and do not read this variable.
+        std::env::set_var("TINYSERVER_ALLOW_FAKE_SCAN", "1");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .expect("lazy pool");
