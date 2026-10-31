@@ -17,6 +17,8 @@ const MAX_PIXELS: u64 = 40_000_000;
 const MAX_GIF_FRAMES: u64 = 500;
 const MAX_RGBA: u64 = 256 * 1024 * 1024;
 const MAX_ASPECT: u64 = 50;
+const MAX_ZIP_ENTRIES: usize = 1024;
+const MAX_ZIP_UNCOMPRESSED: u64 = 200 * 1024 * 1024;
 
 /// Whether zip/7z/rar/tar/gz/bz2 may persist as kind `file`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,13 +321,99 @@ fn refused_mime(mime: &str) -> bool {
 }
 
 fn archive_forbidden(ext: Option<&str>, mime: &str, bytes: &[u8], archives: Archives) -> bool {
-    if archives == Archives::Allowed || is_plain_office(ext, mime) {
+    // OOXML is a zip container and stays a document. It is not on the archive opt-in path.
+    if is_plain_office(ext, mime) {
         return false;
     }
-    ext.is_some_and(archive_extension)
+    let marked = ext.is_some_and(archive_extension)
         || archive_mime(mime)
         || sniff_archive(bytes)
-        || infer_container(bytes)
+        || infer_container(bytes);
+    if !marked {
+        return false;
+    }
+    if archives == Archives::Denied {
+        return true;
+    }
+    if zip_container(ext, mime, bytes) {
+        if ext == Some("zip") && zip_mime(mime) {
+            return zip_exceeds_caps(bytes);
+        }
+        return true;
+    }
+    // 7z/rar/tar/gz/tgz/bz2 have no table of contents. MIME and extension must name the same
+    // kind; `classify` still requires `infer` to agree when it recognizes the bytes.
+    !ext.is_some_and(|ext| archive_mime_fits(ext, mime))
+}
+
+fn zip_container(ext: Option<&str>, mime: &str, bytes: &[u8]) -> bool {
+    ext == Some("zip") || zip_mime(mime) || sniff_zip(bytes)
+}
+
+fn zip_mime(mime: &str) -> bool {
+    matches!(mime, "application/zip" | "application/x-zip-compressed")
+}
+
+fn archive_mime_fits(ext: &str, mime: &str) -> bool {
+    match ext {
+        "zip" => zip_mime(mime),
+        "7z" => mime == "application/x-7z-compressed",
+        "rar" => matches!(mime, "application/vnd.rar" | "application/x-rar-compressed"),
+        "tar" => matches!(mime, "application/x-tar" | "application/x-gtar"),
+        "gz" | "tgz" => matches!(mime, "application/gzip" | "application/x-gzip"),
+        "bz2" => matches!(mime, "application/x-bzip2" | "application/x-bzip"),
+        _ => false,
+    }
+}
+
+/// Central directory only. The outer zip is depth 1. An entry named as another archive is depth 2
+/// and is not opened. A central directory that fails to parse is refused.
+fn zip_exceeds_caps(bytes: &[u8]) -> bool {
+    let Ok(archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return true;
+    };
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return true;
+    }
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index_data(index) else {
+            return true;
+        };
+        if entry.encrypted() || entry.is_symlink() {
+            return true;
+        }
+        let Ok(name) = entry.name() else {
+            return true;
+        };
+        if unsafe_zip_name(&name) {
+            return true;
+        }
+        let compressed = entry.compressed_size();
+        let plain = entry.size();
+        if (compressed == 0 && plain > 0) || plain > compressed.saturating_mul(4) {
+            return true;
+        }
+        total = total.saturating_add(plain);
+        if total > MAX_ZIP_UNCOMPRESSED {
+            return true;
+        }
+    }
+    false
+}
+
+fn unsafe_zip_name(name: &str) -> bool {
+    if name.contains("..") || name.contains('\0') {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    if bytes
+        .first()
+        .is_some_and(|byte| *byte == b'/' || *byte == b'\\')
+    {
+        return true;
+    }
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
 /// `infer` files PDF under `MatcherType::Archive`; that is a document, not a zip.
@@ -783,5 +871,268 @@ mod tests {
             classify("wave.gif", "image/gif", b""),
             Err(MessageError::Invalid)
         ));
+    }
+
+    fn allow(name: &str, mime: &str, bytes: &[u8]) -> Result<Classified, MessageError> {
+        classify_with(name, mime, bytes, Archives::Allowed)
+    }
+
+    fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in files {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file(*name, options).expect("zip entry");
+            writer.write_all(data).expect("zip bytes");
+        }
+        writer.finish().expect("zip finish").into_inner()
+    }
+
+    /// Central-directory sizes, as the bomb cap reads them. Proves the fixture
+    /// before `classify` is asked to refuse it.
+    fn central_entry(bytes: &[u8], index: usize) -> (u64, u64, bool, bool) {
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("read zip");
+        let entry = archive.by_index_data(index).expect("entry");
+        (
+            entry.compressed_size(),
+            entry.size(),
+            entry.encrypted(),
+            entry.is_symlink(),
+        )
+    }
+
+    fn patch_central(
+        bytes: &mut [u8],
+        name: &str,
+        compressed: u32,
+        uncompressed: u32,
+        encrypt: bool,
+    ) {
+        let signature = [0x50, 0x4b, 0x01, 0x02];
+        let wanted = name.as_bytes();
+        let mut index = 0;
+        while index + 46 <= bytes.len() {
+            if bytes[index..index + 4] == signature {
+                let name_len = u16::from_le_bytes([bytes[index + 28], bytes[index + 29]]) as usize;
+                let extra_len = u16::from_le_bytes([bytes[index + 30], bytes[index + 31]]) as usize;
+                let comment_len =
+                    u16::from_le_bytes([bytes[index + 32], bytes[index + 33]]) as usize;
+                let name_at = index + 46;
+                if name_at + name_len <= bytes.len()
+                    && &bytes[name_at..name_at + name_len] == wanted
+                {
+                    bytes[index + 20..index + 24].copy_from_slice(&compressed.to_le_bytes());
+                    bytes[index + 24..index + 28].copy_from_slice(&uncompressed.to_le_bytes());
+                    if encrypt {
+                        bytes[index + 8] |= 1;
+                    }
+                    return;
+                }
+                index += (46 + name_len + extra_len + comment_len).max(1);
+                continue;
+            }
+            index += 1;
+        }
+        panic!("central directory entry {name} not found");
+    }
+
+    #[test]
+    fn an_allowed_zip_of_one_text_file_is_a_file() {
+        let bytes = stored_zip(&[("hello.txt", b"hello")]);
+        let got = allow("notes.zip", "application/zip", &bytes).expect("small zip");
+        assert_eq!(got.kind, "file");
+        assert_eq!(got.mime, "application/zip");
+    }
+
+    #[test]
+    fn allowed_zip_rejects_more_than_1024_entries() {
+        let ok = many_zip(1024);
+        allow("ok.zip", "application/zip", &ok).expect("1024 entries is the limit");
+
+        let over = many_zip(1025);
+        assert!(matches!(
+            allow("over.zip", "application/zip", &over),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    fn many_zip(count: usize) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..count {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer
+                .start_file(format!("f{i}.txt"), options)
+                .expect("zip entry");
+            writer.write_all(b"x").expect("zip bytes");
+        }
+        writer.finish().expect("zip finish").into_inner()
+    }
+
+    #[test]
+    fn allowed_zip_rejects_a_ratio_above_four_to_one() {
+        let mut exact = stored_zip(&[("a.txt", b"hello")]);
+        patch_central(&mut exact, "a.txt", 10, 40, false);
+        assert_eq!(central_entry(&exact, 0).0, 10, "fixture compressed size");
+        assert_eq!(central_entry(&exact, 0).1, 40, "fixture uncompressed size");
+        allow("a.zip", "application/zip", &exact).expect("4× compressed is the limit");
+
+        let mut over = stored_zip(&[("a.txt", b"hello")]);
+        patch_central(&mut over, "a.txt", 10, 41, false);
+        assert_eq!(
+            (central_entry(&over, 0).0, central_entry(&over, 0).1),
+            (10, 41)
+        );
+        assert!(matches!(
+            allow("a.zip", "application/zip", &over),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn allowed_zip_rejects_zero_compressed_with_uncompressed_bytes() {
+        let mut bytes = stored_zip(&[("a.txt", b"hello")]);
+        patch_central(&mut bytes, "a.txt", 0, 5, false);
+        let (compressed, plain, encrypted, _) = central_entry(&bytes, 0);
+        assert_eq!((compressed, plain, encrypted), (0, 5, false));
+        assert!(matches!(
+            allow("a.zip", "application/zip", &bytes),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn allowed_zip_rejects_total_uncompressed_over_200_mib() {
+        const MIB: u32 = 1024 * 1024;
+        let mut at_cap = stored_zip(&[("a.txt", b"hello")]);
+        let plain_ok = 200 * MIB;
+        patch_central(&mut at_cap, "a.txt", plain_ok / 4, plain_ok, false);
+        assert_eq!(central_entry(&at_cap, 0).1, u64::from(plain_ok));
+        allow("cap.zip", "application/zip", &at_cap).expect("200 MiB is the limit");
+
+        let mut over = stored_zip(&[("a.txt", b"hello")]);
+        let plain = 200 * MIB + 1;
+        let compressed = plain / 4 + 1;
+        patch_central(&mut over, "a.txt", compressed, plain, false);
+        assert_eq!(central_entry(&over, 0).1, u64::from(plain));
+        assert!(
+            central_entry(&over, 0).1 <= central_entry(&over, 0).0.saturating_mul(4),
+            "fixture must trip the total cap without also tripping the ratio cap"
+        );
+        assert!(matches!(
+            allow("over.zip", "application/zip", &over),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn allowed_zip_rejects_dotdot_absolute_symlink_and_encryption() {
+        for name in [
+            "../secret.txt",
+            "foo/../../etc/passwd",
+            "/etc/passwd",
+            r"C:\Windows\note.txt",
+        ] {
+            let bytes = stored_zip(&[(name, b"x")]);
+            assert!(
+                matches!(
+                    allow("mods.zip", "application/zip", &bytes),
+                    Err(MessageError::UnsupportedMedia)
+                ),
+                "{name}"
+            );
+        }
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .add_symlink(
+                "link",
+                "target.txt",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("symlink entry");
+        let symlink = writer.finish().expect("zip finish").into_inner();
+        assert!(
+            central_entry(&symlink, 0).3,
+            "fixture must be a unix symlink"
+        );
+        assert!(matches!(
+            allow("mods.zip", "application/zip", &symlink),
+            Err(MessageError::UnsupportedMedia)
+        ));
+
+        let mut encrypted = stored_zip(&[("a.txt", b"hello")]);
+        patch_central(&mut encrypted, "a.txt", 5, 5, true);
+        assert!(
+            central_entry(&encrypted, 0).2,
+            "fixture must set the encryption flag"
+        );
+        assert!(matches!(
+            allow("secret.zip", "application/zip", &encrypted),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn allowed_zip_accepts_nested_archive_names_without_inflating() {
+        let bytes = stored_zip(&[
+            ("readme.txt", b"hi"),
+            ("nested.zip", b"PK\x03\x04not-opened"),
+            ("nested.7z", b"nope"),
+            ("nested.rar", b"nope"),
+            ("nested.tar", b"nope"),
+            ("nested.gz", b"nope"),
+            ("nested.tgz", b"nope"),
+            ("nested.bz2", b"nope"),
+        ]);
+        let got = allow("mods.zip", "application/zip", &bytes).expect("depth 2 by name");
+        assert_eq!(got.kind, "file");
+    }
+
+    #[test]
+    fn allowed_non_zip_needs_mime_and_extension_agreement() {
+        assert!(matches!(
+            allow("mods.7z", "text/plain", b"not-an-archive"),
+            Err(MessageError::UnsupportedMedia)
+        ));
+        assert_eq!(
+            allow("mods.7z", "application/x-7z-compressed", b"not-an-archive")
+                .expect("7z mime agrees with extension")
+                .kind,
+            "file"
+        );
+
+        let gz = [0x1f, 0x8b, 0x08];
+        assert!(matches!(
+            classify("logs.gz", "application/gzip", &gz),
+            Err(MessageError::UnsupportedMedia)
+        ));
+        assert_eq!(
+            allow("logs.gz", "application/gzip", &gz)
+                .expect("gzip when archives are allowed")
+                .kind,
+            "file"
+        );
+        assert!(matches!(
+            allow("logs.gz", "text/plain", &gz),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn a_docx_is_not_bomb_capped() {
+        let bytes = stored_zip(&[
+            ("word/document.xml", b"<w:document/>"),
+            ("../secret.txt", b"nope"),
+        ]);
+        let mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        let got = allow("doc.docx", mime, &bytes).expect("docx stays a document");
+        assert_eq!(got.kind, "file");
+        assert_eq!(got.mime, mime);
     }
 }

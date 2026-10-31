@@ -455,6 +455,48 @@ async fn an_admin_can_lower_the_image_cap() {
 }
 
 #[tokio::test]
+async fn a_zip_is_unsupported_until_the_server_allows_archives() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let zip = stored_text_zip("hello.txt", b"hello");
+
+        let (status, denied) =
+            upload(&app, &token, "notes.zip", "application/zip", &zip, &[]).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{denied}");
+        assert_eq!(denied["error"], "unsupported_media");
+
+        let (status, server) = Call::new(Method::GET, "/v1/server")
+            .token(&token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(server["allow_archives"], false);
+
+        let (status, server) = Call::new(Method::PATCH, "/v1/server")
+            .token(&token)
+            .json(json!({"allow_archives": true}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(server["allow_archives"], true);
+
+        let (status, saved) = upload(&app, &token, "notes.zip", "application/zip", &zip, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn an_eicar_upload_is_blocked() {
     run(|db| async move {
         let dir =
@@ -799,6 +841,72 @@ async fn next_type(ws: &mut Ws, kind: &str) -> Value {
             return value;
         }
     }
+}
+
+/// One stored text file, built in memory. CRC-32 matches the ZIP spec.
+fn stored_text_zip(name: &str, data: &[u8]) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                if crc & 1 == 1 {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
+    }
+
+    let name_bytes = name.as_bytes();
+    let crc = crc32(data);
+    let size = u32::try_from(data.len()).expect("zip size");
+    let name_len = u16::try_from(name_bytes.len()).expect("zip name");
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(data);
+    let cd_offset = u32::try_from(out.len()).expect("cd offset");
+    out.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(name_bytes);
+    let cd_size = u32::try_from(out.len()).expect("cd size") - cd_offset;
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
 }
 
 fn multipart(filename: &str, mime: &str, bytes: &[u8], fields: &[(&str, &str)]) -> Vec<u8> {

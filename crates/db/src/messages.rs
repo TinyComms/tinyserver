@@ -25,6 +25,7 @@ use crate::server::{FILE_MAX_DEFAULT, IMAGE_MAX_DEFAULT};
 struct UploadLimits {
     image: i64,
     file: i64,
+    archives: crate::media::Archives,
 }
 
 #[cfg(test)]
@@ -33,6 +34,7 @@ impl UploadLimits {
         Self {
             image: IMAGE_MAX_DEFAULT,
             file: FILE_MAX_DEFAULT,
+            archives: crate::media::Archives::Denied,
         }
     }
 }
@@ -629,16 +631,23 @@ fn is_uuid(value: &str) -> bool {
 }
 
 async fn upload_limits(tx: &mut Transaction<'_, Postgres>) -> Result<UploadLimits, MessageError> {
-    let row = sqlx::query("SELECT image_max_bytes, file_max_bytes FROM server_settings")
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(message_sql)?;
+    let row =
+        sqlx::query("SELECT image_max_bytes, file_max_bytes, allow_archives FROM server_settings")
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(message_sql)?;
     let Some(row) = row else {
         return Err(MessageError::Forbidden);
     };
+    let allow_archives: bool = row.try_get(2).map_err(message_sql)?;
     Ok(UploadLimits {
         image: row.try_get(0).map_err(message_sql)?,
         file: row.try_get(1).map_err(message_sql)?,
+        archives: if allow_archives {
+            crate::media::Archives::Allowed
+        } else {
+            crate::media::Archives::Denied
+        },
     })
 }
 
@@ -650,8 +659,7 @@ fn prepare(upload: &NewAttachment, limits: UploadLimits) -> Result<Prepared, Mes
             return Err(MessageError::Invalid);
         }
     }
-    let classified =
-        crate::media::classify(&name, &mime, &upload.bytes, crate::media::Archives::Denied)?;
+    let classified = crate::media::classify(&name, &mime, &upload.bytes, limits.archives)?;
     let limit = match classified.kind {
         "image" | "gif" => limits.image,
         _ => limits.file,

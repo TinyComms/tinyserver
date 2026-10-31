@@ -87,6 +87,8 @@ struct ServerBody {
     image_max_bytes: Option<i64>,
     #[serde(default)]
     file_max_bytes: Option<i64>,
+    #[serde(default)]
+    allow_archives: Option<bool>,
 }
 
 async fn server(
@@ -112,6 +114,7 @@ async fn edit_server(
         afk_timeout_secs: body.afk_timeout_secs,
         image_max_bytes: body.image_max_bytes,
         file_max_bytes: body.file_max_bytes,
+        allow_archives: body.allow_archives,
     };
     let settings = db::update_server(&pool, &caller, &patch)
         .await
