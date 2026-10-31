@@ -155,7 +155,7 @@ These extensions are always refused (case-insensitive): `lnk`, `iso`, `img`, `vh
 
 Raster uploads (`image/png`, `image/jpeg`, `image/webp`, `image/gif`) are re-encoded before they are written to disk; other kinds are stored as received after type checks.
 
-Archives (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused unless `allow_archives` is true on the server (default false; owners set it with `PATCH /v1/server`). When archives are allowed, `zip` is still capped: at most 1024 entries, each entry's uncompressed size at most four times its compressed size, total uncompressed at most 200 MiB, depth two (central directory only; an entry named as another archive counts as depth two and is not opened), no `..`, no symlink, no encrypted zip. Other archive kinds are accepted only when extension and MIME name the same archive type.
+Archives (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused unless `allow_archives` is true on the server (default false; `manage_server` on `PATCH /v1/server`). When archives are allowed, `zip` is still capped: at most 1024 entries, each entry's uncompressed size at most four times its compressed size, total uncompressed at most 200 MiB, depth two (central directory only; an entry named as another archive counts as depth two and is not opened), no `..`, no symlink, no encrypted zip. Other archive kinds are accepted only when extension and MIME name the same archive type.
 
 ### Scanning
 
