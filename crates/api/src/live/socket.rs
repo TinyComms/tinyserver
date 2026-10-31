@@ -63,13 +63,33 @@ pub(crate) struct Me {
     pub role: String,
     /// Server-wide permissions, re-read with the session.
     pub permissions: i64,
+    /// Empty for a person. A bot carries the scopes it was granted.
+    pub scopes: Vec<String>,
 }
 
 impl Me {
+    fn is_bot(&self) -> bool {
+        self.role == "bot"
+    }
+
+    fn allows(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|have| have == scope)
+    }
+
+    /// A person sees the snapshot. A bot sees it only with that scope.
+    fn snapshot<'a, T>(&self, items: &'a [T], scope: &str) -> &'a [T] {
+        if self.is_bot() && !self.allows(scope) {
+            &[]
+        } else {
+            items
+        }
+    }
+
     fn caller(&self) -> Caller {
         Caller {
             user_id: self.user_id.clone(),
             role: self.role.clone(),
+            scopes: self.scopes.clone(),
         }
     }
 
@@ -77,6 +97,59 @@ impl Me {
         self.role = identity.role;
         self.permissions = identity.permissions;
     }
+    /// Bots receive only room and member topics covered by their explicit scopes.
+    fn sees_topic(&self, topic: &str) -> bool {
+        if !self.is_bot() {
+            return true;
+        }
+        if topic.starts_with("room.") {
+            return self.allows("rooms.read");
+        }
+        if topic.starts_with("member.") {
+            return self.allows("members.read");
+        }
+        false
+    }
+
+    fn sees_durable(&self, event: &Event) -> bool {
+        if self.is_bot() {
+            return matches!(event.audience, Audience::Everyone) && self.sees_topic(&event.topic);
+        }
+        match event.audience {
+            Audience::Users => event.users.iter().any(|id| id == &self.user_id),
+            other => other.admits(self.permissions),
+        }
+    }
+
+    /// Bots may receive member presence and public call occupancy, never signaling or messages.
+    fn sees_ephemeral(&self, frame: &str) -> bool {
+        let Some(kind) = frame_kind(frame) else {
+            return !self.is_bot();
+        };
+        if !self.is_bot() {
+            return true;
+        }
+        if kind.starts_with("room.") || matches!(kind, "call.joined" | "call.left" | "call.state") {
+            return self.allows("rooms.read");
+        }
+        if kind.starts_with("member.") || kind == "presence" {
+            return self.allows("members.read");
+        }
+        false
+    }
+}
+
+/// The leading `"type"` of a frame this process serialises. Anything else is left alone.
+fn frame_kind(frame: &str) -> Option<&str> {
+    frame
+        .strip_prefix("{\"type\":\"")
+        .and_then(|rest| rest.split('"').next())
+        .filter(|kind| !kind.is_empty())
+}
+
+/// Client frames that change a call. A bot cannot send them.
+fn changes_call(kind: &str) -> bool {
+    kind.starts_with("call.")
 }
 
 /// A request that succeeded.
@@ -97,10 +170,12 @@ pub(crate) async fn run(
     mut me: Me,
     since: Option<i64>,
 ) {
-    let joined = hub.join(&me.user_id);
+    let joined = hub.join(&me.user_id, me.is_bot());
     let conn = joined.conn;
     tracing::info!(user_id = %me.user_id, conn, "live socket opened");
-    hub.saw(&me.user_id);
+    if !me.is_bot() {
+        hub.saw(&me.user_id);
+    }
     let end = serve(&hub, &mut socket, &mut me, since, joined).await;
     let reason = match end {
         End::Close(Close::Removed) => Some(Reason::Removed),
@@ -116,7 +191,9 @@ pub(crate) async fn run(
     }
     hub.hang_up(&me.user_id, conn, reason);
     hub.leave(&me.user_id, conn);
-    hub.saw(&me.user_id);
+    if !me.is_bot() {
+        hub.saw(&me.user_id);
+    }
     drop(slot);
 }
 
@@ -154,14 +231,16 @@ async fn serve(
         Some(since) => since,
         None => bounds.head,
     };
+    let online_frame = me.snapshot(&online, "members.read");
+    let calls_frame = me.snapshot(&calls, "rooms.read");
     let ready = Out::Ready {
         seq: last,
         me: MeFrame {
             user_id: &me.user_id,
             role: &me.role,
         },
-        online: &online,
-        calls: &calls,
+        online: online_frame,
+        calls: calls_frame,
     };
     if let Err(end) = send(hub, socket, ready.text()).await {
         return end;
@@ -212,18 +291,18 @@ async fn serve(
                 Err(RecvError::Closed) => Err(End::Close(Close::Restart)),
             },
             frame = presence.recv() => match frame {
-                Ok(frame) => send(hub, socket, frame.to_string()).await,
+                Ok(frame) => send_visible(hub, socket, me, frame.as_ref()).await,
                 Err(RecvError::Lagged(_)) => return resync(hub, socket).await,
                 Err(RecvError::Closed) => Err(End::Close(Close::Restart)),
             },
-            Some(frame) = direct.recv() => send(hub, socket, frame.to_string()).await,
+            Some(frame) = direct.recv() => send_visible(hub, socket, me, frame.as_ref()).await,
             message = socket.recv() => {
                 seen = Instant::now();
                 receive(hub, socket, me, &mut asking, message).await
             }
             () = tokio::time::sleep_until(seen + limits.idle) => Err(End::Close(Close::Idle)),
             _ = recheck.tick() => {
-                hub.saw(&me.user_id);
+                if !me.is_bot() { hub.saw(&me.user_id); }
                 check(hub, me).await
             }
         };
@@ -248,11 +327,7 @@ async fn resync(hub: &Hub, socket: &mut WebSocket) -> End {
 /// Sends one durable event if this socket may see it, and acts on events about this person.
 async fn deliver(hub: &Hub, socket: &mut WebSocket, me: &mut Me, event: &Event) -> Step {
     let mine = event.subject.as_deref() == Some(me.user_id.as_str());
-    let visible = match event.audience {
-        Audience::Users => event.users.iter().any(|id| id == &me.user_id),
-        other => other.admits(me.permissions),
-    };
-    if visible {
+    if me.sees_durable(event) {
         if let Some(frame) = &event.frame {
             send(hub, socket, frame.clone()).await?;
         }
@@ -268,7 +343,21 @@ async fn deliver(hub: &Hub, socket: &mut WebSocket, me: &mut Me, event: &Event) 
 }
 
 /// Re-reads the session. A database error keeps the socket; the next check tries again.
+/// A bot token is checked with `authenticate_bot`, and its scopes are refreshed.
 async fn check(hub: &Hub, me: &mut Me) -> Step {
+    if me.is_bot() {
+        return match db::authenticate_bot(&hub.pool, &me.token).await {
+            Ok(bot) => {
+                me.scopes = bot.scopes;
+                Ok(())
+            }
+            Err(SessionError::Unauthorized) => Err(End::Close(Close::SessionEnded)),
+            Err(SessionError::Database(error)) => {
+                tracing::warn!(%error, "live session check failed");
+                Ok(())
+            }
+        };
+    }
     match db::current_session(&hub.pool, &me.token).await {
         Ok(identity) => {
             me.update(identity);
@@ -333,6 +422,13 @@ async fn receive(
         };
         return send(hub, socket, reply.text()).await;
     };
+    if me.is_bot() && changes_call(&incoming.kind) {
+        let reply = Out::Error {
+            reference: incoming.reference.as_ref(),
+            code: "forbidden",
+        };
+        return send(hub, socket, reply.text()).await;
+    }
     let room_id = incoming.room_id.as_deref();
     let sdp = incoming.sdp.as_deref();
     let e2ee = incoming.e2ee_version() >= u64::from(super::e2ee::VERSION);
@@ -743,6 +839,15 @@ fn is_too_big(error: &axum::Error) -> bool {
     false
 }
 
+/// Forwards one ephemeral frame when this socket's scopes allow it.
+async fn send_visible(hub: &Hub, socket: &mut WebSocket, me: &Me, frame: &str) -> Step {
+    if me.sees_ephemeral(frame) {
+        send(hub, socket, frame.to_string()).await
+    } else {
+        Ok(())
+    }
+}
+
 /// A send that does not finish within the limit drops the socket. Nothing queues behind it
 /// except the bounded broadcast backlog, and a socket that falls past that gets `resync`.
 async fn send(hub: &Hub, socket: &mut WebSocket, text: String) -> Step {
@@ -827,5 +932,56 @@ mod tests {
         assert_eq!(Close::Removed.frame().code, 4003);
         assert_eq!(Close::Resync.frame().code, 4002);
         assert_eq!(Close::Restart.frame().code, 1012);
+    }
+
+    fn bot(scopes: &[&str]) -> super::Me {
+        super::Me {
+            token: String::new(),
+            user_id: "b".to_string(),
+            role: "bot".to_string(),
+            permissions: 0,
+            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_bot_scope_gates_room_and_member_frames() {
+        let rooms = bot(&["rooms.read"]);
+        assert!(rooms.sees_topic("room.created"));
+        assert!(!rooms.sees_topic("member.joined"));
+        assert!(rooms.sees_ephemeral(r#"{"type":"call.joined","room_id":"r"}"#));
+        assert!(!rooms.sees_ephemeral(r#"{"type":"presence","user_id":"u","online":true}"#));
+        assert_eq!(rooms.caller().scopes, vec!["rooms.read".to_string()]);
+
+        let members = bot(&["members.read"]);
+        assert!(!members.sees_topic("room.deleted"));
+        assert!(members.sees_topic("member.renamed"));
+        assert!(members.sees_ephemeral(r#"{"type":"presence","user_id":"u","online":false}"#));
+        assert!(!members.sees_ephemeral(r#"{"type":"call.left","room_id":"r"}"#));
+
+        let unknown = bot(&["rooms.write"]);
+        assert!(!unknown.sees_topic("room.created"));
+        assert!(!unknown.sees_topic("member.removed"));
+        assert!(!unknown.sees_topic("message.created"));
+        assert!(!unknown.sees_topic("future.secret"));
+        assert!(!unknown.sees_ephemeral(r#"{"type":"message.created"}"#));
+        assert!(!unknown.sees_ephemeral(r#"{"type":"future.secret"}"#));
+
+        let person = super::Me {
+            token: String::new(),
+            user_id: "u".to_string(),
+            role: "member".to_string(),
+            permissions: 0,
+            scopes: Vec::new(),
+        };
+        assert!(person.sees_topic("room.created"));
+        assert!(person.sees_ephemeral(r#"{"type":"presence","user_id":"u","online":true}"#));
+        assert!(person.caller().scopes.is_empty());
+        assert!(super::changes_call("call.join"));
+        assert!(super::changes_call("call.offer"));
+        assert!(super::changes_call("call.moderate"));
+        assert!(super::changes_call("call.move"));
+        assert!(super::changes_call("call.e2ee"));
+        assert!(!super::changes_call("ping"));
     }
 }

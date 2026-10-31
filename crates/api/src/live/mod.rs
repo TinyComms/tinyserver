@@ -1,6 +1,7 @@
-//! `GET /v1/live`: one WebSocket per signed-in device. Durable events come from the outbox in
-//! seq order, presence, call occupancy, and call signaling from memory. The frames are in
-//! `docs/calls.md`.
+//! `GET /v1/live`: one WebSocket per signed-in device, or per bot token. Durable events come
+//! from the outbox in seq order, presence, call occupancy, and call signaling from memory. The
+//! frames are in `docs/calls.md`. A bot is not a member. It receives room events when it has
+//! `rooms.read` and member events when it has `members.read`.
 
 mod call;
 mod e2ee;
@@ -20,7 +21,7 @@ use axum::{Json, Router};
 use db::{PgPool, SessionError};
 use serde::Serialize;
 
-use crate::session::bearer;
+use crate::session::{presented, Presented};
 use hub::Hub;
 
 /// Caps and timers for live sockets. `Default` is what the server runs.
@@ -161,6 +162,7 @@ fn refuse(status: StatusCode, error: &'static str) -> Response {
 }
 
 /// The session is checked before the upgrade, so a bad token is a plain 401.
+/// `Authorization: Bot <token>` opens the same socket when the bot token is live.
 async fn upgrade(
     State(live): State<Live>,
     headers: HeaderMap,
@@ -168,18 +170,34 @@ async fn upgrade(
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     let hub = live.hub;
-    let Some(token) = bearer(&headers) else {
-        return refuse(StatusCode::UNAUTHORIZED, "unauthorized");
-    };
-    let identity = match db::current_session(&hub.pool, token).await {
-        Ok(identity) => identity,
-        Err(SessionError::Unauthorized) => {
-            return refuse(StatusCode::UNAUTHORIZED, "unauthorized");
+    let me = match presented(&headers) {
+        Some(Presented::Bearer(token)) => {
+            let identity = match db::current_session(&hub.pool, token).await {
+                Ok(identity) => identity,
+                Err(error) => return session_unavailable(error),
+            };
+            socket::Me {
+                token: token.to_string(),
+                user_id: identity.user_id,
+                role: identity.role,
+                permissions: identity.permissions,
+                scopes: Vec::new(),
+            }
         }
-        Err(SessionError::Database(error)) => {
-            tracing::warn!(%error, "live session check failed");
-            return refuse(StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        Some(Presented::Bot(token)) => {
+            let bot = match db::authenticate_bot(&hub.pool, token).await {
+                Ok(bot) => bot,
+                Err(error) => return session_unavailable(error),
+            };
+            socket::Me {
+                token: token.to_string(),
+                user_id: bot.id,
+                role: "bot".to_string(),
+                permissions: 0,
+                scopes: bot.scopes,
+            }
         }
+        None => return refuse(StatusCode::UNAUTHORIZED, "unauthorized"),
     };
     let Ok(since) = parse_since(query.as_deref()) else {
         return refuse(StatusCode::BAD_REQUEST, "invalid");
@@ -191,19 +209,29 @@ async fn upgrade(
     if hub.closing() {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "restarting");
     }
+    if tokio::time::timeout(Duration::from_secs(5), hub.ready())
+        .await
+        .is_err()
+    {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    }
     let Some(slot) = hub.reserve() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "busy");
-    };
-    let me = socket::Me {
-        token: token.to_string(),
-        user_id: identity.user_id,
-        role: identity.role,
-        permissions: identity.permissions,
     };
     let frame = hub.limits.frame_bytes;
     ws.max_message_size(frame)
         .max_frame_size(frame)
         .on_upgrade(move |socket| socket::run(hub, socket, slot, me, since))
+}
+
+fn session_unavailable(error: SessionError) -> Response {
+    match error {
+        SessionError::Unauthorized => refuse(StatusCode::UNAUTHORIZED, "unauthorized"),
+        SessionError::Database(error) => {
+            tracing::warn!(%error, "live session check failed");
+            refuse(StatusCode::INTERNAL_SERVER_ERROR, "unavailable")
+        }
+    }
 }
 
 /// `since` is a seq the client already has. Other parameters are ignored.

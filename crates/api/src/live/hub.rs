@@ -35,6 +35,7 @@ pub(crate) struct Hub {
     drained: Notify,
     stop: watch::Sender<bool>,
     dispatcher: Mutex<Option<JoinHandle<()>>>,
+    ready: watch::Sender<bool>,
     pub media: Option<sfu::Media>,
     /// People connected since `last_seen_at` was last written.
     seen: Mutex<HashSet<String>>,
@@ -90,6 +91,7 @@ impl People {
 /// Online while this exists. It outlives the last socket by the presence grace.
 #[derive(Default)]
 struct Person {
+    bot: bool,
     conns: Vec<Conn>,
     epoch: u64,
 }
@@ -146,6 +148,7 @@ impl Hub {
             drained: Notify::new(),
             stop,
             dispatcher: Mutex::new(None),
+            ready: watch::channel(false).0,
             media,
             seen: Mutex::new(HashSet::new()),
         });
@@ -183,6 +186,11 @@ impl Hub {
             Some(media) if media.running() => "up",
             Some(_) => "down",
         }
+    }
+
+    /// Do not establish a socket cursor before the dispatcher has its starting cursor.
+    pub async fn ready(&self) {
+        let _ = self.ready.subscribe().wait_for(|ready| *ready).await;
     }
 
     pub fn closing(&self) -> bool {
@@ -223,7 +231,7 @@ impl Hub {
 
     /// Adds a socket for `user_id`. The first one brings the person online. Past the per-user
     /// cap, the oldest socket is told to close.
-    pub fn join(&self, user_id: &str) -> Joined {
+    pub fn join(&self, user_id: &str, bot: bool) -> Joined {
         let (kick, kicked) = oneshot::channel();
         let (direct, inbox) = mpsc::channel(DIRECT);
         let mut people = lock(&self.people);
@@ -231,6 +239,7 @@ impl Hub {
         let conn = people.next_conn;
         let arrived = !people.users.contains_key(user_id);
         let person = people.users.entry(user_id.to_string()).or_default();
+        person.bot = bot;
         while person.conns.len() >= self.limits.sockets_per_user.max(1) {
             let oldest = person.conns.remove(0);
             let _ = oldest.kick.send(Close::Replaced);
@@ -240,12 +249,17 @@ impl Hub {
             kick,
             direct,
         });
-        if arrived {
+        if arrived && !bot {
             self.announce(user_id, true);
         }
         // Subscribed under the lock, so every presence frame after this snapshot reaches it.
         let presence = self.ephemeral.subscribe();
-        let mut online: Vec<String> = people.users.keys().cloned().collect();
+        let mut online: Vec<String> = people
+            .users
+            .iter()
+            .filter(|(_, person)| !person.bot)
+            .map(|(id, _)| id.clone())
+            .collect();
         online.sort();
         Joined {
             conn,
@@ -282,8 +296,10 @@ impl Hub {
                 .get(&user_id)
                 .is_some_and(|person| person.conns.is_empty() && person.epoch == epoch);
             if gone {
-                people.users.remove(&user_id);
-                hub.announce(&user_id, false);
+                let person = people.users.remove(&user_id);
+                if person.is_some_and(|person| !person.bot) {
+                    hub.announce(&user_id, false);
+                }
             }
         });
     }
@@ -838,6 +854,7 @@ async fn dispatch(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     };
+    hub.ready.send_replace(true);
     let mut listener: Option<PgListener> = None;
     let mut poll = tokio::time::interval(hub.limits.poll);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

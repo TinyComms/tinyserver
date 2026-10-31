@@ -151,15 +151,54 @@ async fn bootstrap(force: bool) -> anyhow::Result<()> {
         .and_then(|origin| join_code(&origin, &issued.token));
     println!();
     println!("Owner invite, single use, until {expires_at}:");
+    if let Ok(origin) = env_var("TINYSERVER_PUBLIC_URL") {
+        if let Some(link) = join_url(&origin, &issued.token) {
+            println!("  Link: {link}");
+        }
+    }
     match code {
-        Some(code) => println!("  {code}"),
-        None => println!("  {}", issued.token),
+        Some(code) => println!("  Code: {code}"),
+        None => println!("  Token: {}", issued.token),
     }
     println!(
         "Paste it into tinyclient's \"Join a server\" and sign in. That person becomes the owner."
     );
     println!();
     Ok(())
+}
+
+/// Shareable URL; use the same strict origin rules as the client link parser.
+fn join_url(origin: &str, token: &str) -> Option<String> {
+    let origin = origin.trim().trim_end_matches('/');
+    if origin.len() > 512
+        || origin
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return None;
+    }
+    let (_, authority) = origin.split_once("://")?;
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.ends_with(':')
+        || authority.ends_with('.')
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(origin).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none_or(|host| host.ends_with('.'))
+        || parsed.port() == Some(0)
+        || token.is_empty()
+        || token.len() > 256
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let code = join_code(&parsed.origin().ascii_serialization(), token)?;
+    (code.len() <= 2048).then(|| format!("https://tinyclient.io/invite#{code}"))
 }
 
 /// tinyclient's invite code: `tc1.`, the server origin in hex, `.`, the invite token.
@@ -531,7 +570,20 @@ fn env_var(name: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::join_code;
+    use super::{join_code, join_url};
+
+    #[test]
+    fn owner_link_contains_the_compatible_invite_code() {
+        assert_eq!(
+            join_url("https://a.b/", "tok-en_1").as_deref(),
+            Some("https://tinyclient.io/invite#tc1.68747470733a2f2f612e62.tok-en_1")
+        );
+        assert!(join_url("https://user@host", "token").is_none());
+        assert!(join_url("https://host/path", "token").is_none());
+        assert!(join_url("ftp://host", "token").is_none());
+        assert!(join_url("https://host", "bad.token").is_none());
+        assert!(join_url("http://[::1]:8080", "token").is_some());
+    }
 
     #[test]
     fn an_owner_invite_prints_as_a_tinyclient_code() {

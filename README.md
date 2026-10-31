@@ -15,6 +15,7 @@ The project is early. People sign in through an OpenID Connect provider. An owne
 | **Roles** | Roles carry permission bits and a position; owners are a flag above them. Each room can allow or deny bits per role. You act only on people and roles below your rank. Details in [`docs/server.md`](docs/server.md). |
 | **Rooms** | A member lists the rooms they may see, in categories, with their own permissions in each. `manage_channels` adds, edits, orders, and removes rooms and categories; a room has a topic, a user limit, a bitrate, push-to-talk only, and video on or off. |
 | **People** | A member lists people, with their roles and when they were last seen. With the permission, someone gives roles, kicks with a reason, times out for up to 28 days, or bans; a ban holds every sign-in identity of that person, so no invite or group lets them back. A removed or banned person is signed out everywhere. The last owner stays. |
+| **Bots** | Someone with `manage_server` calls `POST /v1/bots` with `{name, scopes}` or `{name, permissions}` and is shown the token once. `permissions` `1` is `rooms.read` and `512` is `rooms.write`. When both are sent, the integer wins. The bot uses `Authorization: Bot <token>`. `rooms.read` lists rooms and receives room and call events on `GET /v1/live`. `rooms.write` adds, renames, and removes rooms. `members.read` lists people and receives member and presence events. A bot with neither, or only `rooms.write`, stays connected and receives no room or member payload. It cannot join or change a call. `GET /v1/bots` lists them. `DELETE /v1/bots/{id}` revokes the token. A bot is not a member. |
 | **Messages** | Someone who can manage channels creates a text channel. A member who can view it reads it, and one who can speak posts, reacts, and uploads. `POST /v1/directs` opens a direct conversation with another member. The author can edit or soft-delete a message. A `client_id` makes a retry return the same message. `POST /v1/media` takes an image, GIF, video, or file. Images and GIFs start at 8 MiB, and video and other files at 25 MiB; someone who can manage the server sets either, up to 100 MiB, on `PATCH /v1/server`. Reads move a cursor forward. Channel events go to every live socket. Direct messages, typing, and direct read cursors go only to the two people. |
 | **Invites** | `create_invites` makes an invite with a label, roles to give, a number of uses, and an expiry: 7 days and one use unless asked otherwise. The token is returned once. `DELETE /v1/invites/{id}` revokes one. tinyclient sends the token with a sign-in, which makes the account, or brings an existing one back. |
 | **Audit** | `view_audit_log` reads `GET /v1/audit`, with names and reasons, paged with `before`, filtered by actor and action. |
@@ -78,3 +79,21 @@ Each test creates its own database as `app_owner`, migrates it, serves it as `ap
 | [`crates/server`](crates/server) | `migrate`, `bootstrap`, `serve`, and `identities` and `relink-identity` for a provider whose subjects changed |
 | [`crates/sfu`](crates/sfu) | The SFU: one thread, one UDP socket and an ICE-TCP listener on the same port, str0m. Also the headless test client that tinyclient's `mediad` follows, and its canned H.264 clips in [`fixtures`](crates/sfu/fixtures) |
 | [`fuzz`](fuzz) | cargo-fuzz targets for live-socket frames, SDP offers, ICE-TCP framing, packets into str0m, and video routing. Outside the workspace; `cargo +nightly fuzz run sdp_offer` |
+
+## Application bots
+
+Create an installation with a member session and `manage_server` permission:
+
+```http
+POST /v1/bots
+Authorization: Bearer <member-session>
+Content-Type: application/json
+
+{"name":"Herald","scopes":["rooms.read","members.read"]}
+```
+
+The response contains the token once. Store it privately, then use `Authorization: Bot <token>`. `GET /v1/bots` lists installations without tokens; `DELETE /v1/bots/{id}` revokes one. Existing sockets notice revocation at their next credential recheck.
+
+`rooms.read` permits room listing and public room/call occupancy events. `members.read` permits member listing and presence/member events. `rooms.write` permits room creation, rename, settings changes, and deletion. A `permissions` integer may replace the scopes array: `1` grants `rooms.read`, `512` grants `rooms.write`; members.read must be requested through scopes. If both forms are present, permissions takes precedence.
+
+Bots are not members, do not appear online as people, and cannot join/control calls, receive call keys, read/post messages, create invites, or manage roles. The desktop bot API helper is available to Rust callers; this release does not add a bot management screen.

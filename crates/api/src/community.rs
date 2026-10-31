@@ -15,7 +15,7 @@ use db::{
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::session::bearer;
+use crate::session::{presented, Presented};
 
 pub fn routes() -> Router<PgPool> {
     Router::new()
@@ -217,14 +217,29 @@ fn session_failure(error: SessionError) -> ApiError {
 }
 
 pub(crate) async fn caller(pool: &PgPool, headers: &HeaderMap) -> Result<Caller, ApiError> {
-    let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
-    let identity = db::current_session(pool, token)
-        .await
-        .map_err(session_failure)?;
-    Ok(Caller {
-        user_id: identity.user_id,
-        role: identity.role,
-    })
+    match presented(headers) {
+        Some(Presented::Bearer(token)) => {
+            let identity = db::current_session(pool, token)
+                .await
+                .map_err(session_failure)?;
+            Ok(Caller {
+                user_id: identity.user_id,
+                role: identity.role,
+                scopes: Vec::new(),
+            })
+        }
+        Some(Presented::Bot(token)) => {
+            let bot = db::authenticate_bot(pool, token)
+                .await
+                .map_err(session_failure)?;
+            Ok(Caller {
+                user_id: bot.id,
+                role: "bot".to_string(),
+                scopes: bot.scopes,
+            })
+        }
+        None => Err(ApiError::Unauthorized),
+    }
 }
 
 pub(crate) fn idempotency_key(headers: &HeaderMap) -> Option<&str> {

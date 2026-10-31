@@ -182,6 +182,7 @@ async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
         let owner = Caller {
             user_id: opened.identity.user_id,
             role: opened.identity.role,
+            scopes: Vec::new(),
         };
         assert_eq!(owner.role, "owner");
         let guest_email = "guest@tinyserver.test";
@@ -248,6 +249,7 @@ async fn an_owner_invites_a_person_who_leaves_and_comes_back() {
         let guest = Caller {
             user_id: accepted.user_id.clone(),
             role: accepted.role.clone(),
+            scopes: Vec::new(),
         };
         let guest_token = session(&db, &guest.user_id).await;
         assert_eq!(guest.role, "member");

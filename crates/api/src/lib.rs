@@ -5,6 +5,7 @@
 mod account;
 mod admin;
 mod auth;
+mod bot;
 mod community;
 mod health;
 mod limit;
@@ -44,6 +45,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(account::routes())
         .merge(community::routes())
         .merge(admin::routes())
+        .merge(bot::routes())
         .merge(messages::routes());
     if let Some(live) = live {
         routes = routes.merge(live::routes(live));

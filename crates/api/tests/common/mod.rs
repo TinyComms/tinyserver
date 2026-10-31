@@ -164,6 +164,7 @@ pub async fn first_owner(db: &TestDb) -> Caller {
     Caller {
         user_id: signed_in.user_id,
         role: signed_in.role,
+        scopes: Vec::new(),
     }
 }
 
@@ -196,6 +197,7 @@ pub async fn join(db: &TestDb, by: &Caller, email: &str, role: &str) -> (Caller,
         Caller {
             user_id: signed_in.user_id,
             role: signed_in.role,
+            scopes: Vec::new(),
         },
         token,
     )
@@ -229,6 +231,7 @@ pub struct Call<'a> {
     pub method: Method,
     pub path: &'a str,
     pub token: Option<&'a str>,
+    pub scheme: Option<&'a str>,
     pub body: Option<Value>,
     pub address: Option<&'a str>,
     pub idempotency_key: Option<&'a str>,
@@ -240,6 +243,7 @@ impl<'a> Call<'a> {
             method,
             path,
             token: None,
+            scheme: None,
             body: None,
             address: None,
             idempotency_key: None,
@@ -248,6 +252,12 @@ impl<'a> Call<'a> {
 
     pub fn token(mut self, token: &'a str) -> Self {
         self.token = Some(token);
+        self
+    }
+
+    pub fn bot(mut self, token: &'a str) -> Self {
+        self.token = Some(token);
+        self.scheme = Some("Bot");
         self
     }
 
@@ -279,7 +289,8 @@ impl<'a> Call<'a> {
             request = request.header("idempotency-key", key);
         }
         if let Some(token) = self.token {
-            request = request.header("authorization", format!("Bearer {token}"));
+            let scheme = self.scheme.unwrap_or("Bearer");
+            request = request.header("authorization", format!("{scheme} {token}"));
         }
         let body = match self.body {
             Some(body) => {
