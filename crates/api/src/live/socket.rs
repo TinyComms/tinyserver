@@ -491,6 +491,8 @@ fn typing_code(error: &db::MessageError) -> &'static str {
         }
         db::MessageError::Invalid => "bad_frame",
         db::MessageError::TooLarge | db::MessageError::UnsupportedMedia => "bad_frame",
+        db::MessageError::Scanning | db::MessageError::Blocked => "forbidden",
+        db::MessageError::Unavailable => "unavailable",
         db::MessageError::Store(error) => {
             tracing::warn!(%error, "typing check failed");
             "unavailable"

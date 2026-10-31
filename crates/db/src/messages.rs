@@ -5,12 +5,16 @@
 //! here, before SQL, because a bot is not a member.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 use crate::community::{scope, Caller, CommunityError};
+use crate::scan::{ScanEngine, ScanVerdict};
 use crate::DbError;
 
 #[cfg(test)]
@@ -49,6 +53,12 @@ pub enum MessageError {
     TooLarge,
     #[error("unsupported media")]
     UnsupportedMedia,
+    #[error("scanning")]
+    Scanning,
+    #[error("blocked")]
+    Blocked,
+    #[error("unavailable")]
+    Unavailable,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -352,6 +362,7 @@ pub async fn save_attachment(
     pool: &PgPool,
     caller: &Caller,
     upload: &NewAttachment,
+    engine: &dyn ScanEngine,
 ) -> Result<Value, MessageError> {
     person(caller)?;
     let mut tx = scope(pool, caller).await.map_err(from_community)?;
@@ -388,22 +399,48 @@ pub async fn save_attachment(
         .as_ref()
         .map(|raster| Some(raster.height))
         .unwrap_or(upload.height);
-    let row: Value = sqlx::query_scalar("SELECT app_save_attachment($1, $2, $3, $4, $5, $6, $7)")
-        .bind(&prepared.name)
-        .bind(mime)
-        .bind(kind)
-        .bind(i32::try_from(bytes.len()).map_err(|_| MessageError::TooLarge)?)
-        .bind(width)
-        .bind(height)
-        .bind(upload.duration)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(message_sql)?;
+    let mut row: Value =
+        sqlx::query_scalar("SELECT app_save_attachment($1, $2, $3, $4, $5, $6, $7)")
+            .bind(&prepared.name)
+            .bind(mime)
+            .bind(kind)
+            .bind(i32::try_from(bytes.len()).map_err(|_| MessageError::TooLarge)?)
+            .bind(width)
+            .bind(height)
+            .bind(upload.duration)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(message_sql)?;
     let Some(id) = row.get("id").and_then(Value::as_str) else {
         return Err(MessageError::Invalid);
     };
     let id = id.to_string();
-    write_upload(&id, bytes)?;
+    if let Err(error) = write_upload(&id, bytes) {
+        abort_upload(tx, &id).await;
+        return Err(error);
+    }
+    if let Err(error) = set_scan(&mut tx, &id, "scanning").await {
+        abort_upload(tx, &id).await;
+        return Err(error);
+    }
+    match scan_bytes(engine, bytes, mime, kind).await {
+        ScanVerdict::Clean => {}
+        ScanVerdict::Blocked { .. } => {
+            abort_upload(tx, &id).await;
+            return Err(MessageError::Blocked);
+        }
+        ScanVerdict::Unavailable => {
+            abort_upload(tx, &id).await;
+            return Err(MessageError::Unavailable);
+        }
+    }
+    if let Err(error) = set_scan(&mut tx, &id, "clean").await {
+        abort_upload(tx, &id).await;
+        return Err(error);
+    }
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("scan_status".into(), Value::from("clean"));
+    }
     if let Err(error) = tx.commit().await {
         remove_files(std::slice::from_ref(&id));
         return Err(message_sql(error));
@@ -515,6 +552,9 @@ fn message_sql(error: sqlx::Error) -> MessageError {
         "42501" => MessageError::Forbidden,
         "22023" if message.contains("too large") => MessageError::TooLarge,
         "22023" if message.contains("unsupported media") => MessageError::UnsupportedMedia,
+        "P0423" => MessageError::Scanning,
+        "P0403" => MessageError::Blocked,
+        "P0503" => MessageError::Unavailable,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
@@ -680,6 +720,52 @@ fn write_upload(id: &str, bytes: &[u8]) -> Result<(), MessageError> {
         return Err(MessageError::Store(error));
     }
     Ok(())
+}
+
+async fn set_scan(
+    tx: &mut Transaction<'_, Postgres>,
+    id: &str,
+    status: &str,
+) -> Result<(), MessageError> {
+    sqlx::query("SELECT app_set_attachment_scan($1::uuid, $2)")
+        .bind(id)
+        .bind(status)
+        .execute(&mut **tx)
+        .await
+        .map_err(message_sql)?;
+    Ok(())
+}
+
+async fn abort_upload(tx: Transaction<'_, Postgres>, id: &str) {
+    remove_files(&[id.to_string()]);
+    let _ = tx.rollback().await;
+}
+
+async fn scan_bytes(engine: &dyn ScanEngine, bytes: &[u8], mime: &str, kind: &str) -> ScanVerdict {
+    let timed = tokio::time::timeout(scan_timeout(), async {
+        let Ok(_permit) = scan_slots().acquire().await else {
+            return ScanVerdict::Unavailable;
+        };
+        engine.scan(bytes, mime, kind)
+    })
+    .await;
+    timed.unwrap_or(ScanVerdict::Unavailable)
+}
+
+fn scan_timeout() -> Duration {
+    let parsed = std::env::var("TINYSERVER_SCAN_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let ms = match parsed {
+        Some(0) | None => 8_000,
+        Some(ms) => ms.min(15_000),
+    };
+    Duration::from_millis(ms)
+}
+
+fn scan_slots() -> &'static Semaphore {
+    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| Semaphore::new(3))
 }
 
 /// One unicode grapheme, 1 to 16 scalars, with no ASCII control.

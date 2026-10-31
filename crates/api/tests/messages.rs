@@ -454,6 +454,134 @@ async fn an_admin_can_lower_the_image_cap() {
     .await;
 }
 
+#[tokio::test]
+async fn an_eicar_upload_is_blocked() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-eicar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let (status, denied) =
+            upload(&app, &owner_token, "eicar.txt", "text/plain", eicar, &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert_eq!(denied["error"], "blocked");
+
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id::text FROM attachments")
+            .fetch_all(&db.owner)
+            .await
+            .expect("attachment ids");
+        assert!(
+            ids.is_empty(),
+            "blocked upload must not commit a row: {ids:?}"
+        );
+        if let Some(id) = denied["id"].as_str() {
+            let (status, _) = download(&app, &member_token, id).await;
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "member GET of blocked id must never be 200"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_message_cannot_name_an_unscanned_attachment() {
+    run(|db| async move {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyserver-uploads-unscanned-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&token)
+            .json(json!({"name": "files"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("attachment id").to_string();
+
+        sqlx::query("UPDATE attachments SET scan_status = 'scanning' WHERE id = $1::uuid")
+            .bind(&id)
+            .execute(&db.owner)
+            .await
+            .expect("mark scanning");
+
+        let (status, denied) = send_message(
+            &app,
+            &token,
+            &channel_id,
+            json!({"body": "", "attachment_ids": [id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+        assert_eq!(denied["error"], "invalid");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_scanning_attachment_download_is_locked() {
+    run(|db| async move {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyserver-uploads-scanning-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("attachment id").to_string();
+
+        sqlx::query("UPDATE attachments SET scan_status = 'scanning' WHERE id = $1::uuid")
+            .bind(&id)
+            .execute(&db.owner)
+            .await
+            .expect("mark scanning");
+
+        let (status, bytes) = download(&app, &token, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::LOCKED,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(body["error"], "scanning");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
 async fn send_message(
     app: &Router,
     token: &str,

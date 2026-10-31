@@ -2,17 +2,19 @@
 //!
 //! Upload bytes stay on this request. Live frames carry ids, never the file.
 
+use std::sync::Arc;
+
 use axum::body::to_bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use db::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
     list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
     save_attachment, set_channel_override, toggle_reaction, update_channel, Caller, MessageError,
-    NewAttachment, PgPool,
+    NewAttachment, PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -116,7 +118,10 @@ enum Error {
     Invalid,
     TooLarge,
     UnsupportedMedia,
+    Scanning,
+    Blocked,
     Unavailable,
+    ServiceUnavailable,
 }
 
 impl IntoResponse for Error {
@@ -130,7 +135,10 @@ impl IntoResponse for Error {
             Self::Invalid => (StatusCode::BAD_REQUEST, "invalid"),
             Self::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             Self::UnsupportedMedia => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media"),
+            Self::Scanning => (StatusCode::LOCKED, "scanning"),
+            Self::Blocked => (StatusCode::FORBIDDEN, "blocked"),
             Self::Unavailable => (StatusCode::INTERNAL_SERVER_ERROR, "unavailable"),
+            Self::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -145,6 +153,9 @@ fn lift(error: MessageError) -> Error {
         MessageError::Invalid => Error::Invalid,
         MessageError::TooLarge => Error::TooLarge,
         MessageError::UnsupportedMedia => Error::UnsupportedMedia,
+        MessageError::Scanning => Error::Scanning,
+        MessageError::Blocked => Error::Blocked,
+        MessageError::Unavailable => Error::ServiceUnavailable,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -376,6 +387,7 @@ async fn read(
 
 async fn upload(
     State(pool): State<PgPool>,
+    Extension(engine): Extension<Arc<dyn ScanEngine>>,
     headers: HeaderMap,
     request: Request,
 ) -> Result<(StatusCode, Json<Value>), Error> {
@@ -388,7 +400,7 @@ async fn upload(
         .await
         .map_err(|_| Error::TooLarge)?;
     let upload = parse_upload(content_type, &body).map_err(lift)?;
-    let saved = save_attachment(&pool, &caller, &upload)
+    let saved = save_attachment(&pool, &caller, &upload, engine.as_ref())
         .await
         .map_err(lift)?;
     Ok((StatusCode::CREATED, Json(saved)))

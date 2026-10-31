@@ -20,12 +20,15 @@ pub mod fuzz;
 pub use live::{Limits, Live};
 pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};
 
+use std::sync::Arc;
+
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::Response;
+use axum::Extension;
 use axum::Router;
-use db::PgPool;
+use db::{FakeEngine, PgPool, ScanEngine};
 
 /// The REST routes without `GET /v1/live`. Without `sign_in` there is no `/v1/auth`, so no one
 /// can sign in; tests open sessions through `db`.
@@ -57,6 +60,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(middleware::from_fn(limit::guard))
         .layer(middleware::from_fn(harden))
+        .layer(Extension(Arc::new(FakeEngine) as Arc<dyn ScanEngine>))
         .with_state(pool)
 }
 
