@@ -139,6 +139,8 @@ pub struct Member {
     pub timeout_until: Option<String>,
     /// `invite` or `groups`; `None` for members from before it was recorded.
     pub joined_via: Option<String>,
+    /// SHA-256 of their picture, when they have set one.
+    pub avatar: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -588,7 +590,7 @@ fn member_select(filter: &str) -> String {
                 to_char(m.last_seen_at AT TIME ZONE 'UTC', '{STAMP}'),
                 CASE WHEN m.timeout_until > now()
                      THEN to_char(m.timeout_until AT TIME ZONE 'UTC', '{STAMP}') END,
-                m.joined_via
+                m.joined_via, u.avatar_sha
          FROM memberships m
          JOIN users u ON u.id = m.user_id
          {filter}
@@ -1405,6 +1407,7 @@ fn member_from(row: &PgRow) -> Result<Member, CommunityError> {
         last_seen_at: row.try_get(7).map_err(from_sql)?,
         timeout_until: row.try_get(8).map_err(from_sql)?,
         joined_via: row.try_get(9).map_err(from_sql)?,
+        avatar: row.try_get(10).map_err(from_sql)?,
     })
 }
 

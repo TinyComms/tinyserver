@@ -116,7 +116,7 @@ async fn a_room_the_owner_makes_reaches_a_member() {
         assert_eq!(
             event["member"],
             json!({"user_id": member.user_id, "display_name": "Renamed", "role": "member",
-                   "owner": false, "roles": []})
+                   "owner": false, "roles": [], "avatar": null})
         );
     })
     .await;
@@ -160,7 +160,7 @@ async fn invite_events_reach_admins_and_not_members() {
         assert_eq!(event["type"], "member.joined", "{event}");
         assert_eq!(
             event["member"],
-            json!({"user_id": joined_id, "display_name": "New", "role": "member", "owner": false, "roles": []})
+            json!({"user_id": joined_id, "display_name": "New", "role": "member", "owner": false, "roles": [], "avatar": null})
         );
 
         let Ok(Wrote::Fresh(second)) = db::create_invite(&db.runtime, &owner, "admin", None).await
