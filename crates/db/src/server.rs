@@ -252,6 +252,15 @@ pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Needs manage_server. Checked before the icon is decoded, so someone who may not change it
+/// gets forbidden rather than a media error.
+pub async fn ensure_manage_server(pool: &PgPool, caller: &Caller) -> Result<(), CommunityError> {
+    let mut tx = scope(pool, caller).await?;
+    require(&mut tx, perm::MANAGE_SERVER).await?;
+    tx.commit().await.map_err(from_sql)?;
+    Ok(())
+}
+
 /// Needs manage_server. Returns the new icon's SHA-256 in hex. The caller checks the type and
 /// the size first.
 pub async fn set_icon(

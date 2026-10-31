@@ -169,6 +169,9 @@ async fn put_icon(
     if bytes.len() > db::ICON_MAX {
         return Err(ApiError::TooLarge);
     }
+    db::ensure_manage_server(&pool, &caller)
+        .await
+        .map_err(lift)?;
     let stored = db::prepare_icon(&bytes).map_err(icon_failure)?;
     let sha = db::set_icon(&pool, &caller, &stored.bytes, &stored.mime)
         .await
