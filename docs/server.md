@@ -56,8 +56,11 @@ Upgrading from the three fixed roles: `owner` became the owner flag, `admin` the
 | `hierarchy` | 403 | The person or role is at or above the caller |
 | `default_role` | 400 | @everyone cannot be deleted, renamed, or ordered |
 | `banned` | 403 | A banned person; `/v1/auth/callback` sends `error=banned` |
-| `too_large` | 413 | An icon over 256 KiB |
-| `unsupported_media` | 415 | An icon that is not PNG, JPEG, or WebP |
+| `too_large` | 413 | An icon over 256 KiB, or an upload over the server's cap |
+| `unsupported_media` | 415 | An icon that is not PNG, JPEG, or WebP; a refused attachment type; a liar file whose extension, MIME, and sniff disagree; PE (MZ) or ELF regardless of name |
+| `scanning` | 423 | `GET /v1/media/{id}` while the file is not yet clean |
+| `blocked` | 403 | The scanner blocked the file on upload or download |
+| `unavailable` | 503 | The scanner is down, timed out, or otherwise could not finish; upload gets no 201 |
 
 ## REST
 
@@ -65,7 +68,7 @@ Every route needs a session. "Any member" means any signed-in member.
 
 ### Capabilities and me
 
-`GET /v1/capabilities` (any member) → `{"version": "0.1.0", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls"]}`. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`.
+`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan"]}`. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means uploads are scanned before 201 and downloads stay gated until clean; clients without it keep the older upload behaviour.
 
 `GET /v1/me` and `PATCH /v1/me` add `owner`, `roles [id]` (most senior first), `permissions` (base), and `rank`.
 
@@ -73,8 +76,8 @@ Every route needs a session. "Any member" means any signed-in member.
 
 | Route | Who | |
 | --- | --- | --- |
-| `GET /v1/server` | any member | `{name, description, welcome, icon, default_room_id, afk_room_id, afk_timeout_secs, created_at}`. `icon` is the SHA-256 of the icon in hex, or `null`. A new server is "Tiny server". |
-| `PATCH /v1/server` | manage_server | Any of the writable fields; the room ids take `null`. Name 1 to 80 characters, description up to 500, welcome up to 2000, `afk_timeout_secs` 0 (off) to 86400. Returns the whole object. Audited `server.update`. |
+| `GET /v1/server` | any member | `{name, description, welcome, icon, default_room_id, afk_room_id, afk_timeout_secs, image_max_bytes, file_max_bytes, allow_archives, created_at}`. `icon` is the SHA-256 of the icon in hex, or `null`. A new server is "Tiny server". `image_max_bytes` defaults to 8 MiB (images and GIFs); `file_max_bytes` defaults to 25 MiB (video and every other kind); each may be set up to 100 MiB. `allow_archives` defaults to false. |
+| `PATCH /v1/server` | manage_server | Any of the writable fields; the room ids take `null`. Name 1 to 80 characters, description up to 500, welcome up to 2000, `afk_timeout_secs` 0 (off) to 86400, `image_max_bytes` and `file_max_bytes` each 1 to 100 MiB, `allow_archives` boolean. Returns the whole object. Audited `server.update`. |
 | `GET /v1/server/icon` | any member | The image, its `Content-Type`, and `ETag: "<sha>"`; `If-None-Match` gets 304. 404 without one. |
 | `PUT /v1/server/icon` | manage_server | The body is the image: PNG, JPEG, or WebP, read from its first bytes, up to 256 KiB. Every other route keeps the 8 KiB body cap. `{icon}`. Audited `server.icon`. |
 | `DELETE /v1/server/icon` | manage_server | 204 |
@@ -141,6 +144,30 @@ Accepting an invite makes the membership, gives its roles, counts a use, and rec
 ### Audit
 
 `GET /v1/audit?limit=1..200&before=<id>&actor=<user id>&action=<prefix>` (view_audit_log): newest first. Rows add `actor_name`, `subject_user_id`, `subject_name`, and `reason`. For the next page pass the last row's `id` as `before`. Actions added: `server.update`, `server.icon`, `role.create`, `role.update`, `role.delete`, `role.order`, `member.roles`, `member.owner`, `member.timeout`, `member.ban`, `member.unban`, `category.create`, `category.update`, `category.delete`, `layout.update`, `room.update`, `room.override`, `call.server_mute`, `call.move`. A kick's reason is on its `member.remove` row.
+
+## Messages and attachments
+
+Text channels, directs, and uploads are in [`calls.md`](calls.md#messages) for live topics. Recipients never `GET /v1/media/{id}` until the attachment is clean. `POST /v1/media` does not return 201 until then either; a message cannot reference an attachment that is still scanning, blocked, or in error.
+
+### Type policy
+
+These extensions are always refused (case-insensitive): `lnk`, `iso`, `img`, `vhd`, `vhdx`, `html`, `htm`, `hta`, `svg`, `js`, `vbs`, `cmd`, `bat`, `ps1`, `msi`, `scr`, `jar`, `exe`, `dll`, `com`, `pif`, `wsf`, `one`, `docm`, `xlsm`, `pptm`, `dotm`, `xltm`, `ppsm`. So are `image/svg+xml` and `text/html`, PE (MZ) and ELF magic regardless of filename, and any upload whose extension, declared MIME, and sniff disagree (415 `unsupported_media`).
+
+Raster uploads (`image/png`, `image/jpeg`, `image/webp`, `image/gif`) are re-encoded before they are written to disk; other kinds are stored as received after type checks.
+
+Archives (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused unless `allow_archives` is true on the server (default false; owners set it with `PATCH /v1/server`). When archives are allowed, `zip` is still capped: at most 1024 entries, each entry's uncompressed size at most four times its compressed size, total uncompressed at most 200 MiB, depth two (central directory only; an entry named as another archive counts as depth two and is not opened), no `..`, no symlink, no encrypted zip. Other archive kinds are accepted only when extension and MIME name the same archive type.
+
+### Scanning
+
+Production refuses to start unless `TINYSERVER_CLAMD_SOCKET` is set, except when `TINYSERVER_ALLOW_FAKE_SCAN=1` for local development and tests. Compose sets `TINYSERVER_CLAMD_SOCKET=clamd:3310` and `TINYSERVER_UPLOAD_DIR=/data/uploads`. Each scan may run up to `TINYSERVER_SCAN_TIMEOUT_MS` (default 8000, hard cap 15000). clamd runs beside yara-x rules; there is no separate content router.
+
+On upload, a blocked file is 403 `blocked` with no committed row. Scanner down or timed out is 503 `unavailable` with no 201. On download, still scanning is 423 `scanning`; blocked is 403 `blocked`; scanner error is 503 `unavailable`; missing id or no access is 404.
+
+### Media URLs and download
+
+Attachment objects in JSON responses carry a signed `url`: `/v1/media/{id}?ex=…&is=…&hm=…` (expiry, issued time, HMAC-SHA256). Clients fetch with Bearer auth and those query parameters. `GET /v1/media/{id}` without a valid triple may still work for a member with a session alone; the signed URL is what tinyclient uses.
+
+`Content-Disposition` is `inline` for PNG, JPEG, WebP, and GIF; everything else is `attachment`.
 
 ## Bootstrap
 
