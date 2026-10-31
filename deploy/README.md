@@ -82,13 +82,15 @@ Sessions already open keep working until they expire.
 
 ## The first owner
 
-There is no owner password. The first start migrates and, while there is no owner, prints a single-use owner invite that lasts 24 hours:
+There is no owner password. The first start migrates and, while there is no owner, writes a single-use owner invite that lasts 24 hours to a file on the container tmpfs. The log line only names that file.
 
 ```sh
-docker compose logs tinyserver | grep -A4 'Owner invite'
+docker compose exec tinyserver cat /var/lib/tinyserver/owner-invite
 ```
 
-`grep 'Owner invite'` matches the line that prints the token, and that line is printed once. A later start with no owner prints `No owner yet. The owner invite printed earlier works until …` and does not print the token again. Paste the code into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. Lost it, run `tinyserver bootstrap --owner-invite` for a new one, and the old one stops working. After that, starts leave the owner alone.
+It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. A later start with no owner does not write the token again. It prints that the file still works until the invite expires. The file is on a tmpfs, so recreating the container removes it; lost it, run `tinyserver bootstrap --owner-invite` for a new one, and the old one stops working. After an owner exists, the file is removed.
+
+`RUST_LOG` is ignored. Set `TINYSERVER_LOG_LEVEL` (`error`, `warn`, `info`, `debug`, or `trace`; default `info`). A debug bundle is written only when the process receives `SIGUSR1`, under `/var/lib/tinyserver/logs`, and old bundles are removed on the next start. Nothing in the log path leaves the box.
 
 A server from before sign-in moved to OIDC still has its owner, but that account has no provider identity and cannot sign in. Make an owner invite anyway, sign in with it, and remove the old account from the member list:
 

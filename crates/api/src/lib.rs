@@ -12,6 +12,7 @@ mod limit;
 mod live;
 pub mod media_sign;
 mod messages;
+mod observe;
 mod oidc;
 mod scan_clamd;
 mod session;
@@ -60,6 +61,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         routes = routes.merge(auth::routes(sign_in));
     }
     routes
+        .route_layer(middleware::from_fn(observe::http_span))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(middleware::from_fn(limit::guard))
         .layer(middleware::from_fn(harden))

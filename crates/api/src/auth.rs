@@ -25,7 +25,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use db::{AuthError, PgPool, SignupClaim};
+use db::{AuthError, GrantReason, PgPool, SignupClaim};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -149,17 +149,30 @@ async fn start(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<StartBody>, JsonRejection>,
 ) -> Result<Json<Started>, AuthApiError> {
-    let Json(body) = body.map_err(|_| AuthApiError::BadRequest)?;
+    let Json(body) = body.map_err(|_| {
+        auth_refused("/v1/auth/start", "bad_json");
+        AuthApiError::BadRequest
+    })?;
     let invite = body.invite.as_deref().filter(|invite| !invite.is_empty());
-    let provider = sign_in
-        .provider(body.provider.as_deref())
-        .ok_or(AuthApiError::BadRequest)?;
-    let valid = loopback_redirect(&body.redirect_uri)
-        && body.code_challenge_method == "S256"
-        && db::pkce_challenge_shaped(&body.code_challenge)
-        && client_state_shaped(&body.state)
-        && invite.is_none_or(invite_shaped);
-    if !valid {
+    let Some(provider) = sign_in.provider(body.provider.as_deref()) else {
+        auth_refused("/v1/auth/start", "provider_missing");
+        return Err(AuthApiError::BadRequest);
+    };
+    let reason = if !loopback_redirect(&body.redirect_uri) {
+        "bad_redirect"
+    } else if body.code_challenge_method != "S256"
+        || !db::pkce_challenge_shaped(&body.code_challenge)
+    {
+        "bad_pkce"
+    } else if !client_state_shaped(&body.state) {
+        "bad_state"
+    } else if !invite.is_none_or(invite_shaped) {
+        "bad_invite"
+    } else {
+        ""
+    };
+    if !reason.is_empty() {
+        auth_refused("/v1/auth/start", reason);
         return Err(AuthApiError::BadRequest);
     }
     let begun = provider.begin();
@@ -191,6 +204,19 @@ async fn start(
         begun.authorize_url
     };
     Ok(Json(Started { authorize_url }))
+}
+
+fn auth_refused(route: &'static str, reason: &'static str) {
+    tracing::warn!(route, reason, "auth refused");
+}
+
+pub(crate) fn grant_reason(reason: GrantReason) -> &'static str {
+    match reason {
+        GrantReason::Unknown => "unknown",
+        GrantReason::Used => "used",
+        GrantReason::Expired => "expired",
+        GrantReason::Verifier => "verifier",
+    }
 }
 
 fn join_url(public_url: &str, state: &str) -> String {
@@ -328,12 +354,14 @@ async fn callback(
     query: Result<Query<CallbackQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(query)) = query else {
+        auth_refused("/v1/auth/callback", "bad_json");
         return expired();
     };
     let Some(state) = query
         .state
         .filter(|state| !state.is_empty() && state.len() <= 256)
     else {
+        auth_refused("/v1/auth/callback", "bad_state");
         return expired();
     };
     let pending = match db::take_pending(&pool, &state).await {
@@ -348,6 +376,7 @@ async fn callback(
         |outcome: Outcome| back_to_client(&pending.client_redirect, &pending.client_state, outcome);
     // A provider removed from the configuration since the sign-in started.
     let Some(provider) = sign_in.provider(Some(&pending.provider)) else {
+        auth_refused("/v1/auth/callback", "provider_missing");
         return back(Outcome::Error("failed"));
     };
     if query
@@ -375,6 +404,7 @@ async fn callback(
         .code
         .filter(|code| !code.is_empty() && code.len() <= 2048)
     else {
+        auth_refused("/v1/auth/callback", "missing_code");
         return back(Outcome::Error("failed"));
     };
 
@@ -445,7 +475,10 @@ async fn token(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<TokenBody>, JsonRejection>,
 ) -> Result<Json<Opened>, AuthApiError> {
-    let Json(body) = body.map_err(|_| AuthApiError::InvalidGrant)?;
+    let Json(body) = body.map_err(|_| {
+        auth_refused("/v1/auth/token", "bad_json");
+        AuthApiError::InvalidGrant
+    })?;
     let opened = db::redeem_code(
         &pool,
         &body.code,
@@ -454,7 +487,9 @@ async fn token(
     )
     .await
     .map_err(|error| match error {
-        AuthError::NotMember | AuthError::Banned | AuthError::InvalidGrant => {
+        AuthError::NotMember | AuthError::Banned => AuthApiError::InvalidGrant,
+        AuthError::InvalidGrant(reason) => {
+            tracing::warn!(reason = grant_reason(reason), "auth grant refused");
             AuthApiError::InvalidGrant
         }
         AuthError::Database(error) => {
@@ -721,7 +756,16 @@ fn invite_shaped(invite: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_state_shaped, escape, loopback_redirect};
+    use super::{client_state_shaped, escape, grant_reason, loopback_redirect};
+    use db::GrantReason;
+
+    #[test]
+    fn grant_reasons_are_static() {
+        assert_eq!(grant_reason(GrantReason::Expired), "expired");
+        assert_eq!(grant_reason(GrantReason::Verifier), "verifier");
+        assert_eq!(grant_reason(GrantReason::Unknown), "unknown");
+        assert_eq!(grant_reason(GrantReason::Used), "used");
+    }
 
     #[test]
     fn only_a_loopback_callback_is_a_redirect() {

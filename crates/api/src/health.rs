@@ -35,6 +35,9 @@ async fn health(
             body.media = media;
             body.transports = transports;
             body.ok = body.ok && media != "down";
+            if body.schema == "missing" {
+                tracing::warn!("schema missing");
+            }
             let status = if body.ok {
                 StatusCode::OK
             } else {

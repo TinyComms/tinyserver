@@ -154,6 +154,7 @@ dependencies = [
  "davey",
  "db",
  "futures-util",
+ "getrandom 0.3.4",
  "http-body-util",
  "openidconnect",
  "openmls",

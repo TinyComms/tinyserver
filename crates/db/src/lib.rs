@@ -25,8 +25,8 @@ pub use account::{close_all_sessions, delete_avatar, get_avatar, rename_me, set_
 pub use auth::{
     claim_signup, end_provider_sessions, invited_pending, issue_code, list_identities,
     pkce_challenge_shaped, pkce_verifier_shaped, redeem_code, release_signup, relink_identity,
-    s256, save_pending, sign_in, take_pending, AuthError, Groups, Pending, PendingLogin, Profile,
-    ProviderLeg, Relinked, SignedIn, SignupClaim,
+    s256, save_pending, sign_in, take_pending, AuthError, GrantReason, Groups, Pending,
+    PendingLogin, Profile, ProviderLeg, Relinked, SignedIn, SignupClaim,
 };
 pub use bootstrap::{bootstrap, owner_exists, owner_invite, Bootstrap};
 pub use bot::{authenticate_bot, create_bot, list_bots, revoke_bot, Bot, BotIssued, BotSession};

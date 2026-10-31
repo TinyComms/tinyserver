@@ -79,6 +79,13 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
     };
     if let Some(gate) = gate {
         if !gate.allow(&client_key(request.headers())) {
+            let route = match request.uri().path() {
+                "/v1/auth/start" => "/v1/auth/start",
+                "/v1/auth/token" => "/v1/auth/token",
+                "/v1/auth/join" => "/v1/auth/join",
+                _ => "unknown",
+            };
+            tracing::warn!(route, "rate limited");
             if request.uri().path() == "/v1/auth/join" {
                 return crate::auth::slow_down_page();
             }

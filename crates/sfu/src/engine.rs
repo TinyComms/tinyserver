@@ -477,7 +477,18 @@ impl Engine {
             || from_source >= self.config.tcp_per_source
             || unverified >= self.config.tcp_unverified
         {
-            tracing::debug!(%peer, "media TCP stream refused");
+            let reason = if streams.len() >= self.config.tcp_streams
+                || unverified >= self.config.tcp_unverified
+            {
+                "budget"
+            } else {
+                "source_cap"
+            };
+            if crate::peer_ips_enabled() {
+                tracing::debug!(%peer, reason, "media dropped");
+            } else {
+                tracing::debug!(reason, "media dropped");
+            }
             return None;
         }
         let _ = socket.set_nodelay(true);
@@ -544,7 +555,11 @@ impl Engine {
     fn close_stream(&mut self, token: Token) {
         if let Some(stream) = self.tcp.close(token) {
             self.by_addr.remove(&(Protocol::Tcp, stream.conn.peer));
-            tracing::debug!(peer = %stream.conn.peer, "media TCP stream closed");
+            if crate::peer_ips_enabled() {
+                tracing::debug!(peer = %stream.conn.peer, "media TCP stream closed");
+            } else {
+                tracing::debug!("media TCP stream closed");
+            }
         }
     }
 
@@ -654,8 +669,8 @@ impl Engine {
                 Ok(candidate) => {
                     rtc.add_local_candidate(candidate);
                 }
-                Err(error) => {
-                    tracing::error!(?error, "media candidate refused");
+                Err(_error) => {
+                    tracing::warn!(direction = "offer", reason = "ice", "media failed");
                     let _ = reply.send(Err(Refused::Unavailable));
                     return;
                 }
@@ -664,7 +679,11 @@ impl Engine {
         let answer = match rtc.sdp_api().accept_offer(offer) {
             Ok(answer) => answer,
             Err(error) => {
-                tracing::info!(?error, "offer refused");
+                tracing::warn!(
+                    direction = "offer",
+                    reason = crate::rtc_reason(&error),
+                    "media failed"
+                );
                 let _ = reply.send(Err(Refused::BadSdp));
                 return;
             }
@@ -756,7 +775,12 @@ impl Engine {
         let answer = match peer.rtc.sdp_api().accept_offer(offer) {
             Ok(answer) => answer,
             Err(error) => {
-                tracing::info!(?error, "offer refused");
+                tracing::warn!(
+                    call_id,
+                    direction = "offer",
+                    reason = crate::rtc_reason(&error),
+                    "media failed"
+                );
                 let _ = reply.send(Err(Refused::BadSdp));
                 return;
             }
@@ -1025,7 +1049,9 @@ impl Engine {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 // An ICMP error from an earlier send. Not this read's problem.
-                Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
+                Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                    tracing::debug!(reason = "icmp", "media dropped");
+                }
                 Err(error) => {
                     tracing::warn!(%error, "media read failed");
                     return;
@@ -1045,6 +1071,7 @@ impl Engine {
         now: Instant,
     ) -> Option<PeerId> {
         if !self.sources.contains_key(&source) && self.sources.len() >= SOURCES {
+            tracing::debug!(reason = "source_cap", "media dropped");
             return None;
         }
         let (rate, burst) = (self.config.packets_per_second, self.config.packet_burst);
@@ -1082,7 +1109,7 @@ impl Engine {
         let peer = self.peers.get_mut(&id)?;
         peer.heard_at = now;
         if let Err(error) = peer.rtc.handle_input(input) {
-            tracing::info!(call_id = %peer.call_id, ?error, "media input refused");
+            tracing::warn!(call_id = %peer.call_id, direction = "input", reason = crate::rtc_reason(&error), "media failed");
             peer.rtc.disconnect();
         }
         self.drain(id);
@@ -1119,7 +1146,7 @@ impl Engine {
         for id in due {
             if let Some(peer) = self.peers.get_mut(&id) {
                 if let Err(error) = peer.rtc.handle_input(Input::Timeout(now)) {
-                    tracing::info!(call_id = %peer.call_id, ?error, "media timeout failed");
+                    tracing::warn!(call_id = %peer.call_id, direction = "input", reason = crate::rtc_reason(&error), "media failed");
                     peer.rtc.disconnect();
                 }
             }
@@ -1292,7 +1319,7 @@ impl Engine {
                 if let Err(error) =
                     writer.write(pt, data.network_time, data.time, data.data.clone())
                 {
-                    tracing::info!(call_id = %peer.call_id, ?error, "media write failed");
+                    tracing::warn!(call_id = %peer.call_id, direction = "audio", reason = crate::rtc_reason(&error), "media failed");
                     peer.rtc.disconnect();
                 }
                 let mut sink = Sink {
@@ -1332,6 +1359,9 @@ impl Engine {
         inbound.rid = data.rid;
         let fits = inbound.budget.take(size, now);
         if !fits {
+            if !inbound.broken {
+                tracing::debug!(call_id = %publisher.call_id, reason = "budget", "media dropped");
+            }
             inbound.broken = true;
         }
         let pass = fits && (keyframe || !inbound.broken);
@@ -1376,7 +1406,7 @@ impl Engine {
             };
             let at = MediaTime::new(out, Frequency::NINETY_KHZ);
             if let Err(error) = writer.write(pt, data.network_time, at, data.data.clone()) {
-                tracing::info!(call_id = %peer.call_id, ?error, "media write failed");
+                tracing::warn!(call_id = %peer.call_id, direction = "video", reason = crate::rtc_reason(&error), "media failed");
                 peer.rtc.disconnect();
             }
             let mut sink = Sink {
@@ -1419,7 +1449,7 @@ impl Engine {
         let rid = inbound.rid;
         if let Some(mut writer) = peer.rtc.writer(mid) {
             if let Err(error) = writer.request_keyframe(rid, KeyframeRequestKind::Pli) {
-                tracing::debug!(call_id = %peer.call_id, ?error, "keyframe request failed");
+                tracing::debug!(call_id = %peer.call_id, direction = "video", reason = crate::rtc_reason(&error), "media failed");
             }
         }
         self.drain(publisher);
@@ -1558,7 +1588,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
         let output = match peer.rtc.poll_output() {
             Ok(output) => output,
             Err(error) => {
-                tracing::info!(call_id = %peer.call_id, ?error, "media output failed");
+                tracing::warn!(call_id = %peer.call_id, direction = "output", reason = crate::rtc_reason(&error), "media failed");
                 peer.rtc.disconnect();
                 peer.lost.get_or_insert(Lost::Gone);
                 return;
@@ -1578,7 +1608,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                     .send_to(&transmit.contents, transmit.destination)
                 {
                     if error.kind() != ErrorKind::WouldBlock {
-                        tracing::debug!(%error, "media send failed");
+                        tracing::warn!(call_id = %peer.call_id, direction = "output", reason = "io", "media failed");
                     }
                 }
             }

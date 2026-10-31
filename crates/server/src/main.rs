@@ -5,6 +5,8 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use db::PgPool;
 
+mod log_policy;
+
 #[derive(Parser)]
 #[command(name = "tinyserver", about = "Self-hosted voice and video server")]
 struct Cli {
@@ -49,17 +51,17 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let logs = log_policy::install(log_policy::LogPolicy::from_env());
 
     match Cli::parse().command {
         Command::Migrate => migrate().await?,
         Command::Bootstrap { owner_invite } => bootstrap(owner_invite).await?,
-        Command::Serve => serve().await?,
+        Command::Serve => {
+            if let Err(error) = logs.sweep_bundles() {
+                tracing::warn!(%error, "old debug bundles not removed");
+            }
+            serve().await?;
+        }
         Command::Identities => identities().await?,
         Command::RelinkIdentity {
             user_id,
@@ -131,39 +133,54 @@ async fn bootstrap(force: bool) -> anyhow::Result<()> {
         db::Bootstrap::Created(issued) => issued,
         db::Bootstrap::OwnerExists => {
             tracing::info!("an owner already exists");
+            log_policy::remove_owner_invite(&log_policy::data_dir());
             return Ok(());
         }
         db::Bootstrap::Pending { id, expires_at } => {
-            // Printed once when it was made; the database keeps only its hash.
-            tracing::info!(invite_id = %id, %expires_at, "no owner yet; the owner invite printed earlier still works");
+            // The token was written once, to the invite file. The database keeps only its hash.
+            let path = log_policy::data_dir().join("owner-invite");
+            tracing::info!(
+                invite_id = %id,
+                %expires_at,
+                path = %path.display(),
+                "no owner yet; the earlier owner invite still works"
+            );
             println!();
-            println!("No owner yet. The owner invite printed earlier works until {expires_at}.");
-            println!("Lost it? Run `tinyserver bootstrap --owner-invite` for a new one.");
+            println!(
+                "No owner yet. The owner invite in {} works until {expires_at}.",
+                path.display()
+            );
+            println!(
+                "If that file is gone, run `tinyserver bootstrap --owner-invite` for a new one."
+            );
             println!();
             return Ok(());
         }
     };
     let expires_at = issued.expires_at.clone().unwrap_or_default();
     tracing::info!(invite_id = %issued.id, %expires_at, "owner invite created");
-    // Printed once, to the operator. The database keeps only its hash.
-    let code = env_var("TINYSERVER_PUBLIC_URL")
-        .ok()
-        .and_then(|origin| join_code(&origin, &issued.token));
-    println!();
-    println!("Owner invite, single use, until {expires_at}:");
+    // The database keeps only the hash. The link and token go to a file the operator reads,
+    // not to stdout, which Docker keeps.
+    let mut body = format!("Owner invite, single use, until {expires_at}:\n");
     if let Ok(origin) = env_var("TINYSERVER_PUBLIC_URL") {
         if let Some(link) = join_url(&origin, &issued.token) {
-            println!("  Link: {link}");
+            body.push_str(&format!("  Link: {link}\n"));
         }
     }
-    match code {
-        Some(code) => println!("  Code: {code}"),
-        None => println!("  Token: {}", issued.token),
+    match env_var("TINYSERVER_PUBLIC_URL")
+        .ok()
+        .and_then(|origin| join_code(&origin, &issued.token))
+    {
+        Some(code) => body.push_str(&format!("  Code: {code}\n")),
+        None => body.push_str(&format!("  Token: {}\n", issued.token)),
     }
-    println!(
-        "Paste it into tinyclient's \"Join a server\" and sign in. That person becomes the owner."
+    body.push_str(
+        "Paste it into tinyclient's \"Join a server\" and sign in. That person becomes the owner.\n",
     );
-    println!();
+    let written = log_policy::write_owner_invite(&log_policy::data_dir(), &body);
+    let status = log_policy::invite_status(&written);
+    println!("{status}");
+    tracing::info!("{status}");
     Ok(())
 }
 

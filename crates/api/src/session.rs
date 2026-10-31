@@ -68,7 +68,10 @@ impl IntoResponse for ApiError {
 
 fn failure(error: SessionError, denied: ApiError) -> ApiError {
     match error {
-        SessionError::Unauthorized => denied,
+        SessionError::Unauthorized => {
+            tracing::debug!(reason = "unauthorized", "session rejected");
+            denied
+        }
         SessionError::Database(error) => {
             tracing::warn!(%error, "session query failed");
             ApiError::Unavailable
@@ -85,7 +88,7 @@ async fn current(
             let identity = db::current_session(&pool, token)
                 .await
                 .map_err(|error| failure(error, ApiError::Unauthorized))?;
-            tracing::info!(user_id = %identity.user_id, "session read");
+            tracing::debug!(user_id = %identity.user_id, "session read");
             Ok(Json(Current::from(identity)))
         }
         Some(Presented::Bot(token)) => {
@@ -105,12 +108,18 @@ async fn current(
                 scopes: bot.scopes,
             }))
         }
-        None => Err(ApiError::Unauthorized),
+        None => {
+            tracing::debug!(reason = "unauthorized", "session rejected");
+            Err(ApiError::Unauthorized)
+        }
     }
 }
 
 async fn close(State(pool): State<PgPool>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
-    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+    let Some(token) = bearer(&headers) else {
+        tracing::debug!(reason = "unauthorized", "session rejected");
+        return Err(ApiError::Unauthorized);
+    };
     let user_id = db::close_session(&pool, token)
         .await
         .map_err(|error| failure(error, ApiError::Unauthorized))?;
