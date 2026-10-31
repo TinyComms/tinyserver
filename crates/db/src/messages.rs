@@ -766,26 +766,28 @@ async fn scan_with(
     slots: &Arc<Semaphore>,
     limit: Duration,
 ) -> ScanVerdict {
-    let timed = tokio::time::timeout(limit, async {
-        let Ok(permit) = Arc::clone(slots).acquire_owned().await else {
-            return ScanVerdict::Unavailable;
-        };
-        // The slot lives in this task. Dropping the task on timeout frees it
-        // even when the blocking scan is still running.
-        let engine = Arc::clone(engine);
-        let bytes = bytes.to_vec();
-        let mime = mime.to_owned();
-        let kind = kind.to_owned();
-        let verdict =
-            match tokio::task::spawn_blocking(move || engine.scan(&bytes, &mime, &kind)).await {
-                Ok(verdict) => verdict,
-                Err(_) => ScanVerdict::Unavailable,
-            };
+    let deadline = tokio::time::Instant::now() + limit;
+    // Waiting for a slot shares the request deadline. Timing out here does not start a scan.
+    let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, Arc::clone(slots).acquire_owned()).await
+    else {
+        return ScanVerdict::Unavailable;
+    };
+    let engine = Arc::clone(engine);
+    let bytes = bytes.to_vec();
+    let mime = mime.to_owned();
+    let kind = kind.to_owned();
+    // The permit stays in the blocking task. The request can return Unavailable when `deadline`
+    // passes; the slot is not free until `scan` returns. The clamd socket has its own deadline,
+    // so the thread ends and drops the permit.
+    let scan = tokio::task::spawn_blocking(move || {
+        let verdict = engine.scan(&bytes, &mime, &kind);
         drop(permit);
         verdict
-    })
-    .await;
-    timed.unwrap_or(ScanVerdict::Unavailable)
+    });
+    match tokio::time::timeout_at(deadline, scan).await {
+        Ok(Ok(verdict)) => verdict,
+        _ => ScanVerdict::Unavailable,
+    }
 }
 
 pub fn scan_timeout() -> Duration {
@@ -908,18 +910,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_bytes_releases_its_slot_when_scan_outlives_the_timeout() {
-        let slots = Arc::new(Semaphore::new(1));
-        let entered = Arc::new(AtomicBool::new(false));
+    async fn scan_slot_stays_taken_until_the_scan_returns() {
+        let slots = Arc::new(Semaphore::new(3));
         let release = Arc::new(AtomicBool::new(false));
         let _let_go = LetGo(Arc::clone(&release));
-        let engine: Arc<dyn ScanEngine> = Arc::new(Stall {
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        });
-        let task = tokio::spawn({
+        let mut entered = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let flag = Arc::new(AtomicBool::new(false));
+            entered.push(Arc::clone(&flag));
+            let engine: Arc<dyn ScanEngine> = Arc::new(Stall {
+                entered: flag,
+                release: Arc::clone(&release),
+            });
             let slots = Arc::clone(&slots);
-            async move {
+            tasks.push(tokio::spawn(async move {
                 scan_with(
                     &engine,
                     b"hello",
@@ -929,29 +934,83 @@ mod tests {
                     Duration::from_millis(80),
                 )
                 .await
-            }
-        });
+            }));
+        }
 
         let started = std::time::Instant::now();
-        while !entered.load(Ordering::SeqCst) {
+        while entered.iter().any(|flag| !flag.load(Ordering::SeqCst)) {
             if started.elapsed() > Duration::from_secs(2) {
-                panic!("scan did not start");
+                panic!("scans did not start");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let verdict = match task.await {
-            Ok(verdict) => verdict,
-            Err(error) => panic!("scan task: {error}"),
-        };
-        assert!(matches!(verdict, ScanVerdict::Unavailable));
+        let fourth_entered = Arc::new(AtomicBool::new(false));
+        let fourth_engine: Arc<dyn ScanEngine> = Arc::new(Stall {
+            entered: Arc::clone(&fourth_entered),
+            release: Arc::clone(&release),
+        });
+        let fourth_slots = Arc::clone(&slots);
+        let fourth = tokio::spawn(async move {
+            scan_with(
+                &fourth_engine,
+                b"hello",
+                "text/plain",
+                "file",
+                &fourth_slots,
+                Duration::from_millis(200),
+            )
+            .await
+        });
 
-        let freed = tokio::time::timeout(
-            Duration::from_millis(200),
+        let fourth_verdict = match fourth.await {
+            Ok(verdict) => verdict,
+            Err(error) => panic!("fourth scan task: {error}"),
+        };
+        assert!(matches!(fourth_verdict, ScanVerdict::Unavailable));
+        assert!(
+            !fourth_entered.load(Ordering::SeqCst),
+            "a fourth scan must not start while three are outstanding"
+        );
+
+        for task in tasks {
+            let verdict = match task.await {
+                Ok(verdict) => verdict,
+                Err(error) => panic!("scan task: {error}"),
+            };
+            assert!(matches!(verdict, ScanVerdict::Unavailable));
+        }
+
+        let still_held = tokio::time::timeout(
+            Duration::from_millis(50),
             Arc::clone(&slots).acquire_owned(),
         )
         .await;
-        assert!(freed.is_ok(), "scan slot still held after the timeout");
+        assert!(
+            still_held.is_err(),
+            "the slot stays taken until the scan returns"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        let mut freed = 0;
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while freed < 3 {
+                let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
+                    break;
+                };
+                drop(permit);
+                freed += 1;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok() && freed == 3,
+            "slots return once the scans finish"
+        );
+        assert!(
+            !fourth_entered.load(Ordering::SeqCst),
+            "the fourth scan already returned and must not start later"
+        );
     }
 
     #[test]

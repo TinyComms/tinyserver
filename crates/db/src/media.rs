@@ -97,6 +97,28 @@ pub fn classify(
     })
 }
 
+/// Server icon and user avatar. Sniff, classify, and re-encode so a polyglot trailer is not
+/// what gets stored. The 256 KiB cap applies to the rewritten bytes. A rewrite failure fails
+/// the upload. GIF and every non-image stay unsupported.
+pub fn prepare_icon(bytes: &[u8]) -> Result<Rewritten, MessageError> {
+    let mime = crate::server::sniff_image(bytes).ok_or(MessageError::UnsupportedMedia)?;
+    let name = match mime {
+        "image/png" => "icon.png",
+        "image/jpeg" => "icon.jpg",
+        "image/webp" => "icon.webp",
+        _ => return Err(MessageError::UnsupportedMedia),
+    };
+    let classified = classify(name, mime, bytes, Archives::Denied)?;
+    let rewritten = rewrite_raster(bytes, &classified.mime)?;
+    if rewritten.bytes.is_empty() {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    if rewritten.bytes.len() > crate::server::ICON_MAX {
+        return Err(MessageError::TooLarge);
+    }
+    Ok(rewritten)
+}
+
 /// Re-encode a classified raster. Header caps run before a full decode.
 /// Post-rewrite byte size is checked by `save_attachment` against `image_max_bytes`.
 pub fn rewrite_raster(bytes: &[u8], mime: &str) -> Result<Rewritten, MessageError> {
@@ -322,8 +344,10 @@ fn refused_mime(mime: &str) -> bool {
 
 fn archive_forbidden(ext: Option<&str>, mime: &str, bytes: &[u8], archives: Archives) -> bool {
     // OOXML is a zip container and stays a document. It is not on the archive opt-in path.
+    // A macro package renamed to the plain extension is still a macro: the central directory
+    // names `vbaProject.bin`. The entry is not extracted.
     if is_plain_office(ext, mime) {
-        return false;
+        return ooxml_has_vba_project(ext, bytes);
     }
     let marked = ext.is_some_and(archive_extension)
         || archive_mime(mime)
@@ -448,6 +472,30 @@ fn archive_mime(mime: &str) -> bool {
             | "application/x-bzip2"
             | "application/x-bzip"
     )
+}
+
+/// `docx` / `xlsx` / `pptx` only. The central-directory filename is enough; the deflated
+/// stream is not read. `.doc` / `.xls` / `.ppt` are OLE and are not inspected here.
+fn ooxml_has_vba_project(ext: Option<&str>, bytes: &[u8]) -> bool {
+    if !matches!(ext, Some("docx" | "xlsx" | "pptx")) {
+        return false;
+    }
+    let Ok(archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return false;
+    };
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index_data(index) else {
+            continue;
+        };
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let base = name.rsplit(['/', '\\']).next().unwrap_or(name.as_ref());
+        if base == "vbaProject.bin" {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_plain_office(ext: Option<&str>, mime: &str) -> bool {
@@ -1203,6 +1251,72 @@ mod tests {
         );
         assert!(matches!(
             allow("logs.gz", "text/plain", &gz),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn a_renamed_macro_package_is_refused_and_a_plain_docx_is_not() {
+        let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        let xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        let pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        let plain = stored_zip(&[("word/document.xml", b"<w:document/>")]);
+        let got = classify("notes.docx", docx, &plain).expect("plain docx");
+        assert_eq!(got.kind, "file");
+        assert_eq!(got.mime, docx);
+
+        for (name, mime, entry) in [
+            ("notes.docx", docx, "vbaProject.bin"),
+            ("notes.docx", docx, "word/vbaProject.bin"),
+            ("sheet.xlsx", xlsx, "xl/vbaProject.bin"),
+            ("deck.pptx", pptx, "ppt/vbaProject.bin"),
+        ] {
+            let bytes = stored_zip(&[
+                ("word/document.xml", b"<w:document/>"),
+                (entry, b"macro-bytes-without-the-yara-literal"),
+            ]);
+            assert!(
+                matches!(
+                    classify(name, mime, &bytes),
+                    Err(MessageError::UnsupportedMedia)
+                ),
+                "{name} with {entry} must be refused"
+            );
+            assert!(
+                matches!(
+                    allow(name, mime, &bytes),
+                    Err(MessageError::UnsupportedMedia)
+                ),
+                "{name} stays refused when archives are allowed"
+            );
+        }
+
+        let archive = stored_zip(&[("vbaProject.bin", b"not an office package")]);
+        assert_eq!(
+            allow("mods.zip", "application/zip", &archive)
+                .expect("a zip may contain that name when archives are allowed")
+                .kind,
+            "file"
+        );
+    }
+
+    #[test]
+    fn an_icon_drops_a_polyglot_trailer() {
+        let mut bytes = TINY_PNG.to_vec();
+        bytes.extend_from_slice(b"%PDF-1.4");
+        let got = super::prepare_icon(&bytes).expect("rewritten icon");
+        assert!(
+            !got.bytes.windows(4).any(|chunk| chunk == b"%PDF"),
+            "stored icon still contains a %PDF trailer"
+        );
+        assert_eq!(got.mime, "image/png");
+        assert!(got.bytes.len() <= crate::server::ICON_MAX);
+        assert!(matches!(
+            super::prepare_icon(b"GIF89a"),
+            Err(MessageError::UnsupportedMedia)
+        ));
+        assert!(matches!(
+            super::prepare_icon(b"not an image"),
             Err(MessageError::UnsupportedMedia)
         ));
     }

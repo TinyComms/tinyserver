@@ -89,6 +89,8 @@ services:
       # clamd over TCP on the Docker network. Port 3310 is not published on the host.
       TINYSERVER_CLAMD_SOCKET: clamd:3310
       TINYSERVER_UPLOAD_DIR: /data/uploads
+      # Signed media paths. 32 bytes of hex the operator generates. Required; unset will not start.
+      TINYSERVER_MEDIA_HMAC_SECRET: ${TINYSERVER_MEDIA_HMAC_SECRET:?set TINYSERVER_MEDIA_HMAC_SECRET to 64 hex characters (openssl rand -hex 32)}
     secrets:
       - oidc_client_secret
       - pocketid_api_key

@@ -11,7 +11,7 @@ use db::{LayoutBucket, NewRole, PgPool, RolePatch, ServerPatch};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::community::{bits, caller, lift, nullable, ApiError};
+use crate::community::{bits, caller, icon_failure, lift, nullable, ApiError};
 
 /// What `GET /v1/capabilities` lists. A client that gets 404 there talks to an older server.
 pub const FEATURES: &[&str] = &[
@@ -169,11 +169,11 @@ async fn put_icon(
     if bytes.len() > db::ICON_MAX {
         return Err(ApiError::TooLarge);
     }
-    let content_type = db::sniff_image(&bytes).ok_or(ApiError::UnsupportedMedia)?;
-    let sha = db::set_icon(&pool, &caller, &bytes, content_type)
+    let stored = db::prepare_icon(&bytes).map_err(icon_failure)?;
+    let sha = db::set_icon(&pool, &caller, &stored.bytes, &stored.mime)
         .await
         .map_err(lift)?;
-    tracing::info!(user_id = %caller.user_id, bytes = bytes.len(), "server icon set");
+    tracing::info!(user_id = %caller.user_id, bytes = stored.bytes.len(), "server icon set");
     Ok(Json(IconBody { icon: Some(sha) }))
 }
 
