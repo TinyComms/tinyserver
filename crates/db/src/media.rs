@@ -372,6 +372,11 @@ fn zip_exceeds_caps(bytes: &[u8]) -> bool {
     let Ok(archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
         return true;
     };
+    // `len` and `by_index_data` walk a map keyed by filename. A repeated name replaces the
+    // earlier record, so that record's size, encryption flag, and symlink bit never reach the loop.
+    if archive.has_duplicate_names() {
+        return true;
+    }
     if archive.len() > MAX_ZIP_ENTRIES {
         return true;
     }
@@ -936,6 +941,84 @@ mod tests {
             index += 1;
         }
         panic!("central directory entry {name} not found");
+    }
+
+    /// Rewrite one central-directory filename in place. Lengths must match so the rest of the
+    /// directory stays aligned. `ZipWriter` will not emit two records with the same name.
+    fn rename_central_entry(bytes: &mut [u8], from: &str, to: &str) {
+        assert_eq!(
+            from.len(),
+            to.len(),
+            "rename stays inside the filename field"
+        );
+        let signature = [0x50, 0x4b, 0x01, 0x02];
+        let from_bytes = from.as_bytes();
+        let mut index = 0;
+        while index + 46 <= bytes.len() {
+            if bytes[index..index + 4] == signature {
+                let name_len = u16::from_le_bytes([bytes[index + 28], bytes[index + 29]]) as usize;
+                let extra_len = u16::from_le_bytes([bytes[index + 30], bytes[index + 31]]) as usize;
+                let comment_len =
+                    u16::from_le_bytes([bytes[index + 32], bytes[index + 33]]) as usize;
+                let name_at = index + 46;
+                if name_at + name_len <= bytes.len()
+                    && &bytes[name_at..name_at + name_len] == from_bytes
+                {
+                    bytes[name_at..name_at + name_len].copy_from_slice(to.as_bytes());
+                    return;
+                }
+                index += (46 + name_len + extra_len + comment_len).max(1);
+                continue;
+            }
+            index += 1;
+        }
+        panic!("central directory entry {from} not found");
+    }
+
+    #[test]
+    fn allowed_zip_rejects_a_repeated_central_directory_name() {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .add_symlink(
+                "same.txt",
+                "target.txt",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("symlink entry");
+        writer
+            .start_file(
+                "xxxx.txt",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("benign entry");
+        writer.write_all(b"ok").expect("benign bytes");
+        let mut bytes = writer.finish().expect("zip finish").into_inner();
+        rename_central_entry(&mut bytes, "xxxx.txt", "same.txt");
+
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).expect("read");
+        assert!(
+            archive.has_duplicate_names(),
+            "fixture must repeat a central-directory name"
+        );
+        assert_eq!(
+            archive.len(),
+            1,
+            "the later record replaces the earlier one"
+        );
+        let survivor = archive.by_index_data(0).expect("survivor");
+        assert!(
+            !survivor.is_symlink(),
+            "the kept record is the benign file, so the symlink cap never sees the first record"
+        );
+
+        assert!(matches!(
+            allow("mods.zip", "application/zip", &bytes),
+            Err(MessageError::UnsupportedMedia)
+        ));
     }
 
     #[test]
