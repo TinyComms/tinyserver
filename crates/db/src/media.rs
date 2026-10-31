@@ -17,6 +17,9 @@ pub struct Classified {
 }
 
 /// Classify an upload. Size caps stay in `prepare`; this is type policy only.
+///
+/// MIME is trimmed, stripped of parameters, and lowercased here, so a caller that
+/// skips `normalize_mime` still cannot sneak `TEXT/HTML` past the refuse list.
 pub fn classify(
     name: &str,
     mime: &str,
@@ -26,37 +29,50 @@ pub fn classify(
     if bytes.is_empty() {
         return Err(MessageError::Invalid);
     }
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    if mime.is_empty() {
+        return Err(MessageError::Invalid);
+    }
     let ext = file_extension(name);
     if ext.as_deref().is_some_and(refused_extension) {
         return Err(MessageError::UnsupportedMedia);
     }
-    if refused_mime(mime) {
+    if refused_mime(&mime) {
         return Err(MessageError::UnsupportedMedia);
     }
     if sniff_pe(bytes) || sniff_elf(bytes) {
         return Err(MessageError::UnsupportedMedia);
     }
-    if archive_forbidden(ext.as_deref(), mime, bytes, archives) {
+    if archive_forbidden(ext.as_deref(), &mime, bytes, archives) {
         return Err(MessageError::UnsupportedMedia);
     }
-    if ext.as_deref().is_some_and(|ext| !extension_fits(ext, mime)) {
+    if ext
+        .as_deref()
+        .is_some_and(|ext| !extension_fits(ext, &mime))
+    {
         return Err(MessageError::UnsupportedMedia);
     }
-    let kind = kind_from_mime(ext.as_deref(), mime, bytes)?;
+    let kind = kind_from_mime(ext.as_deref(), &mime, bytes)?;
     if let Some(detected) = infer::get(bytes) {
-        if !mimes_compatible(detected.mime_type(), mime) {
+        if !mimes_compatible(detected.mime_type(), &mime) {
             return Err(MessageError::UnsupportedMedia);
         }
     }
     Ok(Classified {
         name: name.to_string(),
-        mime: mime.to_string(),
+        mime,
         kind,
     })
 }
 
 fn file_extension(name: &str) -> Option<String> {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let base = base.trim_end_matches('.');
     let ext = base.rsplit_once('.')?.1;
     if ext.is_empty() {
         None
@@ -372,6 +388,39 @@ mod tests {
     fn refuses_zip_by_default() {
         assert!(matches!(
             classify("mods.zip", "application/zip", b"PK\x03\x04"),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn refuses_trailing_dot_weaponized_extensions() {
+        assert!(matches!(
+            classify_with("payload.js.", "text/plain", b"alert(1)", Archives::Denied),
+            Err(MessageError::UnsupportedMedia)
+        ));
+        assert!(matches!(
+            classify_with(
+                "page.html.",
+                "text/plain",
+                b"<html>hi</html>",
+                Archives::Denied
+            ),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn refuses_elf_regardless_of_name() {
+        assert!(matches!(
+            classify("note.txt", "text/plain", b"\x7fELF"),
+            Err(MessageError::UnsupportedMedia)
+        ));
+    }
+
+    #[test]
+    fn refuses_html_mime_even_when_uppercase() {
+        assert!(matches!(
+            classify("notes.txt", "TEXT/HTML", b"<html>hi</html>"),
             Err(MessageError::UnsupportedMedia)
         ));
     }
