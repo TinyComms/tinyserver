@@ -1529,3 +1529,76 @@ async fn bootstrap_keeps_a_working_owner_invite() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_member_sets_their_own_picture() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let app = app(&db);
+        let (member, token) = join(&db, &owner, "face@tinyserver.test", "member").await;
+        let png = [b"\x89PNG\r\n\x1a\n".to_vec(), vec![7; 80]].concat();
+        let (status, _, _) = raw(
+            &app,
+            &token,
+            Method::PUT,
+            "/v1/me/avatar",
+            b"GIF89a".to_vec(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let (status, _, body) = raw(
+            &app,
+            &token,
+            Method::PUT,
+            "/v1/me/avatar",
+            png.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).expect("json");
+        let sha = body["avatar"].as_str().expect("sha").to_string();
+        assert_eq!(sha.len(), 64);
+        let path = format!("/v1/users/{}/avatar", member.user_id);
+        let (status, headers, bytes) =
+            raw(&app, &token, Method::GET, &path, Vec::new(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, png);
+        assert_eq!(headers[header::CONTENT_TYPE], "image/png");
+        let row = member_row(&app, &token, &member.user_id).await;
+        assert_eq!(row["avatar"], sha);
+        let owner_token = session(&db, &owner.user_id).await;
+        let (status, _, bytes) =
+            raw(&app, &owner_token, Method::GET, &path, Vec::new(), None).await;
+        assert_eq!((status, bytes), (StatusCode::OK, png));
+        let (status, _, _) = raw(
+            &app,
+            &token,
+            Method::GET,
+            "/v1/users/00000000-0000-0000-0000-000000000000/avatar",
+            Vec::new(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let big = [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; 300 * 1024]].concat();
+        let (status, _, _) = raw(&app, &token, Method::PUT, "/v1/me/avatar", big, None).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let (status, _, _) = raw(
+            &app,
+            &token,
+            Method::DELETE,
+            "/v1/me/avatar",
+            Vec::new(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, _) = raw(&app, &token, Method::GET, &path, Vec::new(), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let row = member_row(&app, &token, &member.user_id).await;
+        assert!(row["avatar"].is_null());
+    })
+    .await;
+}
