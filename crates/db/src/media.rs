@@ -1,6 +1,21 @@
 //! Attachment type policy: extension, MIME, and magic must agree.
+//! Raster uploads are re-encoded so polyglot trailers never hit disk.
+
+use std::io::Cursor;
+
+use image::codecs::gif::{GifDecoder, GifEncoder, Repeat};
+use image::codecs::jpeg::JpegDecoder;
+use image::codecs::png::PngDecoder;
+use image::codecs::webp::WebPDecoder;
+use image::{AnimationDecoder, ImageDecoder, ImageFormat};
 
 use crate::messages::MessageError;
+
+const MAX_EDGE: u64 = 16_384;
+const MAX_PIXELS: u64 = 40_000_000;
+const MAX_GIF_FRAMES: u64 = 500;
+const MAX_RGBA: u64 = 256 * 1024 * 1024;
+const MAX_ASPECT: u64 = 50;
 
 /// Whether zip/7z/rar/tar/gz/bz2 may persist as kind `file`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14,6 +29,15 @@ pub struct Classified {
     pub name: String,
     pub mime: String,
     pub kind: &'static str,
+}
+
+/// Bytes and dimensions after a lossless-enough re-encode of png/jpeg/webp/gif.
+pub struct Rewritten {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub kind: &'static str,
+    pub width: i32,
+    pub height: i32,
 }
 
 /// Classify an upload. Size caps stay in `prepare`; this is type policy only.
@@ -67,6 +91,220 @@ pub fn classify(
         name: name.to_string(),
         mime,
         kind,
+    })
+}
+
+/// Re-encode a classified raster. Header caps run before a full decode.
+/// Post-rewrite byte size is checked by `save_attachment` against `image_max_bytes`.
+pub fn rewrite_raster(bytes: &[u8], mime: &str) -> Result<Rewritten, MessageError> {
+    let format = format_of(mime)?;
+    let (width, height) = header_dimensions(bytes, format)?;
+    let frames = if format == ImageFormat::Gif {
+        gif_frame_count(bytes)?
+    } else {
+        1
+    };
+    reject_caps(width, height, frames)?;
+    let kind = kind_of_raster(mime)?;
+    if format == ImageFormat::Gif {
+        rewrite_gif(bytes, width, height, kind)
+    } else {
+        rewrite_still(bytes, format, mime, kind)
+    }
+}
+
+fn format_of(mime: &str) -> Result<ImageFormat, MessageError> {
+    match mime {
+        "image/png" => Ok(ImageFormat::Png),
+        "image/jpeg" => Ok(ImageFormat::Jpeg),
+        "image/webp" => Ok(ImageFormat::WebP),
+        "image/gif" => Ok(ImageFormat::Gif),
+        _ => Err(MessageError::UnsupportedMedia),
+    }
+}
+
+fn kind_of_raster(mime: &str) -> Result<&'static str, MessageError> {
+    match mime {
+        "image/gif" => Ok("gif"),
+        "image/png" | "image/jpeg" | "image/webp" => Ok("image"),
+        _ => Err(MessageError::UnsupportedMedia),
+    }
+}
+
+fn header_dimensions(bytes: &[u8], format: ImageFormat) -> Result<(u32, u32), MessageError> {
+    let cursor = Cursor::new(bytes);
+    let dims = match format {
+        ImageFormat::Png => PngDecoder::new(cursor)
+            .map_err(|_| MessageError::UnsupportedMedia)?
+            .dimensions(),
+        ImageFormat::Jpeg => JpegDecoder::new(cursor)
+            .map_err(|_| MessageError::UnsupportedMedia)?
+            .dimensions(),
+        ImageFormat::WebP => WebPDecoder::new(cursor)
+            .map_err(|_| MessageError::UnsupportedMedia)?
+            .dimensions(),
+        ImageFormat::Gif => GifDecoder::new(cursor)
+            .map_err(|_| MessageError::UnsupportedMedia)?
+            .dimensions(),
+        _ => return Err(MessageError::UnsupportedMedia),
+    };
+    Ok(dims)
+}
+
+fn reject_caps(width: u32, height: u32, frames: u32) -> Result<(), MessageError> {
+    let width = u64::from(width);
+    let height = u64::from(height);
+    let frames = u64::from(frames);
+    if width == 0 || height == 0 || frames == 0 {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    if width > MAX_EDGE || height > MAX_EDGE {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    if frames > MAX_GIF_FRAMES {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    let pixels = width.saturating_mul(height).saturating_mul(frames);
+    if pixels > MAX_PIXELS {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    if pixels.saturating_mul(4) > MAX_RGBA {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    let long = width.max(height);
+    let short = width.min(height);
+    if long > short.saturating_mul(MAX_ASPECT) {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    Ok(())
+}
+
+fn gif_frame_count(bytes: &[u8]) -> Result<u32, MessageError> {
+    if bytes.len() < 13 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    let packed = bytes[10];
+    let mut i = 13usize;
+    if packed & 0x80 != 0 {
+        let table = 3usize.saturating_mul(1usize << ((packed & 0x07) + 1));
+        i = i.checked_add(table).ok_or(MessageError::UnsupportedMedia)?;
+        if i > bytes.len() {
+            return Err(MessageError::UnsupportedMedia);
+        }
+    }
+    let mut frames = 0u32;
+    while let Some(&marker) = bytes.get(i) {
+        i += 1;
+        match marker {
+            0x3B => break,
+            0x21 => {
+                i = i.checked_add(1).ok_or(MessageError::UnsupportedMedia)?;
+                i = skip_gif_subblocks(bytes, i)?;
+            }
+            0x2C => {
+                i = i.checked_add(9).ok_or(MessageError::UnsupportedMedia)?;
+                if i > bytes.len() {
+                    return Err(MessageError::UnsupportedMedia);
+                }
+                let packed = bytes[i - 1];
+                if packed & 0x80 != 0 {
+                    let table = 3usize.saturating_mul(1usize << ((packed & 0x07) + 1));
+                    i = i.checked_add(table).ok_or(MessageError::UnsupportedMedia)?;
+                    if i > bytes.len() {
+                        return Err(MessageError::UnsupportedMedia);
+                    }
+                }
+                i = i.checked_add(1).ok_or(MessageError::UnsupportedMedia)?;
+                i = skip_gif_subblocks(bytes, i)?;
+                frames = frames.saturating_add(1);
+                if u64::from(frames) > MAX_GIF_FRAMES {
+                    return Err(MessageError::UnsupportedMedia);
+                }
+            }
+            _ => return Err(MessageError::UnsupportedMedia),
+        }
+    }
+    if frames == 0 {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    Ok(frames)
+}
+
+fn skip_gif_subblocks(bytes: &[u8], mut i: usize) -> Result<usize, MessageError> {
+    loop {
+        let Some(&len) = bytes.get(i) else {
+            return Err(MessageError::UnsupportedMedia);
+        };
+        i += 1;
+        if len == 0 {
+            return Ok(i);
+        }
+        i = i
+            .checked_add(usize::from(len))
+            .ok_or(MessageError::UnsupportedMedia)?;
+        if i > bytes.len() {
+            return Err(MessageError::UnsupportedMedia);
+        }
+    }
+}
+
+fn rewrite_still(
+    bytes: &[u8],
+    format: ImageFormat,
+    mime: &str,
+    kind: &'static str,
+) -> Result<Rewritten, MessageError> {
+    let img = image::load_from_memory_with_format(bytes, format)
+        .map_err(|_| MessageError::UnsupportedMedia)?;
+    reject_caps(img.width(), img.height(), 1)?;
+    let width = i32::try_from(img.width()).map_err(|_| MessageError::UnsupportedMedia)?;
+    let height = i32::try_from(img.height()).map_err(|_| MessageError::UnsupportedMedia)?;
+    let mut out = Cursor::new(Vec::new());
+    img.write_to(&mut out, format)
+        .map_err(|_| MessageError::UnsupportedMedia)?;
+    Ok(Rewritten {
+        bytes: out.into_inner(),
+        mime: mime.to_string(),
+        kind,
+        width,
+        height,
+    })
+}
+
+fn rewrite_gif(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    kind: &'static str,
+) -> Result<Rewritten, MessageError> {
+    let decoder =
+        GifDecoder::new(Cursor::new(bytes)).map_err(|_| MessageError::UnsupportedMedia)?;
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|_| MessageError::UnsupportedMedia)?;
+    let frame_count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
+    if frames.is_empty() || frame_count > MAX_GIF_FRAMES {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    let width = i32::try_from(width).map_err(|_| MessageError::UnsupportedMedia)?;
+    let height = i32::try_from(height).map_err(|_| MessageError::UnsupportedMedia)?;
+    let mut out = Vec::new();
+    {
+        let mut encoder = GifEncoder::new(&mut out);
+        encoder
+            .set_repeat(Repeat::Infinite)
+            .map_err(|_| MessageError::UnsupportedMedia)?;
+        encoder
+            .encode_frames(frames)
+            .map_err(|_| MessageError::UnsupportedMedia)?;
+    }
+    Ok(Rewritten {
+        bytes: out,
+        mime: "image/gif".to_string(),
+        kind,
+        width,
+        height,
     })
 }
 
@@ -331,8 +569,75 @@ fn sniff_archive(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify as classify_with, Archives, Classified};
+    use super::{classify as classify_with, rewrite_raster, Archives, Classified};
     use crate::messages::MessageError;
+
+    /// 1×1 RGB PNG (red). Hand-built so the polyglot test does not depend on `image`.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn png_crc(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                if crc & 1 == 0 {
+                    crc >>= 1;
+                } else {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                }
+            }
+        }
+        !crc
+    }
+
+    fn png_ihdr(width: u32, height: u32) -> Vec<u8> {
+        let mut ihdr = Vec::from(*b"IHDR");
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let crc = png_crc(&ihdr);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&png_crc(b"IEND").to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn rewrite_png_drops_polyglot_trailer() {
+        let mut bytes = TINY_PNG.to_vec();
+        bytes.extend_from_slice(b"%PDF-1.4");
+        let got = rewrite_raster(&bytes, "image/png").expect("rewrite");
+        assert!(
+            !got.bytes.windows(4).any(|chunk| chunk == b"%PDF"),
+            "rewritten PNG still contains a %PDF trailer"
+        );
+        assert_eq!(got.mime, "image/png");
+        assert_eq!(got.kind, "image");
+        assert_eq!(got.width, 1);
+        assert_eq!(got.height, 1);
+    }
+
+    #[test]
+    fn rewrite_rejects_pixel_bomb_from_header() {
+        let bytes = png_ihdr(100_000, 100_000);
+        assert!(
+            matches!(
+                rewrite_raster(&bytes, "image/png"),
+                Err(MessageError::UnsupportedMedia | MessageError::TooLarge)
+            ),
+            "pixel bomb from IHDR must fail before a full decode"
+        );
+    }
 
     fn classify(name: &str, mime: &str, bytes: &[u8]) -> Result<Classified, MessageError> {
         classify_with(name, mime, bytes, Archives::Denied)

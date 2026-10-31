@@ -357,13 +357,44 @@ pub async fn save_attachment(
     let mut tx = scope(pool, caller).await.map_err(from_community)?;
     let limits = upload_limits(&mut tx).await?;
     let prepared = prepare(upload, limits)?;
+    let rewritten = if matches!(prepared.kind, "image" | "gif") {
+        Some(crate::media::rewrite_raster(&upload.bytes, &prepared.mime)?)
+    } else {
+        None
+    };
+    if rewritten
+        .as_ref()
+        .is_some_and(|raster| !within(raster.bytes.len(), limits.image))
+    {
+        return Err(MessageError::TooLarge);
+    }
+    let bytes = rewritten
+        .as_ref()
+        .map(|raster| raster.bytes.as_slice())
+        .unwrap_or(&upload.bytes);
+    let mime = rewritten
+        .as_ref()
+        .map(|raster| raster.mime.as_str())
+        .unwrap_or(&prepared.mime);
+    let kind = rewritten
+        .as_ref()
+        .map(|raster| raster.kind)
+        .unwrap_or(prepared.kind);
+    let width = rewritten
+        .as_ref()
+        .map(|raster| Some(raster.width))
+        .unwrap_or(upload.width);
+    let height = rewritten
+        .as_ref()
+        .map(|raster| Some(raster.height))
+        .unwrap_or(upload.height);
     let row: Value = sqlx::query_scalar("SELECT app_save_attachment($1, $2, $3, $4, $5, $6, $7)")
         .bind(&prepared.name)
-        .bind(&prepared.mime)
-        .bind(prepared.kind)
-        .bind(i32::try_from(upload.bytes.len()).map_err(|_| MessageError::TooLarge)?)
-        .bind(upload.width)
-        .bind(upload.height)
+        .bind(mime)
+        .bind(kind)
+        .bind(i32::try_from(bytes.len()).map_err(|_| MessageError::TooLarge)?)
+        .bind(width)
+        .bind(height)
         .bind(upload.duration)
         .fetch_one(&mut *tx)
         .await
@@ -372,7 +403,7 @@ pub async fn save_attachment(
         return Err(MessageError::Invalid);
     };
     let id = id.to_string();
-    write_upload(&id, &upload.bytes)?;
+    write_upload(&id, bytes)?;
     if let Err(error) = tx.commit().await {
         remove_files(std::slice::from_ref(&id));
         return Err(message_sql(error));

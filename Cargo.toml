@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 getrandom = "0.3"
 infer = "0.19"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # Pinned. Discovery, the code exchange with PKCE, and ID token checks. rustls only: the image
 # has no system TLS library and no CA bundle, so reqwest carries the webpki roots.
 openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"] }

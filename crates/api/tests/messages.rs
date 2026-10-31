@@ -250,14 +250,19 @@ async fn a_gif_and_a_video_can_be_uploaded_and_downloaded() {
         assert_eq!(status, StatusCode::CREATED, "{channel}");
         let channel_id = channel["id"].as_str().expect("channel id").to_string();
 
-        let gif = b"GIF89a...";
+        let gif = include_bytes!("fixtures/tiny.gif").as_slice();
         let (status, saved) = upload(&app, &owner_token, "wave.gif", "image/gif", gif, &[]).await;
         assert_eq!(status, StatusCode::CREATED, "{saved}");
         assert_eq!(saved["kind"], "gif");
+        assert_eq!(saved["width"], 1);
+        assert_eq!(saved["height"], 1);
         let gif_id = saved["id"].as_str().expect("gif id").to_string();
         let (status, bytes) = download(&app, &owner_token, &gif_id).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(bytes, gif);
+        assert!(
+            bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            "downloaded gif must still be a GIF after rewrite"
+        );
         let (status, _) = download(&app, &member_token, &gif_id).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
@@ -273,7 +278,10 @@ async fn a_gif_and_a_video_can_be_uploaded_and_downloaded() {
         assert_eq!(message["attachments"][0]["name"], "wave.gif");
         let (status, bytes) = download(&app, &member_token, &gif_id).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(bytes, gif);
+        assert!(
+            bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            "linked gif must still be a GIF after rewrite"
+        );
 
         let mut video = vec![0_u8; 16];
         video[4..8].copy_from_slice(b"ftyp");
@@ -419,7 +427,7 @@ async fn an_admin_can_lower_the_image_cap() {
         let owner = first_owner(&db).await;
         let token = session(&db, &owner.user_id).await;
         let app = api::router(db.runtime.clone(), None);
-        let gif = b"GIF89a...";
+        let gif = include_bytes!("fixtures/tiny.gif").as_slice();
 
         let (status, server) = Call::new(Method::PATCH, "/v1/server")
             .token(&token)
