@@ -1,6 +1,6 @@
 # Server management
 
-Roles with permissions, an owner flag above them, per-room overrides, server settings, categories, bans, timeouts, multi-use invites, and an audit log with names. The wire contract tinyclient builds against. Calls and the live socket are in [`calls.md`](calls.md).
+Roles with permissions, an owner flag above them, per-room overrides, server settings, categories, bans, timeouts, multi-use invites, and an audit log with names. The wire contract tinyclient builds against. Calls and the live socket are in [`calls.md`](calls.md). Text channels, direct messages, attachments, avatars, and bots are in this file. Voice rooms are not text channels.
 
 Everything here is additive: older clients keep working, and `GET /v1/capabilities` answers 404 on servers from before it.
 
@@ -35,7 +35,7 @@ All bits: `1048575`. Bits a room override may hold: `246399`. @everyone on a new
 
 | Rule | |
 | --- | --- |
-| Owner | A flag on the membership, above every role. Owners have every bit everywhere. One or more owners; the last one cannot be demoted, kicked, or banned (`last_owner`). Only owners grant or revoke owner. |
+| Owner | A flag on the membership, above every role. Owners have every bit everywhere. One or more owners; the last one cannot be demoted, kicked, or banned (`409` `last_owner`). Only owners grant or revoke owner. |
 | Base | @everyone OR every role the member has. Server-wide checks use the base. `manage_server` implies nothing else. |
 | In a room | The base, then @everyone's override for the room (deny, then allow), then the OR of the member's other roles' overrides (deny, then allow). An allow beats a deny among the member's roles. |
 | Rank | A role's `position`: higher is more senior, @everyone is 0. A member's rank is the highest position among their roles, 0 with none; an owner's is `2147483647`. |
@@ -55,31 +55,85 @@ Upgrading from the three fixed roles: `owner` became the owner flag, `admin` the
 | --- | --- | --- |
 | `hierarchy` | 403 | The person or role is at or above the caller |
 | `default_role` | 400 | @everyone cannot be deleted, renamed, or ordered |
-| `banned` | 403 | A banned person; `/v1/auth/callback` sends `error=banned` |
+| `banned` | 403 | A banned person on a route that checks membership. `/v1/auth/callback` does not return this JSON. It redirects to the client's loopback with query `error=banned`. |
 | `too_large` | 413 | An icon over 256 KiB, or an upload over the server's cap |
 | `unsupported_media` | 415 | An icon that is not PNG, JPEG, or WebP; a refused attachment type; a liar file whose extension, MIME, and sniff disagree; PE (MZ) or ELF regardless of name |
 | `scanning` | 423 | `GET /v1/media/{id}` while the file is not yet clean |
 | `blocked` | 403 | The scanner blocked the file on upload or download |
 | `unavailable` | 503 | The scanner is down, timed out, or otherwise could not finish; upload gets no 201 |
+| `unauthorized` | 401 | No `Bearer` session, or the token is unknown or expired |
+| `forbidden` | 403 | Missing the permission bit |
+| `not_found` | 404 | No such role, room, member, ban, category, or icon |
+| `invalid` | 400 | A bad name, time, colour, limit, or id |
+| `last_owner` | 409 | Demoting, kicking, or banning the last owner |
+| `idempotency_conflict` | 409 | `Idempotency-Key` reused with a different body |
+
+Community routes return `500` `unavailable` when the database call fails. That is separate from the scanner's `503` `unavailable`.
+
+## Sign-in
+
+tinyserver is an OpenID Connect relying party. It is not an authorization server. A person is `(issuer, subject)` in `user_identities`. Email is stored when the ID token has one that looks like an address, and it never finds an account. The same person at two issuers is two accounts. `0004_oidc.sql` drops `password_hash`. There is no password sign-in and no refresh token.
+
+Compose runs Pocket ID. The issuer is `AUTH_PUBLIC_URL`. `TINYAUTH_PUBLIC_URL` is only the fallback for `AUTH_PUBLIC_URL` when that variable is unset (`TINYSERVER_OIDC_ISSUER` and Pocket ID `APP_URL`). Discovery, the key set, the code exchange, and the sign-up API use `TINYSERVER_OIDC_INTERNAL_URL` when it is set (`http://pocket-id:1411` in compose). The issuer in that discovery document must still be the public issuer. The browser uses the public auth hostname.
+
+`TINYSERVER_OIDC_SCOPES` defaults to `openid profile email`. `openid` is always sent. The client is confidential: a client secret (`client_secret_basic` or `client_secret_post`, whichever discovery offers) or a private-key JWT. Several providers: `TINYSERVER_OIDC_PROVIDERS=pocket-id,google` reads `TINYSERVER_OIDC_POCKET_ID_*` and `TINYSERVER_OIDC_GOOGLE_*`. Without that variable there is one provider, id `default`.
+
+### Routes
+
+No session.
+
+| Route | |
+| --- | --- |
+| `GET /v1/auth/config` | `{methods: ["oidc"], provider_name, providers: [{id, name}]}` |
+| `POST /v1/auth/start` | `{redirect_uri, code_challenge, code_challenge_method, state, invite?, provider?}`. `code_challenge_method` must be `S256`. `redirect_uri` must be `http://127.0.0.1:<port>/callback` or `http://[::1]:<port>/callback`. The client's `state` is 16 to 128 unreserved characters. `invite` is the token from `POST /v1/invites`. → `{authorize_url}` |
+| `GET /v1/auth/callback` | The provider's redirect. On success, `302` to the loopback redirect with `code` and the client's `state`. On failure, the same redirect with `error` of `not_member`, `banned`, `denied`, or `failed`. |
+| `POST /v1/auth/token` | `{code, code_verifier}` → `{token, user_id, email, display_name, role}`. This object does not include `owner`, `roles`, `permissions`, or `rank`; `GET /v1/me` does. |
+| `POST /v1/auth/backchannel-logout` | Form field `logout_token`. `200` with no body. A bad token is `400` `invalid_request`. Sessions for that provider `sid` or subject end. |
+
+`start` keeps the pending sign-in for 10 minutes. The one-time code lives 60 seconds and is spent on the first `token` try, right or wrong. Both are stored as the SHA-256 of the secret. JSON errors on these routes: `bad_request`, `invalid_grant`, and `invalid_request` are `400`; a database failure is `500` `unavailable`.
+
+### New accounts
+
+Account creation at the provider exists only when that provider's `SIGNUP` is `pocket-id` or `pocketid`. Unset, `none`, and `off` leave sign-up off: an invite then works only for someone who already has an account at the provider. Compose defaults `TINYSERVER_OIDC_SIGNUP` to `pocket-id`.
+
+When sign-up is on and `start` carries an invite, `authorize_url` is this server's `/v1/auth/join` page: "I'm new here" or "I already have an account". "I'm new here" asks Pocket ID for one sign-up token, `POST /api/signup-tokens` with `{"ttl":"15m","usageLimit":1}` and `X-API-Key`, and only while `app_invite_usable` is still true. One link per pending sign-in. The page says the link works once, for 15 minutes. A second click does not mint another. An unusable invite ends the sign-in with `error=not_member`.
+
+### Who may come in
+
+A known `(issuer, subject)` who is a member and not banned gets a session. The invite is not consumed. Anyone else needs a usable invite, or a joining group. A ban wins over both. Nothing is written for someone turned away.
+
+Groups default to invite-only. `TINYSERVER_OIDC_MEMBER_GROUPS` and `TINYSERVER_OIDC_ADMIN_GROUPS` are comma lists. The claim name defaults to `groups` (`TINYSERVER_OIDC_GROUPS_CLAIM`). Joining without an invite happens only when member groups are configured. A person in an admin group then joins as admin; otherwise a member group joins as member. The owner role never comes from a claim. `joined_via` is `groups`. An existing member in an admin group is promoted to admin on sign-in. Audited `member.join` or `member.role`.
+
+### Sessions
+
+The session token is 32 random bytes, URL-safe base64 without padding. Postgres stores SHA-256 of that string. It lasts `TINYSERVER_SESSION_MAX_DAYS` (default 30, range 1 to 365) and is not extended by use. `serve` refuses to start when that variable is set outside the range.
+
+`tinyserver identities` lists user id, display name, issuer, and subject. `tinyserver relink-identity --user-id --subject [--issuer]` points that account's row for the issuer at a new subject. The issuer defaults to `TINYSERVER_OIDC_ISSUER`. This is the path when a provider's subjects change and the issuer stays the same, including a move from Tinyauth to Pocket ID at the same address. Audited `identity.relink` with a null actor. It does not merge two accounts.
 
 ## REST
 
-Every route needs a session. "Any member" means any signed-in member.
+The routes in this section need a person's session: `Authorization: Bearer <token>`, with that prefix exact and a non-empty token. "Any member" means any signed-in member. Sign-in routes do not use a session. A `Bot` token is a different prefix; what it may call is under [Bots](#bots).
 
 ### Capabilities and me
 
-`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan"]}`. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means uploads are scanned before 201 and downloads stay gated until clean; clients without it keep the older upload behaviour.
+`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan"]}`. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means a chat upload is scanned before `POST /v1/media` returns `201`, and `GET /v1/media/{id}` stays closed until the row is `clean`. This server always lists `file_scan`. There is no upload path that skips the scan.
 
 `GET /v1/me` and `PATCH /v1/me` add `owner`, `roles [id]` (most senior first), `permissions` (base), and `rank`.
+
+`PATCH /v1/me` takes `{display_name}`. The name is trimmed and must be 1 to 80 characters. The response is the same object as `GET /v1/me`. Audited `account.rename`.
+
+`avatar` is not on `GET /v1/me`. The hash is on `GET /v1/members` and on `member.avatar`. Picture routes are under [Avatars](#avatars). `Authorization: Bot <token>` returns `role` `bot`, `email` `null`, `owner` false, `roles` `[]`, `permissions` `0`, `rank` `-1`, `display_name` the bot name, `user_id` the bot id, and `scopes`. A member session omits `scopes`.
+
+`DELETE /v1/session` ends the presented session, 204. `DELETE /v1/sessions` ends every session for that person, including this one, 204. Audited `session.close_all`.
 
 ### Server
 
 | Route | Who | |
 | --- | --- | --- |
 | `GET /v1/server` | any member | `{name, description, welcome, icon, default_room_id, afk_room_id, afk_timeout_secs, image_max_bytes, file_max_bytes, allow_archives, created_at}`. `icon` is the SHA-256 of the icon in hex, or `null`. A new server is "Tiny server". `image_max_bytes` defaults to 8 MiB (images and GIFs); `file_max_bytes` defaults to 25 MiB (video and every other kind); each may be set up to 100 MiB. `allow_archives` defaults to false. |
-| `PATCH /v1/server` | manage_server | Any of the writable fields; the room ids take `null`. Name 1 to 80 characters, description up to 500, welcome up to 2000, `afk_timeout_secs` 0 (off) to 86400, `image_max_bytes` and `file_max_bytes` each 1 to 100 MiB, `allow_archives` boolean. Returns the whole object. Audited `server.update`. |
+| `PATCH /v1/server` | manage_server | Any of the writable fields; the room ids take `null`. Name 1 to 80 characters, description up to 500, welcome up to 2000, `afk_timeout_secs` 0 (off) to 86400, `image_max_bytes` and `file_max_bytes` each from 1 byte through 104857600 (100 MiB), `allow_archives` boolean. Returns the whole object. Audited `server.update`. |
 | `GET /v1/server/icon` | any member | The image, its `Content-Type`, and `ETag: "<sha>"`; `If-None-Match` gets 304. 404 without one. |
-| `PUT /v1/server/icon` | manage_server | The body is the image: PNG, JPEG, or WebP, read from its first bytes, up to 256 KiB. Every other route keeps the 8 KiB body cap. `{icon}`. Audited `server.icon`. |
+| `PUT /v1/server/icon` | manage_server | The body is the image: PNG, JPEG, or WebP, sniffed from its first bytes, then re-encoded. The 256 KiB cap applies to the rewritten bytes; a rewrite that grows past that is `413` `too_large`. GIF is not an icon. `icon` in JSON is the SHA-256 hex of the stored rewrite. `PUT /v1/me/avatar` uses this same cap. JSON routes keep the 8 KiB body cap. `POST /v1/media` accepts up to the 100 MiB ceiling plus 1 MiB of multipart overhead. `{icon}`. Audited `server.icon`. |
 | `DELETE /v1/server/icon` | manage_server | 204 |
 
 ### Roles
@@ -96,21 +150,21 @@ Every route needs a session. "Any member" means any signed-in member.
 
 | Route | Who | |
 | --- | --- | --- |
-| `GET /v1/members` | any member | Rows add `owner`, `roles`, `last_seen_at`, `timeout_until` (while one runs), and `joined_via` (`invite`, `groups`, or `null` for members from before it was kept). `role` and `email` stay. |
+| `GET /v1/members` | any member | Rows add `owner`, `roles`, `last_seen_at`, `timeout_until` (while one runs), `joined_via` (`invite`, `groups`, or `null` for members from before it was kept), and `avatar` (SHA-256 hex of their picture, or `null`). `role` and `email` stay. |
 | `PATCH /v1/members/{id}` | legacy | `{role}`: `owner` sets the owner flag (owners only), `admin` adds the most senior role with manage_server or manage_roles, `member` takes those away and the owner flag. → `{role}`. |
 | `PUT /v1/members/{id}/roles` | manage_roles | `{role_ids}` replaces their roles → member row |
 | `PUT /v1/members/{id}/owner` | owners | `{owner}` → member row |
-| `PUT /v1/members/{id}/timeout` | timeout_members | `{until, reason?}`: an RFC 3339 time within 28 days, or `null` to end it → member row. A timeout ends their call and refuses `call.join` with `timed_out`. |
+| `PUT /v1/members/{id}/timeout` | timeout_members | `{until, reason?}`: an RFC 3339 time in the future and at most 28 days and 1 minute ahead, or `null` to end it. A time outside that is `400` `invalid`. → member row. A timeout ends their call and refuses `call.join` with `timed_out`. |
 | `DELETE /v1/members/{id}?reason=` | kick_members | Kick: the membership and every session go. The reason goes to the audit row. |
 
-`last_seen_at` is written in batches every 30 s for everyone with a live socket open, and when a socket opens or closes.
+`last_seen_at` is not written on the socket event itself. A person's live socket is queued on open, on close, and on each credential recheck (default 60 seconds). Those ids are written in one update every 30 seconds, and once more when the process is closing. Bots are not queued.
 
 ### Bans
 
 | Route | Who | |
 | --- | --- | --- |
 | `GET /v1/bans` | ban_members | `[{user_id, display_name, email, reason, banned_by, banned_by_name, created_at, expires_at}]`, bans in force |
-| `POST /v1/bans` | ban_members | `{user_id, reason?, expires_at?}` → 201 ban. The membership and every session go, sockets close with `4003`, and their call ends with `banned`. The ban holds every (issuer, subject) the person signed in with, so an invite, a joining group, and a fresh sign-in are refused. A person who is no longer a member can be banned too. |
+| `POST /v1/bans` | ban_members | `{user_id, reason?, expires_at?}` → 201 ban. The membership and every session go, sockets close with `4003` and reason `removed` (a kick uses that same frame), and their call ends with `banned`. The ban holds every (issuer, subject) the person signed in with, so an invite, a joining group, and a fresh sign-in are refused. A person who is no longer a member can be banned too. |
 | `DELETE /v1/bans/{user_id}` | ban_members | 204. They may come back with a new invite. |
 
 ### Categories and layout
@@ -125,9 +179,15 @@ Every route needs a session. "Any member" means any signed-in member.
 
 ### Rooms
 
-`GET /v1/rooms` rows add `category_id`, `position`, `topic`, `user_limit` (0 is the server's room cap), `bitrate_kbps` (16 to 128, default 64), `ptt_only`, `video_enabled`, `e2ee_required` (default false), `overrides [{role_id, allow, deny}]`, and `my_permissions`. Rooms the caller cannot view are left out; owners see all. Rooms come uncategorized first, then by category, each by `position`.
+`GET /v1/rooms` rows add `category_id`, `position`, `topic`, `user_limit` (0 to 99; 0 means the server cap, `TINYSERVER_CALL_ROOM_MAX`, default 12), `bitrate_kbps` (16 to 128, default 64), `ptt_only`, `video_enabled`, `e2ee_required` (default false), `overrides [{role_id, allow, deny}]`, and `my_permissions`. A positive `user_limit` is also clamped to that cap. A move uses the server cap for 30 seconds even when the room limit is lower. Rooms the caller cannot view are left out; owners see all. Rooms come uncategorized first, then by category, each by `position`.
 
-`POST /v1/rooms` takes `{name, category_id?, topic?, user_limit?, bitrate_kbps?, ptt_only?, video_enabled?, e2ee_required?}` (manage_channels); `PATCH /v1/rooms/{id}` any of those and `position` (manage_channels in that room). `PUT /v1/rooms/{id}/overrides/{role_id}` `{allow, deny}` and `DELETE` set and clear one role's override; they need manage_roles and manage_channels in the room, and the role below the caller. Bits outside the room set are dropped; a bit in both is allowed. Audited `room.update` and `room.override`.
+`POST /v1/rooms` takes `{name, category_id?, topic?, user_limit?, bitrate_kbps?, ptt_only?, video_enabled?, e2ee_required?}` (manage_channels); `PATCH /v1/rooms/{id}` any of those and `position` (manage_channels in that room). `DELETE /v1/rooms/{id}` (manage_channels in that room) is 204. Audited `room.delete`.
+
+`POST /v1/rooms` and `POST /v1/invites` take an optional `Idempotency-Key`. The same caller, route, and key with the same body returns the stored 201 again for a day. A different body is `409` `idempotency_conflict`.
+
+`PUT /v1/rooms/{id}/overrides/{role_id}` `{allow, deny}` and `DELETE` set and clear one role's override; they need manage_roles and manage_channels in the room, and the role below the caller. Bits outside the room set are dropped; a bit in both is allowed.
+
+A `PATCH` that changes only the name is audited `room.rename`. Any other `PATCH` is `room.update`. `POST` is `room.create`. Overrides stay `room.override`.
 
 Clients encode at `bitrate_kbps`; `ptt_only` and `voice_activity` are honoured by the client. The SFU is unchanged by them. `e2ee_required` is the server's: while media runs, a `call.join` without `e2ee` to that room gets `e2ee_required` and takes no seat. People already in the call when it is turned on stay; the call is transport only until they leave. It is a promise the server makes, not one the apps can check: see the threat model in [`calls.md`](calls.md#what-it-protects-and-what-it-does-not). Migration [`0007_e2ee.sql`](../crates/db/migrations/0007_e2ee.sql) adds the column and makes `app_call_access` return it; nothing else about end-to-end encryption is stored.
 
@@ -143,32 +203,116 @@ Accepting an invite makes the membership, gives its roles, counts a use, and rec
 
 ### Audit
 
-`GET /v1/audit?limit=1..200&before=<id>&actor=<user id>&action=<prefix>` (view_audit_log): newest first. Rows add `actor_name`, `subject_user_id`, `subject_name`, and `reason`. For the next page pass the last row's `id` as `before`. Actions added: `server.update`, `server.icon`, `role.create`, `role.update`, `role.delete`, `role.order`, `member.roles`, `member.owner`, `member.timeout`, `member.ban`, `member.unban`, `category.create`, `category.update`, `category.delete`, `layout.update`, `room.update`, `room.override`, `call.server_mute`, `call.move`. A kick's reason is on its `member.remove` row.
+`GET /v1/audit?limit=1..200&before=<id>&actor=<user id>&action=<prefix>` (view_audit_log): newest first. An omitted `limit` is 50. Rows add `actor_name`, `subject_user_id`, `subject_name`, `reason`, and `detail`. For the next page pass the last row's `id` as `before`. Actions for this area also include `room.create`, `room.rename` (name-only change), `room.delete`, `room.update`, `room.override`, `invite.create`, `invite.revoke`, `invite.accept`, `member.join` (a group join), `member.role` (legacy role change, and an admin-group promotion), `member.roles`, `member.owner`, `member.remove`, `member.timeout`, `member.ban`, `member.unban`, `account.rename`, `account.avatar`, `session.close_all`, `identity.relink`, `bootstrap`, `server.update`, `server.icon`, `role.create`, `role.update`, `role.delete`, `role.order`, `category.create`, `category.update`, `category.delete`, `layout.update`, `channel.create`, `channel.update`, `channel.delete`, `channel.override`, `call.server_mute`, `call.move`, `bot.create`, and `bot.revoke`. A kick's reason is on its `member.remove` row. Bot routes are under [Bots](#bots).
 
 ## Messages and attachments
 
-Text channels, directs, and uploads are in [`calls.md`](calls.md#messages) for live topics. Recipients never `GET /v1/media/{id}` until the attachment is clean. `POST /v1/media` does not return 201 until then either; a message cannot reference an attachment that is still scanning, blocked, or in error.
+Text channels and direct messages are built. They are not voice rooms and they are not a later milestone. Bots are refused on every route in this section with `403 forbidden` and are not members. `POST /v1/media` returns `201` only after a clean scan and a commit. Migrations: [`0008_messages.sql`](../crates/db/migrations/0008_messages.sql), upload caps in [`0009_upload_limits.sql`](../crates/db/migrations/0009_upload_limits.sql), and the scan gate in [`0011_attachment_gate.sql`](../crates/db/migrations/0011_attachment_gate.sql).
+
+A text channel uses the same permission bits as a room, including the room override mask `246399`, in the same order: owner, base, @everyone override, then the member's other roles. `view_channel` (`1`) sees it. `speak` (`4`) posts, reacts, and types. `manage_channels` (`512`) edits and deletes it. Creating one needs `manage_channels` server-wide. A channel the caller cannot view is `404 not_found`.
+
+A direct is one pair of members, stored with the lower user id first. One pair is one conversation. The caller cannot open one with themselves. The other person must be a member and not banned.
+
+Live frames for these objects are in [`calls.md`](calls.md#messages): `channel.created`, `channel.updated`, `channel.deleted`, `direct.created`, `message.created`, `message.edited`, `message.deleted`, `reaction.updated`, and `read.updated`. Channel events go to every member socket. Direct events, typing, and direct read cursors go only to the two people. A channel read is stored and is not broadcast. Typing is not stored. File bytes never ride on the socket. The open-questions row in `calls.md` that still calls text a later milestone is stale.
+
+| Route | Who | |
+| --- | --- | --- |
+| `GET /v1/channels` | view_channel on each | Channels the caller can view, ordered by `position`, `name`, `id`. There is no `my_permissions` field. `PUT /v1/layout` does not move these. |
+| `POST /v1/channels` | manage_channels | `{name, category_id?, topic?, position?}` → `201` channel. Name 1 to 80 characters. Topic up to 1024, empty when left out. Position defaults to 0. Audited `channel.create`. |
+| `PATCH /v1/channels/{id}` | manage_channels in that channel | Any of `name`, `topic` (`null` clears to empty), `position`, `category_id` (`null` uncategorized). Audited `channel.update`. |
+| `DELETE /v1/channels/{id}` | manage_channels in that channel | `204`. Messages go with the channel. Attachment files are deleted. Audited `channel.delete`. |
+| `PUT /v1/channels/{id}/overrides/{role_id}` | manage_roles, and manage_channels in the channel, role below the caller | `{allow, deny}`. Bits outside `246399` are dropped. A bit in both is allowed. Returns the channel. Audited `channel.override`. |
+| `DELETE /v1/channels/{id}/overrides/{role_id}` | same | Clears that role's override and returns the channel. |
+| `GET /v1/directs` | the two members | The caller's conversations. |
+| `POST /v1/directs` | a member | `{user_id}` → `201` when created, `200` when that pair already has one. |
+| `GET /v1/conversations/{id}/messages?before=&limit=` | view_channel, or either person in the direct | `limit` defaults to 50 and must be 1 to 100. `before` is exclusive. The page is oldest-first inside that window. Deleted messages stay, with an empty body and no attachments or reactions. |
+| `POST /v1/conversations/{id}/messages` | speak in the channel, or either member of the direct, and not timed out | `{body?, reply_to?, client_id?, attachment_ids?}`. Body is trimmed, at most 4000 characters. Empty body needs at least one attachment. `reply_to` must be a message in that conversation. `client_id` is 1 to 64 characters with no ASCII controls; a retry returns the same message and the status is still `201`. → `201` message. |
+| `PATCH /v1/messages/{id}` | the author, with speak, not timed out | `{body}`. A deleted message is `400 invalid`. Empty body is allowed when attachments remain. |
+| `DELETE /v1/messages/{id}` | the author, with speak | `204`. Soft delete: body cleared, reactions and attachment rows removed, files deleted, `deleted_at` set. A second delete is `204`. |
+| `PUT /v1/messages/{id}/reactions` | speak, not timed out | `{emoji}` toggles. One grapheme, 1 to 16 scalars, no ASCII control. → `{emoji, count, me}`. |
+| `DELETE /v1/messages/{id}/reactions` | the member who reacted | `{emoji}` → `204`. Missing reaction is `404`. |
+| `POST /v1/conversations/{id}/read` | someone who can see it | `{message_id}` → `204`. The cursor only moves forward. |
+| `POST /v1/media` | speak server-wide, or speak in at least one text channel; not timed out | Multipart form, one `file` plus optional `width`, `height`, `duration`. At most 8 parts. → `201` only after a clean scan. |
+| `GET /v1/media/{id}` | someone who can see the message, or the uploader while the file is still unlinked and under an hour old | The bytes, after the gate below. |
+
+A timeout may still read. Posting, reacting, uploading, and typing while timed out are `403 forbidden`, not the call socket's `timed_out`. A banned person is `403 banned`.
+
+Channel JSON: `id`, `category_id`, `name`, `topic`, `position`, `created_by`, `created_at`, `overrides [{role_id, allow, deny}]`, `unread`, `last_message`. Direct JSON: `id`, `created_at`, `peer {user_id, display_name}`, `unread`, `last_read`, `peer_read`, `last_message`. `last_message` is `{id, author_id, body, created_at}` with `body` cut at 200 characters, or `null`. `unread` skips the caller's own messages and deleted ones. Peer pictures are not on the direct object; use the member list.
+
+Message JSON: `id`, `author_id`, `body`, `reply_to`, `client_id`, `created_at`, `edited_at`, `deleted_at`, `attachments`, `reactions [{emoji, count, me}]`. An attachment on a message is `{id, name, mime, kind, bytes, width, height, duration}`. `kind` is `image`, `gif`, `video`, or `file`. `scan_status` is on the upload response, not on a message's attachments.
 
 ### Type policy
 
-These extensions are always refused (case-insensitive): `lnk`, `iso`, `img`, `vhd`, `vhdx`, `html`, `htm`, `hta`, `svg`, `js`, `vbs`, `cmd`, `bat`, `ps1`, `msi`, `scr`, `jar`, `exe`, `dll`, `com`, `pif`, `wsf`, `one`, `docm`, `xlsm`, `pptm`, `dotm`, `xltm`, `ppsm`. So are `image/svg+xml` and `text/html`, PE (MZ) and ELF magic regardless of filename, and any upload whose extension, declared MIME, and sniff disagree (415 `unsupported_media`).
+These extensions are always refused, case-insensitive: `lnk`, `iso`, `img`, `vhd`, `vhdx`, `html`, `htm`, `hta`, `svg`, `js`, `vbs`, `cmd`, `bat`, `ps1`, `msi`, `scr`, `jar`, `exe`, `dll`, `com`, `pif`, `wsf`, `one`, `docm`, `xlsm`, `pptm`, `dotm`, `xltm`, `ppsm`. So are `image/svg+xml` and `text/html`, PE (`MZ`) and ELF magic regardless of name, and any upload whose extension, declared MIME, and sniffed type disagree (`415 unsupported_media`). `image/jpg` is stored as `image/jpeg`.
 
-Raster uploads (`image/png`, `image/jpeg`, `image/webp`, `image/gif`) are re-encoded before they are written to disk; other kinds are stored as received after type checks.
+Raster uploads (`image/png`, `image/jpeg`, `image/webp`, `image/gif`) are re-encoded before they are written, so a trailer after the image is not what hits disk. The rewrite fails with `415` when an edge exceeds 16384, the pixel count exceeds 40 million, a GIF has more than 500 frames, the decoded buffer would exceed 256 MiB, or the long edge is more than 50 times the short one. Dimensions on a raster come from the rewrite. Other kinds keep the client's `width`, `height`, and `duration` after a non-negative check. A rewritten image over `image_max_bytes` is `413 too_large`.
 
-Archives (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused unless `allow_archives` is true on the server (default false; `manage_server` on `PATCH /v1/server`). When archives are allowed, `zip` is still capped: at most 1024 entries, each entry's uncompressed size at most four times its compressed size, total uncompressed at most 200 MiB, depth two (central directory only; an entry named as another archive counts as depth two and is not opened), no `..`, no symlink, no encrypted zip. Other archive kinds are accepted only when extension and MIME name the same archive type.
+`docx`, `xlsx`, and `pptx` are office packages, not the archive opt-in. A package whose central directory names `vbaProject.bin` is refused. Macro extensions in the list above are refused by name.
+
+Archives (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused unless `allow_archives` is true (default false; `manage_server` on `PATCH /v1/server`). When archives are allowed, `zip` is still capped from the central directory only: at most 1024 entries, each entry's uncompressed size at most four times its compressed size, total uncompressed at most 200 MiB, no nested open (an entry named as another archive is not opened), no `..`, no absolute or drive-letter name, no symlink, no encrypted entry, no duplicate central-directory name, and no zero compressed size with a non-zero uncompressed size. A zip that does not parse is refused. Other archive kinds are accepted only when the extension and the MIME name the same kind.
 
 ### Scanning
 
-Production refuses to start unless `TINYSERVER_CLAMD_SOCKET` is set, except when `TINYSERVER_ALLOW_FAKE_SCAN=1` for local development and tests. Compose sets `TINYSERVER_CLAMD_SOCKET=clamd:3310` and `TINYSERVER_UPLOAD_DIR=/data/uploads`. Each scan may run up to `TINYSERVER_SCAN_TIMEOUT_MS` (default 8000, hard cap 15000). clamd runs beside yara-x rules; there is no separate content router.
+`serve` refuses to start unless `TINYSERVER_CLAMD_SOCKET` is set, except when that variable is unset and `TINYSERVER_ALLOW_FAKE_SCAN=1`. If the socket is set, the fake scanner is not used. The socket is `host:port`. A filesystem path works on Unix only. On Windows a path is a startup error. Compose sets `TINYSERVER_CLAMD_SOCKET=clamd:3310` and `TINYSERVER_UPLOAD_DIR=/data/uploads` and does not publish port 3310.
 
-On upload, a blocked file is 403 `blocked` with no committed row. Scanner down or timed out is 503 `unavailable` with no 201. On download, still scanning is 423 `scanning`; blocked is 403 `blocked`; scanner error is 503 `unavailable`; missing id or no access is 404.
+The scanner is clamd plus three yara-x rules compiled into the process (`lnk_header`, `html_prefix`, `vba_stream`). There is no rules file and no separate content router. A yara hit is `blocked` before clamd is asked. clamd down, a socket timeout, or any IO error is unavailable even when yara is clean. The fake scanner blocks the EICAR test string and calls everything else clean.
+
+Each scan may run up to `TINYSERVER_SCAN_TIMEOUT_MS` (unset, `0`, or unparseable means 8000; the hard cap is 15000). Three scans run at once. Waiting for a free slot uses the same deadline. Past it, the upload is `503 unavailable` and nothing is committed.
+
+`POST /v1/media` writes the file, marks the row `scanning`, and commits only after the verdict is `clean`, with `scan_status` `clean` on the `201` body. A blocked file is `403 blocked`, the transaction rolls back, and the file is removed. Scanner down or timed out is `503 unavailable`, same rollback, and no `201`. A store or database failure on this route is `500` with `{"error":"unavailable"}`, which is a different status from the scanner's `503`.
+
+`POST /v1/conversations/{id}/messages` accepts an attachment id only when that row is `clean`, owned by the caller, not yet linked, and younger than one hour. Scanning, blocked, error, or a missing id is `400 invalid`. A message cannot point at a file that has not passed.
+
+On `GET /v1/media/{id}`, `uploaded` or `scanning` is `423 scanning`, `blocked` is `403 blocked`, and `error` is `503 unavailable`. Missing id, no access, or bytes missing on disk is `404`. The upload path does not commit `scanning`, `blocked`, or `error`. The download statuses are what a row in that state returns. `0011` marks attachments that were already linked when the gate was added as `clean`, so those stay downloadable.
+
+Unlinked rows older than one hour are deleted by the sweep, which runs at start and every 10 minutes, and their files go with them.
+
+Files are `{TINYSERVER_UPLOAD_DIR}/{attachment uuid}`. Unset, the directory is `uploads`. The database stores metadata, not the bytes.
 
 ### Media URLs and download
 
-Attachment objects in JSON responses carry a signed `url`: `/v1/media/{id}?ex=…&is=…&hm=…` (expiry, issued time, HMAC-SHA256). Clients fetch with Bearer auth and those query parameters. `GET /v1/media/{id}` without a valid triple may still work for a member with a session alone; the signed URL is what tinyclient uses.
+When `TINYSERVER_MEDIA_HMAC_SECRET` is 64 hex characters (32 bytes), attachment objects gain `url`: `/v1/media/{id}?ex=…&is=…&hm=…`. `ex` is expiry, `is` is issued time, `hm` is HMAC-SHA256 over `v1`, those times, and the path. The minted life is 86400 seconds. Compose refuses to start until the secret is set. If it is unset, the JSON has no `url`.
 
-`Content-Disposition` is `inline` for PNG, JPEG, WebP, and GIF; everything else is `attachment`.
+Clients send the session and, when they use the signed URL, all three query parameters. No query parameters: the session is enough. Any of the three present: all three must be valid for that id and the current time, or `401 unauthorized`.
+
+`Content-Disposition` is `inline` for PNG, JPEG, WebP, and GIF, and `attachment` for everything else, with `filename` and `filename*`.
+
+## Avatars
+
+A member's picture is [`0010_user_avatars.sql`](../crates/db/migrations/0010_user_avatars.sql). It is PNG, JPEG, or WebP, re-encoded the same way as the server icon, at most 256 KiB after the rewrite. GIF is refused. The bytes live on `users`, not in the upload directory, and they are not sent through clamd. This is not the chat-upload `201`.
+
+| Route | Who | |
+| --- | --- | --- |
+| `PUT /v1/me/avatar` | the member | The body is the image. → `{avatar}` the SHA-256 hex. Audited `account.avatar`. Live `member.avatar` carries `app_member_json`, including `avatar`. |
+| `DELETE /v1/me/avatar` | the member | `204`, including when they had none. Same audit and live topic, with `avatar` `null`. |
+| `GET /v1/users/{user_id}/avatar` | a member, or a bot with `members.read` | The image, `Content-Type`, `ETag: "<sha>"`, `Cache-Control: private, max-age=3600`. `If-None-Match` gets `304`. `404` when that member has no picture. A bot without `members.read` does not see membership rows, so this is `404` for them too. |
+
+`GET /v1/members` adds `avatar` (the hash, or `null`). `GET /v1/me` does not.
+
+## Bots
+
+Bots are [`0012_bots.sql`](../crates/db/migrations/0012_bots.sql). A bot is an application principal, not a member, and it has no membership row. It does not appear in `GET /v1/members` or in presence. The token is 32 random bytes, URL-safe base64 without padding, shown once. Postgres stores SHA-256 of that string.
+
+Someone with `manage_server` creates and revokes bots. A bot cannot.
+
+| Route | Who | |
+| --- | --- | --- |
+| `POST /v1/bots` | manage_server | `{name, scopes}` or `{name, permissions}`. Name 1 to 80. → `201` `{id, name, scopes, permissions, token, created_at}`. Audited `bot.create`. |
+| `GET /v1/bots` | manage_server | The same fields without `token`, active bots only. |
+| `DELETE /v1/bots/{id}` | manage_server | `204`. Unknown or already revoked is `404`. Audited `bot.revoke`. |
+
+`scopes` may be empty, or any unique subset of `rooms.read`, `rooms.write`, and `members.read`. An unknown scope is `400 invalid`.
+
+`permissions`, when present, replaces `scopes`, including `members.read`. The integer is stored as sent when it is zero or positive. A negative integer is rejected. `1` (`VIEW_CHANNEL`, `1 << 0`) is `rooms.read`. `512` (`MANAGE_CHANNELS`, `1 << 9`) is `rooms.write`. Other bits are stored and add no scope. `members.read` has no bit, so it is granted only by the `scopes` array, and only when `permissions` is omitted.
+
+The bot calls the API with `Authorization: Bot <token>`. The prefix is exact. `Bearer` remains a member session. Unknown or revoked is `401`.
+
+`GET /v1/me` for a bot is the shape under Capabilities and me. `GET /v1/live` takes the same `Bot` header. `ready.online` is empty without `members.read`. `ready.calls` is empty without `rooms.read`. A bot with neither, or with only `rooms.write`, stays connected, answers `ping`, and receives no room or member payload.
+
+`rooms.read` lists rooms and receives `room.*` plus `call.joined`, `call.left`, and `call.state`. `members.read` lists members and receives `member.*` and `presence`. `rooms.write` creates, renames, and deletes rooms and receives none of those payloads by itself. A bot does not receive message, direct, typing, or read frames, and it cannot post them. Any client frame whose type starts with `call.` is `forbidden`. Revocation closes the socket with `4001 session_ended` on the next credential check, every 60 seconds.
 
 ## Bootstrap
 
-While there is no owner, `tinyserver bootstrap` keeps an owner invite that still works and prints nothing new; once it has expired it makes a new one and prints it. `--owner-invite` makes a new one at any time and the earlier one stops working. Only a new invite writes the `bootstrap` audit row, so restarts no longer fill the audit log.
+While there is no owner, `tinyserver bootstrap` keeps an unexpired unused owner invite. It prints a reminder with that invite's expiry and does not print the token again. Once the invite has expired it makes a new one, good for 24 hours, single use, and prints the link and the `tc1.` code (or the raw token when `TINYSERVER_PUBLIC_URL` cannot form a link). When an owner already exists it prints nothing and writes nothing.
+
+`--owner-invite` makes a new 24-hour single-use owner invite even when one is still valid or an owner exists. Unused earlier owner invites stop working. Each of those writes `invite.revoke`. The new invite writes `bootstrap`. A repeat with no `--owner-invite`, while the current owner invite is still valid, writes no audit row.

@@ -1,10 +1,10 @@
 # Running a community
 
-Postgres, tinyserver, and Pocket ID sit on a Docker network that has no route to the internet. cloudflared is on that network and on a second network that can reach Cloudflare, and it carries HTTP and the live socket for the chat hostname and the sign-in pages for the auth hostname. The one published port is the media port, UDP and the same number on TCP, for call audio and video. Starting a sign-in, trading its code, and asking for a sign-up link are limited to a few tries a minute per address.
+Postgres and Pocket ID sit on the internal `inside` network, which has no route to the internet. tinyserver is on `inside` and on `media`. clamd is only on `media`, so tinyserver and clamd have a route out. cloudflared is on `inside` and on a second network that can reach Cloudflare, and it carries HTTP and the live socket for the chat hostname and the sign-in pages for the auth hostname. The one published port is the media port, UDP and the same number on TCP, for call audio and video. Starting a sign-in, trading its code, and asking for a sign-up link are limited to a few tries a minute per address.
 
 tinyserver keeps no passwords. People sign in at an OpenID Connect provider; Pocket ID comes set up as the default one, and people sign in there with a passkey. Signing in proves who someone is to the server. It never grants decryption.
 
-The environment file next to the compose file holds the database passwords, the tunnel token, and the two public URLs. The sign-in secrets are files in `deploy/secrets`. Neither is committed.
+The environment file next to `deploy/compose.yml` is `deploy/.env` when you run compose from `deploy/`. It has to set the database passwords, `TUNNEL_TOKEN`, `TINYSERVER_PUBLIC_URL`, `AUTH_PUBLIC_URL`, and `TINYSERVER_MEDIA_HMAC_SECRET` (64 hex characters, `openssl rand -hex 32`) before `setup.sh`, because that script renders the compose file. There is no `deploy/.env.example`. The repo-root `.env.example` is for a local checkout and does not include `AUTH_PUBLIC_URL` or `TUNNEL_TOKEN`. The sign-in secrets are files in `deploy/secrets`. Neither the env file nor the secrets are committed.
 
 `deploy/compose.yml` reads them. `TINYSERVER_PG_DIR` and `POCKETID_DATA_DIR` can be host directories. Left unset, Docker keeps named volumes.
 
@@ -17,7 +17,7 @@ The environment file next to the compose file holds the database passwords, the 
 
 Add both as public hostnames on the tunnel in Cloudflare. Passkeys need https; Cloudflare provides it. The issuer is `AUTH_PUBLIC_URL` exactly, with no trailing slash and no path, because that is what Pocket ID puts in its tokens.
 
-tinyserver has no route out, so it reaches Pocket ID inside, at `http://pocket-id:1411` (`TINYSERVER_OIDC_INTERNAL_URL`). Discovery, the keys, the code exchange, and the sign-up API go there, with the endpoints Pocket ID names moved to that address. The issuer in discovery and in every ID token must still be the public one. The browser always goes to the public auth hostname.
+tinyserver reaches Pocket ID on the internal network, at `http://pocket-id:1411` (`TINYSERVER_OIDC_INTERNAL_URL`). Discovery, the keys, the code exchange, and the sign-up API go there, with the endpoints Pocket ID names moved to that address. The issuer in discovery and in every ID token must still be the public one. The browser always goes to the public auth hostname. clamd listens at `clamd:3310` on `media` only. That port is not published. Uploads are stored at `/data/uploads` and scanned there. Signature updates use clamd's route out.
 
 The other way is to give tinyserver a route out and leave `TINYSERVER_OIDC_INTERNAL_URL` unset; it then reads everything at the public issuer, through Cloudflare. That is the only way for a provider outside this compose file, such as Google; tinyserver is already on the `media` network, which has a route out.
 
@@ -37,10 +37,10 @@ sh pocket-id/setup.sh moss
 
 It writes the three secrets unless they are there (the directory 0700, the files 0444, because the containers read them as their own users), starts Pocket ID and waits for it, and then, through Pocket ID's API from a `curlimages/curl` container pinned by digest that shares Pocket ID's network:
 
-1. Makes the OIDC client `tinyserver`, or brings it up to date: confidential (`client_secret_basic`), PKCE, callback `${TINYSERVER_PUBLIC_URL}/v1/auth/callback`, back-channel logout to `http://tinyserver:8080/v1/auth/backchannel-logout`, and no consent screen. Its secret is `secrets/oidc_client_secret`, registered once.
+1. Makes the OIDC client `tinyserver`, or brings it up to date: a confidential client with PKCE, callback `${TINYSERVER_PUBLIC_URL}/v1/auth/callback`, back-channel logout to `http://tinyserver:8080/v1/auth/backchannel-logout`, and no consent screen. The setup request does not set `client_secret_basic`. tinyserver uses that method when discovery allows it, and `client_secret_post` when that is all discovery offers. Its secret is `secrets/oidc_client_secret`, registered once.
 2. With a username, here `moss`: makes that admin unless they exist and prints a one-time login link, `${AUTH_PUBLIC_URL}/lc/<token>`, good for an hour. Open it, and Pocket ID asks for a passkey. Run it again for a fresh link. It also prints their Pocket ID user id, which is the subject tinyserver sees.
 
-Run it again any time; every step is skipped when already done. Compose options go in `COMPOSE`, such as `COMPOSE="docker compose -p tinyserver --env-file ../../.env" sh pocket-id/setup.sh`. The API key and the client secret reach curl on its standard input, never in a command line. Then `docker compose up -d`.
+Run it again any time; every step is skipped when already done. Compose options go in `COMPOSE`. From `deploy/`, an explicit env file is `COMPOSE="docker compose -p tinyserver --env-file .env" sh pocket-id/setup.sh`. The API key and the client secret reach curl on its standard input, never in a command line. Then `docker compose up -d`.
 
 A Pocket ID account is not a membership, and a membership needs no Pocket ID account made by hand. People still need an invite, or a group the owner allows, to join.
 
@@ -85,10 +85,10 @@ Sessions already open keep working until they expire.
 There is no owner password. The first start migrates and, while there is no owner, prints a single-use owner invite that lasts 24 hours:
 
 ```sh
-docker compose logs tinyserver | grep -A2 'Owner invite'
+docker compose logs tinyserver | grep -A4 'Owner invite'
 ```
 
-It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. Until someone does, a start keeps that invite while it works and prints a new one only once it has expired; lost it, run `tinyserver bootstrap --owner-invite` for a new one, and the old one stops working. After that, starts leave the owner alone.
+`grep 'Owner invite'` matches the line that prints the token, and that line is printed once. A later start with no owner prints `No owner yet. The owner invite printed earlier works until …` and does not print the token again. Paste the code into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. Lost it, run `tinyserver bootstrap --owner-invite` for a new one, and the old one stops working. After that, starts leave the owner alone.
 
 A server from before sign-in moved to OIDC still has its owner, but that account has no provider identity and cannot sign in. Make an owner invite anyway, sign in with it, and remove the old account from the member list:
 
@@ -118,7 +118,7 @@ Any provider with discovery, the authorization code flow, and a confidential cli
 | `TINYSERVER_OIDC_POCKETID_GROUP_IDS` | Comma list of Pocket ID group ids a new account joins. |
 | `TINYSERVER_SESSION_MAX_DAYS` | How long a session from sign-in lasts, 1 to 365, 30 unless set. Then tinyclient signs in again. Nothing extends a session, and no provider refresh token is kept. |
 
-Several providers at once: `TINYSERVER_OIDC_PROVIDERS=tinyauth,google`, then the same variables with the id after `OIDC_`, such as `TINYSERVER_OIDC_GOOGLE_ISSUER`, `TINYSERVER_OIDC_GOOGLE_CLIENT_SECRET_FILE`, and `TINYSERVER_OIDC_GOOGLE_NAME` for the name. The first is the default. A person is the pair of issuer and subject, so the same person at two providers is two accounts. Email never links accounts.
+Several providers at once: `TINYSERVER_OIDC_PROVIDERS=pocket-id,google`, then the same variables with the id after `OIDC_`, such as `TINYSERVER_OIDC_GOOGLE_ISSUER`, `TINYSERVER_OIDC_GOOGLE_CLIENT_SECRET_FILE`, and `TINYSERVER_OIDC_GOOGLE_NAME` for the name. The first is the default. A person is the pair of issuer and subject, so the same person at two providers is two accounts. Email never links accounts.
 
 PKCE is S256 on every sign-in, whether or not discovery mentions it. ID tokens must be RS256, ES256, or EdDSA, signed by a key in the provider's key set; a token with a key id the server has not seen makes it read the set again, at most every 10 seconds.
 
@@ -139,10 +139,10 @@ Call audio and video do not fit through the tunnel, so they go straight to the s
 1. Set `TINYSERVER_PUBLIC_IP` in the environment file to the address members reach: the router's public IPv4 address. The server does not guess it.
 2. `TINYSERVER_MEDIA_PORT` is 50000 unless set. Compose publishes the same number inside and out, on UDP and TCP, because the server advertises the port it binds.
 3. On the router, forward that port to the host, both UDP and TCP.
-4. On the host firewall, allow both: `ufw allow 50000/udp` and `ufw allow 50000/tcp`.
+4. On the host firewall, allow `TINYSERVER_MEDIA_PORT` for both UDP and TCP. With the default port that is `ufw allow 50000/udp` and `ufw allow 50000/tcp`.
 5. Optional: set `TINYSERVER_LAN_IP` to the host's address on the home network, such as `192.168.1.20`. Many routers do not hairpin, so members at home cannot reach the public address from inside; with this set, the answer offers them the LAN address too. Members elsewhere see it in the SDP but cannot use it.
 6. Optional: set `TINYSERVER_MEDIA_EGRESS_KBPS` to what the host can upload for calls, in kb/s, such as `8000` on a 10 Mb/s line. The server plans every call together to fit it: everyone gets the high camera layer if that fits, else the low one, else audio only. Each listener with a camera to watch costs about 1,200 kb/s on the high layer and 350 on the low one, and each voice about 50.
-7. `docker compose up -d`, then check that `GET /health` says `"media": "up"` and lists `"transports": ["udp", "tcp"]`, with `"lan"` as well when step 5 is set.
+7. `docker compose up -d`, then open `GET /health` on the chat hostname through the tunnel. Port 8080 is not published on the host. It says `"media": "up"` and lists `"transports": ["udp", "tcp"]`, with `"lan"` as well when step 5 is set.
 
 Every member in a call sees `TINYSERVER_PUBLIC_IP` in the SDP answer. The tunnel no longer hides the host's address from members. Strangers who find the port get STUN handling only; nothing else is processed without the per-join ICE password, which only travels over the signed-in live socket.
 
