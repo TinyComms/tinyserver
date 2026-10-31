@@ -15,6 +15,8 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use tokio::sync::Mutex;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::Router;
@@ -28,6 +30,8 @@ use tower::ServiceExt;
 pub const OWNER_EMAIL: &str = "owner@tinyserver.test";
 /// The issuer of identities made through `db` directly, without a provider.
 pub const ISSUER: &str = "https://issuer.tinyserver.test";
+/// 32-byte HMAC key as lowercase hex. Same value as `api::media_sign::TEST_SECRET_HEX`.
+pub const MEDIA_HMAC_SECRET: &str = api::media_sign::TEST_SECRET_HEX;
 
 #[derive(Clone)]
 pub struct TestDb {
@@ -43,6 +47,7 @@ where
     F: FnOnce(TestDb) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let _run = RUN.lock().await;
     let (Ok(migrate_url), Ok(runtime_url)) = (
         std::env::var("TEST_DATABASE_URL_MIGRATE"),
         std::env::var("TEST_DATABASE_URL"),
@@ -50,6 +55,7 @@ where
         eprintln!("skipped: TEST_DATABASE_URL_MIGRATE and TEST_DATABASE_URL are not set");
         return;
     };
+    std::env::set_var("TINYSERVER_MEDIA_HMAC_SECRET", MEDIA_HMAC_SECRET);
     let admin = PgConnectOptions::from_str(&migrate_url).expect("TEST_DATABASE_URL_MIGRATE");
     let base_runtime = PgConnectOptions::from_str(&runtime_url).expect("TEST_DATABASE_URL");
 
@@ -220,6 +226,9 @@ pub fn sqlstate(error: &sqlx::Error) -> String {
 }
 
 static ADDRESS: AtomicU32 = AtomicU32::new(1);
+/// Upload dir and HMAC secret live in process env; one `run` at a time so tests do not
+/// read another test's `TINYSERVER_UPLOAD_DIR`.
+static RUN: Mutex<()> = Mutex::const_new(());
 
 /// A different client address on every call, so tests do not share a rate limit bucket.
 pub fn fresh_address() -> String {

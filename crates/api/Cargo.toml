@@ -27,6 +27,7 @@ serde_json.workspace = true
 # The hash of the sign-in pages' stylesheet, for their Content-Security-Policy.
 sha2.workspace = true
 sqlx.workspace = true
+subtle.workspace = true
 tokio.workspace = true
 # The version axum's `ws` feature uses. Only its error type is read, to tell an oversized frame.
 tokio-tungstenite = { version = "0.29", default-features = false }

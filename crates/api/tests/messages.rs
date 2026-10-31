@@ -582,6 +582,181 @@ async fn a_scanning_attachment_download_is_locked() {
     .await;
 }
 
+#[tokio::test]
+async fn download_sends_attachment_disposition_for_files() {
+    run(|db| async move {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyserver-uploads-disposition-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let pdf = b"%PDF-1.4\n";
+        let (status, saved) = upload(&app, &token, "doc.pdf", "application/pdf", pdf, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "file");
+        assert_eq!(saved["mime"], "application/pdf");
+        let pdf_id = saved["id"].as_str().expect("pdf id").to_string();
+
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{pdf_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("attachment"),
+            "pdf disposition: {disposition}"
+        );
+        assert_eq!(
+            header_str(&headers, header::CONTENT_TYPE),
+            "application/pdf"
+        );
+
+        let pdf_url = saved["url"].as_str().expect("signed url");
+        assert!(
+            pdf_url.starts_with(&format!("/v1/media/{pdf_id}?")),
+            "{pdf_url}"
+        );
+        assert!(pdf_url.contains("ex="), "{pdf_url}");
+        assert!(pdf_url.contains("is="), "{pdf_url}");
+        assert!(pdf_url.contains("hm="), "{pdf_url}");
+
+        let notes = b"hello notes";
+        let (status, saved) = upload(&app, &token, "notes.txt", "text/plain", notes, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let notes_id = saved["id"].as_str().expect("notes id");
+        let (status, headers, _) =
+            download_at(&app, &token, &format!("/v1/media/{notes_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("attachment"),
+            "file disposition: {disposition}"
+        );
+
+        let gif = include_bytes!("fixtures/tiny.gif").as_slice();
+        let (status, saved) = upload(&app, &token, "wave.gif", "image/gif", gif, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "gif");
+        let gif_id = saved["id"].as_str().expect("gif id");
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{gif_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("inline"),
+            "gif disposition: {disposition}"
+        );
+        assert_eq!(header_str(&headers, header::CONTENT_TYPE), "image/gif");
+
+        let png = include_bytes!("fixtures/tiny.png").as_slice();
+        let (status, saved) = upload(&app, &token, "dot.png", "image/png", png, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["kind"], "image");
+        let png_id = saved["id"].as_str().expect("png id");
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{png_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = header_str(&headers, header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.starts_with("inline"),
+            "png disposition: {disposition}"
+        );
+        assert_eq!(header_str(&headers, header::CONTENT_TYPE), "image/png");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn download_keeps_nosniff_and_no_store() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-nosniff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("id");
+        let (status, headers, _) = download_at(&app, &token, &format!("/v1/media/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header_str(&headers, header::X_CONTENT_TYPE_OPTIONS),
+            "nosniff"
+        );
+        assert_eq!(header_str(&headers, header::CACHE_CONTROL), "no-store");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_bad_hmac_is_refused() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-hmac-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, saved) =
+            upload(&app, &token, "notes.txt", "text/plain", b"hello notes", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let id = saved["id"].as_str().expect("id").to_string();
+
+        let (status, _, bytes) = download_at(
+            &app,
+            &token,
+            &format!("/v1/media/{id}?ex=2000000000&is=1&hm=00"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "invalid hm must 401: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let (status, _, bytes) = download_at(&app, &token, &format!("/v1/media/{id}?ex=1")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "partial hmac params must 401: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let (status, _) = download(&app, &token, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "missing hmac params stay Bearer-compat"
+        );
+
+        let url = saved["url"].as_str().expect("signed url");
+        let (status, _, _) = download_at(&app, &token, url).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a minted url still downloads with Bearer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
 async fn send_message(
     app: &Router,
     token: &str,
@@ -671,7 +846,7 @@ async fn upload(
 
 async fn download(app: &Router, token: &str, id: &str) -> (StatusCode, Vec<u8>) {
     let path = format!("/v1/media/{id}");
-    let (status, headers, bytes) = exchange(app, Method::GET, &path, token, "", Vec::new()).await;
+    let (status, headers, bytes) = download_at(app, token, &path).await;
     if status == StatusCode::OK {
         let mime = headers
             .get(header::CONTENT_TYPE)
@@ -680,6 +855,21 @@ async fn download(app: &Router, token: &str, id: &str) -> (StatusCode, Vec<u8>) 
         assert!(!mime.is_empty(), "download content type");
     }
     (status, bytes)
+}
+
+async fn download_at(
+    app: &Router,
+    token: &str,
+    path: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    exchange(app, Method::GET, path, token, "", Vec::new()).await
+}
+
+fn header_str(headers: &axum::http::HeaderMap, name: axum::http::HeaderName) -> &str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
 }
 
 async fn exchange(

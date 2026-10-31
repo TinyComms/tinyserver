@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::community::{caller, ApiError};
+use crate::media_sign;
 
 /// A file plus its multipart headers. A little over the largest cap an admin may set.
 const UPLOAD_BODY: usize = db::UPLOAD_MAX as usize + 1024 * 1024;
@@ -102,6 +103,14 @@ struct ReadBody {
 struct OverrideBody {
     allow: Option<i64>,
     deny: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct MediaQuery {
+    ex: Option<String>,
+    #[serde(rename = "is")]
+    issued: Option<String>,
+    hm: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -188,9 +197,17 @@ async fn member(pool: &PgPool, headers: &HeaderMap) -> Result<Caller, Error> {
     caller(pool, headers).await.map_err(from_api)
 }
 
+fn signed(mut value: Value) -> Json<Value> {
+    media_sign::overlay(&mut value);
+    Json(value)
+}
+
 async fn channels(State(pool): State<PgPool>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
-    list_channels(&pool, &caller).await.map(Json).map_err(lift)
+    list_channels(&pool, &caller)
+        .await
+        .map(signed)
+        .map_err(lift)
 }
 
 async fn add_channel(
@@ -209,7 +226,7 @@ async fn add_channel(
     )
     .await
     .map_err(lift)?;
-    Ok((StatusCode::CREATED, Json(channel)))
+    Ok((StatusCode::CREATED, signed(channel)))
 }
 
 async fn rename_channel(
@@ -221,7 +238,7 @@ async fn rename_channel(
     let caller = member(&pool, &headers).await?;
     update_channel(&pool, &caller, &id, &patch)
         .await
-        .map(Json)
+        .map(signed)
         .map_err(lift)
 }
 
@@ -262,7 +279,7 @@ async fn remove_override(
 
 async fn directs(State(pool): State<PgPool>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
-    list_directs(&pool, &caller).await.map(Json).map_err(lift)
+    list_directs(&pool, &caller).await.map(signed).map_err(lift)
 }
 
 async fn add_direct(
@@ -279,7 +296,7 @@ async fn add_direct(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(direct)))
+    Ok((status, signed(direct)))
 }
 
 async fn messages(
@@ -297,7 +314,7 @@ async fn messages(
         page.limit.unwrap_or(50),
     )
     .await
-    .map(Json)
+    .map(signed)
     .map_err(lift)
 }
 
@@ -320,7 +337,7 @@ async fn add_message(
     )
     .await
     .map_err(lift)?;
-    Ok((StatusCode::CREATED, Json(message)))
+    Ok((StatusCode::CREATED, signed(message)))
 }
 
 async fn edit(
@@ -332,7 +349,7 @@ async fn edit(
     let caller = member(&pool, &headers).await?;
     edit_message(&pool, &caller, &id, &body.body)
         .await
-        .map(Json)
+        .map(signed)
         .map_err(lift)
 }
 
@@ -403,24 +420,51 @@ async fn upload(
     let saved = save_attachment(&pool, &caller, &upload, engine.as_ref())
         .await
         .map_err(lift)?;
-    Ok((StatusCode::CREATED, Json(saved)))
+    Ok((StatusCode::CREATED, signed(saved)))
 }
 
 async fn download(
     State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<MediaQuery>,
 ) -> Result<Response, Error> {
     let caller = member(&pool, &headers).await?;
+    if query.ex.is_some() || query.issued.is_some() || query.hm.is_some() {
+        let (Some(ex), Some(issued), Some(hm)) = (
+            query.ex.as_deref(),
+            query.issued.as_deref(),
+            query.hm.as_deref(),
+        ) else {
+            return Err(Error::Unauthorized);
+        };
+        let Some(secret) = media_sign::load_secret() else {
+            return Err(Error::Unauthorized);
+        };
+        let Ok(ex) = ex.parse::<i64>() else {
+            return Err(Error::Unauthorized);
+        };
+        let Ok(issued) = issued.parse::<i64>() else {
+            return Err(Error::Unauthorized);
+        };
+        if !media_sign::verify(&secret, &id, ex, issued, hm, media_sign::unix_now()) {
+            return Err(Error::Unauthorized);
+        }
+    }
     let file = open_attachment(&pool, &caller, &id).await.map_err(lift)?;
     Ok(file_response(file.name, file.mime, file.bytes))
 }
 
 fn file_response(name: String, mime: String, bytes: Vec<u8>) -> Response {
+    let inline = matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    );
     let mime = HeaderValue::from_str(&mime)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    let disposition = HeaderValue::from_str(&content_disposition(&name))
-        .unwrap_or_else(|_| HeaderValue::from_static("inline"));
+    let fallback = if inline { "inline" } else { "attachment" };
+    let disposition = HeaderValue::from_str(&content_disposition(&name, inline))
+        .unwrap_or_else(|_| HeaderValue::from_static(fallback));
     let mut response = (StatusCode::OK, bytes).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, mime);
@@ -428,7 +472,7 @@ fn file_response(name: String, mime: String, bytes: Vec<u8>) -> Response {
     response
 }
 
-fn content_disposition(name: &str) -> String {
+fn content_disposition(name: &str, inline: bool) -> String {
     let ascii: String = name
         .chars()
         .map(|c| {
@@ -447,7 +491,8 @@ fn content_disposition(name: &str) -> String {
             encoded.push_str(&format!("%{byte:02X}"));
         }
     }
-    format!("inline; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+    let kind = if inline { "inline" } else { "attachment" };
+    format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
 fn parse_upload(content_type: &str, body: &[u8]) -> Result<NewAttachment, MessageError> {

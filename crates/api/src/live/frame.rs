@@ -60,7 +60,7 @@ struct Durable<'a> {
 }
 
 impl Event {
-    pub fn from_row(row: OutboxRow) -> Self {
+    pub fn from_row(mut row: OutboxRow) -> Self {
         let audience = if !row.users.is_empty() {
             Audience::Users
         } else if row.topic.starts_with("invite.") {
@@ -88,6 +88,7 @@ impl Event {
                 .payload
                 .get("timeout_until")
                 .is_some_and(|until| !until.is_null());
+        crate::media_sign::overlay(&mut row.payload);
         let frame = match audience {
             Audience::Server => None,
             Audience::Everyone | Audience::Invites | Audience::Bans | Audience::Users => {

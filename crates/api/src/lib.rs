@@ -10,6 +10,7 @@ mod community;
 mod health;
 mod limit;
 mod live;
+pub mod media_sign;
 mod messages;
 mod oidc;
 mod session;
