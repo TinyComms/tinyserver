@@ -300,6 +300,54 @@ async fn a_gif_and_a_video_can_be_uploaded_and_downloaded() {
 }
 
 #[tokio::test]
+async fn an_html_upload_is_unsupported_media() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-html-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let (status, denied) = upload(
+            &app,
+            &token,
+            "page.html",
+            "text/html",
+            b"<html>hi</html>",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{denied}");
+        assert_eq!(denied["error"], "unsupported_media");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_pe_named_as_png_is_unsupported_media() {
+    run(|db| async move {
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-pe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let mut bytes = b"MZ".to_vec();
+        bytes.extend_from_slice(&[0; 64]);
+        let (status, denied) = upload(&app, &token, "photo.png", "image/png", &bytes, &[]).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{denied}");
+        assert_eq!(denied["error"], "unsupported_media");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_direct_message_is_not_delivered_to_a_third_member() {
     run(|db| async move {
         let owner = first_owner(&db).await;

@@ -9,6 +9,7 @@ mod bootstrap;
 mod bot;
 mod community;
 mod error;
+mod media;
 mod messages;
 mod migrate;
 mod moderation;

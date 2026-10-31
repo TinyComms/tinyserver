@@ -579,8 +579,20 @@ fn prepare(upload: &NewAttachment, limits: UploadLimits) -> Result<Prepared, Mes
             return Err(MessageError::Invalid);
         }
     }
-    let kind = kind_of(&mime, &upload.bytes, limits)?;
-    Ok(Prepared { name, mime, kind })
+    let classified =
+        crate::media::classify(&name, &mime, &upload.bytes, crate::media::Archives::Denied)?;
+    let limit = match classified.kind {
+        "image" | "gif" => limits.image,
+        _ => limits.file,
+    };
+    if !within(upload.bytes.len(), limit) {
+        return Err(MessageError::TooLarge);
+    }
+    Ok(Prepared {
+        name: classified.name,
+        mime: classified.mime,
+        kind: classified.kind,
+    })
 }
 
 fn clean_name(name: &str) -> Result<String, MessageError> {
@@ -612,58 +624,8 @@ fn normalize_mime(mime: &str) -> Result<String, MessageError> {
     }
 }
 
-fn kind_of(mime: &str, bytes: &[u8], limits: UploadLimits) -> Result<&'static str, MessageError> {
-    if bytes.is_empty() {
-        return Err(MessageError::Invalid);
-    }
-    let (kind, limit, sniffed) = match mime {
-        "image/png" => ("image", limits.image, Some(sniff_png(bytes))),
-        "image/jpeg" => ("image", limits.image, Some(sniff_jpeg(bytes))),
-        "image/webp" => ("image", limits.image, Some(sniff_webp(bytes))),
-        "image/gif" => ("gif", limits.image, Some(sniff_gif(bytes))),
-        "video/mp4" => ("video", limits.file, Some(sniff_mp4(bytes))),
-        "video/webm" => ("video", limits.file, Some(sniff_webm(bytes))),
-        other if other.starts_with("image/") || other.starts_with("video/") => {
-            return Err(MessageError::UnsupportedMedia);
-        }
-        _ => ("file", limits.file, None),
-    };
-    if !within(bytes.len(), limit) {
-        return Err(MessageError::TooLarge);
-    }
-    if sniffed == Some(false) {
-        return Err(MessageError::UnsupportedMedia);
-    }
-    Ok(kind)
-}
-
 fn within(len: usize, limit: i64) -> bool {
     i64::try_from(len).is_ok_and(|len| len <= limit)
-}
-
-fn sniff_png(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-}
-
-fn sniff_jpeg(bytes: &[u8]) -> bool {
-    bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
-}
-
-fn sniff_webp(bytes: &[u8]) -> bool {
-    bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
-}
-
-fn sniff_gif(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
-}
-
-fn sniff_mp4(bytes: &[u8]) -> bool {
-    let window = &bytes[..bytes.len().min(32)];
-    window.windows(4).any(|chunk| chunk == b"ftyp")
-}
-
-fn sniff_webm(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3])
 }
 
 fn upload_dir() -> String {
@@ -760,11 +722,7 @@ fn is_extend(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_of as classify, one_emoji, MessageError, UploadLimits};
-
-    fn kind_of(mime: &str, bytes: &[u8]) -> Result<&'static str, MessageError> {
-        classify(mime, bytes, UploadLimits::defaults())
-    }
+    use super::{one_emoji, MessageError, NewAttachment, UploadLimits};
 
     #[test]
     fn an_emoji_is_one_grapheme() {
@@ -783,42 +741,17 @@ mod tests {
     }
 
     #[test]
-    fn uploads_match_their_declared_type() {
-        assert_eq!(kind_of("image/gif", b"GIF89a").expect("gif"), "gif");
-        assert_eq!(
-            kind_of("image/png", b"\x89PNG\r\n\x1a\n").expect("png"),
-            "image"
-        );
-        assert_eq!(
-            kind_of("image/jpeg", b"\xFF\xD8\xFF").expect("jpeg"),
-            "image"
-        );
-        let mut webp = vec![0_u8; 12];
-        webp[0..4].copy_from_slice(b"RIFF");
-        webp[8..12].copy_from_slice(b"WEBP");
-        assert_eq!(kind_of("image/webp", &webp).expect("webp"), "image");
-        let mut mp4 = vec![0_u8; 16];
-        mp4[4..8].copy_from_slice(b"ftyp");
-        assert_eq!(kind_of("video/mp4", &mp4).expect("mp4"), "video");
-        assert_eq!(
-            kind_of("video/webm", &[0x1A, 0x45, 0xDF, 0xA3]).expect("webm"),
-            "video"
-        );
-        assert_eq!(kind_of("application/pdf", b"%PDF").expect("file"), "file");
+    fn an_oversized_file_is_too_large() {
+        let upload = NewAttachment {
+            name: "notes.txt".to_string(),
+            mime: "text/plain".to_string(),
+            bytes: vec![0_u8; FILE_MAX_PLUS],
+            width: None,
+            height: None,
+            duration: None,
+        };
         assert!(matches!(
-            kind_of("image/png", b"GIF89a"),
-            Err(MessageError::UnsupportedMedia)
-        ));
-        assert!(matches!(
-            kind_of("image/bmp", b"BM"),
-            Err(MessageError::UnsupportedMedia)
-        ));
-        assert!(matches!(
-            kind_of("image/gif", b""),
-            Err(MessageError::Invalid)
-        ));
-        assert!(matches!(
-            kind_of("text/plain", &vec![0_u8; FILE_MAX_PLUS]),
+            super::prepare(&upload, UploadLimits::defaults()),
             Err(MessageError::TooLarge)
         ));
     }
