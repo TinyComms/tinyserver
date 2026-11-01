@@ -122,7 +122,19 @@ const JSON_FIELDS: &[&str] = &[
 ];
 
 const FIRST_PARTY: &[&str] = &["tinyserver", "api", "sfu"];
-const DEPENDENCIES: &[&str] = &["reqwest", "hyper", "h2", "sqlx", "tower", "str0m"];
+/// Crates whose own logging is held at warn, whatever the operator asks for. `webauthn_rs_core`
+/// traces whole credentials, ids included, at TRACE.
+const DEPENDENCIES: &[&str] = &[
+    "reqwest",
+    "hyper",
+    "h2",
+    "sqlx",
+    "tower",
+    "str0m",
+    "webauthn_rs",
+    "webauthn_rs_core",
+    "webauthn_rs_proto",
+];
 
 #[derive(Clone, Debug)]
 pub struct LogPolicy {
@@ -854,6 +866,40 @@ mod tests {
                 assert!(!line.contains("REPORT-MARKER-TEXT"), "{field}: {line}");
                 assert!(line.contains("report_id=0192"), "{field}: {line}");
             }
+        }
+    }
+
+    #[test]
+    fn the_passkey_library_is_held_at_warn_under_the_most_verbose_policy() {
+        // `webauthn_rs_core` traces a whole registration, credential id included, at TRACE.
+        let verbose = LogPolicy {
+            operator: Level::TRACE,
+            ring: true,
+            ..LogPolicy::default()
+        };
+        for target in [
+            "webauthn_rs",
+            "webauthn_rs_core",
+            "webauthn_rs_core::core",
+            "webauthn_rs_core::internals",
+            "webauthn_rs_proto",
+        ] {
+            for sink in [Sink::Operator, Sink::Ring] {
+                assert_eq!(
+                    target_ceiling(&verbose, sink, target),
+                    Level::WARN,
+                    "{target}"
+                );
+            }
+        }
+        // The filter says the same, so the event is not even built.
+        let directive = filter_for(&verbose).to_string();
+        for name in [
+            "webauthn_rs=warn",
+            "webauthn_rs_core=warn",
+            "webauthn_rs_proto=warn",
+        ] {
+            assert!(directive.contains(name), "{directive}");
         }
     }
 
