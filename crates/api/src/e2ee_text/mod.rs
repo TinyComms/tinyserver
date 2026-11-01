@@ -1079,7 +1079,10 @@ pub(crate) async fn post_ciphertext(
     } else {
         None
     };
-    let aad = mls::message_aad_for(kind, target.as_deref(), bound.as_deref());
+    let aad = match bound.as_deref() {
+        Some(id) => mls::message_aad_for(kind, target.as_deref(), Some(id)),
+        None => mls::message_aad(kind, target.as_deref()),
+    };
     if let Err(refusal) = mls::check_ciphertext(&group, epoch, &aad, &data) {
         return Err(refine(pool, caller, conversation, refused(refusal)).await);
     }
