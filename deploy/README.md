@@ -67,11 +67,11 @@ The auth hostname stays, so the issuer stays and tinyclient notices nothing. Eve
 6. List the accounts and their old subjects, then move each one to its new subject:
 
    ```sh
-   docker compose exec tinyserver tinyserver identities
-   docker compose exec tinyserver tinyserver relink-identity --user-id <tinyserver user id> --subject <Pocket ID user id>
+   docker compose run --rm --entrypoint tinyserver tinyserver-init identities
+   docker compose run --rm --entrypoint tinyserver tinyserver-init relink-identity --user-id <tinyserver user id> --subject <Pocket ID user id>
    ```
 
-   `--issuer` defaults to `TINYSERVER_OIDC_ISSUER`. It refuses a subject another account already has, and writes an `identity.relink` audit row. The same in SQL, as `app_owner` (`docker compose exec -T postgres psql -U app_owner tinyserver`):
+   Both need the database owner role, so they run in `tinyserver-init`, not in the serving container. `--issuer` defaults to `TINYSERVER_OIDC_ISSUER`. It refuses a subject another account already has, and writes an `identity.relink` audit row. The same in SQL, as `app_owner` (`docker compose exec -T postgres psql -U app_owner tinyserver`):
 
    ```sql
    UPDATE user_identities SET subject = '<Pocket ID user id>'
@@ -151,6 +151,29 @@ Every member in a call sees `TINYSERVER_PUBLIC_IP` in the SDP answer. The tunnel
 Joining the `media` network gives the server a route out, which it did not have. It makes no outbound connections except to a sign-in provider outside the compose file, when one is configured; an owner who wants that enforced can add a `DOCKER-USER` rule that allows only replies.
 
 TCP streams are capped at 256 in all and 16 from one address. One that sends no STUN for a call within 5 s, or nothing at all for 30 s, is closed. A relay mode for hosts that cannot open a port comes in a later release.
+
+## Upgrading
+
+From `deploy/`, back up the database first (`docker compose exec -T postgres pg_dump -U postgres tinyserver > backups/before-upgrade.sql`), then:
+
+```sh
+git pull
+docker compose up -d --build --remove-orphans
+```
+
+`tinyserver-init` applies any new migrations and exits before the server starts. If it fails, the server does not start; `docker compose logs tinyserver-init` says why. Going back to an older release means restoring that backup: an older binary refuses a database that has migrations it does not know.
+
+### Upgrading to the release with `tinyserver-init`
+
+The release that moved the database owner password out of the serving container changes these things for an existing install. The steps above are all that is needed; nothing has to be set by hand.
+
+- **New one-shot service and volume.** `tinyserver-init` (same image) migrates and bootstraps, and `tinyserver_bootstrap` holds the owner invite. `up` creates both. `tinyserver-uploads` now also gives the new volume to user 10001, and runs again because its command changed. The serving container has `DATABASE_URL` (`app_runtime`) only, and its entrypoint no longer migrates.
+- **Owner-role commands move.** `bootstrap --owner-invite`, `identities` and `relink-identity` run as `docker compose run --rm --entrypoint tinyserver tinyserver-init <command>`. `docker compose exec tinyserver tinyserver <command>` now fails with `DATABASE_URL_MIGRATE is not set`, on purpose.
+- **The owner invite moved** from `/var/lib/tinyserver/owner-invite` to `/bootstrap/owner-invite` (read it with `docker compose exec tinyserver cat /bootstrap/owner-invite`). It is removed by the next `tinyserver-init` run after an owner exists, so after the owner has signed in, `docker compose up -d` once more clears it.
+- **Migrations 0013 and 0014.** 0013 replaces `app_emit` and `app_emit_to` so a channel's live events go only to members who can view it. 0014 adds `users.deleted_at`, `DELETE /v1/me`, and a trigger that rewrites the live-event history when a message is edited or deleted. Neither rewrites existing rows; both are quick. Events already in the 24 hour outbox before the upgrade keep the audience and text they were stored with until they age out.
+- **Resource limits.** tinyserver 1 GiB, 512 processes, 2 CPUs; Postgres 1 GiB, 256 processes; clamd 3 GiB; tinyserver-init 256 MiB. These are caps, not reservations. A large community raises them with `TINYSERVER_MEM_LIMIT`, `TINYSERVER_PIDS_LIMIT`, `TINYSERVER_CPUS`, `TINYSERVER_PG_MEM_LIMIT`, `TINYSERVER_PG_PIDS_LIMIT` and `TINYSERVER_CLAMD_MEM_LIMIT`. Postgres now starts with only the capabilities it needs to drop to its own user, and the tunnel with none and a read-only root.
+- **Sign-in limiter.** It counts the connection's own address and believes `cf-connecting-ip` only from a trusted proxy. The default trusts private, loopback, link-local and 100.64.0.0/10 peers, which covers cloudflared on the `inside` network. To trust only the tunnel, set `TINYSERVER_TRUSTED_PROXIES=172.30.53.10` (or your `TINYSERVER_TUNNEL_IP`); a proxy with a public address must be listed; `none` believes no header.
+- **Single-container setups** that run the image on its own and pass `DATABASE_URL_MIGRATE` keep working: the entrypoint still migrates and bootstraps when that variable is set, then drops it before serving. That keeps the owner role in the serving process; prefer running `tinyserver migrate` and `tinyserver bootstrap` as a separate step.
 
 ## Stopping
 

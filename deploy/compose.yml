@@ -109,7 +109,11 @@ services:
       TINYSERVER_UPLOAD_DIR: /data/uploads
       # Signed media paths. 32 bytes of hex the operator generates. Required; unset will not start.
       TINYSERVER_MEDIA_HMAC_SECRET: ${TINYSERVER_MEDIA_HMAC_SECRET:?set TINYSERVER_MEDIA_HMAC_SECRET to 64 hex characters (openssl rand -hex 32)}
-      # Invite file and debug bundles. The image is read-only, so this is a tmpfs.
+      # Whose cf-connecting-ip the sign-in limiter believes. Unset trusts private peers, which
+      # covers cloudflared here; set it to the tunnel's address to trust only the tunnel.
+      TINYSERVER_TRUSTED_PROXIES: ${TINYSERVER_TRUSTED_PROXIES:-}
+      # Debug bundles. The image is read-only, so this is a tmpfs. The owner invite is in
+      # /bootstrap, written by tinyserver-init.
       TINYSERVER_DATA_DIR: /var/lib/tinyserver
     tmpfs:
       - /var/lib/tinyserver:uid=10001,gid=10001,mode=0700
@@ -159,6 +163,8 @@ services:
       DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
       TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
       TINYSERVER_DATA_DIR: /bootstrap
+      # The default issuer for `relink-identity`, which runs here.
+      TINYSERVER_OIDC_ISSUER: ${AUTH_PUBLIC_URL:-${TINYAUTH_PUBLIC_URL:?set AUTH_PUBLIC_URL, such as https://auth.example.org}}
     volumes:
       - tinyserver_bootstrap:/bootstrap
     # The inside network has no route out. It reaches Postgres and nothing else.
