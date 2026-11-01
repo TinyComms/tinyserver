@@ -1943,3 +1943,312 @@ async fn no_secret_a_flow_makes_reaches_the_logs() {
     assert!(!text.contains("Ada Lovelace"));
     assert!(!text.contains("grace@example.org"));
 }
+
+// First-run setup, where it meets passkeys.
+
+/// Puts a passkey on an existing account with a claim link, as an owner's roster would.
+async fn attach_passkey(app: &Router, db: &TestDb, user_id: &str, device: &mut Device) -> Account {
+    let token = db::mint_claim(&db.owner, user_id, 14).await.expect("claim");
+    note(&token);
+    let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/claim/begin")
+        .json(json!({"token": token}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{begun}");
+    note(begun["cid"].as_str().expect("cid"));
+    let credential = device.register(&begun["options"]);
+    let (status, claimed) = Call::new(Method::POST, "/v1/auth/passkey/claim/finish")
+        .json(json!({"token": token, "cid": begun["cid"], "credential": credential}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{claimed}");
+    let codes: Vec<String> = claimed["codes"]
+        .as_array()
+        .expect("codes")
+        .iter()
+        .map(|code| code.as_str().expect("code").to_string())
+        .collect();
+    for code in &codes {
+        note(code);
+    }
+    Account {
+        token: String::new(),
+        user_id: user_id.to_string(),
+        credential_id: raw_id(&credential),
+        subject: subject_of(db, user_id).await,
+        codes,
+    }
+}
+
+async fn put_setup(app: &Router, token: &str, body: Value) -> (StatusCode, Value) {
+    Call::new(Method::PUT, "/v1/setup")
+        .token(token)
+        .json(body)
+        .send(app)
+        .await
+}
+
+async fn get_setup(app: &Router, token: &str) -> Value {
+    let (status, setup) = Call::new(Method::GET, "/v1/setup")
+        .token(token)
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{setup}");
+    setup
+}
+
+/// The query tinyserver sent the browser back to tinyclient with.
+fn redirect_pairs(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
+    let location = headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("location");
+    Url::parse(location)
+        .expect("url")
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+#[tokio::test]
+async fn passkeys_only_waits_for_the_owner_to_have_a_passkey_and_for_members_to_be_ready() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let ada = oidc_member(&db, &owner, "ada@example.org").await;
+        let ada_token = session(&db, &ada.user_id).await;
+        let app = passkey_app(&db);
+
+        let setup = get_setup(&app, &owner_token).await;
+        assert_eq!(setup["deployment"], json!({"passkeys": true, "sso": false}));
+        assert_eq!(setup["counts"]["owner_has_passkey"], false);
+        assert_eq!(setup["counts"]["members_without_passkey"], 2);
+        assert_eq!(setup["presets"][1]["available"], true);
+
+        // The owner has no passkey: choosing passkeys only would lock the owner out.
+        let (status, body) =
+            put_setup(&app, &owner_token, json!({"sign_in_methods": "passkey"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "owner_needs_passkey");
+
+        let mut owner_device = Device::new();
+        let owner_passkey = attach_passkey(&app, &db, &owner.user_id, &mut owner_device).await;
+        let setup = get_setup(&app, &owner_token).await;
+        assert_eq!(setup["counts"]["owner_has_passkey"], true);
+        assert_eq!(setup["counts"]["members_without_passkey"], 1);
+
+        // Ada has none: she is counted, and nothing is changed until the owner says so.
+        let (status, body) = put_setup(&app, &owner_token, json!({"preset": "privacy"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "members_without_passkey");
+        assert_eq!(body["count"], 1);
+        let setup = get_setup(&app, &owner_token).await;
+        assert_eq!(setup["current"]["sign_in_methods"], "any");
+        assert_eq!(
+            setup["current"]["provider_profile"], "full",
+            "a refused request changed a choice"
+        );
+        assert_eq!(setup["needed"], true);
+
+        let (status, body) = put_setup(
+            &app,
+            &owner_token,
+            json!({"preset": "privacy", "allow_lockout": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["settings"]["sign_in_methods"], "passkey");
+
+        // A session Ada already has carries on. The owner signs in with the passkey.
+        let (status, _) = Call::new(Method::GET, "/v1/me")
+            .token(&ada_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, user_id) = signed_in(&app, &mut owner_device, &owner_passkey).await;
+        assert_eq!(user_id, owner.user_id);
+
+        // The owner gives Ada a link, and she is in with a passkey.
+        let mut ada_device = Device::new();
+        let ada_passkey = attach_passkey(&app, &db, &ada.user_id, &mut ada_device).await;
+        let (_, user_id) = signed_in(&app, &mut ada_device, &ada_passkey).await;
+        assert_eq!(user_id, ada.user_id);
+        let setup = get_setup(&app, &owner_token).await;
+        assert_eq!(setup["counts"]["members_without_passkey"], 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn passkeys_only_turns_a_provider_away_and_the_page_stops_offering_it() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let provider = Provider::start().await;
+        let sign_in =
+            api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
+                .await
+                .expect("discover")
+                .with_passkeys(passkeys());
+        let app = api::router(db.runtime.clone(), Some(sign_in));
+        let mut device = Device::new();
+        let owner_passkey = attach_passkey(&app, &db, &owner.user_id, &mut device).await;
+
+        let setup = get_setup(&app, &owner_token).await;
+        assert_eq!(setup["deployment"], json!({"passkeys": true, "sso": true}));
+
+        // Someone is part-way through signing in at the provider when the owner chooses.
+        let invite_token = invite(&db, &owner).await;
+        let begin = |invite: String| {
+            let app = app.clone();
+            async move {
+                Call::new(Method::POST, "/v1/auth/start")
+                    .json(json!({
+                        "redirect_uri": REDIRECT,
+                        "code_challenge": db::s256(VERIFIER),
+                        "code_challenge_method": "S256",
+                        "state": "client-state-0123456789abcdef",
+                        "provider": "default",
+                        "invite": invite,
+                    }))
+                    .send(&app)
+                    .await
+            }
+        };
+        let (status, body) = begin(invite_token.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let url = body["authorize_url"].as_str().expect("url").to_string();
+        assert!(url.starts_with(&provider.issuer), "{url}");
+        let (code, state) =
+            provider.authorize(&url, oidc::Person::new("zed"), oidc::Tamper::default());
+
+        let (status, body) =
+            put_setup(&app, &owner_token, json!({"sign_in_methods": "passkey"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The provider vouches for them, and the community does not take it.
+        let (status, headers, _) = page(
+            &app,
+            &format!("/v1/auth/callback?code={code}&state={state}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FOUND);
+        let pairs = redirect_pairs(&headers);
+        assert_eq!(pairs.get("error").map(String::as_str), Some("passkey_only"));
+        assert!(!pairs.contains_key("code"));
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM users WHERE display_name LIKE '%zed%'"
+            )
+            .await,
+            0
+        );
+        // The invite was not spent either.
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM invites WHERE accepted_at IS NOT NULL AND role = 'member'"
+            )
+            .await,
+            0
+        );
+
+        // Starting a sign-in now, even naming the provider, opens the passkey page, and the page
+        // has no way to the provider on it.
+        let (status, body) = begin(invite_token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let url = Url::parse(body["authorize_url"].as_str().expect("url")).expect("url");
+        assert_eq!(url.path(), "/v1/auth/passkey");
+        let (status, _, html) = page(
+            &app,
+            &format!("{}?{}", url.path(), url.query().unwrap_or("")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("instead"), "{html}");
+        assert!(
+            !html.contains(&provider.issuer.replace('&', "&amp;")),
+            "{html}"
+        );
+
+        // A person with a passkey is unaffected.
+        let (_, user_id) = signed_in(&app, &mut device, &owner_passkey).await;
+        assert_eq!(user_id, owner.user_id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_choice_does_not_lock_everyone_out_when_the_server_is_started_without_passkeys() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        // Passkeys only was chosen while passkeys were on.
+        sqlx::query("UPDATE server_settings SET sign_in_methods = 'passkey'")
+            .execute(&db.owner)
+            .await
+            .expect("choice");
+        // The operator then starts the server with providers only, as a rollback does.
+        let provider = Provider::start().await;
+        let sign_in =
+            api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
+                .await
+                .expect("discover");
+        let app = api::router(db.runtime.clone(), Some(sign_in));
+        let invite_token = invite(&db, &owner).await;
+        let (status, body) = Call::new(Method::POST, "/v1/auth/start")
+            .json(json!({
+                "redirect_uri": REDIRECT,
+                "code_challenge": db::s256(VERIFIER),
+                "code_challenge_method": "S256",
+                "state": "client-state-0123456789abcdef",
+                "invite": invite_token,
+            }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let url = body["authorize_url"].as_str().expect("url");
+        assert!(url.starts_with(&provider.issuer), "{url}");
+        let (code, state) =
+            provider.authorize(url, oidc::Person::new("zed"), oidc::Tamper::default());
+        let (status, headers, _) = page(
+            &app,
+            &format!("/v1/auth/callback?code={code}&state={state}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FOUND);
+        let pairs = redirect_pairs(&headers);
+        assert!(pairs.contains_key("code"), "{pairs:?}");
+        assert!(!pairs.contains_key("error"), "{pairs:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn what_the_owner_chose_about_providers_does_not_touch_the_name_typed_for_a_passkey() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let app = passkey_app(&db);
+        let (status, body) = put_setup(
+            &app,
+            &owner_token,
+            json!({"provider_profile": "none", "activity_visibility": "nobody"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let mut device = Device::new();
+        let invite_token = invite(&db, &owner).await;
+        let account = sign_up(&app, &db, &mut device, &invite_token, "Ada Lovelace").await;
+        let (email, name): (Option<String>, String) =
+            sqlx::query_as("SELECT email, display_name FROM users WHERE id = $1::uuid")
+                .bind(&account.user_id)
+                .fetch_one(&db.owner)
+                .await
+                .expect("account");
+        assert_eq!(name, "Ada Lovelace");
+        assert_eq!(email, None);
+    })
+    .await;
+}

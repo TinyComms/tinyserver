@@ -23,6 +23,7 @@ mod roles;
 mod scan;
 mod server;
 mod session;
+mod setup;
 mod sweep;
 
 pub use account::{
@@ -96,6 +97,10 @@ pub use server::{
 };
 pub use session::{
     close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,
+};
+pub use setup::{
+    apply_setup, posture, setup_state, ActivityVisibility, Applied, Posture, Preset,
+    ProviderProfile, SetupChange, SetupError, SetupState, SignInMethods,
 };
 pub use sqlx::PgPool;
 pub use sweep::{sweep, Swept};

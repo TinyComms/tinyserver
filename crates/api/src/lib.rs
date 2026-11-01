@@ -20,6 +20,7 @@ mod passkey;
 mod reports;
 mod scan_clamd;
 mod session;
+mod setup;
 
 #[cfg(feature = "fuzz")]
 pub mod fuzz;
@@ -54,6 +55,7 @@ pub fn app(pool: PgPool, live: Live, sign_in: Option<SignIn>) -> Router {
 
 fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
     let operator = Operator::new(pool.clone());
+    let deployment = setup::Deployment::of(sign_in.as_ref());
     let mut routes = Router::new()
         .merge(health::routes(live.clone()))
         .merge(operator::routes())
@@ -61,6 +63,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(account::routes())
         .merge(community::routes())
         .merge(admin::routes())
+        .merge(setup::routes(deployment))
         .merge(bot::routes())
         .merge(messages::routes())
         .merge(reports::routes())

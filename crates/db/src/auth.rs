@@ -74,6 +74,7 @@ pub struct Pending {
 }
 
 /// The verified ID token, reduced to what tinyserver keeps.
+#[derive(Clone)]
 pub struct Profile {
     pub issuer: String,
     pub subject: String,
@@ -373,6 +374,10 @@ pub(crate) async fn sign_in_in(
     invite_hash: Option<&[u8]>,
     groups: Groups,
 ) -> Result<SignedIn, AuthError> {
+    // What the owner chose at setup about what a provider may leave in a new account. Which
+    // methods are accepted is decided before this, where the deployment's methods are known.
+    let posture = crate::setup::posture_in(&mut **tx).await?;
+    let passkey = profile.issuer == crate::passkey::PASSKEY_ISSUER;
     // Two first sign-ins for one person at once would otherwise both make an account.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(10) || $2, 0))")
         .bind(&profile.issuer)
@@ -417,8 +422,8 @@ pub(crate) async fn sign_in_in(
             let user_id: String = sqlx::query_scalar(
                 "INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING id::text",
             )
-            .bind(profile_email(profile.email.as_deref()))
-            .bind(profile_name(profile))
+            .bind(new_email(profile, posture.provider_profile, passkey))
+            .bind(new_name(profile, posture.provider_profile, passkey))
             .fetch_one(&mut **tx)
             .await?;
             sqlx::query(
@@ -688,6 +693,35 @@ fn profile_email(email: Option<&str>) -> Option<String> {
         && email.contains('@')
         && !email.chars().any(|c| c.is_whitespace() || c.is_control());
     shaped.then(|| email.to_string())
+}
+
+/// The email a new account keeps: the provider's, when the owner chose to keep it.
+fn new_email(
+    profile: &Profile,
+    kept: crate::setup::ProviderProfile,
+    passkey: bool,
+) -> Option<String> {
+    if passkey || !kept.keeps_email() {
+        return None;
+    }
+    profile_email(profile.email.as_deref())
+}
+
+/// The name a new account starts with. A passkey account's name is the one the person typed,
+/// so the owner's choice about providers does not reach it. Otherwise the provider's name,
+/// and when the owner chose not to keep the email, not the start of the email either; with
+/// neither, "Member".
+fn new_name(profile: &Profile, kept: crate::setup::ProviderProfile, passkey: bool) -> String {
+    if passkey || kept == crate::setup::ProviderProfile::Full {
+        return profile_name(profile);
+    }
+    if !kept.keeps_name() {
+        return "Member".to_string();
+    }
+    profile_name(&Profile {
+        email: None,
+        ..profile.clone()
+    })
 }
 
 /// `name`, else the email's local part, else "Member", without control characters and cut to

@@ -615,15 +615,22 @@ fn member_select(filter: &str) -> String {
                 u.display_name, app_member_role(u.id),
                 to_char(m.created_at AT TIME ZONE 'UTC', '{STAMP}'),
                 m.owner, app_roles_of(u.id),
-                to_char(m.last_seen_at AT TIME ZONE 'UTC', '{STAMP}'),
+                CASE WHEN {SEES_ACTIVITY}
+                     THEN to_char(m.last_seen_at AT TIME ZONE 'UTC', '{STAMP}') END,
                 CASE WHEN m.timeout_until > now()
                      THEN to_char(m.timeout_until AT TIME ZONE 'UTC', '{STAMP}') END,
-                m.joined_via, u.avatar_sha
+                CASE WHEN {SEES_ACTIVITY} THEN m.joined_via END, u.avatar_sha
          FROM memberships m
          JOIN users u ON u.id = m.user_id
          {filter}
          ORDER BY m.created_at, u.id",
         MANAGE_SERVER = perm::MANAGE_SERVER,
+        SEES_ACTIVITY = format!(
+            // The owner's choice at setup: everyone, holders of manage_server, or no one.
+            "(app_activity_visibility() = 'everyone'
+              OR (app_activity_visibility() = 'admins' AND (app_perms() & {}) <> 0))",
+            perm::MANAGE_SERVER
+        ),
     )
 }
 

@@ -146,6 +146,7 @@ async fn capabilities_and_me_describe_what_the_caller_may_do() {
             "voice_moderation",
             "upload_limits",
             "file_scan",
+            "first_run_setup",
         ] {
             assert!(
                 body["features"]

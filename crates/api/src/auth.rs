@@ -163,13 +163,19 @@ async fn start(
         AuthApiError::BadRequest
     })?;
     let invite = body.invite.as_deref().filter(|invite| !invite.is_empty());
+    // The owner may have chosen passkeys only. Then the passkey page is the only way in, and
+    // there is no provider beside it.
+    let passkey_only = passkey_only(&pool, &sign_in).await?;
     // With passkeys on, sign-in opens the passkey page unless the client names a provider.
     let passkey_page = sign_in.passkeys().is_some()
-        && body
-            .provider
-            .as_deref()
-            .is_none_or(|id| id == crate::passkey::PROVIDER_ID);
-    let provider = if passkey_page {
+        && (passkey_only
+            || body
+                .provider
+                .as_deref()
+                .is_none_or(|id| id == crate::passkey::PROVIDER_ID));
+    let provider = if passkey_only {
+        None
+    } else if passkey_page {
         // The provider that stays the way in beside it, if one is configured.
         sign_in.provider(None)
     } else {
@@ -464,6 +470,15 @@ async fn callback(
             return back(Outcome::Error("failed"));
         }
     };
+    // Passkeys only: a provider has proved who this is, and the community does not take it.
+    match passkey_only(&pool, &sign_in).await {
+        Ok(false) => {}
+        Ok(true) => {
+            tracing::info!(provider = %provider.id(), "sign-in refused: passkeys only");
+            return back(Outcome::Error("passkey_only"));
+        }
+        Err(_) => return back(Outcome::Error("failed")),
+    }
     let signed_in = match db::sign_in(
         &pool,
         &verified.profile,
@@ -514,6 +529,22 @@ async fn callback(
             back(Outcome::Error("failed"))
         }
     }
+}
+
+/// Whether the owner chose passkeys only, and this deployment has passkeys to honour it. Without
+/// passkeys the choice cannot apply: refusing every provider then would lock everyone out, as it
+/// would after switching `TINYSERVER_AUTH` back.
+async fn passkey_only(pool: &PgPool, sign_in: &SignIn) -> Result<bool, AuthApiError> {
+    if sign_in.passkeys().is_none() {
+        return Ok(false);
+    }
+    db::posture(pool)
+        .await
+        .map(|posture| posture.sign_in_methods == db::SignInMethods::Passkey)
+        .map_err(|error| {
+            tracing::warn!(%error, "sign-in choices not read");
+            AuthApiError::Unavailable
+        })
 }
 
 async fn token(
