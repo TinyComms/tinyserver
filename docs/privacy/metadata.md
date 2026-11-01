@@ -155,7 +155,7 @@ The `tinyserver` binary's commands (`crates/server/src/main.rs`):
 | `relink-identity` | same | Moves an account's `(issuer, subject)` | `identity.relink`, null actor |
 | `serve` | `DATABASE_URL` (`app_runtime`) | The server | n/a |
 
-`DATABASE_URL_MIGRATE` exists only in the `tinyserver-init` container (finding S2). The commands that need it are therefore run as `docker compose run --rm --entrypoint tinyserver tinyserver-init <command>`. [`../../deploy/README.md`](../../deploy/README.md) step 6 of "Moving from Tinyauth" still says `docker compose exec tinyserver tinyserver identities`; that no longer works since the S2 change (see [`findings.md`](findings.md) corrections). Direct SQL as `app_owner` is possible for anyone with the password and bypasses row-level security and the audit log.
+`DATABASE_URL_MIGRATE` exists only in the `tinyserver-init` container (finding S2). The commands that need it are therefore run as `docker compose run --rm --entrypoint tinyserver tinyserver-init <command>`. [`../../deploy/README.md`](../../deploy/README.md) step 6 of "Moving from Tinyauth" and its upgrade section give these commands (finding N5, fixed). Direct SQL as `app_owner` is possible for anyone with the password and bypasses row-level security and the audit log.
 
 ## 14. Client devices (read only, at tinyclient `26916e9`)
 

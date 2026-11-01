@@ -56,7 +56,7 @@ Implemented in `0014_account_deletion.sql` by `app_delete_account()`, one transa
 | Removed | Evidence |
 |---|---|
 | `users.email`, `display_name` (set to "Deleted user"), avatar bytes, hash and type; `deleted_at` set | The test asserts `(None, "Deleted user", true, true)` |
-| `user_identities`, `memberships` (and `member_roles` by cascade), `sessions` | The test asserts no rows remain |
+| `user_identities`, `memberships` (and `member_roles` by cascade), `sessions`, unredeemed `auth_codes` | The test asserts no rows remain |
 | Every message the person wrote: body emptied, `deleted_at` set | The test asserts the other member sees an empty body and a `deleted_at` |
 | Their attachments and the attachments of their messages, and reactions on and by them; files unlinked after the commit | Read; not asserted by the test |
 | `reads`, bots they created, unused invites they created, idempotency keys | Read; not asserted |

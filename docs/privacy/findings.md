@@ -6,7 +6,7 @@ Audit of tinyserver at `bbe1cd7` and tinyclient at `26916e9` (both `origin/main`
 - **Read**: confirmed by reading the cited code, with no failing test written first.
 - **Reported**: found by an audit pass over the code and not independently re-checked. Treat as likely, not proven.
 
-Severity is exposure if the flaw is abused by the party named, not likelihood. `Status` is what this branch does about it. A finding is only "Fixed" when a test in this branch fails without the fix.
+Severity is exposure if the flaw is abused by the party named, not likelihood. `Status` is what this branch does about it. A finding is only "Fixed" when a test in this branch fails without the fix, or, for S2, S13 and S14, when it was checked by running the containers. `client:` statuses describe tinyclient's `hardening/privacy-architecture` branch, which is not merged and was not re-run here.
 
 Paths are in tinyserver unless marked `client:`.
 
@@ -22,15 +22,15 @@ Paths are in tinyserver unless marked `client:`.
 | S6 | Medium | Every member can read every member's email | Fixed |
 | S7 | Medium | Rate-limit key is a forgeable header, raw IPs held in memory | Fixed |
 | S8 | Medium | No account deletion; edit and delete leave text in the outbox | Fixed |
-| S9 | Medium | Plaintext attachments hit disk before the scan verdict | Resolved for sealed uploads, see S3 |
+| S9 | Medium | Plaintext attachments hit disk before the scan verdict | Open; sealed uploads (specified in `docs/e2ee-text.md`, not built) would remove it for encrypted conversations |
 | S10 | Medium | Call identity: any member can be impersonated by the server (8-byte ids, server-attested roster) | Documented, residual |
-| S11 | Medium | No backup story, no encrypted backups | Planned, `deploy/` tooling in this branch |
-| S12 | Medium | No per-tenant isolation contract or checks | Contract and checks in this branch |
+| S11 | Medium | No backup story, no encrypted backups | Open, planned; no tooling in this branch |
+| S12 | Medium | No per-tenant isolation contract or checks | Open, planned; no contract or checks in this branch |
 | S13 | Low | Dev compose published Postgres on `0.0.0.0` with known passwords | Fixed |
 | S14 | Low | Resource limits missing on most containers | Fixed |
 | S15 | Low | Migrations were not tracked as a build input | Fixed |
 | S16 | Low | Last-seen time and how a member joined are visible to every member | Documented |
-| C1 | High | `client:` Tiny text and files are plaintext to the server; local cache unencrypted | Remediation in progress |
+| C1 | High | `client:` Tiny text and files are plaintext to the server; local cache unencrypted | Open; remediation in progress elsewhere, not merged |
 | C2 | High | `client:` Accepts a server `off` frame and carries on unencrypted | Fixed (opt-in require mode) |
 | C3 | Medium | `client:` Identity key written non-atomically, overwritten when unreadable | Fixed |
 | C4 | Medium | `client:` Identity key is plaintext on disk, not in the OS keychain | Open, see limits |
@@ -56,7 +56,7 @@ Paths are in tinyserver unless marked `client:`.
 - **Behavior**: `DATABASE_URL_MIGRATE` (role `app_owner`, which has CREATEDB and BYPASSRLS) was in the environment of the process that serves the internet, because migrate, bootstrap and serve shared one entrypoint.
 - **Exposure**: remote code execution in the server defeats row-level security and can rewrite the schema.
 - **Remediation**: a one-shot `tinyserver-init` service holds the owner password, runs `migrate` and `bootstrap` and writes the owner invite to a volume the server mounts read only. The server container has `DATABASE_URL` only.
-- **Tests**: run by hand: the init container, with the compose restrictions (read-only root, all capabilities dropped, uid 10001), migrated a database and wrote a mode 0600 invite; a serving container's environment held no `DATABASE_URL_MIGRATE`. No automated test: it needs Docker. `deploy/tests/` has the check as a script.
+- **Tests**: run by hand: the init container, with the compose restrictions (read-only root, all capabilities dropped, uid 10001), migrated a database and wrote a mode 0600 invite; a serving container's environment held no `DATABASE_URL_MIGRATE`. No automated test: it needs Docker, and no script for it is in this branch.
 - **Limits**: the app runtime role can still read and write every table through its row-level security and definer functions. A flaw that executes arbitrary SQL as `app_runtime` is not contained by this.
 
 ### S3 High: text messages and attachments are plaintext to the server (Read)
@@ -64,7 +64,7 @@ Paths are in tinyserver unless marked `client:`.
 - **Files**: `crates/db/migrations/0008_messages.sql` (`messages.body`, `attachments`), `crates/db/src/messages.rs`, `crates/api/src/messages.rs`.
 - **Behavior**: message bodies are plaintext columns, attachment bytes are plaintext files in the upload volume, names and types are plaintext, and the 200 character last-message preview is built from the body.
 - **Exposure**: anyone with read access to Postgres, its backups or write-ahead log, the upload volume, or the server's memory reads every conversation.
-- **Remediation**: see `docs/e2ee-text.md`: per-conversation MLS groups, ciphertext-only storage, client-side sealed attachments, explicit per-conversation `e2ee` flag, no downgrade, no in-place conversion of existing history.
+- **Remediation** (specified, not built in this branch): see `docs/e2ee-text.md`: per-conversation MLS groups, ciphertext-only storage, client-side sealed attachments, explicit per-conversation `e2ee` flag, no downgrade, no in-place conversion of existing history.
 - **Limits**: see the "What this does not protect" section of that document.
 
 ### S4 High: a server or one old client can disable call E2EE (Read)
@@ -118,12 +118,12 @@ Paths are in tinyserver unless marked `client:`.
 ### S11 Medium: backups (Read)
 
 - **Behavior**: the only documentation is a manual `pg_dump` as the Postgres superuser, unencrypted, and no coverage of the upload volume.
-- **Remediation**: see `deploy/backup/`.
+- **Remediation**: none yet. Backup tooling is planned; nothing for it is in this branch.
 
 ### S12 Medium: multi-tenant isolation (Read)
 
 - **Behavior**: tinyserver is single-community by design. The compose file is isolated well for one community, but roles are cluster-global and the database name is fixed, so a shared Postgres cluster would collide; the media port is per-instance.
-- **Remediation**: `docs/privacy/tenancy.md` is the isolation contract; `deploy/tenant/` has a per-tenant template and `deploy/tests/` checks the contract.
+- **Remediation**: none yet. An isolation contract (`docs/privacy/tenancy.md`), a per-tenant template and checks are planned; none is in this branch.
 
 ### S13, S14, S15 Low (Read, and S15 reproduced)
 
@@ -148,7 +148,7 @@ Covered under S4 and "Fixed" above. C3 test: `the_identity_key_is_kept_and_read_
 
 ### C4 Medium: identity key plaintext on disk (Read)
 
-The call identity key is two hex lines in `<support>/e2ee/<account>/identity.key`, mode 0600 on Unix and inherited ACL on Windows (Roaming `%APPDATA%`). Text E2EE keys are stored through the OS keychain; the call identity key keeps its file for compatibility with the shipped format and is a known remaining item.
+The call identity key is two hex lines in `<support>/e2ee/<account>/identity.key`, mode 0600 on Unix and inherited ACL on Windows (Roaming `%APPDATA%`). The text E2EE specification puts device keys in the OS keychain; that is not built. The call identity key keeps its file for compatibility with the shipped format and is a known remaining item.
 
 ### C5, C6, C7, C8 (Read)
 
@@ -164,13 +164,13 @@ Hardening details and what could not be done are in the client's `SECURITY.md`.
 
 ## Corrections and additions from the documentation pass
 
-Made while writing the privacy documents, 2026-10-31, at `ea3cd39`. Corrections to this ledger are applied above (S7: nine tests, not seven, and the default trusted range also covers 100.64.0.0/10; S16 summary line). The items below are **Read** unless stated, and are rated by the same scale.
+Made while writing the privacy documents, 2026-10-31, at `ea3cd39`. Corrections to this ledger are applied above (S7: nine tests, not seven, and the default trusted range also covers 100.64.0.0/10; S16 summary line; S2, S3, S9, S11, S12, C1 and C4 no longer claim tooling or code that is not in this branch). The items below are **Read** unless stated, and are rated by the same scale.
 
 ### Not matching this branch
 
-- S2, S11 and S12 cite `deploy/tests/`, `deploy/backup/` and `deploy/tenant/`. None exists at `ea3cd39`. They are described here only as planned.
+- S2, S11 and S12 cited `deploy/tests/`, `deploy/backup/` and `deploy/tenant/`. None exists at `ea3cd39`. The entries above now describe them as planned.
 - "Not findings", SFU addresses: established by reading `crates/sfu/src/engine.rs` (`candidates`); no test asserts it. The "no telemetry crate" statement was re-checked against both `Cargo.lock` files (server and client).
-- C4 says text E2EE keys "are stored through the OS keychain". That is the specification, not merged code.
+- C4 said text E2EE keys "are stored through the OS keychain". That is the specification, not merged code; corrected above.
 
 ### New findings
 
@@ -180,8 +180,8 @@ Made while writing the privacy documents, 2026-10-31, at `ea3cd39`. Corrections 
 | N2 | Medium | The default `info` log records socket open and close with `user_id`, and Docker timestamps each line: a connection history. "No activity logs" cannot be claimed at the default level | `crates/api/src/live/socket.rs`, [`telemetry-and-logging.md`](telemetry-and-logging.md) |
 | N3 | Medium | `DELETE /v1/me` does not delete the Pocket ID account (passkeys, username, optional email, an audit log with client IPs kept 90 days by default). It also leaves `directs` rows and free-text `audit_log.reason` | `0014_account_deletion.sql`, `crates/api/src/oidc.rs` |
 | N4 | Medium | No per-user or per-address rate limit on REST writes or uploads, and no storage quota. Only the three sign-in routes and the live socket are limited | `crates/api/src/limit.rs` |
-| N5 | Low | `deploy/README.md` "Moving from Tinyauth" step 6 runs `identities` and `relink-identity` with `docker compose exec tinyserver`; since S2 that container has no `DATABASE_URL_MIGRATE`, so they fail. They must run in `tinyserver-init` | `deploy/README.md`, `deploy/compose.yml` |
-| N6 | Low | The owner invite file stays on its volume until the next `tinyserver-init` run after an owner exists, not until the owner signs up | `crates/server/src/main.rs` |
+| N5 | Low | `deploy/README.md` "Moving from Tinyauth" step 6 runs `identities` and `relink-identity` with `docker compose exec tinyserver`; since S2 that container has no `DATABASE_URL_MIGRATE`, so they failed. **Fixed** in `hardening/privacy-architecture`: they run in `tinyserver-init`, which now also has `TINYSERVER_OIDC_ISSUER`, and `deploy/README.md` has an upgrade section | `deploy/README.md`, `deploy/compose.yml` |
+| N6 | Low | The owner invite file stays on its volume until the next `tinyserver-init` run after an owner exists, not until the owner signs up. Documented in `deploy/README.md`: run `up` once more after the owner signs in | `crates/server/src/main.rs` |
 | N7 | Low | `bans` and `ban_identities` are never swept, including expired bans; the audit log is never pruned | `app_sweep`, `crates/db/src/sweep.rs` |
 | N8 | Low | `GET /health` is unauthenticated and returns `db_role` | `crates/api/src/health.rs` |
 | N9 | Low | A binary rollback below the E2EE version could accept plaintext into an encrypted conversation unless `migrate` fails first. Relies on sqlx's default; untested | [`migration.md`](migration.md) |
@@ -192,8 +192,8 @@ Made while writing the privacy documents, 2026-10-31, at `ea3cd39`. Corrections 
 | Document | Says | Code says |
 |---|---|---|
 | `docs/logging.md` | The request span carries `req_id` | The layer never renders span fields; `req_id` is never printed |
-| `docs/logging.md`, `docs/server.md` | The owner invite is read from `/var/lib/tinyserver/owner-invite` (or `{TINYSERVER_DATA_DIR}/owner-invite`) | In compose it is `/bootstrap/owner-invite` |
-| `docs/server.md`, `docs/calls.md` | Channel events go to every member socket; channel message and reaction events use a null audience | Replaced by `0013`: a channel that can be restricted narrows the audience to its viewers |
-| `docs/server.md` | Lists no `DELETE /v1/me` and no `account.delete` audit action | Both exist (`crates/api/src/account.rs`, `0014`) |
+| `docs/logging.md`, `docs/server.md` | The owner invite is read from `/var/lib/tinyserver/owner-invite` (or `{TINYSERVER_DATA_DIR}/owner-invite`) | In compose it is `/bootstrap/owner-invite`. **Fixed**: `docs/logging.md` in `hardening/privacy-architecture`, `docs/server.md` here |
+| `docs/server.md`, `docs/calls.md` | Channel events go to every member socket; channel message and reaction events use a null audience | Replaced by `0013`: a channel that can be restricted narrows the audience to its viewers. **Fixed** here |
+| `docs/server.md` | Lists no `DELETE /v1/me` and no `account.delete` audit action | Both exist (`crates/api/src/account.rs`, `0014`). **Fixed** here, with the narrowed `email` on `GET /v1/members` |
 | `docs/calls.md` | At `trace` the WebSocket library prints whole frames | Targets other than `tinyserver`, `api` and `sfu` are capped at `warn` |
 | tinyclient `SECURITY.md` | Video and screen share on a Tiny server are not end-to-end encrypted | `crates/mediad/src/e2ee.rs` has `seal_video`, used by `tiny.rs` at `26916e9`; `docs/calls.md` and the README say sealed |
