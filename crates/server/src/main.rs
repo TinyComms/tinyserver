@@ -46,6 +46,55 @@ enum Command {
         #[arg(long)]
         issuer: Option<String>,
     },
+    /// The operator's switches for the whole community: suspend it read-only or offline with a
+    /// notice, resume it, and place or release a legal hold. As the owner role
+    /// (`DATABASE_URL_MIGRATE`), so only whoever runs the init container can. The serving process
+    /// obeys a change within `TINYSERVER_OPERATOR_REFRESH_MS` (2 seconds).
+    Operator {
+        #[command(subcommand)]
+        action: OperatorAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum OperatorAction {
+    /// Print the mode, the notice, the hold, and how many reports owners put on hold.
+    Status {
+        /// One line of JSON, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read-only: members sign in, read, download, report, sign out and delete their account,
+    /// and nothing else. Offline: only the notice and the health check answer.
+    Suspend {
+        #[arg(long, conflicts_with = "offline", required_unless_present = "offline")]
+        read_only: bool,
+        #[arg(long)]
+        offline: bool,
+        /// What members see, 1 to 500 characters.
+        #[arg(
+            long,
+            conflicts_with = "notice_file",
+            required_unless_present = "notice_file"
+        )]
+        notice: Option<String>,
+        /// The notice from a file.
+        #[arg(long)]
+        notice_file: Option<String>,
+    },
+    /// Back to normal. The notice goes; a legal hold stays.
+    Resume,
+    /// Stop the community being deleted, and resolved reports expiring, until released.
+    Hold {
+        /// For the operator's record only; never shown to members.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Release the legal hold.
+    Release {
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
             subject,
             issuer,
         } => relink_identity(&user_id, &subject, issuer).await?,
+        Command::Operator { action } => operator(action).await?,
     }
     Ok(())
 }
@@ -113,6 +163,82 @@ async fn relink_identity(
         db::Relinked::NoSuchUser => bail!("no account {user_id}"),
     }
     Ok(())
+}
+
+async fn operator(action: OperatorAction) -> anyhow::Result<()> {
+    let pool = db::owner_pool(&env_var("DATABASE_URL_MIGRATE")?).await?;
+    let state = match action {
+        OperatorAction::Status { json } => {
+            let state = db::operator_state(&pool).await?;
+            let held = db::held_reports(&pool).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "mode": state.mode.as_str(),
+                        "notice": state.notice,
+                        "since": state.since,
+                        "legal_hold": state.legal_hold,
+                        "held_reports": held,
+                    })
+                );
+            } else {
+                print_state(&state);
+                println!("reports on hold  {held}");
+            }
+            return Ok(());
+        }
+        OperatorAction::Suspend {
+            read_only,
+            offline: _,
+            notice,
+            notice_file,
+        } => {
+            let notice = match (notice, notice_file) {
+                (Some(notice), _) => notice,
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read --notice-file {path}"))?,
+                (None, None) => bail!("pass --notice or --notice-file"),
+            };
+            let mode = if read_only {
+                db::Mode::ReadOnly
+            } else {
+                db::Mode::Offline
+            };
+            let state = db::set_operator_mode(&pool, mode, Some(&notice)).await?;
+            tracing::info!(mode = mode.as_str(), "community suspended");
+            state
+        }
+        OperatorAction::Resume => {
+            let state = db::set_operator_mode(&pool, db::Mode::Normal, None).await?;
+            tracing::info!("community resumed");
+            state
+        }
+        OperatorAction::Hold { reason } => {
+            let state = db::set_legal_hold(&pool, true, reason.as_deref()).await?;
+            tracing::info!("legal hold placed");
+            state
+        }
+        OperatorAction::Release { reason } => {
+            let state = db::set_legal_hold(&pool, false, reason.as_deref()).await?;
+            tracing::info!("legal hold released");
+            state
+        }
+    };
+    print_state(&state);
+    Ok(())
+}
+
+fn print_state(state: &db::OperatorState) {
+    println!("mode             {}", state.mode.as_str());
+    if let Some(notice) = &state.notice {
+        println!("notice           {notice}");
+    }
+    println!("since            {}", state.since);
+    println!(
+        "legal hold       {}",
+        if state.legal_hold { "yes" } else { "no" }
+    );
 }
 
 async fn migrate() -> anyhow::Result<()> {
@@ -230,12 +356,32 @@ fn join_code(origin: &str, token: &str) -> Option<String> {
 
 async fn serve() -> anyhow::Result<()> {
     api::engine_from_env().context("refusing to serve without a scan engine")?;
+    if api::scanning_off() {
+        tracing::warn!(
+            "TINYSERVER_SCAN_ENGINE is none: uploads are not scanned; only for sealed attachments"
+        );
+    }
     // Whose `cf-connecting-ip` is believed. Unset: any private or loopback peer, which is the
     // tunnel on the Docker network. `none`: nobody's, and every client counts as its own
     // connection. A public address is never believed, whatever this says it trusts by default.
     if let Ok(spec) = env_var("TINYSERVER_TRUSTED_PROXIES") {
         api::trust_proxies(&spec)
             .map_err(|error| anyhow::anyhow!("TINYSERVER_TRUSTED_PROXIES: {error}"))?;
+    }
+    // Days a dismissed or actioned abuse report is kept. A bad value stops the start: guessing
+    // would either keep reports longer than the operator said or delete them sooner.
+    if db::retention_days_from(
+        std::env::var("TINYSERVER_REPORT_RETENTION_DAYS")
+            .ok()
+            .as_deref(),
+    )
+    .is_none()
+    {
+        anyhow::bail!(
+            "TINYSERVER_REPORT_RETENTION_DAYS is not a whole number from {} to {}",
+            db::RETENTION_MIN_DAYS,
+            db::RETENTION_MAX_DAYS
+        );
     }
     let url = env_var("DATABASE_URL")?;
     let bind: SocketAddr = env_var("BIND")
@@ -519,6 +665,7 @@ async fn sweep_every(pool: PgPool, period: Duration) {
                 idempotency_keys = swept.idempotency_keys,
                 events = swept.events,
                 logins = swept.logins,
+                reports = swept.reports,
                 "expired rows deleted"
             ),
             Ok(_) => {}

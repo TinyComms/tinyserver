@@ -13,8 +13,10 @@ mod media;
 mod messages;
 mod migrate;
 mod moderation;
+mod operator;
 mod outbox;
 pub mod perm;
+mod reports;
 mod roles;
 mod scan;
 mod server;
@@ -52,7 +54,18 @@ pub use moderation::{
     ban, call_access, end_share, kick_from_call, list_bans, moderate_call, move_in_call,
     room_permissions, touch_seen, unban, Ban, CallAccess,
 };
+pub use operator::{
+    clean_notice, held_reports, operator_state, set_legal_hold, set_operator_mode, Mode,
+    OperatorError, OperatorState, NOTICE_MAX,
+};
 pub use outbox::{outbox_after, outbox_bounds, OutboxBounds, OutboxRow, WAKE_CHANNEL};
+pub use reports::{
+    file_report, get_report, list_reports, retention_days, retention_days_from, update_report,
+    Filed, NewReport, Person, ReportDetail, ReportError, ReportNote, ReportPatch, ReportQuery,
+    ReportSummary, CATEGORIES as REPORT_CATEGORIES, EVIDENCE_MAX as REPORT_EVIDENCE_MAX,
+    KINDS as REPORT_KINDS, NOTE_MAX as REPORT_NOTE_MAX, RETENTION_DEFAULT_DAYS, RETENTION_MAX_DAYS,
+    RETENTION_MIN_DAYS, STATUSES as REPORT_STATUSES,
+};
 pub use roles::{
     create_role, delete_role, list_roles, order_roles, update_role, NewRole, Role, RolePatch,
 };

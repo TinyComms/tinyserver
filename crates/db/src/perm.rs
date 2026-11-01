@@ -21,9 +21,12 @@ pub const MOVE_MEMBERS: i64 = 1 << 16;
 pub const DISCONNECT_MEMBERS: i64 = 1 << 17;
 pub const VIEW_AUDIT_LOG: i64 = 1 << 18;
 pub const MANAGE_SERVER: i64 = 1 << 19;
+/// Lists, reads, triages, annotates and links actions to abuse reports. Not in @everyone and not
+/// in the room override mask.
+pub const MANAGE_REPORTS: i64 = 1 << 20;
 
 /// Every bit this server knows. Unknown bits in a request are dropped.
-pub const ALL: i64 = (1 << 20) - 1;
+pub const ALL: i64 = (1 << 21) - 1;
 const _: () = assert!(ALL < 1 << 53, "permissions must fit in a JSON number");
 
 /// The bits a room override may allow or deny.
@@ -71,7 +74,11 @@ mod tests {
 
     #[test]
     fn the_masks_match_the_sql() {
-        assert_eq!(ALL, 1_048_575);
+        assert_eq!(ALL, 2_097_151);
+        assert_eq!(MANAGE_REPORTS, 1_048_576);
+        // Not something a member has by default, and not something a room can override.
+        assert_eq!(EVERYONE & MANAGE_REPORTS, 0);
+        assert_eq!(CHANNEL & MANAGE_REPORTS, 0);
         assert_eq!(CHANNEL, 246_399);
         assert_eq!(EVERYONE, 63);
     }

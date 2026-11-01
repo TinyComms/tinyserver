@@ -1,0 +1,46 @@
+# Added on top of deploy/compose.yml by deploy/tests/isolation.sh, and only by it.
+#
+# It changes what runs, never how it is confined. The tinyserver image takes minutes to build, and
+# the checks do not need the program in it: they need the container Docker makes from the real
+# service definition. So the serving container and the init container run a stand-in image that
+# has psql, sh and busybox, with the real user, read-only root, capabilities, no-new-privileges,
+# limits, networks, secrets, environment and tmpfs from deploy/compose.yml. Nothing here touches
+# those. What this file does change:
+#   * the image and the command, to the stand-in and `sleep`, and for init a psql that proves the
+#     owner credentials work;
+#   * what the serving container waits for, so it does not wait for Pocket ID, clamd and the tunnel,
+#     none of which a check needs and two of which need a network and a token;
+#   * the published media port is dropped, so a check does not open a port on the host. The port
+#     each tenant would publish is read from the compose configuration instead.
+#
+# `user` is what the Dockerfile sets with USER 10001. The stand-in has no such user, so it is
+# given here, and isolation.sh checks the Dockerfile still says 10001.
+
+services:
+  tinyserver:
+    image: postgres:17-alpine
+    pull_policy: never
+    build: !reset null
+    user: "10001:10001"
+    entrypoint: ["sleep", "3600"]
+    # `sleep` as PID 1 does not reap the children it adopts, and a zombie holds a slot in the pids
+    # limit. The real server is PID 1 and is not a shell script. This is only for the stand-in.
+    init: true
+    ports: !reset []
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      tinyserver-uploads:
+        condition: service_completed_successfully
+      tinyserver-init:
+        condition: service_completed_successfully
+
+  tinyserver-init:
+    image: postgres:17-alpine
+    pull_policy: never
+    build: !reset null
+    user: "10001:10001"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'psql "$$DATABASE_URL_MIGRATE" -Atc "select ''init:'' || current_user || '':'' || current_database()"'

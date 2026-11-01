@@ -12,6 +12,7 @@ axum.workspace = true
 clap.workspace = true
 db = { path = "../db" }
 dotenvy.workspace = true
+serde_json.workspace = true
 sfu = { path = "../sfu" }
 tokio.workspace = true
 tracing.workspace = true

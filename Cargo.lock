@@ -4794,6 +4794,7 @@ dependencies = [
  "clap",
  "db",
  "dotenvy",
+ "serde_json",
  "sfu",
  "tokio",
  "tracing",

@@ -14,6 +14,8 @@ pub mod media_sign;
 mod messages;
 mod observe;
 mod oidc;
+mod operator;
+mod reports;
 mod scan_clamd;
 mod session;
 
@@ -23,7 +25,8 @@ pub mod fuzz;
 pub use limit::trust_proxies;
 pub use live::{Limits, Live};
 pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};
-pub use scan_clamd::{engine_from_env, ScanBootError};
+pub use operator::Operator;
+pub use scan_clamd::{engine_from_env, scanning_off, select_engine, NoScan, ScanBootError};
 
 use std::sync::Arc;
 
@@ -47,14 +50,17 @@ pub fn app(pool: PgPool, live: Live, sign_in: Option<SignIn>) -> Router {
 }
 
 fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
+    let operator = Operator::new(pool.clone());
     let mut routes = Router::new()
         .merge(health::routes(live.clone()))
+        .merge(operator::routes())
         .merge(session::routes())
         .merge(account::routes())
         .merge(community::routes())
         .merge(admin::routes())
         .merge(bot::routes())
-        .merge(messages::routes());
+        .merge(messages::routes())
+        .merge(reports::routes());
     if let Some(live) = live {
         routes = routes.merge(live::routes(live));
     }
@@ -65,7 +71,11 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .route_layer(middleware::from_fn(observe::http_span))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(middleware::from_fn(limit::guard))
+        // The suspension comes before everything that does work, the sign-in limiter too, so a
+        // refused request costs nothing else.
+        .layer(middleware::from_fn(operator::gate))
         .layer(middleware::from_fn(harden))
+        .layer(Extension(operator))
         .layer(Extension(installed_engine()))
         .with_state(pool)
 }

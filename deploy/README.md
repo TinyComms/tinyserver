@@ -179,6 +179,18 @@ The release that moved the database owner password out of the serving container 
 
 `docker stop` sends SIGTERM. The server ends every call, finishes the requests it has, and exits.
 
+## Suspending, backups and moving out
+
+`sh tenant/operator.sh <command> --stack .env` works on this community as it does on a tenant: `suspend --read-only` or `--offline` with a notice members see, `resume`, a legal `hold`, an age-encrypted `backup` and `restore` of the database, uploads, Pocket ID's data and the secrets, an `export` to run elsewhere, and `delete`. `tenant/README.md` has the commands and `docs/privacy/tenancy.md` what each one does and does not do. Nothing in them listens on a port.
+
+## Scanning off
+
+`docker compose -f compose.yml -f scan-off.yml up -d` runs without clamd and without scanning uploads. Only for a community whose attachments are sealed on the sending device; anywhere else it lets any file through. Without that file nothing changes.
+
+## Many communities on one host
+
+`tenant/tenant.sh` runs this compose file once per community, each with its own project, networks, volumes, subnet, media port, database, roles, passwords and secrets. See `tenant/README.md`.
+
 ## Housekeeping
 
 Every ten minutes the server deletes expired sessions, expired invites nobody used, expired idempotency keys, sign-ins nobody finished, and one-time codes nobody redeemed. Accepted invites stay in the invite list.

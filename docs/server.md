@@ -30,8 +30,9 @@ A permission is one bit, `1 << n`. Permissions are JSON numbers; every bit is be
 | 17 | disconnect_members | yes |
 | 18 | view_audit_log | |
 | 19 | manage_server | |
+| 20 | manage_reports (list, read, triage, annotate abuse reports; not in a room override, not in @everyone) | |
 
-All bits: `1048575`. Bits a room override may hold: `246399`. @everyone on a new server: view_channel, connect, speak, video, share_screen, voice_activity, `63`.
+All bits: `2097151`. Bits a room override may hold: `246399`. @everyone on a new server: view_channel, connect, speak, video, share_screen, voice_activity, `63`. Before [`0015_abuse_reports.sql`](../crates/db/migrations/0015_abuse_reports.sql) all bits was `1048575`. That migration adds bit 20 and handles roles that already exist: every owner has it through the owner flag, every role other than @everyone that holds manage_server gets it (including "Admin"), and no other role does. @everyone does not get it even if someone gave @everyone manage_server. A client that sends `1048575` or any older value gets exactly what it got before.
 
 | Rule | |
 | --- | --- |
@@ -67,6 +68,9 @@ Upgrading from the three fixed roles: `owner` became the owner flag, `admin` the
 | `invalid` | 400 | A bad name, time, colour, limit, or id |
 | `last_owner` | 409 | Demoting, kicking, or banning the last owner |
 | `idempotency_conflict` | 409 | `Idempotency-Key` reused with a different body |
+| `slow_down` | 429 | Filing a report past 10 in an hour or 50 in a day |
+| `read_only` | 503 | The operator suspended the community read-only, and this route writes. The body has `mode` and `notice`. |
+| `suspended` | 503 | The operator took the community offline. Every route but `/health` and `/v1/status` answers this, with `mode` and `notice`. |
 
 Community routes return `500` `unavailable` when the database call fails. That is separate from the scanner's `503` `unavailable`.
 
@@ -116,7 +120,7 @@ The routes in this section need a person's session: `Authorization: Bearer <toke
 
 ### Capabilities and me
 
-`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan"]}`. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means a chat upload is scanned before `POST /v1/media` returns `201`, and `GET /v1/media/{id}` stays closed until the row is `clean`. This server always lists `file_scan`. There is no upload path that skips the scan.
+`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan", "abuse_reports"]}`. `abuse_reports` means [abuse reports](#abuse-reports) exist. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means a chat upload is scanned before `POST /v1/media` returns `201`, and `GET /v1/media/{id}` stays closed until the row is `clean`. This server always lists `file_scan`. There is no upload path that skips the scan.
 
 `GET /v1/me` and `PATCH /v1/me` add `owner`, `roles [id]` (most senior first), `permissions` (base), and `rank`.
 
@@ -203,7 +207,30 @@ Accepting an invite makes the membership, gives its roles, counts a use, and rec
 
 ### Audit
 
-`GET /v1/audit?limit=1..200&before=<id>&actor=<user id>&action=<prefix>` (view_audit_log): newest first. An omitted `limit` is 50. Rows add `actor_name`, `subject_user_id`, `subject_name`, `reason`, and `detail`. For the next page pass the last row's `id` as `before`. Actions for this area also include `room.create`, `room.rename` (name-only change), `room.delete`, `room.update`, `room.override`, `invite.create`, `invite.revoke`, `invite.accept`, `member.join` (a group join), `member.role` (legacy role change, and an admin-group promotion), `member.roles`, `member.owner`, `member.remove`, `member.timeout`, `member.ban`, `member.unban`, `account.rename`, `account.avatar`, `session.close_all`, `identity.relink`, `bootstrap`, `server.update`, `server.icon`, `role.create`, `role.update`, `role.delete`, `role.order`, `category.create`, `category.update`, `category.delete`, `layout.update`, `channel.create`, `channel.update`, `channel.delete`, `channel.override`, `call.server_mute`, `call.move`, `bot.create`, and `bot.revoke`. A kick's reason is on its `member.remove` row. Bot routes are under [Bots](#bots).
+`GET /v1/audit?limit=1..200&before=<id>&actor=<user id>&action=<prefix>` (view_audit_log): newest first. An omitted `limit` is 50. Rows add `actor_name`, `subject_user_id`, `subject_name`, `reason`, and `detail`. For the next page pass the last row's `id` as `before`. Actions for this area also include `room.create`, `room.rename` (name-only change), `room.delete`, `room.update`, `room.override`, `invite.create`, `invite.revoke`, `invite.accept`, `member.join` (a group join), `member.role` (legacy role change, and an admin-group promotion), `member.roles`, `member.owner`, `member.remove`, `member.timeout`, `member.ban`, `member.unban`, `account.rename`, `account.avatar`, `session.close_all`, `identity.relink`, `bootstrap`, `server.update`, `server.icon`, `role.create`, `role.update`, `role.delete`, `role.order`, `category.create`, `category.update`, `category.delete`, `layout.update`, `channel.create`, `channel.update`, `channel.delete`, `channel.override`, `call.server_mute`, `call.move`, `bot.create`, `bot.revoke`, and the report rows under [Abuse reports](#abuse-reports). A kick's reason is on its `member.remove` row. Bot routes are under [Bots](#bots).
+
+## Abuse reports
+
+A member can report a message, a member or a channel to the people who run this community. This is only the part inside one community server: it is not a way for anyone outside to read conversations. The policy, what a moderator can and cannot see, and what the operator can and cannot do are in [`privacy/abuse-response.md`](privacy/abuse-response.md). Migration [`0015_abuse_reports.sql`](../crates/db/migrations/0015_abuse_reports.sql). Capability: `abuse_reports`. Bots are refused on every route here.
+
+**Evidence is unverified, and the server says so.** A report may carry `evidence`: text the reporter's own client chose to send. For an end-to-end encrypted conversation that is the plaintext the reporter's client chose to disclose, because the server cannot read it. The server has no way to check that it is genuine: it may be edited, invented, or from a conversation that never happened. Every report that carries evidence is stored with `evidence_unverified: true`, and every response that shows evidence says so. Reporting a message stores the message's id, where it was posted and who posted it. It never stores or reads the message's text; a message's text is in a report only if the reporter sent it as `evidence`.
+
+| Route | Who | |
+| --- | --- | --- |
+| `POST /v1/reports` | any member who is not banned (a timeout does not stop it) | `{kind, target_id, category, note?, evidence?}`. `kind` is `message`, `member` or `channel`; `target_id` is that object's id. `category` is `spam`, `harassment`, `hate`, `violence`, `sexual`, `illegal`, `impersonation` or `other`. `note` is at most 2000 characters, `evidence` at most 32768 bytes of UTF-8; neither may hold control characters other than newline, return and tab. → `201` `{id, kind, category, status, created_at, evidence_unverified, duplicate: false}`. It names nobody. Reporting the same thing again while the first report is `open` or `reviewing` is `200` with the first report and `duplicate: true`, and stores nothing. |
+| `GET /v1/reports?status=&kind=&before=&limit=` | manage_reports | Newest first. `status` is `open`, `reviewing`, `actioned` or `dismissed`; `limit` 1 to 200, 50 when left out; `before` is the last row's `id`. Rows: `{id, kind, category, status, preserve, reported, reporter, message_id, channel_id, direct_id, has_evidence, evidence_unverified, linked_audit_ids, created_at, updated_at, resolved_at}`. `reported` and `reporter` are `{user_id, display_name}` or `null`. No note and no evidence. |
+| `GET /v1/reports/{id}` | manage_reports | The row above plus `note`, `evidence`, `preserved_by`, `preserved_at` and `notes [{id, author, body, created_at}]`, the moderators' annotations. |
+| `PATCH /v1/reports/{id}` | manage_reports (`preserve`: owners only) | Any of `status`, `note`, `link_audit_id`, `preserve`, together or alone, in one transaction. `status` moves between the four values in any direction; `actioned` and `dismissed` set `resolved_at`, any other clears it. `note` adds a moderator annotation of up to 2000 characters. `link_audit_id` is the `id` of a `member.remove`, `member.ban` or `member.timeout` audit row, and for a report about a person it must be an action against that person; linking one twice adds nothing. `preserve` sets or clears the legal hold. → the full report. An empty `{}` is `400`. |
+
+Errors: `400 invalid` for a bad kind, category, id, status, a note or evidence with control characters, a note over its limit, reporting yourself, or a link that is not an enforcement action against the person reported; `413 too_large` for evidence over 32768 bytes, or any body over 80 KiB on this route; `404 not_found` when the target does not exist **or the caller cannot see it** (a private channel, a direct between other people) and for a report that does not exist or that is about the caller; `403 forbidden` without manage_reports, or `preserve` from someone who is not an owner; `429 slow_down` past 10 new reports an hour or 50 a day for one reporter. The limit is counted in the database per reporter, not per address.
+
+Who sees what. Only holders of manage_reports see reports, and never one about themselves: for a moderator who is the subject of a report, the list leaves it out, `GET` and `PATCH` answer `404` exactly as for an id nobody has, and its audit rows are hidden (`audit_select` shuts out rows whose subject is the caller). The reported member never learns who reported, because they cannot read the report. Moderators do see the reporter, so they can deal with a reporter who misuses the button. The reporter cannot read their own report back: `GET` is `403` for them. There is no live event for reports, so nothing about one is pushed to any socket.
+
+The audit log gets a row for every change, and never any report text. `report.create` (no actor: the audit log does not say who reported; the subject is the person reported), `report.triage` (`from`, `to`), `report.annotate` (the note's id), `report.link` (the audit id and its action), `report.preserve`, `report.unpreserve`, and `report.expire` (a count, written by the retention sweep). Rows whose action starts with `report.` are visible only to holders of manage_reports other than the subject, whatever else they can see in the audit log.
+
+Retention. `actioned` and `dismissed` reports, with their moderator notes, are deleted `TINYSERVER_REPORT_RETENTION_DAYS` days (7 to 3650, default 90, anything else stops `serve` from starting) after they were resolved, by the same sweep that runs at start and every 10 minutes. A report that is `open` or `reviewing` is never aged out. A report with `preserve` is never deleted by the sweep. `preserve` is the legal hold: only an owner can set or clear it, it is audited, it shows in the list, and it is the only thing that stops deletion.
+
+Account deletion (`DELETE /v1/me`). A person who deletes their account loses their link on every report they made (`reporter` becomes `null`), held or not. On reports that are not held, the note and the evidence they wrote are deleted too, and the report stays with its kind, target, category and status. A person who is the subject of reports loses, from every report about them that is not held, the evidence, the reporter's note and the moderators' notes; the report row stays. A held report is never otherwise touched.
 
 ## Messages and attachments
 
@@ -254,6 +281,8 @@ Archives (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused unless `all
 ### Scanning
 
 `serve` refuses to start unless `TINYSERVER_CLAMD_SOCKET` is set, except when that variable is unset and `TINYSERVER_ALLOW_FAKE_SCAN=1`. If the socket is set, the fake scanner is not used. The socket is `host:port`. A filesystem path works on Unix only. On Windows a path is a startup error. Compose sets `TINYSERVER_CLAMD_SOCKET=clamd:3310` and `TINYSERVER_UPLOAD_DIR=/data/uploads` and does not publish port 3310.
+
+`TINYSERVER_SCAN_ENGINE` is `clamd`, the default and all of the above, or `none`. `none` turns server-side scanning off for a community whose files are sealed on the sending device, where the server could only scan ciphertext: every upload is marked `clean` without being scanned, and `serve` logs a warning when it starts. `none` with `TINYSERVER_CLAMD_SOCKET` also set is a startup error, so a half-changed setting does not run. `deploy/scan-off.yml` is the compose file for it; it also stops clamd running. On a community whose files are not sealed it lets any file through.
 
 The scanner is clamd plus three yara-x rules compiled into the process (`lnk_header`, `html_prefix`, `vba_stream`). There is no rules file and no separate content router. A yara hit is `blocked` before clamd is asked. clamd down, a socket timeout, or any IO error is unavailable even when yara is clean. The fake scanner blocks the EICAR test string and calls everything else clean.
 
@@ -310,6 +339,20 @@ The bot calls the API with `Authorization: Bot <token>`. The prefix is exact. `B
 `GET /v1/me` for a bot is the shape under Capabilities and me. `GET /v1/live` takes the same `Bot` header. `ready.online` is empty without `members.read`. `ready.calls` is empty without `rooms.read`. A bot with neither, or with only `rooms.write`, stays connected, answers `ping`, and receives no room or member payload.
 
 `rooms.read` lists rooms and receives `room.*` plus `call.joined`, `call.left`, and `call.state`. `members.read` lists members and receives `member.*` and `presence`. `rooms.write` creates, renames, and deletes rooms and receives none of those payloads by itself. A bot does not receive message, direct, typing, or read frames, and it cannot post them. Any client frame whose type starts with `call.` is `forbidden`. Revocation closes the socket with `4001 session_ended` on the next credential check, every 60 seconds.
+
+## Operator suspension and legal hold
+
+`migrations/0016_operator.sql`. One row, `operator_state`, that the runtime role may read and only the owner role may write, through `tinyserver operator` in the init container. Every change is a row in `operator_events`, which the runtime role cannot read.
+
+| Command | Effect |
+| --- | --- |
+| `tinyserver operator status [--json]` | The mode, notice, since, hold, and the number of reports owners put on hold |
+| `tinyserver operator suspend --read-only --notice TEXT` | Reads, signing in and out, `DELETE /v1/me`, and `POST /v1/reports` still work. Every other write is `503 read_only`. On the live socket, `call.join`, `call.offer`, `typing` and the moderation frames get `error {code: "read_only"}`; calls already running go on until they end. |
+| `tinyserver operator suspend --offline --notice TEXT` | Only `GET /health` and `GET /v1/status` answer; everything else is `503 suspended`. Open live sockets close with `4010 suspended` at their next session check, within a minute. |
+| `tinyserver operator resume` | Normal again. The notice is cleared. |
+| `tinyserver operator hold [--reason TEXT]` / `release` | A legal hold. Resolved reports stop expiring, and `deploy/tenant/operator.sh` refuses to delete or overwrite the community. The reason is kept in `operator_events` only. |
+
+The notice is 1 to 500 characters with no control characters but new lines. `GET /v1/status`, with no session, is `{"mode": "normal" | "read_only" | "offline", "notice", "since"}`. It never says whether there is a hold. The server reads the row at most every `TINYSERVER_OPERATOR_REFRESH_MS` (2000 by default; `0` reads it for every request), so a change reaches every request within that; when the row cannot be read the last state read is kept.
 
 ## Bootstrap
 

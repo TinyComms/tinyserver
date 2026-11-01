@@ -1,0 +1,31 @@
+# Server-side scanning off, for a community whose files are sealed on the sending device, so the
+# server could only ever scan ciphertext. Add it after deploy/compose.yml:
+#
+#   docker compose -f compose.yml -f scan-off.yml up -d
+#
+# or give a tenant `--scan none` (deploy/tenant/tenant.sh), which adds it for that tenant only.
+# Without this file nothing changes: tinyserver needs clamd and refuses to start without it.
+#
+# With it, clamd does not run and is not waited for, and tinyserver runs with
+# TINYSERVER_SCAN_ENGINE=none: every upload passes the gate unscanned, and the server says so in
+# its log when it starts. Use it only where attachments are sealed; on a community where they are
+# not, it lets any file through.
+
+services:
+  tinyserver:
+    environment:
+      TINYSERVER_SCAN_ENGINE: none
+      TINYSERVER_CLAMD_SOCKET: ""
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      pocket-id:
+        condition: service_healthy
+      tinyserver-uploads:
+        condition: service_completed_successfully
+      tinyserver-init:
+        condition: service_completed_successfully
+
+  # Kept defined, so the file still merges with compose.yml, but started only on request.
+  clamd:
+    profiles: ["scan"]

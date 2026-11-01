@@ -1,6 +1,7 @@
 //! Deletes rows that can no longer be used. Accepted invites are kept for the invite list.
 //! Unfinished sign-ins and unredeemed one-time codes go once they expire.
 //! Outbox rows are kept 24 hours, which is how far back a live socket can resume.
+//! Resolved abuse reports go after `TINYSERVER_REPORT_RETENTION_DAYS` (90), unless on hold.
 
 use sqlx::PgPool;
 
@@ -17,6 +18,8 @@ pub struct Swept {
     pub logins: i64,
     /// Uploads nobody attached within an hour.
     pub attachments: i64,
+    /// Resolved abuse reports past their retention. Reports on legal hold are never counted.
+    pub reports: i64,
 }
 
 impl Swept {
@@ -27,6 +30,7 @@ impl Swept {
             + self.events
             + self.logins
             + self.attachments
+            + self.reports
     }
 }
 
@@ -42,6 +46,7 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
     let orphans = crate::messages::expire_orphans(pool).await?;
     crate::messages::remove_files(&orphans);
     let attachments = i64::try_from(orphans.len()).unwrap_or(i64::MAX);
+    let reports = crate::reports::expire_reports(pool).await?;
     Ok(Swept {
         sessions,
         invites,
@@ -49,5 +54,6 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
         events,
         logins,
         attachments,
+        reports,
     })
 }
