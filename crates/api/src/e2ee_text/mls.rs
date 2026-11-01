@@ -191,12 +191,25 @@ pub(crate) fn parse_key_package(data: &[u8]) -> Result<KeyPackage, Refused> {
 }
 
 /// Runs a parser of bytes a member sent. openmls and tls_codec have debug assertions that fire on
-/// cut input, where a release build returns an error; a panic is caught so a debug build answers
-/// the same, and so nothing a client sends can take down its request. A panic is a refusal.
+/// cut input, where a release build returns an error, and openmls 0.8 also panics in release on
+/// some malformed extension lists (it slices past the end after re-encoding what it decoded:
+/// `key_package_extensions_panic.bin`, found by the `e2ee_handshake` fuzz target). A panic is
+/// caught, so nothing a client sends can take down its request, and is a refusal. This needs
+/// `panic = "unwind"`, the default, which the workspace keeps.
 fn untrusted<T>(parse: impl FnOnce() -> Option<T>) -> Option<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse))
+    // libFuzzer's panic hook aborts the process on any panic, caught or not. A panic caught here
+    // is not a crash of ours, so the fuzz build quiets the hook for the parse; one that escapes
+    // still aborts.
+    #[cfg(feature = "fuzz")]
+    let hook = std::panic::take_hook();
+    #[cfg(feature = "fuzz")]
+    std::panic::set_hook(Box::new(|_| {}));
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse))
         .ok()
-        .flatten()
+        .flatten();
+    #[cfg(feature = "fuzz")]
+    std::panic::set_hook(hook);
+    parsed
 }
 
 /// An MLSMessage, or `Bad`.

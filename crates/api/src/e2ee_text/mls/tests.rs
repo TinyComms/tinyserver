@@ -633,6 +633,21 @@ fn a_last_resort_key_package_is_valid_too() {
     );
 }
 
+#[test]
+fn a_key_package_on_which_openmls_panics_is_refused() {
+    // Found by the fuzz target: openmls 0.8 slices past the end of this key package's extension
+    // list. Every parser refuses it; none lets the panic out.
+    let bytes = include_bytes!("key_package_extensions_panic.bin");
+    let group = uuid16(GROUP);
+    assert_eq!(parse_key_package(bytes).err(), Some(Refused::Bad));
+    assert!(key_package_ref(bytes).is_none());
+    assert!(validate_key_package(USER_A, DEVICE_A, &[4; 65], bytes, unix_now()).is_err());
+    assert!(parse_commit(&group, 0, bytes).is_err());
+    assert!(check_ciphertext(&group, 0, MSG, bytes).is_err());
+    assert!(welcome_recipients(bytes).is_err());
+    assert!(check_ratchet_tree(&group, bytes).is_err());
+}
+
 /// Writes real objects as the seeds of the `e2ee_handshake` fuzz target:
 ///   cargo test -p api --lib write_fuzz_seeds -- --ignored
 #[test]
@@ -650,7 +665,8 @@ fn write_fuzz_seeds() {
     let remove = server.remove(1, &group, 1).expect("remove");
     a.take_proposals(&batch(&[&add, &remove]).expect("batch"));
     let committed = a.commit();
-    let ciphertext = a.encrypt(b"seed");
+    a.merge();
+    let ciphertext = a.encrypt_as("edit", Some(GROUP), b"seed");
     let _ = &mut b;
     let dir =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/e2ee_handshake");
@@ -663,6 +679,11 @@ fn write_fuzz_seeds() {
         ("add", add),
         ("remove", remove),
         ("private_message", ciphertext),
+        ("ratchet_tree", committed.tree),
+        (
+            "sealed_blob",
+            [b"TNYA1".as_slice(), &[16], &[1; 7], &[2; 40]].concat(),
+        ),
         ("batch", batch(&[&[1, 0, 1, 0]]).expect("batch")),
     ] {
         std::fs::write(dir.join(name), bytes).expect("seed");
