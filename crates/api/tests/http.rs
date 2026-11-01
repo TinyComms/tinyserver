@@ -237,8 +237,20 @@ async fn an_invite_lets_a_person_in_once_and_not_after_it_expires() {
 
         let issued = invite(&app, &owner_token, Some("first-invite")).await;
         let replayed = invite(&app, &owner_token, Some("first-invite")).await;
-        assert_eq!(replayed, issued);
+        // A replay returns the same invite and not its secret: the table behind it holds
+        // no bearer token, and the server keeps only a hash of the invite.
+        assert_eq!(replayed["id"], issued["id"]);
+        assert_eq!(replayed["token_unavailable"], true);
+        assert!(replayed.get("token").is_none(), "{replayed}");
         let token = issued["token"].as_str().expect("token");
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM idempotency_keys WHERE response::text LIKE '%' || $1 || '%'",
+        )
+        .bind(token)
+        .fetch_one(&db.owner)
+        .await
+        .expect("idempotency scan");
+        assert_eq!(stored, 0, "the invite token is stored in idempotency_keys");
 
         let guest = db::sign_in(
             &db.runtime,

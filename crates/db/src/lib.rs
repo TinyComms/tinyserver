@@ -21,7 +21,9 @@ mod server;
 mod session;
 mod sweep;
 
-pub use account::{close_all_sessions, delete_avatar, get_avatar, rename_me, set_avatar};
+pub use account::{
+    close_all_sessions, delete_account, delete_avatar, get_avatar, rename_me, set_avatar,
+};
 pub use auth::{
     claim_signup, end_provider_sessions, invited_pending, issue_code, list_identities,
     pkce_challenge_shaped, pkce_verifier_shaped, redeem_code, release_signup, relink_identity,

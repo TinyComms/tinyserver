@@ -607,7 +607,12 @@ fn topic(topic: Option<&str>) -> Result<Option<String>, CommunityError> {
 
 fn member_select(filter: &str) -> String {
     format!(
-        "SELECT u.id::text, u.email, u.display_name, app_member_role(u.id),
+        // An email is the person's, seeded from their provider. Other members do not need it
+        // to talk to them, so it goes to the person and to whoever manages the server.
+        "SELECT u.id::text,
+                CASE WHEN u.id = app_uid() OR (app_perms() & {MANAGE_SERVER}) <> 0
+                     THEN u.email END,
+                u.display_name, app_member_role(u.id),
                 to_char(m.created_at AT TIME ZONE 'UTC', '{STAMP}'),
                 m.owner, app_roles_of(u.id),
                 to_char(m.last_seen_at AT TIME ZONE 'UTC', '{STAMP}'),
@@ -617,7 +622,8 @@ fn member_select(filter: &str) -> String {
          FROM memberships m
          JOIN users u ON u.id = m.user_id
          {filter}
-         ORDER BY m.created_at, u.id"
+         ORDER BY m.created_at, u.id",
+        MANAGE_SERVER = perm::MANAGE_SERVER,
     )
 }
 
@@ -1348,7 +1354,16 @@ async fn finish<T: Serialize>(
     let Claim::Reserved(key) = claim else {
         return Ok(());
     };
-    let body = serde_json::to_value(value).map_err(|_| CommunityError::Invalid)?;
+    let mut body = serde_json::to_value(value).map_err(|_| CommunityError::Invalid)?;
+    // A bearer secret (an invite token) is never written to this table. Everywhere else the
+    // server keeps only a hash of it, so a replay cannot return it: it returns the rest of the
+    // response and says the token is gone. A caller that lost the first response makes a new
+    // invite and revokes this one.
+    if let Some(object) = body.as_object_mut() {
+        if object.remove("token").is_some() {
+            object.insert("token_unavailable".to_string(), Value::Bool(true));
+        }
+    }
     sqlx::query("UPDATE idempotency_keys SET status_code = 201, response = $2 WHERE key = $1")
         .bind(key)
         .bind(body)
