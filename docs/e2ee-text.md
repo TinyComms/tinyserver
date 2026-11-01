@@ -1,10 +1,10 @@
 # End-to-end encrypted text and attachments
 
-Status: **version 1. The server side is implemented and tested on main; the client side is not merged.**
+Status: **version 1. The server side is implemented and tested on main; the client side is merged on tinyclient main and is in no release yet.**
 
 - **Built (server):** `crates/api/src/e2ee_text/` and `crates/db/migrations/0020`–`0023`: devices and cross-signatures, key packages, one MLS group per encrypted conversation with the server as delivery service and external sender, membership kept in step with permissions, ciphertext posts and edits bound to their authenticated data, no downgrade either way, sealed uploads, ratchet trees served apart from the Welcome, a device cap per group, the `required` mode, the community root key and its signed policy, and refusal of every encrypted write while the community is suspended. The tests are in section 11; `crates/api/tests/e2ee_text.rs` passes.
-- **Not merged (client):** tinyclient's `crates/e2ee` and the Tiny adapter, on its `hardening/e2ee-core` branch. Until it ships, no conversation is encrypted in practice, and every property that rests on a client check against a hostile server (sections 3, 8 and 9) is unverified.
-- **Left to do:** G2 to G5 and G9 in section 8, encrypted reactions, coarse timestamps and padding.
+- **Built (client):** tinyclient main: #126 (`0c405dc`, the `crates/e2ee` crate) and #127 (`89188e8`, the Tiny adapter), in no release yet. Its own account of what it does and does not do is tinyclient's `docs/e2ee-text-client.md`. The client checks that a hostile server can only be stopped by (cross-signatures, the pinned external sender key, an epoch going backwards, sealed files matching their message) are asserted by tinyclient's tests, named in section 11 and in `docs/privacy/guarantees.md`; they were not run from this repository. Not done in the client: pinning the community root key, fetching ratchet trees from the tree endpoint, creating an encrypted channel (it starts encrypted direct messages only), padding sealed files, and sealing chatd's own message store, which keeps opened text in plaintext.
+- **Left to do:** G2 to G5 and G7 to G9 in section 8, encrypted reactions, and the client items listed above.
 
 Where this document and the code disagree, the code is wrong or this document is out of date: open an issue. Calls already have end-to-end encryption (`docs/calls.md`); this is the same family of design for stored text. What can and cannot be promised from this is in `docs/privacy/guarantees.md` (G1.3 to G1.7).
 
@@ -139,7 +139,7 @@ Validations that remain possible on the server: size, per-user upload rate and d
 
 The server stores, for an encrypted message: ids, timestamps, `epoch`, `device_id`, `kind`, `target_id`, the ciphertext, and for each attachment its id, ciphertext size and uploader. `messages.body` is the empty string. The `last_message` preview of an encrypted channel is empty, the outbox and live events carry the ciphertext only, and a deleted message loses its ciphertext in the outbox too. No log line carries a ciphertext, a key package, a commit, a Welcome, a proposal, a tree or a key (`crates/server/src/log_policy.rs`). Group state is the handshake log (public MLS handshake messages), the public ratchet trees of recent epochs, the device and key package tables, and the external sender key. No table holds a key that opens a message, and no table, log line or file holds plaintext of an encrypted message: a test says a canary through every encrypted path and looks for it everywhere.
 
-The client (not merged, see the status) stores MLS state through the OS keychain-protected key, and caches decrypted messages encrypted with a per-install key kept in the OS keychain, never with the key in the same file.
+The client (tinyclient #127, `docs/e2ee-text-client.md` there) keeps its state key and cache key in the account's keychain item and stores MLS state sealed under the state key, and caches decrypted messages encrypted with a per-install key kept in the OS keychain, never with the key in the same file. chatd's general message store (SQLite) still keeps the opened text of encrypted conversations in plaintext, as it does for every network; sealing it is open in the client.
 
 ## 7. What a person sees
 
@@ -159,7 +159,7 @@ Open work, with the labels other documents use (they follow TinyCloud's `design/
 | G3 | Invite capability keys: an invite's secret in the URL fragment, certified by an admin device that chains to the community root | Client first, then an invite column on the server |
 | G4 | The first-device capability signature, so a first device proves the invite it came through | Client first, then a device column on the server |
 | G5 | Binding the group to its conversation in a GroupContext extension | Client; the server only passes it through |
-| G7 | Padding of ciphertexts and sealed blobs | Client and schema |
+| G7 | Padding of sealed blobs. Message text is already padded to buckets by the client (tinyclient `messages_are_padded_to_buckets_so_the_server_sees_short_medium_or_long`); sealed files are not | Client |
 | G8 | Coarse timestamps | Client and schema |
 | G9 | The server's external sender private key is a row in Postgres (`e2ee_server_key`), so it is in every backup; move it to a secret file | Server |
 | | Encrypted reactions | Client and schema |
@@ -175,7 +175,7 @@ The rest of this section is what the design does not protect against even when t
 - **A first device is trust on first use.** A malicious server that is present when a person first registers could substitute the key of that first device; verifying safety numbers out of band is the only defence.
 - **Compromised endpoint** reads everything the device can.
 - **Removal latency** as described in section 4.
-- **Membership is the server's word.** A malicious server can create an account, grant it `view_channel`, and it joins with its own first device; cross-signing does not help against a new person. The community root key and its signed policy are on the server (`/v1/e2ee/community`); the rest of the fix is G3 and G4 above (`design/security.md` section 2.8 in tinycloud) and is not in this version.
+- **Membership is the server's word.** A malicious server can create an account, grant it `view_channel`, and it joins with its own first device; cross-signing does not help against a new person. The community root key and its signed policy are on the server (`/v1/e2ee/community`), but the client does not pin or check them yet; the rest of the fix is G3 and G4 above (`design/security.md` section 2.8 in tinycloud) and is not in this version.
 - **Group size** is capped (section 4) until groups per permission audience exist.
 
 ## 9. Compatibility and migration
@@ -230,7 +230,7 @@ Server (`crates/api/tests/e2ee_text.rs` and unit tests under `e2ee_text/`):
 - suspension: in read-only and offline mode no encrypted post, sealed upload, key package or commit is taken
 - migration: an old client and old request shapes against the new server, as in section 9 (`old_requests_and_old_clients_keep_working`); a new client against an old server is the client's test
 
-Client (`crates/e2ee`): real openmls groups with 3 and 20 devices, add, remove, epoch change; a removed device cannot decrypt a later message; a new device cannot decrypt an earlier one; replay and tamper rejection; attachment encryption round trip, truncation, reorder, bit flip, wrong key; AES-GCM known-answer vectors from NIST and Wycheproof; property tests on the envelope codec and on chunk boundaries.
+Client (tinyclient `crates/e2ee` from #126 and the Tiny adapter from #127; not run from this repository). Those that stand for a client check against a hostile server: `an_add_of_a_device_that_is_not_cross_signed_is_rejected`, `a_forged_cross_signature_does_not_get_a_device_added`, `a_device_the_server_invented_is_rejected`, `the_first_device_is_trusted_on_first_use_and_the_rest_must_chain_to_it`, `proposals_not_signed_by_the_pinned_server_key_are_invalid`, `a_changed_server_key_is_reported_and_blocks_until_accepted`, `an_epoch_that_goes_backwards_is_detected_and_freezes_the_group`, `a_new_identity_is_reported_and_needs_the_person_to_agree`, `an_encrypted_conversation_is_labelled_its_rows_never_read_the_servers_body_and_nothing_goes_plain`, `a_sealed_file_opens_with_its_entry_only_in_its_conversation`, `an_opened_sealed_file_must_be_what_its_message_says`. The end-to-end `adapters::tiny::e2ee::live` test against a real tinyserver is ignored unless sessions are supplied. As specified: real openmls groups with 3 and 20 devices, add, remove, epoch change; a removed device cannot decrypt a later message; a new device cannot decrypt an earlier one; replay and tamper rejection; attachment encryption round trip, truncation, reorder, bit flip, wrong key; AES-GCM known-answer vectors from NIST and Wycheproof; property tests on the envelope codec and on chunk boundaries.
 
 ## 12. Not covered by tests or verified
 

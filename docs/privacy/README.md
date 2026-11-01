@@ -2,7 +2,7 @@
 
 How TinyComms (tinyserver, the community server, and tinyclient, the desktop app) handles private communication, and what a managed service built on it (TinyCloud) can and cannot honestly promise. Written to be true: every claim cites code, a test, a document or says "not verified". Read [`guarantees.md`](guarantees.md) first if you need to know what may be said to a customer; read [`threat-model.md`](threat-model.md) first if you need to know who the adversaries are.
 
-State described: tinyserver `origin/main` at `c4ae28b` (#20: abuse reports, operator suspension and legal hold, tenants, encrypted backups), first written on `ea3cd39` on 2026-10-31 and re-checked against `c4ae28b` on 2026-11-01, then updated for #23 (the server side of text and attachment E2EE, migrations `0020` to `0023`); tinyclient `26916e9` (read only). The TinyCloud control plane (provisioning, billing, staff tooling) is not in this repository.
+State described: tinyserver `origin/main` at `c4ae28b` (#20: abuse reports, operator suspension and legal hold, tenants, encrypted backups), first written on `ea3cd39` on 2026-10-31 and re-checked against `c4ae28b` on 2026-11-01, then updated for #23 (the server side of text and attachment E2EE, migrations `0020` to `0023`); tinyclient `26916e9` (read only), and tinyclient main at `89188e8` (#126, #127: the text E2EE client) for text E2EE, read only. The TinyCloud control plane (provisioning, billing, staff tooling) is not in this repository.
 
 ## Status words
 
@@ -13,7 +13,7 @@ Used the same way in every document here.
 | Implemented, tested | The code does it and a named test fails if it stops |
 | Implemented | The code does it; no test asserts it |
 | Designed | Written down, not built |
-| In progress | Being built elsewhere, **not merged**. The main case is the client side of text and attachment end-to-end encryption (E2EE), on tinyclient's `hardening/e2ee-core`. The server side is implemented and tested in this repository (#23, [`../e2ee-text.md`](../e2ee-text.md)); a property that rests on the client is marked "client: not verified" |
+| In progress | Being built elsewhere, **not merged**. Text and attachment end-to-end encryption (E2EE) is no longer this case: the server side is #23 here and the client side is merged on tinyclient main (#126, #127; [`../e2ee-text.md`](../e2ee-text.md)). A property that rests on a client check names the tinyclient test that asserts it, or says "client: not verified" where none does |
 | Not done | Neither designed nor built |
 | Not verified | Could not be checked; the document says what was and was not looked at |
 
@@ -61,7 +61,7 @@ The link to `benchmarks.md` does not resolve yet.
 
 ## Existing documents these build on
 
-[`../server.md`](../server.md) (API and permissions), [`../calls.md`](../calls.md) (live socket, SFU, call E2EE), [`../logging.md`](../logging.md), [`../e2ee-text.md`](../e2ee-text.md) (text E2EE: server side implemented, client not merged), [`../../deploy/README.md`](../../deploy/README.md) (running a community), [`../../deploy/tenant/README.md`](../../deploy/tenant/README.md) (tenants and the operator's hooks), [`../../deploy/tests/README.md`](../../deploy/tests/README.md) (what the shell checks check). tinyclient's `SECURITY.md`, `docs/logging.md` and `docs/architecture.md` were read from the client repository and are cited by name.
+[`../server.md`](../server.md) (API and permissions), [`../calls.md`](../calls.md) (live socket, SFU, call E2EE), [`../logging.md`](../logging.md), [`../e2ee-text.md`](../e2ee-text.md) (text E2EE: server side here, client on tinyclient main), [`../../deploy/README.md`](../../deploy/README.md) (running a community), [`../../deploy/tenant/README.md`](../../deploy/tenant/README.md) (tenants and the operator's hooks), [`../../deploy/tests/README.md`](../../deploy/tests/README.md) (what the shell checks check). tinyclient's `SECURITY.md`, `docs/logging.md` and `docs/architecture.md` were read from the client repository and are cited by name.
 
 ## What is verified and what is not
 
@@ -75,4 +75,4 @@ Not verified anywhere in this set: Pocket ID's behaviour beyond its published do
 
 ## Maintenance
 
-A change that adds a table, a column, a log call, an outbound connection, a volume or a container must update [`metadata.md`](metadata.md) and, if it moves a guarantee, [`guarantees.md`](guarantees.md) in the same change. When the text E2EE client ships or a gap closes, follow [`guarantees.md`](guarantees.md) section 8.
+A change that adds a table, a column, a log call, an outbound connection, a volume or a container must update [`metadata.md`](metadata.md) and, if it moves a guarantee, [`guarantees.md`](guarantees.md) in the same change. When a tinyclient release carries the text E2EE client or a gap closes, follow [`guarantees.md`](guarantees.md) section 8.

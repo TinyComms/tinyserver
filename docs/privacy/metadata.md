@@ -2,7 +2,7 @@
 
 Every place user content or sensitive metadata exists in a tinyserver stack, what is there, in what form, who can read it, how long it stays, and whether end-to-end encryption (E2EE) covers it. Built by reading the migrations, the API and server code, `deploy/compose.yml` and the client repository (read only). Section 15 says how to re-check each part.
 
-Status words are explained in [`README.md`](README.md). **Text and attachment E2EE: the server side is implemented and tested (#23, migrations `0020` to `0023`); the client side is not merged** ([`../e2ee-text.md`](../e2ee-text.md)). Where this inventory says a column holds ciphertext, the server stores only what the client sent; that the client encrypted it is not verified here. Call E2EE is implemented ([`../calls.md`](../calls.md)).
+Status words are explained in [`README.md`](README.md). **Text and attachment E2EE: the server side is implemented and tested (#23, migrations `0020` to `0023`); the client side is on tinyclient main (#126, #127)** ([`../e2ee-text.md`](../e2ee-text.md)). Where this inventory says a column holds ciphertext, the server stores only what the client sent; that the client encrypts it is asserted by tinyclient's tests, not run here. Call E2EE is implemented ([`../calls.md`](../calls.md)).
 
 Reading the columns:
 
@@ -191,7 +191,7 @@ Included because the person's device is where E2EE keys and plaintext live.
 | Tiny call identity key | `e2ee/<account>/identity.key` | Two hex lines, mode 0600 on Unix, inherited ACL on Windows (finding C4, open) |
 | Verified keys | `e2ee/<account>/verified.json` | |
 | Logs | `logs/*.log`, rolled at 2 MiB, two generations; bundles only on Save debug log | Redacted lines |
-| Specified for text E2EE | MLS state through a key in the OS keychain; decrypted cache encrypted with a per-install keychain key | Client not merged; not verified |
+| Text E2EE (tinyclient #127) | `<support>/e2ee/Tiny-<user>/text/`: the engine's snapshot (identity key, trust store, MLS groups) sealed under a state key, opened messages sealed one by one under a cache key, both keys in the account's keychain item; `notes.json` with handshake positions and verified safety numbers; sealed files waiting to upload under `e2ee/outgoing/`. Owner-only directories. **chatd's SQLite store and media cache keep opened text and files in plaintext**, as for every network | Implemented (tinyclient `the_cache_opens_only_its_own_rows_under_its_own_key`, `the_folder_is_the_owners_alone`, not run here). The plaintext store is open (finding C1) |
 
 ## 15. How this inventory was checked, and how to repeat it
 

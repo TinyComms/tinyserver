@@ -6,7 +6,7 @@ Audit of tinyserver at `bbe1cd7` and tinyclient at `26916e9` (both `origin/main`
 - **Read**: confirmed by reading the cited code, with no failing test written first.
 - **Reported**: found by an audit pass over the code and not independently re-checked. Treat as likely, not proven.
 
-Severity is exposure if the flaw is abused by the party named, not likelihood. `Status` is what `origin/main` does about it at `c4ae28b` (#20: abuse reports, operator hooks and tenants), re-checked by reading on 2026-11-01, plus #23 (the server side of text E2EE) for S3, S9, C1, N9, N15 and N16. A finding is only "Fixed" when a test fails without the fix, or, for S13 and S14, when it was checked by running the containers. The shell checks in `deploy/tests/` start real containers; they were read for this pass, not run, and CI does not run them. `client:` statuses describe tinyclient's `hardening/privacy-architecture` branch, which is not merged and was not re-run here.
+Severity is exposure if the flaw is abused by the party named, not likelihood. `Status` is what `origin/main` does about it at `c4ae28b` (#20: abuse reports, operator hooks and tenants), re-checked by reading on 2026-11-01, plus #23 (the server side of text E2EE) for S3, S9, C1, N9, N15 and N16. A finding is only "Fixed" when a test fails without the fix, or, for S13 and S14, when it was checked by running the containers. The shell checks in `deploy/tests/` start real containers; they were read for this pass, not run, and CI does not run them. `client:` statuses describe tinyclient's `hardening/privacy-architecture` work, since merged on tinyclient main as #125 (`8560884`), and for C1 the text E2EE client, #126 (`0c405dc`) and #127 (`89188e8`); none was re-run here.
 
 Paths are in tinyserver unless marked `client:`.
 
@@ -16,7 +16,7 @@ Paths are in tinyserver unless marked `client:`.
 |---|---|---|---|
 | S1 | High | Private-channel messages reach every member's socket | Fixed |
 | S2 | High | The serving container holds the database owner credentials | Fixed; checked by `deploy/tests/isolation.sh` |
-| S3 | High | Text messages and attachments are plaintext to the server | Server side fixed for conversations created encrypted (#23, `crates/api/tests/e2ee_text.rs`); client not verified; plaintext conversations, existing ones included, stay plaintext |
+| S3 | High | Text messages and attachments are plaintext to the server | Server side fixed for conversations created encrypted (#23, `crates/api/tests/e2ee_text.rs`); client on tinyclient main (#126, #127), tested there; plaintext conversations, existing ones included, stay plaintext |
 | S4 | High | A server, or one old client, can turn call E2EE off with no check by the others | Mitigated client-side (opt-in), residual risk documented |
 | S5 | Medium | Invite token stored in `idempotency_keys` | Fixed |
 | S6 | Medium | Every member can read every member's email | Fixed |
@@ -30,7 +30,7 @@ Paths are in tinyserver unless marked `client:`.
 | S14 | Low | Resource limits missing on most containers | Fixed |
 | S15 | Low | Migrations were not tracked as a build input | Fixed |
 | S16 | Low | Last-seen time and how a member joined are visible to every member | Documented |
-| C1 | High | `client:` Tiny text and files are plaintext to the server; local cache unencrypted | Open; the server side is in #23; the client side is on tinyclient's `hardening/e2ee-core`, not merged |
+| C1 | High | `client:` Tiny text and files are plaintext to the server; local cache unencrypted | Partly fixed: encrypted text and sealed files go to the server as ciphertext (tinyclient #126, #127). Open: plaintext conversations, and chatd's message store keeps opened text of encrypted conversations in plaintext |
 | C2 | High | `client:` Accepts a server `off` frame and carries on unencrypted | Fixed (opt-in require mode) |
 | C3 | Medium | `client:` Identity key written non-atomically, overwritten when unreadable | Fixed |
 | C4 | Medium | `client:` Identity key is plaintext on disk, not in the OS keychain | Open, see limits |
@@ -65,7 +65,7 @@ Paths are in tinyserver unless marked `client:`.
 - **Behavior**: message bodies are plaintext columns, attachment bytes are plaintext files in the upload volume, names and types are plaintext, and the 200 character last-message preview is built from the body.
 - **Exposure**: anyone with read access to Postgres, its backups or write-ahead log, the upload volume, or the server's memory reads every conversation.
 - **Remediation** (server side in #23, migrations `0020` to `0023`, `crates/api/src/e2ee_text/`): see `docs/e2ee-text.md`: per-conversation MLS groups, ciphertext-only storage, client-side sealed attachments, explicit per-conversation `e2ee` flag, no downgrade, no in-place conversion of existing history, and a `required` mode that refuses plaintext.
-- **Tests**: `crates/api/tests/e2ee_text.rs`: `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server` (no table, log line, upload file or temporary file holds a canary sent only through encrypted paths; controls show the scans find plaintext), `there_is_no_downgrade_in_either_direction`, `under_required_the_server_takes_no_plaintext_at_all`. The client (tinyclient `crates/e2ee`) is not verified here.
+- **Tests**: `crates/api/tests/e2ee_text.rs`: `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server` (no table, log line, upload file or temporary file holds a canary sent only through encrypted paths; controls show the scans find plaintext), `there_is_no_downgrade_in_either_direction`, `under_required_the_server_takes_no_plaintext_at_all`. Client: tinyclient #126 and #127 (`an_encrypted_conversation_is_labelled_its_rows_never_read_the_servers_body_and_nothing_goes_plain` and the `crates/e2ee` tests), not run here.
 - **Limits**: only conversations created encrypted; metadata, reactions and sizes stay visible; see `docs/e2ee-text.md` section 8.
 
 ### S4 High: a server or one old client can disable call E2EE (Read)
@@ -144,7 +144,7 @@ Paths are in tinyserver unless marked `client:`.
 
 - **Files**: `client:crates/chatd/src/adapters/tiny/messages.rs`, `upload.rs`, `store.rs`, `blobs.rs`.
 - **Behavior**: `post_message` sends `{"body": text}`; uploads are plaintext multipart; `chat.sqlite` is plain SQLite with `LIKE` search and plaintext drafts; downloaded media is plaintext on disk.
-- **Remediation**: the client implements the protocol in `docs/e2ee-text.md`. The server side it talks to is in #23.
+- **Remediation**: tinyclient #126 (`0c405dc`, `crates/e2ee`) and #127 (`89188e8`, the Tiny adapter) implement the protocol in `docs/e2ee-text.md`; the server side is #23. Encrypted direct messages and sealed files are sent as ciphertext (`an_encrypted_conversation_is_labelled_its_rows_never_read_the_servers_body_and_nothing_goes_plain`). Still open: chatd's SQLite store and media cache keep opened text and files in plaintext (only the e2ee cache is sealed, `the_cache_opens_only_its_own_rows_under_its_own_key`); plaintext conversations are unchanged.
 - **Limits**: the local cache of an end-to-end conversation protects only against someone who gets the file without the OS user's keychain. A person with their own logged-in session can read it.
 
 ### C2, C3 (Read)
@@ -153,7 +153,7 @@ Covered under S4 and "Fixed" above. C3 test: `the_identity_key_is_kept_and_read_
 
 ### C4 Medium: identity key plaintext on disk (Read)
 
-The call identity key is two hex lines in `<support>/e2ee/<account>/identity.key`, mode 0600 on Unix and inherited ACL on Windows (Roaming `%APPDATA%`). The text E2EE specification puts device keys in the OS keychain; that is not built. The call identity key keeps its file for compatibility with the shipped format and is a known remaining item.
+The call identity key is two hex lines in `<support>/e2ee/<account>/identity.key`, mode 0600 on Unix and inherited ACL on Windows (Roaming `%APPDATA%`). Text E2EE device keys are not stored this way: tinyclient #127 keeps them in the engine's snapshot, sealed under a state key held in the account's keychain item (`docs/e2ee-text-client.md` in tinyclient; store tests `the_stored_state_is_authenticated_and_bound_to_its_name_and_key`, `the_blob_holds_no_plaintext_key_material`, not run here). The call identity key keeps its file for compatibility with the shipped format and is a known remaining item.
 
 ### C5, C6, C7, C8 (Read)
 

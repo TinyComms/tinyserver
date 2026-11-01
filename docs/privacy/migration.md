@@ -1,6 +1,6 @@
 # Compatibility and migration
 
-What happens to existing plaintext, to old and new clients and servers, to the schema, and to backups, when text and attachment E2EE is introduced and when a community moves hosts. Sources: [`../e2ee-text.md`](../e2ee-text.md) section 9, [`../calls.md`](../calls.md) "Compatibility", `crates/db/src/migrate.rs`, `crates/db/migrations/`, `deploy/compose.yml`, `deploy/README.md`, tinyclient `docs/architecture.md` (read only). Status words are in [`README.md`](README.md). Text E2EE: the server side is implemented and tested (#23); the client is not merged, so client behaviour here is the specification.
+What happens to existing plaintext, to old and new clients and servers, to the schema, and to backups, when text and attachment E2EE is introduced and when a community moves hosts. Sources: [`../e2ee-text.md`](../e2ee-text.md) section 9, [`../calls.md`](../calls.md) "Compatibility", `crates/db/src/migrate.rs`, `crates/db/migrations/`, `deploy/compose.yml`, `deploy/README.md`, tinyclient `docs/architecture.md` (read only). Status words are in [`README.md`](README.md). Text E2EE: the server side is implemented and tested (#23); the client is on tinyclient main (#126, #127), read there, not run here.
 
 ## 1. Existing plaintext
 
@@ -19,7 +19,7 @@ A plaintext conversation in a community that also has encrypted ones is not prot
 
 Capability discovery is `GET /v1/capabilities`: `e2ee_calls` and `e2ee_text` (both implemented; `e2ee_text` reports `off`, `optional`, `new_required` or `required`, tested by `the_setting_and_the_capability_say_what_the_server_does`). A server from before capabilities answers 404.
 
-### Text and attachments (server implemented, #23; client not merged)
+### Text and attachments (server #23; client tinyclient #126, #127)
 
 | Client | Server | Conversation | Result |
 |---|---|---|---|
@@ -96,7 +96,7 @@ A backup that holds the database and the secrets together lets whoever opens it 
 | Accounts deleted after the backup reappear, with their messages | Defeats `DELETE /v1/me` | Keep a minimal ledger of deleted account ids and replay it after a restore ([`retention-and-deletion.md`](retention-and-deletion.md)). **Not built** (N11) |
 | Restoring over held data | Overwrites what a legal hold keeps | `restore` refuses under the operator's hold or a held report (`deploy/tests/hooks.sh`) |
 | Event sequence | Clients holding a `seq` higher than the restored `outbox` get `resync` (`since` above the newest seq closes with `4002`; `docs/calls.md`) | None. Behaviour documented |
-| MLS group rolled back to an earlier epoch | Specified: clients detect an epoch that went backwards and refuse to continue; the group is rebuilt (new group, welcome, history not carried) | Client behaviour; not verified here. The server cannot detect its own rollback |
+| MLS group rolled back to an earlier epoch | Specified: clients detect an epoch that went backwards and refuse to continue; the group is rebuilt (new group, welcome, history not carried) | The client detects it and freezes the group (tinyclient `an_epoch_that_goes_backwards_is_detected_and_freezes_the_group`, not run here); rebuilding the group is not covered by a test. The server cannot detect its own rollback |
 | Pocket ID restored to a different time than tinyserver | `(issuer, subject)` pairs can disagree: accounts created or removed on one side only | Restore both from the same instant, or reconcile with `tinyserver identities` and `relink-identity` |
 | Upload volume and database at different times | Missing files give `404` on download; orphan files stay | Take them together |
 | Restored backup of a deleted tenant | Resurrects data the customer asked to delete | Retention horizon and key destruction. A backup encrypted to the tenant's key alone cannot be restored after `delete` unless an escrow copy of the key survives (`hooks.sh`) |
