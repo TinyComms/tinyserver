@@ -16,6 +16,7 @@ mod migrate;
 mod moderation;
 mod operator;
 mod outbox;
+mod passkey;
 pub mod perm;
 mod reports;
 mod roles;
@@ -73,6 +74,15 @@ pub use reports::{
     ReportSummary, CATEGORIES as REPORT_CATEGORIES, EVIDENCE_MAX as REPORT_EVIDENCE_MAX,
     KINDS as REPORT_KINDS, NOTE_MAX as REPORT_NOTE_MAX, RETENTION_DEFAULT_DAYS, RETENTION_MAX_DAYS,
     RETENTION_MIN_DAYS, STATUSES as REPORT_STATUSES,
+};
+pub use passkey::{
+    begin_ceremony, begin_continue, claim, claim_hash, claim_link_for_me, codes_left,
+    credential_ids_of, display_name_of, find_credential, flag_credential, invite_usable, list_mine,
+    mint_claim, new_recovery_codes, peek_claim, peek_pending, random_id, record_use, recover,
+    recovery_hash, recovery_owner, regenerate_codes, remove_mine, rename_mine, retire_identities,
+    roster, session_is_recent, signup, subject_of, take_ceremony, Ceremony, Claim, Found,
+    NewCeremony, NewCredential, PasskeyError, PasskeyRow, PendingPeek, Recovery, Retired,
+    RosterRow, Signup, CEREMONY_SECS, CONTINUE_SECS, PASSKEY_ISSUER, RECOVERY_CODES,
 };
 pub use roles::{
     create_role, delete_role, list_roles, order_roles, update_role, NewRole, Role, RolePatch,

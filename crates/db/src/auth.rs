@@ -358,34 +358,48 @@ pub async fn sign_in(
     groups: Groups,
 ) -> Result<SignedIn, AuthError> {
     let mut tx = pool.begin().await?;
+    let signed_in = sign_in_in(&mut tx, profile, invite_hash, groups).await?;
+    tx.commit().await?;
+    Ok(signed_in)
+}
+
+/// [`sign_in`] inside a transaction the caller owns and commits. On `Err` the caller must roll
+/// back: a refusal writes nothing, but an error may leave the transaction mid-way. The passkey
+/// sign-up uses this to make the account, accept the invite, and store the first credential as
+/// one unit.
+pub(crate) async fn sign_in_in(
+    tx: &mut Transaction<'_, Postgres>,
+    profile: &Profile,
+    invite_hash: Option<&[u8]>,
+    groups: Groups,
+) -> Result<SignedIn, AuthError> {
     // Two first sign-ins for one person at once would otherwise both make an account.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(10) || $2, 0))")
         .bind(&profile.issuer)
         .bind(&profile.subject)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     let found: Option<String> = sqlx::query_scalar(
         "SELECT user_id::text FROM user_identities WHERE issuer = $1 AND subject = $2",
     )
     .bind(&profile.issuer)
     .bind(&profile.subject)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if let Some(user_id) = &found {
         let banned: bool = sqlx::query_scalar("SELECT app_banned($1::uuid)")
             .bind(user_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
         if banned {
             return Err(AuthError::Banned);
         }
         let role: Option<String> = sqlx::query_scalar("SELECT app_member_role($1::uuid)")
             .bind(user_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
         if let Some(role) = role {
-            let role = promote(&mut tx, user_id, &role, &profile.issuer, groups).await?;
-            tx.commit().await?;
+            let role = promote(tx, user_id, &role, &profile.issuer, groups).await?;
             return Ok(SignedIn {
                 user_id: user_id.clone(),
                 role,
@@ -405,7 +419,7 @@ pub async fn sign_in(
             )
             .bind(profile_email(profile.email.as_deref()))
             .bind(profile_name(profile))
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             sqlx::query(
                 "INSERT INTO user_identities (user_id, issuer, subject) VALUES ($1::uuid, $2, $3)",
@@ -413,7 +427,7 @@ pub async fn sign_in(
             .bind(&user_id)
             .bind(&profile.issuer)
             .bind(&profile.subject)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             user_id
         }
@@ -422,7 +436,7 @@ pub async fn sign_in(
     let mut role = None;
     if let Some(invite_hash) = invite_hash {
         // A savepoint, so a bad invite can still fall through to the groups.
-        let mut attempt = sqlx::Acquire::begin(&mut *tx).await?;
+        let mut attempt = sqlx::Acquire::begin(&mut **tx).await?;
         let accepted: Result<String, sqlx::Error> =
             sqlx::query_scalar("SELECT app_accept_invite($1, $2::uuid)")
                 .bind(invite_hash)
@@ -448,7 +462,7 @@ pub async fn sign_in(
                     .bind(&user_id)
                     .bind(join)
                     .bind(&profile.issuer)
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut **tx)
                     .await;
             match joined {
                 Ok(role) => role,
@@ -459,8 +473,7 @@ pub async fn sign_in(
         // The account made above rolls back with the transaction.
         (None, None) => return Err(AuthError::NotMember),
     };
-    let role = promote(&mut tx, &user_id, &role, &profile.issuer, groups).await?;
-    tx.commit().await?;
+    let role = promote(tx, &user_id, &role, &profile.issuer, groups).await?;
     Ok(SignedIn {
         user_id,
         role,
