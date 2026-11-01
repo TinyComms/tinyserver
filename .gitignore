@@ -3,3 +3,6 @@
 .env
 /deploy/secrets/
 /uploads
+# Tenants made by deploy/tenant/tenant.sh: env files with passwords, secrets, backup keys.
+/deploy/tenant/tenants/
+*.age.partial

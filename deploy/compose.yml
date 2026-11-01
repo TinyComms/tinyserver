@@ -24,14 +24,19 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-      POSTGRES_DB: tinyserver
+      # One community, one database and two login roles. The defaults are what a single community
+      # has always had; a tenant (deploy/tenant/) sets all four, so no two tenants share a name.
+      POSTGRES_DB: ${TINYSERVER_DB_NAME:-tinyserver}
+      TINYSERVER_OWNER_ROLE: ${TINYSERVER_OWNER_ROLE:-app_owner}
+      TINYSERVER_RUNTIME_ROLE: ${TINYSERVER_RUNTIME_ROLE:-app_runtime}
+      TINYSERVER_OWNER_CREATEDB: ${TINYSERVER_OWNER_CREATEDB:-yes}
       APP_OWNER_PASSWORD: ${APP_OWNER_PASSWORD:?set APP_OWNER_PASSWORD}
       APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:?set APP_RUNTIME_PASSWORD}
     volumes:
       - ${TINYSERVER_PG_DIR:-tinyserver_pg}:/var/lib/postgresql/data
       - ../docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d tinyserver"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${TINYSERVER_DB_NAME:-tinyserver}"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -49,6 +54,11 @@ services:
       - SETUID
     security_opt:
       - no-new-privileges:true
+    # The image writes only its data directory, its socket directory and /tmp.
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:size=1m
+      - /tmp:size=16m
     pids_limit: ${TINYSERVER_PG_PIDS_LIMIT:-256}
     mem_limit: ${TINYSERVER_PG_MEM_LIMIT:-1g}
     networks:
@@ -75,7 +85,7 @@ services:
       # The serving process holds the runtime role only. The owner role, which can change the
       # schema and bypasses row-level security, lives in tinyserver-init and nowhere else, so
       # a flaw in this process cannot reach it.
-      DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
+      DATABASE_URL: postgres://${TINYSERVER_RUNTIME_ROLE:-app_runtime}:${APP_RUNTIME_PASSWORD}@postgres:5432/${TINYSERVER_DB_NAME:-tinyserver}
       BIND: 0.0.0.0:8080
       # The address people type into tinyclient. The sign-in callback is under it.
       TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
@@ -105,6 +115,8 @@ services:
       # What media may upload to everyone, in kb/s. Optional; unset is no budget.
       TINYSERVER_MEDIA_EGRESS_KBPS: ${TINYSERVER_MEDIA_EGRESS_KBPS:-}
       # clamd over TCP on the Docker network. Port 3310 is not published on the host.
+      # deploy/scan-off.yml turns scanning off, for files sealed before they reach the server.
+      TINYSERVER_SCAN_ENGINE: ${TINYSERVER_SCAN_ENGINE:-clamd}
       TINYSERVER_CLAMD_SOCKET: clamd:3310
       TINYSERVER_UPLOAD_DIR: /data/uploads
       # Signed media paths. 32 bytes of hex the operator generates. Required; unset will not start.
@@ -160,7 +172,7 @@ services:
         condition: service_completed_successfully
     entrypoint: ["/bin/sh", "-c", "tinyserver migrate && tinyserver bootstrap"]
     environment:
-      DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
+      DATABASE_URL_MIGRATE: postgres://${TINYSERVER_OWNER_ROLE:-app_owner}:${APP_OWNER_PASSWORD}@postgres:5432/${TINYSERVER_DB_NAME:-tinyserver}
       TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
       TINYSERVER_DATA_DIR: /bootstrap
       # The default issuer for `relink-identity`, which runs here.
@@ -213,6 +225,17 @@ services:
     # ClamAV holds its signature set in memory, about 1.5 GiB loaded. Below this it is killed.
     pids_limit: 128
     mem_limit: ${TINYSERVER_CLAMD_MEM_LIMIT:-3g}
+    # The image starts as root to own its directories and drops to the clamav user for clamd and
+    # freshclam. It needs these five for that. Its root stays writable: the entrypoint writes the
+    # CLAMD_CONF_ settings above into /etc/clamav.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     # media, not the internal network: freshclam needs a route out, and tinyserver is already here.
