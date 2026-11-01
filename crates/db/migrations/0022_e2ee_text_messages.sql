@@ -178,6 +178,7 @@ AS $$
 $$;
 
 -- A new conversation follows the server's e2ee_text setting. An existing one is never changed.
+-- Under new_required and required a new conversation must be encrypted.
 CREATE FUNCTION app_e2ee_may_create(p_e2ee boolean)
 RETURNS void
 LANGUAGE plpgsql
@@ -192,13 +193,33 @@ BEGIN
     IF p_e2ee AND v_mode = 'off' THEN
         RAISE EXCEPTION 'e2ee is off' USING ERRCODE = 'P0E12';
     END IF;
-    IF NOT p_e2ee AND v_mode = 'new_required' THEN
+    IF NOT p_e2ee AND v_mode IN ('new_required', 'required') THEN
         RAISE EXCEPTION 'e2ee required' USING ERRCODE = 'P0E01';
     END IF;
 END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION app_e2ee_may_create(boolean) FROM PUBLIC, app_runtime;
+
+-- Under the required setting the server takes no plaintext text at all: a post or an edit to an
+-- old plaintext conversation is refused as if it were encrypted, and so is a plaintext upload.
+-- Such a conversation is read-only and stays labelled "not end-to-end encrypted".
+CREATE FUNCTION app_e2ee_plaintext_allowed()
+RETURNS void
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF (SELECT s.e2ee_text FROM server_settings s) = 'required' THEN
+        RAISE EXCEPTION 'e2ee required' USING ERRCODE = 'P0E01';
+    END IF;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION app_e2ee_plaintext_allowed() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_e2ee_plaintext_allowed() TO app_runtime;
 
 DROP FUNCTION app_create_channel(text, uuid, text, integer);
 
@@ -235,6 +256,12 @@ BEGIN
     INSERT INTO channels (category_id, name, topic, position, created_by, e2ee)
     VALUES (p_category, v_name, v_topic, coalesce(p_position, 0), app_uid(), v_e2ee)
     RETURNING id INTO v_id;
+    -- An encrypted channel whose audience already has more devices than one group may hold is
+    -- not made: its group could never take everyone in. A channel that grows past the cap later
+    -- keeps working for the devices in it, and the rest wait (app_e2ee_info's `waiting`).
+    IF v_e2ee AND (SELECT count(*) FROM app_e2ee_desired(v_id)) > app_e2ee_group_devices_max() THEN
+        RAISE EXCEPTION 'group too large' USING ERRCODE = 'P0E16';
+    END IF;
     PERFORM app_audit(
         'channel.create', 'channel',
         jsonb_build_object('id', v_id, 'name', v_name, 'e2ee', v_e2ee),
@@ -332,6 +359,7 @@ BEGIN
     IF app_conv_e2ee(p_conversation) THEN
         RAISE EXCEPTION 'e2ee required' USING ERRCODE = 'P0E01';
     END IF;
+    PERFORM app_e2ee_plaintext_allowed();
     IF v_client IS NOT NULL AND (
         char_length(v_client) > 64 OR v_client ~ E'[\\x00-\\x1F\\x7F]'
     ) THEN
@@ -592,6 +620,7 @@ BEGIN
     IF v_e2ee THEN
         RAISE EXCEPTION 'e2ee required' USING ERRCODE = 'P0E01';
     END IF;
+    PERFORM app_e2ee_plaintext_allowed();
     IF v_author <> app_uid() THEN
         RAISE EXCEPTION 'not allowed' USING ERRCODE = '42501';
     END IF;
@@ -714,8 +743,9 @@ $$;
 
 -- A sealed upload is read by the server as bytes and nothing else: no type, no decode, no scan.
 -- Size is the server's file limit, and the rate is per person. It is the same permission as
--- any upload.
-CREATE FUNCTION app_save_sealed_attachment(p_bytes integer)
+-- any upload. `p_id`, when given, is the id the client chose before it sealed the blob, so that
+-- the blob's first chunk can be bound to it; an id already taken is P0E17.
+CREATE FUNCTION app_save_sealed_attachment(p_bytes integer, p_id uuid DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -752,10 +782,19 @@ BEGIN
     IF v_files >= v_per_hour OR v_bytes + p_bytes > v_per_day THEN
         RAISE EXCEPTION 'slow down' USING ERRCODE = 'P0E11';
     END IF;
+    IF p_id IS NOT NULL AND EXISTS (SELECT 1 FROM attachments a WHERE a.id = p_id) THEN
+        RAISE EXCEPTION 'id taken' USING ERRCODE = 'P0E17';
+    END IF;
     INSERT INTO e2ee_upload_ledger (user_id, bytes) VALUES (app_uid(), p_bytes);
-    INSERT INTO attachments (uploader_id, name, mime, kind, bytes, scan_status)
-    VALUES (app_uid(), 'sealed', 'application/octet-stream', 'sealed', p_bytes, 'sealed')
-    RETURNING id INTO v_id;
+    BEGIN
+        INSERT INTO attachments (id, uploader_id, name, mime, kind, bytes, scan_status)
+        VALUES (coalesce(p_id, gen_random_uuid()), app_uid(), 'sealed', 'application/octet-stream',
+                'sealed', p_bytes, 'sealed')
+        RETURNING id INTO v_id;
+    EXCEPTION
+        WHEN unique_violation THEN
+            RAISE EXCEPTION 'id taken' USING ERRCODE = 'P0E17';
+    END;
     RETURN jsonb_build_object(
         'id', v_id::text,
         'name', 'sealed',
@@ -928,7 +967,7 @@ BEGIN
         'app_create_channel(text, uuid, text, integer, boolean)',
         'app_open_direct(uuid, boolean)',
         'app_post_e2ee_message(uuid, bytea, bigint, uuid, text, text, uuid, uuid[], boolean)',
-        'app_save_sealed_attachment(integer)',
+        'app_save_sealed_attachment(integer, uuid)',
         'app_e2ee_sweep()'
     ]
     LOOP

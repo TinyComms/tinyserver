@@ -162,6 +162,8 @@ pub(crate) enum Error {
     BadDevice,
     TooManyDevices,
     BadE2ee,
+    GroupTooLarge,
+    IdTaken,
 }
 
 impl IntoResponse for Error {
@@ -194,6 +196,8 @@ impl IntoResponse for Error {
             Self::BadDevice => (StatusCode::BAD_REQUEST, "bad_device"),
             Self::TooManyDevices => (StatusCode::BAD_REQUEST, "too_many_devices"),
             Self::BadE2ee => (StatusCode::BAD_REQUEST, "bad_e2ee"),
+            Self::GroupTooLarge => (StatusCode::BAD_REQUEST, "e2ee_group_too_large"),
+            Self::IdTaken => (StatusCode::CONFLICT, "id_taken"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -227,6 +231,8 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::BadDevice => "bad_device",
         Error::TooManyDevices => "too_many_devices",
         Error::BadE2ee => "bad_e2ee",
+        Error::GroupTooLarge => "e2ee_group_too_large",
+        Error::IdTaken => "id_taken",
     }
 }
 
@@ -267,6 +273,8 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::BadDevice => Error::BadDevice,
         MessageError::TooManyDevices => Error::TooManyDevices,
         MessageError::BadE2ee => Error::BadE2ee,
+        MessageError::GroupTooLarge => Error::GroupTooLarge,
+        MessageError::IdTaken => Error::IdTaken,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -590,9 +598,21 @@ async fn upload(
         error
     })?;
     let saved = match parsed {
-        Parsed::Plain(upload) => save_attachment(&pool, &caller, &upload, &engine).await,
-        // Opaque bytes: no type check, no decode, no scan, and so no engine.
-        Parsed::Sealed(sealed) => save_sealed_attachment(&pool, &caller, &sealed).await,
+        Parsed::Plain(upload) => match db::e2ee_text_mode(&pool).await {
+            // Under `required` the server takes no plaintext, and a file is plaintext.
+            Ok(mode) if mode == "required" => Err(MessageError::E2eeRequired),
+            Ok(_) => save_attachment(&pool, &caller, &upload, &engine).await,
+            Err(error) => Err(MessageError::Database(error)),
+        },
+        // Opaque bytes: no type check, no decode, no scan, and so no engine. Only the framing of
+        // a sealed blob is checked, so that this is not a free host for any file.
+        Parsed::Sealed { bytes, id } => {
+            if crate::e2ee_text::sealed_framing_ok(&bytes) {
+                save_sealed_attachment(&pool, &caller, &bytes, id.as_deref()).await
+            } else {
+                Err(MessageError::Invalid)
+            }
+        }
     }
     .map_err(|error| {
         let error = lift(error);
@@ -674,10 +694,11 @@ fn content_disposition(name: &str, inline: bool) -> String {
     format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
-/// What a multipart upload is: a file to check and scan, or sealed bytes to store as they are.
+/// What a multipart upload is: a file to check and scan, or sealed bytes to store as they are,
+/// with the id the client chose for them if it chose one.
 enum Parsed {
     Plain(NewAttachment),
-    Sealed(Vec<u8>),
+    Sealed { bytes: Vec<u8>, id: Option<String> },
 }
 
 fn parse_upload(content_type: &str, body: &[u8]) -> Result<Parsed, MessageError> {
@@ -688,6 +709,7 @@ fn parse_upload(content_type: &str, body: &[u8]) -> Result<Parsed, MessageError>
     }
     let mut file: Option<NewAttachment> = None;
     let mut sealed = false;
+    let mut chosen_id = None;
     let mut width = None;
     let mut height = None;
     let mut duration = None;
@@ -711,6 +733,10 @@ fn parse_upload(content_type: &str, body: &[u8]) -> Result<Parsed, MessageError>
                 });
             }
             "sealed" => sealed = field_sealed(&parsed.body)?,
+            "id" => {
+                let text = std::str::from_utf8(&parsed.body).map_err(|_| MessageError::Invalid)?;
+                chosen_id = Some(text.trim().to_ascii_lowercase());
+            }
             "width" => width = Some(field_i32(&parsed.body)?),
             "height" => height = Some(field_i32(&parsed.body)?),
             "duration" => duration = Some(field_i32(&parsed.body)?),
@@ -719,7 +745,14 @@ fn parse_upload(content_type: &str, body: &[u8]) -> Result<Parsed, MessageError>
     }
     let mut file = file.ok_or(MessageError::Invalid)?;
     if sealed {
-        return Ok(Parsed::Sealed(file.bytes));
+        return Ok(Parsed::Sealed {
+            bytes: file.bytes,
+            id: chosen_id,
+        });
+    }
+    // Only a sealed upload names its own id.
+    if chosen_id.is_some() {
+        return Err(MessageError::Invalid);
     }
     if file.name.is_empty() {
         return Err(MessageError::Invalid);

@@ -374,6 +374,33 @@ pub async fn handshake_after(
         .collect())
 }
 
+/// The ratchet tree of `epoch`, as its committer uploaded it, for one of the caller's devices in
+/// the group. `None` when there is none.
+pub async fn ratchet_tree(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    device_id: &str,
+    epoch: u64,
+) -> Result<Option<Vec<u8>>, MessageError> {
+    uuid_arg(conversation)?;
+    uuid_arg(device_id)?;
+    let epoch = epoch_arg(epoch)?;
+    let mut tx = scoped(pool, caller).await?;
+    let parts: Vec<Vec<u8>> = sqlx::query_scalar("SELECT app_e2ee_tree($1::uuid, $2::uuid, $3)")
+        .bind(conversation)
+        .bind(device_id)
+        .bind(epoch)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts.concat()))
+}
+
 /// What a commit from `device_id` for `epoch` is checked against. A stale epoch, a device not in
 /// the group, or one that is being removed is an error.
 pub async fn commit_snapshot(
@@ -433,6 +460,7 @@ pub async fn apply_commit(
     commit_bytes: &[u8],
     ids: &[i64],
     welcomes: &[WelcomeFor],
+    tree: &[Vec<u8>],
 ) -> Result<i64, MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
@@ -450,7 +478,7 @@ pub async fn apply_commit(
         .collect();
     let mut tx = scoped(pool, caller).await?;
     let seq: i64 = sqlx::query_scalar(
-        "SELECT app_e2ee_apply_commit($1::uuid, $2::uuid, $3, $4, $5, $6::text[]::uuid[], $7)",
+        "SELECT app_e2ee_apply_commit($1::uuid, $2::uuid, $3, $4, $5, $6::text[]::uuid[], $7, $8)",
     )
     .bind(conversation)
     .bind(device_id)
@@ -459,6 +487,7 @@ pub async fn apply_commit(
     .bind(ids)
     .bind(devices)
     .bind(data)
+    .bind(tree)
     .fetch_one(&mut *tx)
     .await
     .map_err(message_sql)?;

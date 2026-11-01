@@ -17,7 +17,7 @@ use openmls::prelude::{
     BasicCredential, Capabilities, Ciphersuite, CredentialWithKey, Extension, ExtensionType,
     Extensions, ExternalSender, GroupId, KeyPackage, Lifetime, MlsGroup, MlsGroupCreateConfig,
     MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, ProcessedMessageContent,
-    ProtocolVersion, StagedWelcome, MIXED_PLAINTEXT_WIRE_FORMAT_POLICY,
+    ProtocolVersion, RatchetTreeIn, StagedWelcome, MIXED_PLAINTEXT_WIRE_FORMAT_POLICY,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -66,10 +66,23 @@ fn capabilities() -> Capabilities {
         .build()
 }
 
-/// What a commit made: the commit, and the welcome if it added anyone, both as MLSMessages.
+/// The authenticated data of an application message, as tinyclient's `crates/e2ee` sets it:
+/// `"tiny-e2ee-v1 msg" 0x00 kind 0x00 target_id`.
+pub fn message_aad(kind: &str, target_id: Option<&str>) -> Vec<u8> {
+    let mut aad = b"tiny-e2ee-v1 msg".to_vec();
+    aad.push(0);
+    aad.extend_from_slice(kind.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(target_id.unwrap_or("").as_bytes());
+    aad
+}
+
+/// What a commit made: the commit, and the welcome if it added anyone, both as MLSMessages, and
+/// the public ratchet tree of the epoch it makes (TLS `RatchetTree`).
 pub struct Committed {
     pub commit: Vec<u8>,
     pub welcome: Option<Vec<u8>>,
+    pub tree: Vec<u8>,
 }
 
 /// One device holds a group for each encrypted conversation it is in. The methods that read or
@@ -286,9 +299,18 @@ impl Client {
         let (commit, welcome, _) = group
             .commit_to_pending_proposals(provider, keys)
             .expect("commit");
+        let tree = group
+            .pending_commit()
+            .expect("staged")
+            .export_ratchet_tree(provider.crypto(), group.export_ratchet_tree())
+            .expect("tree")
+            .expect("a member's commit");
         Committed {
             commit: commit.tls_serialize_detached().expect("serialise"),
             welcome: welcome.map(|welcome| welcome.tls_serialize_detached().expect("serialise")),
+            tree: RatchetTreeIn::from(tree)
+                .tls_serialize_detached()
+                .expect("serialise"),
         }
     }
 
@@ -354,6 +376,27 @@ impl Client {
 
     /// Joins from a welcome (an MLSMessage).
     pub fn join(&mut self, welcome: &[u8]) {
+        self.join_with_tree(welcome, None);
+    }
+
+    /// From now on the commits of the current group put the ratchet tree in their Welcome, or
+    /// leave it out for the joiner to fetch.
+    pub fn inline_tree(&mut self, inline: bool) {
+        let config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(inline)
+            .build();
+        let provider = &self.provider;
+        self.groups
+            .get_mut(&self.current)
+            .expect("in a group")
+            .set_configuration(provider.storage(), &config)
+            .expect("configure");
+    }
+
+    /// Joins from a welcome, with the ratchet tree given apart from it when it has none inside.
+    pub fn join_with_tree(&mut self, welcome: &[u8], tree: Option<&[u8]>) {
+        let tree = tree.map(|tree| RatchetTreeIn::tls_deserialize_exact_bytes(tree).expect("tree"));
         let message = MlsMessageIn::tls_deserialize_exact_bytes(welcome).expect("message");
         let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
             panic!("not a welcome");
@@ -362,7 +405,7 @@ impl Client {
             .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
             .build();
-        let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
+        let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, tree)
             .expect("welcome");
         let group = staged.into_group(&self.provider).expect("group");
         let id: [u8; 16] = group
@@ -374,11 +417,22 @@ impl Client {
         self.current = id;
     }
 
-    /// Encrypts an application message, as an MLS PrivateMessage.
+    /// Encrypts a message, as an MLS PrivateMessage with the authenticated data of a message.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        self.encrypt_as("message", None, plaintext)
+    }
+
+    /// Encrypts with the authenticated data of `kind` and `target_id`.
+    pub fn encrypt_as(&mut self, kind: &str, target_id: Option<&str>, plaintext: &[u8]) -> Vec<u8> {
+        self.encrypt_with_aad(message_aad(kind, target_id), plaintext)
+    }
+
+    /// Encrypts with any authenticated data.
+    pub fn encrypt_with_aad(&mut self, aad: Vec<u8>, plaintext: &[u8]) -> Vec<u8> {
         let provider = &self.provider;
         let keys = &self.keys;
         let group = self.groups.get_mut(&self.current).expect("in a group");
+        group.set_aad(aad);
         group
             .create_message(provider, keys, plaintext)
             .expect("encrypt")

@@ -138,7 +138,7 @@ pub async fn update_server(
     if patch
         .e2ee_text
         .as_deref()
-        .is_some_and(|mode| !matches!(mode, "off" | "optional" | "new_required"))
+        .is_some_and(|mode| !matches!(mode, "off" | "optional" | "new_required" | "required"))
     {
         return Err(CommunityError::Invalid);
     }

@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use db::{Caller, Issued, PgPool, Unissued, WelcomeFor};
@@ -34,8 +35,15 @@ const KEY_PACKAGES_PER_CALL: usize = 50;
 const HANDSHAKE_PAGE: i32 = 100;
 /// A body of key packages: 50 of 8 KiB as base64, and the fields around them.
 const KEY_PACKAGES_BODY: usize = 640 * 1024;
-/// A commit and its welcomes as base64.
-const COMMIT_BODY: usize = 8 * 1024 * 1024;
+/// A commit, its welcomes and the ratchet tree of the epoch it makes, as base64: 4 MiB of commit,
+/// 4 MiB of welcomes and 8 MiB of tree, and the fields around them.
+const COMMIT_BODY: usize = 22 * 1024 * 1024;
+/// The header of a sealed blob: `"TNYA1"`, the log2 of its chunk size, a 7 byte nonce prefix.
+const SEALED_HEADER: usize = 13;
+/// What a sealed blob starts with.
+const SEALED_MAGIC: &[u8; 5] = b"TNYA1";
+/// The AES-GCM tag after each chunk.
+const SEALED_TAG: usize = 16;
 
 /// What the routes share. One per router, so a test with its own database has its own key and its
 /// own limits.
@@ -136,6 +144,7 @@ pub fn routes() -> Router<PgPool> {
         .route("/v1/e2ee/conversations/{id}", get(conversation))
         .route("/v1/e2ee/conversations/{id}/group", post(create_group))
         .route("/v1/e2ee/conversations/{id}/handshake", get(handshake))
+        .route("/v1/e2ee/conversations/{id}/tree", get(ratchet_tree))
         .route(
             "/v1/e2ee/conversations/{id}/commit",
             post(commit).layer(DefaultBodyLimit::max(COMMIT_BODY)),
@@ -470,12 +479,48 @@ async fn handshake(
 }
 
 #[derive(Deserialize)]
+struct TreeQuery {
+    device_id: Option<String>,
+    epoch: Option<u64>,
+}
+
+/// The public ratchet tree of an epoch as its committer uploaded it, as the bytes of a TLS
+/// `RatchetTree`, for a device that joined by a Welcome with no tree inside. `404` when there is
+/// none: the committer did not send it, or it is older than the 8 epochs kept.
+async fn ratchet_tree(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<TreeQuery>,
+) -> Result<Response, Error> {
+    let caller = member(&pool, &headers).await?;
+    let (Some(device_id), Some(epoch)) = (query.device_id, query.epoch) else {
+        return Err(Error::Invalid);
+    };
+    let tree = db::ratchet_tree(&pool, &caller, &id, &device_id, epoch)
+        .await
+        .map_err(lift)
+        .inspect_err(|error| failed(&caller.user_id, "tree", error))?
+        .ok_or(Error::NotFound)?;
+    let mut response = (StatusCode::OK, tree).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
+}
+
+#[derive(Deserialize)]
 struct CommitBody {
     device_id: String,
     epoch: u64,
     commit: String,
     #[serde(default)]
     welcomes: Vec<WelcomeBody>,
+    /// The public ratchet tree of the epoch the commit makes, for joiners whose Welcome does not
+    /// carry it.
+    #[serde(default)]
+    ratchet_tree: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -516,6 +561,15 @@ async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> R
             return Err(Error::BadE2ee);
         }
     }
+
+    let tree = match body.ratchet_tree.as_deref() {
+        Some(text) => {
+            let tree = mls::decode(text, mls::TREE_MAX).map_err(refused)?;
+            mls::check_ratchet_tree(&group, &tree).map_err(refused)?;
+            tree.chunks(mls::TREE_PART).map(<[u8]>::to_vec).collect()
+        }
+        None => Vec::new(),
+    };
 
     let snapshot = db::commit_snapshot(pool, caller, id, &body.device_id, body.epoch)
         .await
@@ -588,10 +642,28 @@ async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> R
         &commit,
         &ids,
         &welcomes,
+        &tree,
     )
     .await
     .map_err(lift)?;
     Ok(())
+}
+
+/// Whether bytes have the shape of a sealed blob: the header, a chunk size from 1 KiB to 1 MiB,
+/// then chunks of exactly that size plus a tag, but the last, which is 0 bytes to a full chunk of
+/// plaintext plus its tag. The server cannot tell a blob from random bytes of that shape, and
+/// does not try: this only keeps the sealed route from storing any file of any shape.
+pub(crate) fn sealed_framing_ok(bytes: &[u8]) -> bool {
+    if bytes.len() <= SEALED_HEADER || &bytes[..SEALED_MAGIC.len()] != SEALED_MAGIC {
+        return false;
+    }
+    let log2 = bytes[SEALED_MAGIC.len()];
+    if !(10..=20).contains(&log2) {
+        return false;
+    }
+    let chunk = (1usize << log2) + SEALED_TAG;
+    let rest = (bytes.len() - SEALED_HEADER) % chunk;
+    rest == 0 || rest >= SEALED_TAG
 }
 
 /// The fields of a post that make it ciphertext, as the message route reads them.
@@ -657,7 +729,14 @@ pub(crate) async fn post_ciphertext(
         Ok(data) => data,
         Err(refusal) => return Err(refine(pool, caller, conversation, refused(refusal)).await),
     };
-    if let Err(refusal) = mls::check_ciphertext(&group, epoch, &data) {
+    // The kind and target the server stores must be the ones the sender authenticated, with the
+    // target in the form the server gives it back in.
+    let target = match fields.target_id {
+        Some(target) => Some(canonical_uuid(target).ok_or(Error::Invalid)?),
+        None => None,
+    };
+    let aad = mls::message_aad(kind, target.as_deref());
+    if let Err(refusal) = mls::check_ciphertext(&group, epoch, &aad, &data) {
         return Err(refine(pool, caller, conversation, refused(refusal)).await);
     }
     post_stored(
@@ -671,6 +750,20 @@ pub(crate) async fn post_ciphertext(
         kind,
     )
     .await
+}
+
+/// A uuid as Postgres writes it: lowercase, hyphenated.
+fn canonical_uuid(id: &str) -> Option<String> {
+    let bytes = mls::uuid_bytes(id)?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
 }
 
 /// A ciphertext that is no good for an encrypted conversation is `not_e2ee` when the conversation
@@ -724,7 +817,9 @@ pub fn fuzz_handshake(data: &[u8]) {
     let _ = mls::validate_key_package(USER, DEVICE, &[4; 65], data, 1_700_000_000);
     let _ = mls::key_package_ref(data);
     let _ = mls::parse_commit(&GROUP, 0, data);
-    let _ = mls::check_ciphertext(&GROUP, 0, data);
+    let _ = mls::check_ciphertext(&GROUP, 0, &mls::message_aad("message", None), data);
+    let _ = mls::check_ratchet_tree(&GROUP, data);
+    let _ = sealed_framing_ok(data);
     let _ = mls::welcome_recipients(data);
     let _ = mls::proposal_ref(data);
     let _ = mls::cross_signed(USER, DEVICE, &[4; 65], data, &[vec![4; 65]]);

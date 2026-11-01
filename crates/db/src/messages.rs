@@ -97,6 +97,12 @@ pub enum MessageError {
     /// An MLS object that is not what it must be, or a request that does not match the group.
     #[error("bad e2ee")]
     BadE2ee,
+    /// An encrypted channel whose audience has more devices than one group may hold.
+    #[error("e2ee group too large")]
+    GroupTooLarge,
+    /// A client-chosen id that is already some upload's.
+    #[error("id taken")]
+    IdTaken,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -500,14 +506,16 @@ pub async fn save_sealed_attachment(
     pool: &PgPool,
     caller: &Caller,
     bytes: &[u8],
+    id: Option<&str>,
 ) -> Result<Value, MessageError> {
-    if bytes.is_empty() {
+    if bytes.is_empty() || id.is_some_and(|id| !is_uuid(id)) {
         return Err(MessageError::Invalid);
     }
     let size = i32::try_from(bytes.len()).map_err(|_| MessageError::TooLarge)?;
     let mut tx = scoped(pool, caller).await?;
-    let row: Value = sqlx::query_scalar("SELECT app_save_sealed_attachment($1)")
+    let row: Value = sqlx::query_scalar("SELECT app_save_sealed_attachment($1, $2::uuid)")
         .bind(size)
+        .bind(id)
         .fetch_one(&mut *tx)
         .await
         .map_err(message_sql)?;
@@ -651,6 +659,8 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E13" => MessageError::BadDevice,
         "P0E14" => MessageError::TooManyDevices,
         "P0E15" => MessageError::BadE2ee,
+        "P0E16" => MessageError::GroupTooLarge,
+        "P0E17" => MessageError::IdTaken,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),

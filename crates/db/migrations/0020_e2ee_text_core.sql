@@ -11,12 +11,21 @@
 --   P0E07 not_in_group       P0E08 device_exists       P0E09 cross_signature_required
 --   P0E10 too_many_keys      P0E11 slow_down           P0E12 e2ee_off
 --   P0E13 bad_device         P0E14 too_many_devices    P0E15 bad_e2ee
+--   P0E16 group_too_large    P0E17 id_taken
 
 -- off: no new encrypted conversations. optional: either, the default. new_required: a new
--- conversation must be encrypted. Existing conversations are never converted either way.
+-- conversation must be encrypted. required: as new_required, and no plaintext text is accepted
+-- anywhere any more: an old plaintext conversation is read-only, and plaintext uploads are
+-- refused. Existing conversations are never converted either way.
 ALTER TABLE server_settings
     ADD COLUMN e2ee_text text NOT NULL DEFAULT 'optional'
-        CHECK (e2ee_text IN ('off', 'optional', 'new_required')),
+        CHECK (e2ee_text IN ('off', 'optional', 'new_required', 'required')),
+    -- The most devices one encrypted group may hold. Past it, the server refuses to make an
+    -- encrypted channel and stops adding devices to a group: a Welcome carries the whole ratchet
+    -- tree unless the committer uploads the tree, and a joiner checks every leaf, so a bigger
+    -- group is slow on a phone and near the size limits (docs/e2ee-text.md section 10).
+    ADD COLUMN e2ee_group_devices_max integer NOT NULL DEFAULT 2000
+        CHECK (e2ee_group_devices_max BETWEEN 2 AND 20000),
     -- Sealed uploads are opaque to the server, so size and rate are all it can limit.
     ADD COLUMN sealed_files_per_hour integer NOT NULL DEFAULT 60
         CHECK (sealed_files_per_hour BETWEEN 1 AND 100000),

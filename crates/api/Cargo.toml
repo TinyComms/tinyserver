@@ -38,6 +38,9 @@ url.workspace = true
 yara-x = { version = "1", default-features = false }
 
 [dev-dependencies]
+# The sealed attachment format (AES-256-GCM STREAM), as tinyclient's crates/e2ee writes it, so the
+# tests upload real sealed blobs and open what they download.
+aes-gcm = { version = "0.10.3", features = ["stream"] }
 # Discord's DAVE, as tinyclient runs it: the e2ee tests drive real clients through the server.
 davey = "=0.1.5"
 # The fake provider in tests/common/oidc.rs signs ID tokens with openidconnect itself.

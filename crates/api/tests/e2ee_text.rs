@@ -17,6 +17,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use common::live::{connect, durable, ping, serve};
 use common::mls_client::{uuid16, Client};
+use common::sealed::{self, framed};
 use common::{first_owner, join, run, session, Call, TestDb};
 use db::Caller;
 use http_body_util::BodyExt;
@@ -382,6 +383,8 @@ struct Dev {
     client: Client,
     token: String,
     cursor: i64,
+    /// Joins with the ratchet tree it fetches from the server, not one inside the Welcome.
+    fetch_tree: bool,
 }
 
 impl Dev {
@@ -390,6 +393,7 @@ impl Dev {
             client: Client::new(user_id, &fresh_uuid()),
             token: token.to_string(),
             cursor: 0,
+            fetch_tree: false,
         }
     }
 
@@ -534,6 +538,23 @@ async fn pull(app: &Router, dev: &mut Dev, conv: &str) -> Result<usize, (StatusC
                     dev.client.take_commit(&data);
                     applied += 1;
                 }
+                "welcome" if !in_group && dev.fetch_tree => {
+                    let (status, _, tree) = raw(
+                        app,
+                        Method::GET,
+                        &format!(
+                            "/v1/e2ee/conversations/{conv}/tree?device_id={}&epoch={epoch}",
+                            dev.id()
+                        ),
+                        &dev.token,
+                        "",
+                        Vec::new(),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "the tree of epoch {epoch}");
+                    dev.client.join_with_tree(&data, Some(&tree));
+                    applied += 1;
+                }
                 "welcome" if !in_group => {
                     dev.client.join(&data);
                     applied += 1;
@@ -582,6 +603,7 @@ async fn commit(app: &Router, dev: &mut Dev, conv: &str) -> (StatusCode, Value) 
             "epoch": dev.client.epoch(),
             "commit": b64(&committed.commit),
             "welcomes": welcomes,
+            "ratchet_tree": b64(&committed.tree),
         })),
     )
     .await;
@@ -655,7 +677,9 @@ async fn say(
     text: &str,
     extra: Value,
 ) -> (StatusCode, Value) {
-    let ciphertext = at(dev, conv).encrypt(&payload(text));
+    let kind = extra["kind"].as_str().unwrap_or("message").to_string();
+    let target = extra["target_id"].as_str().map(str::to_string);
+    let ciphertext = at(dev, conv).encrypt_as(&kind, target.as_deref(), &payload(text));
     post_raw(app, dev, conv, &ciphertext, extra).await
 }
 
@@ -742,7 +766,7 @@ async fn a_group_forms_and_the_server_stores_only_ciphertext() {
         assert_eq!(first["kind"], "message");
         assert_eq!(first["device_id"], p.owner.id());
         assert_eq!(first["epoch"], 1);
-        let file = p.owner.client.encrypt(format!("file says {MARKER}").as_bytes());
+        let file = sealed::seal(&[7; 32], b"", format!("file says {MARKER}").as_bytes());
         let (status, sealed) = upload_sealed(&w.app, &p.owner.token, &file).await;
         assert_eq!(status, StatusCode::CREATED, "{sealed}");
         let (status, with_file) = say(
@@ -955,7 +979,7 @@ async fn there_is_no_downgrade_in_either_direction() {
         }
 
         // A sealed file is for an encrypted conversation only, and a plain one is not.
-        let (status, sealed) = upload_sealed(&w.app, &p.owner.token, b"opaque bytes").await;
+        let (status, sealed) = upload_sealed(&w.app, &p.owner.token, &framed(b"opaque bytes")).await;
         assert_eq!(status, StatusCode::CREATED, "{sealed}");
         let (status, refused) = w
             .send(
@@ -2070,7 +2094,7 @@ async fn nothing_of_another_conversation_is_reachable() {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{said}");
-        let file = p.owner.client.encrypt(b"a sealed secret");
+        let file = sealed::seal(&[8; 32], b"", b"a sealed secret");
         let (status, sealed) = upload_sealed(&w.app, &p.owner.token, &file).await;
         assert_eq!(status, StatusCode::CREATED, "{sealed}");
         let (status, with_file) = say(
@@ -2139,7 +2163,7 @@ async fn nothing_of_another_conversation_is_reachable() {
             (StatusCode::NOT_FOUND, Some("not_found"))
         );
         // An unlinked sealed upload is its uploader's alone for an hour.
-        let (status, loose) = upload_sealed(&w.app, &p.owner.token, b"loose bytes").await;
+        let (status, loose) = upload_sealed(&w.app, &p.owner.token, &framed(b"loose bytes")).await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(
             download(&w.app, &p.other.token, loose["id"].as_str().expect("id"))
@@ -2440,7 +2464,9 @@ async fn malformed_and_oversized_input_is_refused_without_harm() {
         let huge = vec![b'a'; 60 * 1024];
         let (status, _, _) = raw(&w.app, Method::POST, &path, &p.owner.token, "application/json", huge).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        let huge = vec![b'a'; 9 * 1024 * 1024];
+        // A commit route body holds 4 MiB of commit, 4 MiB of welcomes and an 8 MiB tree, as
+        // base64: 22 MiB.
+        let huge = vec![b'a'; 23 * 1024 * 1024];
         let (status, _, _) = raw(&w.app, Method::POST, &commit_path, &p.owner.token, "application/json", huge).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         // And the plain routes keep their 8 KiB.
@@ -2496,6 +2522,10 @@ async fn a_sealed_upload_is_opaque_and_stored_as_it_came() {
             ("html", b"<html><script>alert(1)</script></html>".to_vec()),
             ("one byte", vec![0]),
         ];
+        let samples: Vec<(&str, Vec<u8>)> = samples
+            .into_iter()
+            .map(|(what, bytes)| (what, framed(&bytes)))
+            .collect();
         let mut ids = Vec::new();
         for (what, bytes) in &samples {
             let (status, saved) = upload_sealed(&w.app, &p.owner.token, bytes).await;
@@ -2516,13 +2546,23 @@ async fn a_sealed_upload_is_opaque_and_stored_as_it_came() {
         }
         // The same bytes, not sealed, are what they always were: refused.
         let (status, body) = upload_plain(&w.app, &p.owner.token, "payload.bin", eicar).await;
+        // And bare, without a sealed blob's frame, they are not taken as sealed either: the
+        // route is not a free host for any file.
+        for (what, bytes) in [("eicar", eicar.to_vec()), ("text", b"plain words".to_vec())] {
+            let (status, refused) = upload_sealed(&w.app, &p.owner.token, &bytes).await;
+            assert_eq!(
+                (status, refused["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("invalid")),
+                "{what}"
+            );
+        }
         assert_ne!(status, StatusCode::CREATED, "{body}");
         let (status, body) = upload_plain(&w.app, &p.owner.token, "prog.exe", b"MZ....").await;
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
         // A name and type are the server's, whatever the client calls the file.
         let body = multipart(
             Some(("holiday.png", "image/png")),
-            b"opaque",
+            &framed(b"opaque"),
             &[("sealed", "1"), ("width", "12")],
         );
         let (status, _, bytes) = raw(
@@ -2547,7 +2587,7 @@ async fn a_sealed_upload_is_opaque_and_stored_as_it_came() {
         );
         assert!(saved["width"].is_null());
         // A sealed upload with no file name at all, and the field after the file.
-        let body = multipart(None, b"anonymous", &[("sealed", "1")]);
+        let body = multipart(None, &framed(b"anonymous"), &[("sealed", "1")]);
         let (status, _, _) = raw(
             &w.app,
             Method::POST,
@@ -2670,9 +2710,9 @@ async fn sealed_uploads_have_a_size_limit_and_a_rate() {
             .execute(&w.db.owner)
             .await
             .expect("limits");
-        let (status, body) = upload_sealed(&w.app, &token, &[1u8; 100]).await;
+        let (status, body) = upload_sealed(&w.app, &token, &framed(&[1u8; 71])).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
-        let (status, body) = upload_sealed(&w.app, &token, &[1u8; 101]).await;
+        let (status, body) = upload_sealed(&w.app, &token, &framed(&[1u8; 72])).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::PAYLOAD_TOO_LARGE, Some("too_large")), "{body}");
         sqlx::query("UPDATE server_settings SET file_max_bytes = 26214400, image_max_bytes = 8388608")
             .execute(&w.db.owner)
@@ -2685,13 +2725,13 @@ async fn sealed_uploads_have_a_size_limit_and_a_rate() {
             .execute(&w.db.owner)
             .await
             .expect("rate");
-        let (status, _) = upload_sealed(&w.app, &token, b"two").await;
+        let (status, _) = upload_sealed(&w.app, &token, &framed(b"two")).await;
         assert_eq!(status, StatusCode::CREATED);
-        let (status, _) = upload_sealed(&w.app, &token, b"three").await;
+        let (status, _) = upload_sealed(&w.app, &token, &framed(b"three")).await;
         assert_eq!(status, StatusCode::CREATED);
-        let (status, body) = upload_sealed(&w.app, &token, b"four").await;
+        let (status, body) = upload_sealed(&w.app, &token, &framed(b"four")).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("slow_down")), "{body}");
-        let (status, _) = upload_sealed(&w.app, &vic_token, b"someone else").await;
+        let (status, _) = upload_sealed(&w.app, &vic_token, &framed(b"someone else")).await;
         assert_eq!(status, StatusCode::CREATED, "the limit is per person");
         // A refused upload leaves no file and no row.
         assert_eq!(files_in(&dir).len(), 4);
@@ -2701,20 +2741,20 @@ async fn sealed_uploads_have_a_size_limit_and_a_rate() {
             .execute(&w.db.owner)
             .await
             .expect("age");
-        let (status, _) = upload_sealed(&w.app, &token, b"five").await;
+        let (status, _) = upload_sealed(&w.app, &token, &framed(b"five")).await;
         assert_eq!(status, StatusCode::CREATED);
-        // Room for ten more bytes today, past what she has uploaded.
+        // Room for forty more bytes today, past what she has uploaded.
         sqlx::query(
             "UPDATE server_settings SET sealed_bytes_per_day =
-             (SELECT sum(bytes) + 10 FROM e2ee_upload_ledger WHERE user_id = $1::uuid)",
+             (SELECT sum(bytes) + 40 FROM e2ee_upload_ledger WHERE user_id = $1::uuid)",
         )
         .bind(&uma.user_id)
         .execute(&w.db.owner)
         .await
         .expect("volume");
-        let (status, body) = upload_sealed(&w.app, &token, &[9u8; 40]).await;
+        let (status, body) = upload_sealed(&w.app, &token, &framed(&[9u8; 40])).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("slow_down")), "{body}");
-        let (status, _) = upload_sealed(&w.app, &token, b"x").await;
+        let (status, _) = upload_sealed(&w.app, &token, &framed(b"x")).await;
         assert_eq!(status, StatusCode::CREATED, "a small one still fits the day");
         let _ = std::fs::remove_dir_all(dir);
     })
@@ -2726,9 +2766,9 @@ async fn an_orphaned_sealed_upload_is_swept_with_its_file() {
     run(|db| async move {
         let dir = upload_dir();
         let w = world(db).await;
-        let (_, saved) = upload_sealed(&w.app, &w.owner_token, b"never attached").await;
+        let (_, saved) = upload_sealed(&w.app, &w.owner_token, &framed(b"never attached")).await;
         let id = saved["id"].as_str().expect("id").to_string();
-        let (_, kept) = upload_sealed(&w.app, &w.owner_token, b"just now").await;
+        let (_, kept) = upload_sealed(&w.app, &w.owner_token, &framed(b"just now")).await;
         assert_eq!(files_in(&dir).len(), 2);
         // Within the hour nothing is swept.
         let swept = db::sweep(&w.db.runtime).await.expect("sweep");
@@ -3480,6 +3520,616 @@ async fn the_group_is_rebuilt_when_nobody_in_it_can_commit() {
         start(&w.app, &mut third, &conv).await;
         let (status, said) = say(&w.app, &mut third, &conv, "in the new group", json!({})).await;
         assert_eq!(status, StatusCode::CREATED, "{said}");
+    })
+    .await;
+}
+
+// ---- hardening: the invariant, the tree, the cap, the setting, bound attachments --------------
+
+/// A sealed upload under an id the client chose before it sealed the blob.
+async fn upload_sealed_as(
+    app: &Router,
+    token: &str,
+    bytes: &[u8],
+    id: &str,
+) -> (StatusCode, Value) {
+    let body = multipart(
+        Some(("sealed", "application/octet-stream")),
+        bytes,
+        &[("sealed", "1"), ("id", id)],
+    );
+    let (status, _, bytes) = raw(app, Method::POST, "/v1/media", token, MULTIPART, body).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Every file under `dir` changed since `since`, as its path and bytes. What cannot be read is
+/// skipped: other programs use the temporary directory too.
+fn files_since(
+    dir: &std::path::Path,
+    since: std::time::SystemTime,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let path = entry.path();
+        if meta.is_dir() {
+            files_since(&path, since, out);
+            continue;
+        }
+        let fresh = meta.modified().is_ok_and(|modified| modified >= since);
+        if fresh && meta.len() < 64 * 1024 * 1024 {
+            if let Ok(bytes) = std::fs::read(&path) {
+                out.push((path.display().to_string(), bytes));
+            }
+        }
+    }
+}
+
+/// The invariant this whole feature stands on. A canary said only through encrypted paths (a
+/// channel message, a reply inside the envelope, an edit, a direct message, a sealed file and
+/// the name it travels under, and a message then deleted) is afterwards in no table (messages,
+/// outbox, notifications and every other), in no log line at any level, in no upload file, and in
+/// no file the server wrote anywhere under the temporary directory.
+#[tokio::test]
+async fn a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server() {
+    run(|db| async move {
+        const CANARY: &str = "CANARY-7c41e09b-said-only-in-ciphertext";
+        let started = std::time::SystemTime::now();
+        let dir = upload_dir();
+        let w = world(db).await;
+        let mut p = pair(&w, "cara").await;
+
+        // A message, then a reply to it (the reply is inside the envelope), then an edit of it.
+        let (status, first) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            &format!("one {CANARY}"),
+            json!({"client_id": "canary-1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let first_id = first["id"].as_str().expect("id").to_string();
+        let reply =
+            json!({"v": 1, "text": format!("re {CANARY}"), "reply_to": first_id, "sent_at": 1});
+        let ciphertext = at(&mut p.other, &p.conv).encrypt(reply.to_string().as_bytes());
+        let (status, body) = post_raw(&w.app, &mut p.other, &p.conv, &ciphertext, json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            &format!("one, edited {CANARY}"),
+            json!({"kind": "edit", "target_id": first_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // A sealed file: the canary in its contents and in the name inside the envelope. The
+        // blob is bound to the conversation and to the id the client chose for it.
+        let file_id = fresh_uuid();
+        let key = [0x42u8; 32];
+        let context = sealed::context(&uuid16(&p.conv), &uuid16(&file_id));
+        let contents = format!("the file says {CANARY}").repeat(5000);
+        let blob = sealed::seal(&key, &context, contents.as_bytes());
+        assert!(blob.len() > 64 * 1024, "more than one chunk");
+        let (status, saved) = upload_sealed_as(&w.app, &p.owner.token, &blob, &file_id).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["id"], file_id.as_str());
+        let envelope = json!({"v": 1, "text": "a file", "sent_at": 2, "attachments": [{
+            "id": file_id, "key": b64(&key), "name": format!("{CANARY}.txt"), "mime": "text/plain",
+            "bytes": contents.len(), "sha256": "", "width": 0, "height": 0
+        }]});
+        let ciphertext = at(&mut p.owner, &p.conv).encrypt(envelope.to_string().as_bytes());
+        let (status, body) = post_raw(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            &ciphertext,
+            json!({"attachment_ids": [file_id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // A message that is then deleted.
+        let (status, gone) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            &format!("regret {CANARY}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{gone}");
+        let (status, _) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/messages/{}", gone["id"].as_str().expect("id")),
+                &p.owner.token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // A direct message between the two.
+        let (status, direct) = w
+            .send(
+                Method::POST,
+                "/v1/directs",
+                &w.owner_token,
+                Some(json!({"user_id": p.other.user(), "e2ee": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let dm = direct["id"].as_str().expect("id").to_string();
+        start(&w.app, &mut p.owner, &dm).await;
+        let mut devs = [p.owner, p.other];
+        settle(&w.app, &mut devs, 0, &dm).await;
+        let [mut owner, mut other] = devs;
+        let (status, body) = say(&w.app, &mut owner, &dm, &format!("dm {CANARY}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // The members read every one of them, and open the file with the context it is bound to.
+        assert_eq!(
+            read(&w.app, &mut other, &dm).await,
+            [format!("dm {CANARY}")]
+        );
+        let texts = read(&w.app, &mut other, &p.conv).await;
+        assert_eq!(texts, [format!("one {CANARY}"), "a file".to_string()]);
+        let (status, _, downloaded) = download(&w.app, &other.token, &file_id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(downloaded, blob);
+        let opened = sealed::open(&key, &context, &downloaded).expect("opens");
+        assert_eq!(opened, contents.as_bytes());
+        let elsewhere = sealed::context(&uuid16(&dm), &uuid16(&file_id));
+        assert!(
+            sealed::open(&key, &elsewhere, &downloaded).is_none(),
+            "bound to its conversation"
+        );
+
+        // The scans find what is there: a plaintext channel name, and a file written just now.
+        const CONTROL: &str = "CONTROL-5d2e-visible-in-plaintext";
+        w.channel(CONTROL, false).await;
+        assert!(tables_holding(&w.db, CONTROL)
+            .await
+            .contains(&"channels".to_string()));
+        let control_file =
+            std::env::temp_dir().join(format!("tinyserver-control-{}", fresh_uuid()));
+        std::fs::write(&control_file, CONTROL).expect("control file");
+        let mut seen = Vec::new();
+        files_since(&std::env::temp_dir(), started, &mut seen);
+        assert!(seen
+            .iter()
+            .any(|(_, bytes)| contains(bytes, CONTROL.as_bytes())));
+        let _ = std::fs::remove_file(control_file);
+
+        // And the server holds it nowhere.
+        assert_eq!(tables_holding(&w.db, CANARY).await, Vec::<String>::new());
+        let lines = logs().text();
+        assert!(!lines.contains(CANARY), "a log line holds the canary");
+        assert!(
+            !lines.contains(&hex(CANARY.as_bytes())),
+            "a log line holds it as hex"
+        );
+        for (name, bytes) in files_in(&dir) {
+            assert!(
+                !contains(&bytes, CANARY.as_bytes()),
+                "upload {name} holds it"
+            );
+        }
+        let mut written = Vec::new();
+        files_since(&std::env::temp_dir(), started, &mut written);
+        for (path, bytes) in &written {
+            assert!(!contains(bytes, CANARY.as_bytes()), "{path} holds it");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_device_joins_with_the_ratchet_tree_the_server_keeps_apart_from_the_welcome() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (other_user, other_token) = w.member("tree").await;
+        let (late_user, late_token) = w.member("late").await;
+        let conv = w.channel("tree-room", true).await;
+        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let mut other = ready(&w.app, &other_user.user_id, &other_token).await;
+        other.fetch_tree = true;
+        start(&w.app, &mut owner, &conv).await;
+        // The committer leaves the tree out of its Welcome, as a big group's must.
+        at(&mut owner, &conv).inline_tree(false);
+        let mut devs = [owner, other];
+        settle(&w.app, &mut devs, 0, &conv).await;
+        let [mut owner, mut other] = devs;
+        assert_eq!(at(&mut other, &conv).epoch(), 1);
+        let (_, group) = info(&w.app, &owner.token, &conv).await;
+        assert_eq!(group["trees"], json!([1]), "{group}");
+        let (status, said) = say(&w.app, &mut owner, &conv, "through a fetched tree", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        assert_eq!(read(&w.app, &mut other, &conv).await, ["through a fetched tree"]);
+
+        let tree_path = |dev: &Dev, epoch: u64| {
+            format!("/v1/e2ee/conversations/{conv}/tree?device_id={}&epoch={epoch}", dev.id())
+        };
+        let (status, headers, tree) = raw(&w.app, Method::GET, &tree_path(&other, 1), &other.token, "", Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!tree.is_empty());
+        assert_eq!(headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/octet-stream"));
+        // Not for an epoch nobody uploaded, not for one before the device joined, not without
+        // the device, and not for a device that is not in the group.
+        assert_eq!(raw(&w.app, Method::GET, &tree_path(&other, 7), &other.token, "", Vec::new()).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(raw(&w.app, Method::GET, &tree_path(&other, 0), &other.token, "", Vec::new()).await.0, StatusCode::NOT_FOUND);
+        let bare = format!("/v1/e2ee/conversations/{conv}/tree?epoch=1");
+        assert_eq!(raw(&w.app, Method::GET, &bare, &other.token, "", Vec::new()).await.0, StatusCode::BAD_REQUEST);
+        let late = ready(&w.app, &late_user.user_id, &late_token).await;
+        assert_eq!(raw(&w.app, Method::GET, &tree_path(&late, 1), &late.token, "", Vec::new()).await.0, StatusCode::FORBIDDEN);
+
+        // A commit whose tree is junk or cut short is refused and changes nothing; the same commit
+        // with its own tree goes through.
+        pull_ok(&w.app, &mut owner, &conv).await;
+        let committed = at(&mut owner, &conv).commit();
+        let (_, group) = info(&w.app, &owner.token, &conv).await;
+        let added = group["pending"][0]["device_id"].as_str().expect("pending add").to_string();
+        let welcome = committed.welcome.clone().expect("welcome");
+        for bad in [b64(b"not a tree"), b64(&tree[..tree.len() - 1]), "%%%".to_string()] {
+            let (status, refused) = call(&w.app, Method::POST, &format!("/v1/e2ee/conversations/{conv}/commit"), &owner.token, Some(json!({
+                "device_id": owner.id(), "epoch": 1, "commit": b64(&committed.commit),
+                "welcomes": [{"device_id": added, "data": b64(&welcome)}], "ratchet_tree": bad,
+            }))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            assert_eq!(refused["error"], "bad_e2ee");
+        }
+        assert_eq!(info(&w.app, &owner.token, &conv).await.1["epoch"], 1);
+        let (status, body) = call(&w.app, Method::POST, &format!("/v1/e2ee/conversations/{conv}/commit"), &owner.token, Some(json!({
+            "device_id": owner.id(), "epoch": 1, "commit": b64(&committed.commit),
+            "welcomes": [{"device_id": added, "data": b64(&welcome)}], "ratchet_tree": b64(&committed.tree),
+        }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        at(&mut owner, &conv).merge();
+        let mut late = late;
+        late.fetch_tree = true;
+        pull_ok(&w.app, &mut late, &conv).await;
+        assert_eq!(at(&mut late, &conv).epoch(), 2);
+        let (_, group) = info(&w.app, &owner.token, &conv).await;
+        assert_eq!(group["trees"], json!([1, 2]));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_kind_and_target_stored_are_the_ones_the_sender_authenticated() {
+    run(|db| async move {
+        let w = world(db).await;
+        let mut p = pair(&w, "aad").await;
+        let (_, first) = say(&w.app, &mut p.owner, &p.conv, "first", json!({})).await;
+        let (_, second) = say(&w.app, &mut p.owner, &p.conv, "second", json!({})).await;
+        let first_id = first["id"].as_str().expect("id").to_string();
+        let second_id = second["id"].as_str().expect("id").to_string();
+        let refused = |status: StatusCode, body: &Value| {
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("bad_e2ee")),
+                "{body}"
+            );
+        };
+        // An edit of the first, stored as a message, or as an edit of the second.
+        let edit = at(&mut p.owner, &p.conv).encrypt_as("edit", Some(&first_id), &payload("fixed"));
+        let (status, body) = post_raw(&w.app, &mut p.owner, &p.conv, &edit, json!({})).await;
+        refused(status, &body);
+        let (status, body) = post_raw(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            &edit,
+            json!({"kind": "edit", "target_id": second_id}),
+        )
+        .await;
+        refused(status, &body);
+        // A message, stored as an edit.
+        let message = at(&mut p.owner, &p.conv).encrypt(&payload("just words"));
+        let (status, body) = post_raw(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            &message,
+            json!({"kind": "edit", "target_id": first_id}),
+        )
+        .await;
+        refused(status, &body);
+        // A ciphertext with no authenticated data, or someone else's label.
+        let bare = at(&mut p.owner, &p.conv).encrypt_with_aad(Vec::new(), &payload("bare"));
+        let (status, body) = post_raw(&w.app, &mut p.owner, &p.conv, &bare, json!({})).await;
+        refused(status, &body);
+        let foreign =
+            at(&mut p.owner, &p.conv).encrypt_with_aad(b"other app".to_vec(), &payload("x"));
+        let (status, body) = post_raw(&w.app, &mut p.owner, &p.conv, &foreign, json!({})).await;
+        refused(status, &body);
+        // The target is compared in the form the server gives it back in, however it was sent.
+        let edit = at(&mut p.owner, &p.conv).encrypt_as("edit", Some(&first_id), &payload("fixed"));
+        let (status, body) = post_raw(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            &edit,
+            json!({"kind": "edit", "target_id": first_id.to_uppercase()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["target_id"], first_id.as_str());
+        // Nothing refused was stored.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM messages WHERE channel_id = $1::uuid")
+                .bind(&p.conv)
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("count");
+        assert_eq!(rows, 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_group_takes_no_more_devices_than_its_cap_and_says_how_many_wait() {
+    run(|db| async move {
+        let w = world(db).await;
+        // How many Adds one commit may carry shrinks as the group grows.
+        for (leaves, adds) in [
+            (0, 94),
+            (1, 94),
+            (100, 57),
+            (1000, 8),
+            (2000, 4),
+            (20000, 1),
+        ] {
+            let got: i32 = sqlx::query_scalar("SELECT app_e2ee_adds_per_commit($1)")
+                .bind(leaves)
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("adds");
+            assert_eq!(got, adds, "{leaves} leaves");
+        }
+        sqlx::query("UPDATE server_settings SET e2ee_group_devices_max = 2")
+            .execute(&w.db.owner)
+            .await
+            .expect("cap");
+        let (ann, ann_token) = w.member("ann").await;
+        let (bob, bob_token) = w.member("bob").await;
+        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let ann_dev = ready(&w.app, &ann.user_id, &ann_token).await;
+        let conv = w.channel("capped", true).await;
+        let bob_dev = ready(&w.app, &bob.user_id, &bob_token).await;
+        start(&w.app, &mut owner, &conv).await;
+        let mut devs = [owner, ann_dev, bob_dev];
+        settle(&w.app, &mut devs, 0, &conv).await;
+        let (_, group) = info(&w.app, &devs[0].token, &conv).await;
+        assert_eq!(
+            group["members"].as_array().expect("members").len(),
+            2,
+            "{group}"
+        );
+        assert_eq!(group["device_cap"], 2);
+        assert_eq!(
+            group["waiting"], 1,
+            "one device can use the channel and is not in it"
+        );
+        let joined = |devs: &[Dev]| {
+            devs[1..]
+                .iter()
+                .filter(|dev| dev.client.has_group(&uuid16(&conv)))
+                .count()
+        };
+        assert_eq!(joined(&devs), 1);
+        let (status, body) = say(&w.app, &mut devs[0], &conv, "two of us", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // A new encrypted channel whose audience is over the cap is not made, and says why.
+        let (status, refused) = w
+            .send(
+                Method::POST,
+                "/v1/channels",
+                &w.owner_token,
+                Some(json!({"name": "too-big", "e2ee": true})),
+            )
+            .await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("e2ee_group_too_large")),
+            "{refused}"
+        );
+        w.channel("plain-is-fine", false).await;
+
+        // Raised, the waiting device comes in at the next commit.
+        sqlx::query("UPDATE server_settings SET e2ee_group_devices_max = 3")
+            .execute(&w.db.owner)
+            .await
+            .expect("cap");
+        settle(&w.app, &mut devs, 0, &conv).await;
+        let (_, group) = info(&w.app, &devs[0].token, &conv).await;
+        assert_eq!(
+            group["members"].as_array().expect("members").len(),
+            3,
+            "{group}"
+        );
+        assert_eq!(group["waiting"], 0);
+        assert_eq!(joined(&devs), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn under_required_the_server_takes_no_plaintext_at_all() {
+    run(|db| async move {
+        let _dir = upload_dir();
+        let w = world(db).await;
+        let plain = w.channel("old-plain", false).await;
+        let mut p = pair(&w, "req").await;
+        let (status, old) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{plain}/messages"),
+                &w.owner_token,
+                Some(json!({"body": "from before"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{old}");
+
+        let (status, set) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_text": "required"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(set["e2ee_text"], "required");
+        let (_, caps) = w
+            .send(Method::GET, "/v1/capabilities", &p.other.token, None)
+            .await;
+        assert_eq!(caps["e2ee_text"], "required");
+
+        let required = |status: StatusCode, body: &Value| {
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("e2ee_required")),
+                "{body}"
+            );
+        };
+        // The old plaintext channel is read-only: no post, no edit; what it holds stays readable.
+        let (status, body) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{plain}/messages"),
+                &w.owner_token,
+                Some(json!({"body": "more plaintext"})),
+            )
+            .await;
+        required(status, &body);
+        let (status, body) = w
+            .send(
+                Method::PATCH,
+                &format!("/v1/messages/{}", old["id"].as_str().expect("id")),
+                &w.owner_token,
+                Some(json!({"body": "changed"})),
+            )
+            .await;
+        required(status, &body);
+        let (status, page) = messages(&w.app, &w.owner_token, &plain).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page[0]["body"], "from before");
+        // No new plaintext conversation, of either kind, and no plaintext file.
+        let (status, body) = w
+            .send(
+                Method::POST,
+                "/v1/channels",
+                &w.owner_token,
+                Some(json!({"name": "new-plain", "e2ee": false})),
+            )
+            .await;
+        required(status, &body);
+        let (status, body) = w
+            .send(
+                Method::POST,
+                "/v1/directs",
+                &w.owner_token,
+                Some(json!({"user_id": p.other.user(), "e2ee": false})),
+            )
+            .await;
+        required(status, &body);
+        let (status, body) = upload_plain(&w.app, &w.owner_token, "notes.txt", b"plain file").await;
+        required(status, &body);
+        // Everything encrypted goes on as before.
+        w.channel("new-encrypted", true).await;
+        let (status, body) = upload_sealed(&w.app, &p.owner.token, &framed(b"sealed")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            "still fine",
+            json!({"attachment_ids": [body["id"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(read(&w.app, &mut p.other, &p.conv).await, ["still fine"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_sealed_upload_may_carry_the_id_its_blob_is_bound_to() {
+    run(|db| async move {
+        let dir = upload_dir();
+        let w = world(db).await;
+        let mut p = pair(&w, "bind").await;
+        let id = fresh_uuid();
+        let key = [9u8; 32];
+        let context = sealed::context(&uuid16(&p.conv), &uuid16(&id));
+        let blob = sealed::seal(&key, &context, b"bound to its id");
+        let (status, saved) =
+            upload_sealed_as(&w.app, &p.owner.token, &blob, &id.to_uppercase()).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert_eq!(saved["id"], id.as_str(), "in the server's form");
+        // An id is used once, whoever asks for it again.
+        for token in [&p.owner.token, &p.other.token] {
+            let (status, taken) = upload_sealed_as(&w.app, token, &framed(b"again"), &id).await;
+            assert_eq!(
+                (status, taken["error"].as_str()),
+                (StatusCode::CONFLICT, Some("id_taken")),
+                "{taken}"
+            );
+        }
+        // Not a uuid, and an id on a file that is not sealed, are refused.
+        let (status, _) =
+            upload_sealed_as(&w.app, &p.owner.token, &framed(b"x"), "not-a-uuid").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let loose_id = fresh_uuid();
+        let body = multipart(
+            Some(("notes.txt", "text/plain")),
+            b"plain",
+            &[("id", loose_id.as_str())],
+        );
+        let (status, _, _) = raw(
+            &w.app,
+            Method::POST,
+            "/v1/media",
+            &p.owner.token,
+            MULTIPART,
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Linked, downloaded and opened with the context it was sealed with, and not without it.
+        let (status, body) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            "bound",
+            json!({"attachment_ids": [id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, _, downloaded) = download(&w.app, &p.other.token, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sealed::open(&key, &context, &downloaded).as_deref(),
+            Some(b"bound to its id".as_slice())
+        );
+        assert!(sealed::open(&key, b"", &downloaded).is_none());
+        let other = sealed::context(&uuid16(&p.conv), &uuid16(&fresh_uuid()));
+        assert!(sealed::open(&key, &other, &downloaded).is_none());
+        assert_eq!(files_in(&dir).len(), 1, "the refused ones left no file");
+        let _ = std::fs::remove_dir_all(dir);
     })
     .await;
 }

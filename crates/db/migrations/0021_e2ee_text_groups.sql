@@ -25,6 +25,32 @@ AS $$
     SELECT 20;
 $$;
 
+-- The most devices one group may hold: the server setting e2ee_group_devices_max.
+CREATE FUNCTION app_e2ee_group_devices_max()
+RETURNS integer
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT s.e2ee_group_devices_max FROM server_settings s;
+$$;
+
+-- The most Adds one commit may carry in a group of `p_leaves` leaves. The commit's one Welcome
+-- carries the ratchet tree (about 300 bytes a leaf, as measured with openmls) and the committer
+-- posts a copy of it for each added device; those copies together must stay under 4 MiB. So
+-- n * (leaves + n) is kept under 9000, with room to spare: 94 Adds into an empty group, 57 at
+-- 100 leaves, 8 at 1,000, 4 at 2,000. Never fewer than one, never more than 100.
+CREATE FUNCTION app_e2ee_adds_per_commit(p_leaves integer)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT greatest(1, least(100, floor(
+        (sqrt(greatest(p_leaves, 0)::float8 ^ 2 + 36000) - greatest(p_leaves, 0)) / 2
+    )::integer));
+$$;
+
 CREATE TABLE e2ee_groups (
     conversation_id uuid PRIMARY KEY,
     epoch bigint NOT NULL DEFAULT 0 CHECK (epoch >= 0),
@@ -71,7 +97,13 @@ CREATE TABLE e2ee_handshake (
     conversation_id uuid NOT NULL REFERENCES e2ee_groups (conversation_id) ON DELETE CASCADE,
     kind text NOT NULL CHECK (kind IN ('proposals', 'commit', 'welcome')),
     epoch bigint NOT NULL CHECK (epoch >= 0),
-    data bytea NOT NULL CHECK (octet_length(data) BETWEEN 1 AND 1048576),
+    -- A commit with an update path grows with the leaves its path has to encrypt to (117 KB for a
+    -- Remove in a 1,000 device group grown by joins); 4 MiB leaves room past the device cap. A
+    -- Welcome or a batch of proposals is at most 1 MiB.
+    data bytea NOT NULL CHECK (
+        octet_length(data) >= 1
+        AND octet_length(data) <= CASE WHEN kind = 'commit' THEN 4194304 ELSE 1048576 END
+    ),
     for_device uuid REFERENCES e2ee_devices (device_id),
     created_at timestamptz NOT NULL DEFAULT now(),
     CHECK ((kind = 'welcome') = (for_device IS NOT NULL))
@@ -80,7 +112,21 @@ CREATE TABLE e2ee_handshake (
 CREATE INDEX e2ee_handshake_conversation ON e2ee_handshake (conversation_id, seq);
 CREATE INDEX e2ee_handshake_welcome ON e2ee_handshake (for_device, seq) WHERE kind = 'welcome';
 
-REVOKE ALL ON e2ee_groups, e2ee_leaves, e2ee_pending, e2ee_handshake FROM app_runtime;
+-- The public ratchet tree of an epoch, as the committer that made the epoch uploaded it, for a
+-- device that joins by a Welcome without the tree inside it. In parts of at most 1 MiB, so that
+-- no single row is near a limit whatever the group's size. The joiner checks it against the tree
+-- hash in the GroupInfo its Welcome carries; the server checked that it parses and that its
+-- signatures hold. It is public: no secret is in a tree. The last 8 epochs of a group are kept.
+CREATE TABLE e2ee_trees (
+    conversation_id uuid NOT NULL REFERENCES e2ee_groups (conversation_id) ON DELETE CASCADE,
+    epoch bigint NOT NULL CHECK (epoch >= 1),
+    part integer NOT NULL CHECK (part BETWEEN 0 AND 15),
+    data bytea NOT NULL CHECK (octet_length(data) BETWEEN 1 AND 1048576),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (conversation_id, epoch, part)
+);
+
+REVOKE ALL ON e2ee_groups, e2ee_leaves, e2ee_pending, e2ee_handshake, e2ee_trees FROM app_runtime;
 
 ALTER TABLE e2ee_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE e2ee_groups FORCE ROW LEVEL SECURITY;
@@ -90,6 +136,8 @@ ALTER TABLE e2ee_pending ENABLE ROW LEVEL SECURITY;
 ALTER TABLE e2ee_pending FORCE ROW LEVEL SECURITY;
 ALTER TABLE e2ee_handshake ENABLE ROW LEVEL SECURITY;
 ALTER TABLE e2ee_handshake FORCE ROW LEVEL SECURITY;
+ALTER TABLE e2ee_trees ENABLE ROW LEVEL SECURITY;
+ALTER TABLE e2ee_trees FORCE ROW LEVEL SECURITY;
 
 -- A deleted channel takes its group, leaves, pending proposals and handshake log with it.
 CREATE FUNCTION app_e2ee_forget_channel()
@@ -244,6 +292,9 @@ DECLARE
     v_row record;
     v_package record;
     v_left integer;
+    v_leaves integer;
+    v_removing integer;
+    v_adding integer;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtextextended('tinyserver.e2ee.' || p_conv::text, 0));
     IF NOT EXISTS (SELECT 1 FROM e2ee_groups g WHERE g.conversation_id = p_conv) THEN
@@ -290,9 +341,18 @@ BEGIN
         v_changed := true;
     END LOOP;
 
-    -- At most 100 Adds wait at once; the rest follow in a later epoch.
-    SELECT greatest(0, 100 - count(*)) INTO v_room
-    FROM e2ee_pending p WHERE p.conversation_id = p_conv AND p.op = 'add';
+    -- One commit applies every Add pending, so as many wait as one commit may carry in a group
+    -- this big (app_e2ee_adds_per_commit); the rest follow in a later epoch. And no Add is made
+    -- that would take the group past the device cap: those devices wait, and the conversation's
+    -- info says how many do.
+    SELECT count(*) INTO v_leaves FROM e2ee_leaves l WHERE l.conversation_id = p_conv;
+    SELECT count(*) FILTER (WHERE p.op = 'remove'), count(*) FILTER (WHERE p.op = 'add')
+    INTO v_removing, v_adding
+    FROM e2ee_pending p WHERE p.conversation_id = p_conv;
+    v_room := greatest(0, least(
+        app_e2ee_adds_per_commit(v_leaves) - v_adding,
+        app_e2ee_group_devices_max() - (v_leaves - v_removing + v_adding)
+    ));
     FOR v_row IN
         SELECT w.d_device
         FROM unnest(v_desired) AS w (d_device)
@@ -670,12 +730,29 @@ BEGIN
     SELECT g.epoch INTO v_epoch FROM e2ee_groups g WHERE g.conversation_id = p_conv;
     IF NOT FOUND THEN
         RETURN jsonb_build_object(
-            'e2ee', true, 'epoch', NULL, 'members', '[]'::jsonb, 'pending', '[]'::jsonb
+            'e2ee', true, 'epoch', NULL, 'members', '[]'::jsonb, 'pending', '[]'::jsonb,
+            'device_cap', app_e2ee_group_devices_max(), 'waiting', 0, 'trees', '[]'::jsonb
         );
     END IF;
     RETURN jsonb_build_object(
         'e2ee', true,
         'epoch', v_epoch,
+        'device_cap', app_e2ee_group_devices_max(),
+        -- Devices that may use the conversation and are neither in the group nor pending: past
+        -- the device cap, past this commit's share of Adds, or with no key package uploaded.
+        'waiting', (
+            SELECT count(*) FROM app_e2ee_desired(p_conv) x
+            WHERE NOT EXISTS (SELECT 1 FROM e2ee_leaves l
+                              WHERE l.conversation_id = p_conv AND l.device_id = x.d_device)
+              AND NOT EXISTS (SELECT 1 FROM e2ee_pending p
+                              WHERE p.conversation_id = p_conv AND p.device_id = x.d_device
+                                AND p.op = 'add')
+        ),
+        -- The epochs whose ratchet tree a joiner can fetch from GET .../tree.
+        'trees', coalesce((
+            SELECT jsonb_agg(DISTINCT t.epoch ORDER BY t.epoch)
+            FROM e2ee_trees t WHERE t.conversation_id = p_conv
+        ), '[]'::jsonb),
         'members', coalesce((
             SELECT jsonb_agg(jsonb_build_object(
                 'user_id', l.user_id::text,
@@ -883,7 +960,8 @@ CREATE FUNCTION app_e2ee_apply_commit(
     p_commit bytea,
     p_ids bigint[],
     p_welcome_devices uuid[],
-    p_welcomes bytea[]
+    p_welcomes bytea[],
+    p_tree bytea[] DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql
@@ -965,12 +1043,51 @@ BEGIN
     END LOOP;
     UPDATE e2ee_groups SET epoch = p_epoch + 1, updated_at = now() WHERE conversation_id = p_conv;
 
+    -- The ratchet tree of the new epoch, when the committer sent it, in the parts the API cut.
+    IF coalesce(cardinality(p_tree), 0) > 16 THEN
+        RAISE EXCEPTION 'tree too large' USING ERRCODE = 'P0E15';
+    END IF;
+    FOR v_i IN 1..coalesce(cardinality(p_tree), 0) LOOP
+        INSERT INTO e2ee_trees (conversation_id, epoch, part, data)
+        VALUES (p_conv, p_epoch + 1, v_i - 1, p_tree[v_i]);
+    END LOOP;
+    DELETE FROM e2ee_trees t WHERE t.conversation_id = p_conv AND t.epoch <= p_epoch + 1 - 8;
+
     -- Who can use the conversation may have changed while the commit was made.
     PERFORM app_e2ee_reconcile(p_conv, false);
     IF EXISTS (SELECT 1 FROM e2ee_groups g WHERE g.conversation_id = p_conv) THEN
         PERFORM app_e2ee_hint(p_conv);
     END IF;
     RETURN v_seq;
+END;
+$$;
+
+-- The parts of an epoch's ratchet tree, in order, for one of the caller's devices that is in the
+-- group and joined at or before that epoch. None when the committer did not send it, or it is
+-- older than the 8 epochs kept.
+CREATE FUNCTION app_e2ee_tree(p_conv uuid, p_device uuid, p_epoch bigint)
+RETURNS SETOF bytea
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_joined bigint;
+BEGIN
+    PERFORM app_e2ee_gate(p_conv, p_device, false);
+    SELECT l.joined_epoch INTO v_joined FROM e2ee_leaves l
+    WHERE l.conversation_id = p_conv AND l.device_id = p_device;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'not in group' USING ERRCODE = 'P0E07';
+    END IF;
+    IF p_epoch IS NULL OR p_epoch < v_joined THEN
+        RAISE EXCEPTION 'not found' USING ERRCODE = 'P0002';
+    END IF;
+    RETURN QUERY
+    SELECT t.data FROM e2ee_trees t
+    WHERE t.conversation_id = p_conv AND t.epoch = p_epoch
+    ORDER BY t.part;
 END;
 $$;
 
@@ -993,7 +1110,8 @@ BEGIN
         'app_e2ee_issue(uuid, bigint, bigint[], bytea[], bytea)',
         'app_e2ee_handshake(uuid, uuid, bigint, integer)',
         'app_e2ee_commit_snapshot(uuid, uuid, bigint)',
-        'app_e2ee_apply_commit(uuid, uuid, bigint, bytea, bigint[], uuid[], bytea[])'
+        'app_e2ee_apply_commit(uuid, uuid, bigint, bytea, bigint[], uuid[], bytea[], bytea[])',
+        'app_e2ee_tree(uuid, uuid, bigint)'
     ]
     LOOP
         EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', v_function);
@@ -1002,6 +1120,8 @@ BEGIN
     -- Internals: only other definer functions and the triggers call these.
     FOREACH v_function IN ARRAY ARRAY[
         'app_e2ee_max_devices()',
+        'app_e2ee_group_devices_max()',
+        'app_e2ee_adds_per_commit(integer)',
         'app_e2ee_forget_channel()',
         'app_e2ee_gate(uuid, uuid, boolean)',
         'app_e2ee_desired(uuid)',

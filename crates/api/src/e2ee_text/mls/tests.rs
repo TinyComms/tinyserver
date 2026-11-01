@@ -14,6 +14,8 @@ const DEVICE_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const USER_B: &str = "22222222-2222-4222-8222-222222222222";
 const DEVICE_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const GROUP: &str = "33333333-3333-4333-8333-333333333333";
+/// The authenticated data of a plain message.
+const MSG: &[u8] = b"tiny-e2ee-v1 msg\x00message\x00";
 
 fn server() -> Signer {
     let (public, stored) = Signer::generate().expect("key");
@@ -357,21 +359,122 @@ fn a_commit_for_another_group_epoch_or_without_a_member_sender_is_refused() {
 fn an_application_message_is_checked_on_its_outer_frame_only() {
     let (mut a, _b, _server, group) = joined();
     let ciphertext = a.encrypt(b"secret words");
-    assert!(check_ciphertext(&group, 1, &ciphertext).is_ok());
-    assert_eq!(check_ciphertext(&group, 0, &ciphertext), Err(Refused::Bad));
+    assert!(check_ciphertext(&group, 1, MSG, &ciphertext).is_ok());
     assert_eq!(
-        check_ciphertext(&[1; 16], 1, &ciphertext),
+        check_ciphertext(&group, 0, MSG, &ciphertext),
         Err(Refused::Bad)
     );
     assert_eq!(
-        check_ciphertext(&group, 1, b"plain words"),
+        check_ciphertext(&[1; 16], 1, MSG, &ciphertext),
         Err(Refused::Bad)
     );
-    assert_eq!(check_ciphertext(&group, 1, &[]), Err(Refused::Bad));
     assert_eq!(
-        check_ciphertext(&group, 1, &vec![0; CIPHERTEXT_MAX + 1]),
+        check_ciphertext(&group, 1, MSG, b"plain words"),
+        Err(Refused::Bad)
+    );
+    assert_eq!(check_ciphertext(&group, 1, MSG, &[]), Err(Refused::Bad));
+    assert_eq!(
+        check_ciphertext(&group, 1, MSG, &vec![0; CIPHERTEXT_MAX + 1]),
         Err(Refused::TooLarge)
     );
+}
+
+#[test]
+fn the_kind_and_target_stored_must_be_the_ones_the_sender_authenticated() {
+    let (mut a, _b, _server, group) = joined();
+    let target = "44444444-4444-4444-8444-444444444444";
+    assert_eq!(message_aad("message", None), MSG);
+    let edit = a.encrypt_as("edit", Some(target), b"new words");
+    let edit_aad = message_aad("edit", Some(target));
+    assert!(check_ciphertext(&group, 1, &edit_aad, &edit).is_ok());
+    // A server, or a database, that relabels an edit as a message, or points it at another
+    // message, stores a row its own check refuses.
+    assert_eq!(check_ciphertext(&group, 1, MSG, &edit), Err(Refused::Bad));
+    let other = message_aad("edit", Some("55555555-5555-4555-8555-555555555555"));
+    assert_eq!(
+        check_ciphertext(&group, 1, &other, &edit),
+        Err(Refused::Bad)
+    );
+    let message = a.encrypt(b"words");
+    assert_eq!(
+        check_ciphertext(&group, 1, &edit_aad, &message),
+        Err(Refused::Bad)
+    );
+    // A message with no authenticated data at all is not one of ours.
+    let bare = a.encrypt_with_aad(Vec::new(), b"words");
+    assert_eq!(check_ciphertext(&group, 1, MSG, &bare), Err(Refused::Bad));
+}
+
+#[test]
+fn a_ratchet_tree_is_checked_before_it_is_kept() {
+    let (mut a, b, server, group) = pair();
+    let add = server
+        .add(
+            parse_key_package(&b.key_package()).expect("package"),
+            &group,
+            0,
+        )
+        .expect("add");
+    a.take_proposals(&batch(&[&add]).expect("batch"));
+    a.inline_tree(false);
+    let committed = a.commit();
+    assert!(check_ratchet_tree(&group, &committed.tree).is_ok());
+    let mut flipped = committed.tree.clone();
+    let middle = flipped.len() / 2;
+    flipped[middle] ^= 1;
+    assert_eq!(check_ratchet_tree(&group, &flipped), Err(Refused::Bad));
+    assert_eq!(
+        check_ratchet_tree(&group, &committed.tree[..10]),
+        Err(Refused::Bad)
+    );
+    assert_eq!(check_ratchet_tree(&group, b""), Err(Refused::Bad));
+    assert_eq!(
+        check_ratchet_tree(&group, &vec![0; TREE_MAX + 1]),
+        Err(Refused::TooLarge)
+    );
+    // And the joiner joins with it from outside the Welcome, which no longer carries it.
+    a.merge();
+    let mut b = b;
+    b.join_with_tree(&committed.welcome.expect("welcome"), Some(&committed.tree));
+    assert_eq!(b.epoch(), 1);
+}
+
+#[test]
+fn a_sealed_blob_is_known_by_its_framing_only() {
+    use crate::e2ee_text::sealed_framing_ok;
+    let header = |log2: u8| {
+        let mut blob = b"TNYA1".to_vec();
+        blob.push(log2);
+        blob.extend_from_slice(&[7; 7]);
+        blob
+    };
+    let chunk = 65536 + 16;
+    for tail in [16, 17, 1000, chunk] {
+        let mut blob = header(16);
+        blob.extend(std::iter::repeat_n(0xa5, tail));
+        assert!(sealed_framing_ok(&blob), "{tail}");
+        let mut two = header(16);
+        two.extend(std::iter::repeat_n(0xa5, chunk + tail));
+        assert!(sealed_framing_ok(&two), "{tail}");
+    }
+    // An empty file is one chunk of nothing but its tag.
+    let mut empty = header(16);
+    empty.extend_from_slice(&[0; 16]);
+    assert!(sealed_framing_ok(&empty));
+    // A last chunk shorter than a tag, no chunk at all, a bad magic or chunk size, or a plain
+    // file, are not sealed blobs.
+    for bad in [
+        header(16),
+        [header(16), vec![0; 15]].concat(),
+        [header(16), vec![0; chunk + 3]].concat(),
+        [header(9), vec![0; 100]].concat(),
+        [header(21), vec![0; 100]].concat(),
+        [b"TNYA2".to_vec(), vec![16], vec![0; 7], vec![0; 100]].concat(),
+        b"\x89PNG\r\n\x1a\n not a sealed blob at all".to_vec(),
+        Vec::new(),
+    ] {
+        assert!(!sealed_framing_ok(&bad), "{:?}", &bad[..bad.len().min(16)]);
+    }
 }
 
 #[test]
@@ -387,12 +490,15 @@ fn a_handshake_message_is_not_an_application_message() {
     a.take_proposals(&batch(&[&add]).expect("batch"));
     let committed = a.commit();
     assert_eq!(
-        check_ciphertext(&group, 0, &committed.commit),
+        check_ciphertext(&group, 0, MSG, &committed.commit),
         Err(Refused::Bad)
     );
-    assert_eq!(check_ciphertext(&group, 0, &add), Err(Refused::Bad));
+    assert_eq!(check_ciphertext(&group, 0, MSG, &add), Err(Refused::Bad));
     let welcome = committed.welcome.expect("welcome");
-    assert_eq!(check_ciphertext(&group, 1, &welcome), Err(Refused::Bad));
+    assert_eq!(
+        check_ciphertext(&group, 1, MSG, &welcome),
+        Err(Refused::Bad)
+    );
 }
 
 #[test]
@@ -433,7 +539,7 @@ fn malformed_bytes_are_refused_and_never_panic() {
     let try_all = |bytes: &[u8]| {
         let _ = validate_key_package(USER_A, DEVICE_A, &[4; 65], bytes, 0);
         let _ = parse_commit(&group, 0, bytes);
-        let _ = check_ciphertext(&group, 0, bytes);
+        let _ = check_ciphertext(&group, 0, MSG, bytes);
         let _ = welcome_recipients(bytes);
         let _ = proposal_ref(bytes);
         let _ = key_package_ref(bytes);
@@ -458,7 +564,7 @@ fn malformed_bytes_are_refused_and_never_panic() {
         &[0xc0, 0, 0, 0, 0, 0, 0, 0][..],
     ] {
         assert!(parse_commit(&group, 0, bytes).is_err());
-        assert!(check_ciphertext(&group, 0, bytes).is_err());
+        assert!(check_ciphertext(&group, 0, MSG, bytes).is_err());
         assert!(welcome_recipients(bytes).is_err());
         assert!(parse_key_package(bytes).is_err());
     }

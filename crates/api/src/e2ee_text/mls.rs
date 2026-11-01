@@ -16,8 +16,8 @@ use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _, VLBytes
 use openmls::prelude::{
     BasicCredential, Ciphersuite, ContentType, CredentialType, ExternalProposal, ExternalSender,
     GroupEpoch, GroupId, KeyPackage, KeyPackageIn, LeafNodeIndex, MlsMessageBodyIn, MlsMessageIn,
-    OpenMlsCrypto, OpenMlsProvider, ProtocolMessage, ProtocolVersion, Sender as MlsSender,
-    SenderExtensionIndex, SignatureScheme,
+    OpenMlsCrypto, OpenMlsProvider, ProtocolMessage, ProtocolVersion, RatchetTreeIn,
+    Sender as MlsSender, SenderExtensionIndex, SignatureScheme,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -27,8 +27,15 @@ use sha2::{Digest, Sha256};
 pub(crate) const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
 /// The most a key package may be, as bytes.
 pub(crate) const KEY_PACKAGE_MAX: usize = 8 * 1024;
-/// The most a commit may be, as bytes.
-pub(crate) const COMMIT_MAX: usize = 256 * 1024;
+/// The most a commit may be, as bytes. A commit with an update path grows with the unmerged leaves
+/// it encrypts to: 117 KB for a Remove in a group of 1,000 devices grown by joins (measured with
+/// openmls 0.8 by the client), so 4 MiB leaves room past the 2,000 device cap.
+pub(crate) const COMMIT_MAX: usize = 4 * 1024 * 1024;
+/// The most a ratchet tree uploaded beside a commit may be: about 300 bytes a leaf, so this is
+/// room for some 25,000 devices, far past the cap.
+pub(crate) const TREE_MAX: usize = 8 * 1024 * 1024;
+/// The parts a ratchet tree is stored in, each at most this.
+pub(crate) const TREE_PART: usize = 1024 * 1024;
 /// The most one welcome may be: a ratchet tree of a large group.
 pub(crate) const WELCOME_MAX: usize = 1024 * 1024;
 /// The most the welcomes of one commit may add up to.
@@ -39,6 +46,22 @@ pub(crate) const CIPHERTEXT_MAX: usize = 20 * 1024;
 const LIFETIME_MAX_SECS: u64 = 400 * 24 * 60 * 60;
 /// What a device signs to vouch for another of the same person.
 const CROSS_LABEL: &[u8] = b"tiny-e2ee-v1 device-add";
+/// The start of the authenticated data of every application message.
+const MESSAGE_AAD_LABEL: &[u8] = b"tiny-e2ee-v1 msg";
+
+/// The authenticated data an application message must carry, so that the kind and target the
+/// server stores beside it are the ones its sender signed: `"tiny-e2ee-v1 msg" 0x00 kind 0x00
+/// target_id`, the target as a lowercase hyphenated uuid, or nothing for a message.
+pub(crate) fn message_aad(kind: &str, target_id: Option<&str>) -> Vec<u8> {
+    let target = target_id.unwrap_or("");
+    let mut aad = Vec::with_capacity(MESSAGE_AAD_LABEL.len() + kind.len() + target.len() + 2);
+    aad.extend_from_slice(MESSAGE_AAD_LABEL);
+    aad.push(0);
+    aad.extend_from_slice(kind.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(target.as_bytes());
+    aad
+}
 
 static PROVIDER: LazyLock<OpenMlsRustCrypto> = LazyLock::new(OpenMlsRustCrypto::default);
 
@@ -201,8 +224,16 @@ pub(crate) fn cross_signed(
 }
 
 /// The outer framing of an application message: an MLS PrivateMessage for this group at this
-/// epoch. The server cannot see more, and does not try.
-pub(crate) fn check_ciphertext(group: &[u8; 16], epoch: u64, data: &[u8]) -> Result<(), Refused> {
+/// epoch whose authenticated data (in the clear in a PrivateMessage, and covered by its AEAD and
+/// the sender's signature) is `aad`. The server cannot see more, and does not try. That the
+/// authenticated data is what it says is checked by every receiver when it decrypts; the server
+/// checks only that what it stores beside the ciphertext agrees with it.
+pub(crate) fn check_ciphertext(
+    group: &[u8; 16],
+    epoch: u64,
+    aad: &[u8],
+    data: &[u8],
+) -> Result<(), Refused> {
     if data.len() > CIPHERTEXT_MAX {
         return Err(Refused::TooLarge);
     }
@@ -210,14 +241,34 @@ pub(crate) fn check_ciphertext(group: &[u8; 16], epoch: u64, data: &[u8]) -> Res
     let Ok(protocol) = message.try_into_protocol_message() else {
         return Err(Refused::Bad);
     };
-    if !matches!(protocol, ProtocolMessage::PrivateMessage(_))
-        || protocol.group_id().as_slice() != group
+    let ProtocolMessage::PrivateMessage(private) = &protocol else {
+        return Err(Refused::Bad);
+    };
+    if protocol.group_id().as_slice() != group
         || protocol.epoch().as_u64() != epoch
         || protocol.content_type() != ContentType::Application
+        || private.aad() != aad
     {
         return Err(Refused::Bad);
     }
     Ok(())
+}
+
+/// A public ratchet tree for this group that parses and whose signatures and parent hashes hold,
+/// as openmls checks a tree a joiner is given. The joiner still checks it against the tree hash
+/// in its Welcome's GroupInfo; this only keeps junk out of the store.
+pub(crate) fn check_ratchet_tree(group: &[u8; 16], data: &[u8]) -> Result<(), Refused> {
+    if data.len() > TREE_MAX {
+        return Err(Refused::TooLarge);
+    }
+    untrusted(|| {
+        RatchetTreeIn::tls_deserialize_exact_bytes(data)
+            .ok()?
+            .into_verified(SUITE, PROVIDER.crypto(), &GroupId::from_slice(group))
+            .ok()
+    })
+    .map(|_| ())
+    .ok_or(Refused::Bad)
 }
 
 /// What a commit says on its face.
