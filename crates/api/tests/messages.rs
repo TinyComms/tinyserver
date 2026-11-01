@@ -417,6 +417,138 @@ async fn a_direct_message_is_not_delivered_to_a_third_member() {
 }
 
 #[tokio::test]
+async fn a_private_channels_events_reach_only_members_who_can_view_it() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (viewer, viewer_token) = join(&db, &owner, "viewer@tinyserver.test", "member").await;
+        let (barred, barred_token) = join(&db, &owner, "barred@tinyserver.test", "member").await;
+        let server = serve(&db, api::Limits::default()).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (_, roles) = Call::new(Method::GET, "/v1/roles")
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        let everyone = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == "@everyone")
+            .and_then(|role| role["id"].as_str())
+            .expect("everyone")
+            .to_string();
+        let (status, crew) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Crew", "permissions": 0, "color": "#22c55e"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{crew}");
+        let crew = crew["id"].as_str().expect("crew id").to_string();
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", viewer.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({ "role_ids": [crew] }))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        let mut channels = Vec::new();
+        for name in ["open", "staff"] {
+            let (status, channel) = Call::new(Method::POST, "/v1/channels")
+                .token(&owner_token)
+                .json(json!({ "name": name }))
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{channel}");
+            channels.push(channel["id"].as_str().expect("channel id").to_string());
+        }
+        let (open, staff) = (channels[0].clone(), channels[1].clone());
+        // @everyone cannot view staff; Crew can.
+        for (role, allow, deny) in [(&everyone, 0, 1), (&crew, 1, 0)] {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{staff}/overrides/{role}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+
+        let (mut owner_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut viewer_ws, _) = connect(&server, &viewer_token, None).await;
+        let (mut barred_ws, ready) = connect(&server, &barred_token, None).await;
+        let since = ready["seq"].as_i64().expect("seq");
+
+        // The control: a channel everyone can view still reaches everyone.
+        let (status, hello) =
+            send_message(&app, &owner_token, &open, json!({"body": "public hello"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{hello}");
+        assert_eq!(
+            next_type(&mut barred_ws, "message.created").await["message"]["body"],
+            "public hello"
+        );
+        next_type(&mut viewer_ws, "message.created").await;
+        next_type(&mut owner_ws, "message.created").await;
+
+        // The private channel: its body, its edit and its reaction reach the member who can
+        // view it and no one else.
+        let (status, secret) = send_message(
+            &app,
+            &owner_token,
+            &staff,
+            json!({"body": "layoffs friday"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{secret}");
+        let secret_id = secret["id"].as_str().expect("message id").to_string();
+        let (status, edited) = Call::new(Method::PATCH, &format!("/v1/messages/{secret_id}"))
+            .token(&owner_token)
+            .json(json!({"body": "layoffs monday"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        let created = next_type(&mut viewer_ws, "message.created").await;
+        assert_eq!(created["message"]["body"], "layoffs friday");
+        let edit = next_type(&mut viewer_ws, "message.edited").await;
+        assert_eq!(edit["message"]["body"], "layoffs monday");
+
+        // Nothing about the staff channel reached the barred socket: its next durable frame
+        // is the pong.
+        ping(&mut barred_ws).await;
+
+        // A socket that reconnects and replays does not see it either.
+        let (mut replay_ws, _) = connect(&server, &barred_token, Some(since)).await;
+        let replayed = next_type(&mut replay_ws, "message.created").await;
+        assert_eq!(replayed["message"]["body"], "public hello");
+        ping(&mut replay_ws).await;
+
+        // The stored rows say the same: every event that carries the private text is
+        // addressed to named viewers. None is addressed to NULL, which is every socket.
+        let rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT topic, audience::text[] FROM outbox WHERE payload::text LIKE '%layoffs%' ORDER BY id",
+        )
+        .fetch_all(&db.owner)
+        .await
+        .expect("outbox");
+        assert!(rows.len() >= 2, "{rows:?}");
+        for (topic, audience) in rows {
+            let audience = audience.unwrap_or_else(|| panic!("{topic} has no audience"));
+            assert!(!audience.is_empty(), "{topic} has an empty audience");
+            assert!(
+                audience.iter().all(|id| id != &barred.user_id),
+                "{topic} names the barred member"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn an_admin_can_lower_the_image_cap() {
     run(|db| async move {
         let dir =
