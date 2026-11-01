@@ -374,6 +374,40 @@ pub async fn handshake_after(
         .collect())
 }
 
+/// The community's root key and the policy it signed, as base64, or nulls when none is set.
+pub async fn community_root(pool: &PgPool, caller: &Caller) -> Result<Value, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let root: Value = sqlx::query_scalar("SELECT app_e2ee_root()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(root)
+}
+
+/// Sets the community's root key and signed policy; the caller checked the signature. A different
+/// root than the one set needs `replace`.
+pub async fn set_community_root(
+    pool: &PgPool,
+    caller: &Caller,
+    root_key: &[u8],
+    policy: &[u8],
+    signature: &[u8],
+    replace: bool,
+) -> Result<Value, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let root: Value = sqlx::query_scalar("SELECT app_e2ee_set_root($1, $2, $3, $4)")
+        .bind(root_key)
+        .bind(policy)
+        .bind(signature)
+        .bind(replace)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(root)
+}
+
 /// The ratchet tree of `epoch`, as its committer uploaded it, for one of the caller's devices in
 /// the group. `None` when there is none.
 pub async fn ratchet_tree(

@@ -4133,3 +4133,127 @@ async fn a_sealed_upload_may_carry_the_id_its_blob_is_bound_to() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn the_community_root_key_signs_the_policy_and_a_new_root_is_loud() {
+    use common::mls_client::sign_with;
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::OpenMlsRustCrypto;
+    run(|db| async move {
+        let w = world(db).await;
+        let (_, member_token) = w.member("rooted").await;
+        let provider = OpenMlsRustCrypto::default();
+        let first = SignatureKeyPair::new(SignatureScheme::ECDSA_SECP256R1_SHA256).expect("key");
+        let second = SignatureKeyPair::new(SignatureScheme::ECDSA_SECP256R1_SHA256).expect("key");
+        let signed = |keys: &SignatureKeyPair, policy: &[u8]| {
+            let message = [b"tiny-e2ee-v1 community-policy".as_slice(), policy].concat();
+            json!({
+                "root_key": b64(keys.public()),
+                "policy": b64(policy),
+                "policy_signature": b64(&sign_with(&provider, keys, &message)),
+            })
+        };
+        let path = "/v1/e2ee/community";
+        let (status, none) = w.send(Method::GET, path, &member_token, None).await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert_eq!(
+            (none["version"].as_i64(), none["root_key"].is_null()),
+            (Some(0), true)
+        );
+
+        let policy = br#"{"v":1,"e2ee":"required"}"#;
+        // Only a manager sets it, and only with a signature by the key it names.
+        let (status, _) = w
+            .send(
+                Method::PUT,
+                path,
+                &member_token,
+                Some(signed(&first, policy)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut forged = signed(&first, policy);
+        forged["policy"] = json!(b64(br#"{"v":1,"e2ee":"optional"}"#));
+        let (status, refused) = w
+            .send(Method::PUT, path, &w.owner_token, Some(forged))
+            .await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_e2ee"))
+        );
+        let mut borrowed = signed(&first, policy);
+        borrowed["root_key"] = json!(b64(second.public()));
+        let (status, _) = w
+            .send(Method::PUT, path, &w.owner_token, Some(borrowed))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, set) = w
+            .send(
+                Method::PUT,
+                path,
+                &w.owner_token,
+                Some(signed(&first, policy)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(set["version"], 1);
+        assert_eq!(set["root_key"], b64(first.public()).as_str());
+        let (_, seen) = w.send(Method::GET, path, &member_token, None).await;
+        assert_eq!(seen, set, "every member sees the same");
+        // A new policy under the same root is an update.
+        let (status, again) = w
+            .send(
+                Method::PUT,
+                path,
+                &w.owner_token,
+                Some(signed(&first, b"{\"v\":2}")),
+            )
+            .await;
+        assert_eq!(
+            (status, again["version"].as_i64()),
+            (StatusCode::OK, Some(2))
+        );
+        // Another root replaces the community's identity: only when asked for, and everyone hears.
+        let (status, refused) = w
+            .send(
+                Method::PUT,
+                path,
+                &w.owner_token,
+                Some(signed(&second, policy)),
+            )
+            .await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (StatusCode::CONFLICT, Some("root_exists"))
+        );
+        let mut replace = signed(&second, policy);
+        replace["replace"] = json!(true);
+        let (status, replaced) = w
+            .send(Method::PUT, path, &w.owner_token, Some(replace))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{replaced}");
+        assert_eq!(replaced["version"], 3);
+        assert_eq!(replaced["root_key"], b64(second.public()).as_str());
+        let events: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload FROM outbox WHERE topic = 'e2ee.community' ORDER BY id",
+        )
+        .fetch_all(&w.db.owner)
+        .await
+        .expect("events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[2],
+            json!({"version": 3, "root_changed": true}),
+            "no key material"
+        );
+        let audited: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'e2ee.root'")
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("audit");
+        assert_eq!(audited, 3);
+    })
+    .await;
+}

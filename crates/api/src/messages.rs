@@ -164,6 +164,7 @@ pub(crate) enum Error {
     BadE2ee,
     GroupTooLarge,
     IdTaken,
+    RootExists,
 }
 
 impl IntoResponse for Error {
@@ -198,6 +199,7 @@ impl IntoResponse for Error {
             Self::BadE2ee => (StatusCode::BAD_REQUEST, "bad_e2ee"),
             Self::GroupTooLarge => (StatusCode::BAD_REQUEST, "e2ee_group_too_large"),
             Self::IdTaken => (StatusCode::CONFLICT, "id_taken"),
+            Self::RootExists => (StatusCode::CONFLICT, "root_exists"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -233,6 +235,7 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::BadE2ee => "bad_e2ee",
         Error::GroupTooLarge => "e2ee_group_too_large",
         Error::IdTaken => "id_taken",
+        Error::RootExists => "root_exists",
     }
 }
 
@@ -275,6 +278,7 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::BadE2ee => Error::BadE2ee,
         MessageError::GroupTooLarge => Error::GroupTooLarge,
         MessageError::IdTaken => Error::IdTaken,
+        MessageError::RootExists => Error::RootExists,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable

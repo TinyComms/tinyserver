@@ -145,6 +145,7 @@ pub fn routes() -> Router<PgPool> {
         .route("/v1/e2ee/conversations/{id}/group", post(create_group))
         .route("/v1/e2ee/conversations/{id}/handshake", get(handshake))
         .route("/v1/e2ee/conversations/{id}/tree", get(ratchet_tree))
+        .route("/v1/e2ee/community", get(community).put(set_community))
         .route(
             "/v1/e2ee/conversations/{id}/commit",
             post(commit).layer(DefaultBodyLimit::max(COMMIT_BODY)),
@@ -476,6 +477,52 @@ async fn handshake(
     }
     .await;
     result.inspect_err(|error| failed(&caller.user_id, "handshake", error))
+}
+
+/// The community's root key and the policy it signed. Clients pin the key on first sight.
+async fn community(State(pool): State<PgPool>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    db::community_root(&pool, &caller)
+        .await
+        .map(Json)
+        .map_err(lift)
+        .inspect_err(|error| failed(&caller.user_id, "community", error))
+}
+
+#[derive(Deserialize)]
+struct CommunityBody {
+    root_key: String,
+    policy: String,
+    policy_signature: String,
+    #[serde(default)]
+    replace: bool,
+}
+
+/// Sets the community's root key and the policy it signs. The signature must hold; a different
+/// root than the one set needs `replace: true`, and every member hears of it.
+async fn set_community(
+    State(pool): State<PgPool>,
+    Extension(server): Extension<Arc<Server>>,
+    headers: HeaderMap,
+    Json(body): Json<CommunityBody>,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    server.allow(&caller.user_id)?;
+    let result = async {
+        let root_key = mls::decode(&body.root_key, 65).map_err(refused)?;
+        let policy = mls::decode(&body.policy, 4096).map_err(refused)?;
+        let signature = mls::decode(&body.policy_signature, 128).map_err(refused)?;
+        if root_key.len() != 65 || !mls::policy_signed(&root_key, &policy, &signature) {
+            return Err(Error::BadE2ee);
+        }
+        db::set_community_root(&pool, &caller, &root_key, &policy, &signature, body.replace)
+            .await
+            .map_err(lift)
+    }
+    .await;
+    result
+        .map(Json)
+        .inspect_err(|error| failed(&caller.user_id, "community.set", error))
 }
 
 #[derive(Deserialize)]
@@ -820,6 +867,7 @@ pub fn fuzz_handshake(data: &[u8]) {
     let _ = mls::check_ciphertext(&GROUP, 0, &mls::message_aad("message", None), data);
     let _ = mls::check_ratchet_tree(&GROUP, data);
     let _ = sealed_framing_ok(data);
+    let _ = mls::policy_signed(&[4; 65], data, data);
     let _ = mls::welcome_recipients(data);
     let _ = mls::proposal_ref(data);
     let _ = mls::cross_signed(USER, DEVICE, &[4; 65], data, &[vec![4; 65]]);

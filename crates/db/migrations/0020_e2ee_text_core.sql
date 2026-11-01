@@ -11,7 +11,7 @@
 --   P0E07 not_in_group       P0E08 device_exists       P0E09 cross_signature_required
 --   P0E10 too_many_keys      P0E11 slow_down           P0E12 e2ee_off
 --   P0E13 bad_device         P0E14 too_many_devices    P0E15 bad_e2ee
---   P0E16 group_too_large    P0E17 id_taken
+--   P0E16 group_too_large    P0E17 id_taken            P0E18 root_exists
 
 -- off: no new encrypted conversations. optional: either, the default. new_required: a new
 -- conversation must be encrypted. required: as new_required, and no plaintext text is accepted

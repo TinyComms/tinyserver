@@ -103,6 +103,9 @@ pub enum MessageError {
     /// A client-chosen id that is already some upload's.
     #[error("id taken")]
     IdTaken,
+    /// A community root key is set, and a different one was given without saying to replace it.
+    #[error("root exists")]
+    RootExists,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -661,6 +664,7 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E15" => MessageError::BadE2ee,
         "P0E16" => MessageError::GroupTooLarge,
         "P0E17" => MessageError::IdTaken,
+        "P0E18" => MessageError::RootExists,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),

@@ -46,6 +46,24 @@ pub(crate) const CIPHERTEXT_MAX: usize = 20 * 1024;
 const LIFETIME_MAX_SECS: u64 = 400 * 24 * 60 * 60;
 /// What a device signs to vouch for another of the same person.
 const CROSS_LABEL: &[u8] = b"tiny-e2ee-v1 device-add";
+/// What the community root key signs a policy under.
+const POLICY_LABEL: &[u8] = b"tiny-e2ee-v1 community-policy";
+
+/// Whether `signature` is `root_key` signing `policy`: ECDSA P-256 (DER) over SHA-256 of the label
+/// and the policy.
+pub(crate) fn policy_signed(root_key: &[u8], policy: &[u8], signature: &[u8]) -> bool {
+    let message = [POLICY_LABEL, policy].concat();
+    PROVIDER
+        .crypto()
+        .verify_signature(
+            SignatureScheme::ECDSA_SECP256R1_SHA256,
+            &message,
+            root_key,
+            signature,
+        )
+        .is_ok()
+}
+
 /// The start of the authenticated data of every application message.
 const MESSAGE_AAD_LABEL: &[u8] = b"tiny-e2ee-v1 msg";
 
