@@ -88,7 +88,7 @@ There is no owner password. `tinyserver-init` runs before the server on every `u
 docker compose exec tinyserver cat /bootstrap/owner-invite
 ```
 
-It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. A later start with no owner does not write the token again. It prints that the file still works until the invite expires. Lost it, run `docker compose run --rm --entrypoint tinyserver tinyserver-init bootstrap --owner-invite` for a new one, and the old one stops working. After an owner exists, the file is removed.
+It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. The first time the owner opens the server, the app asks them to choose what the community keeps about its members (convenience or privacy, or each choice one by one: [`docs/server-setup.md`](../docs/server-setup.md)). Nothing is chosen for them. A later start with no owner does not write the token again. It prints that the file still works until the invite expires. Lost it, run `docker compose run --rm --entrypoint tinyserver tinyserver-init bootstrap --owner-invite` for a new one, and the old one stops working. After an owner exists, the file is removed.
 
 `RUST_LOG` is ignored. Set `TINYSERVER_LOG_LEVEL` (`error`, `warn`, `info`, `debug`, or `trace`; default `info`). A debug bundle is written only when the process receives `SIGUSR1`, under `/var/lib/tinyserver/logs`, and old bundles are removed on the next start. Nothing in the log path leaves the box.
 

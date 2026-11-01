@@ -1608,8 +1608,16 @@ async fn upgrading_grants_manage_reports_to_owners_and_manage_server_roles_only(
         // Roles as they exist on a server today, before the feature: the old bit set.
         let manager = new_role_old(&db, "Manager", perm::MANAGE_SERVER | perm::VIEW_CHANNEL).await;
         let plain_role = new_role_old(&db, "Plain", perm::MANAGE_ROLES | perm::KICK_MEMBERS).await;
-        give_role(&app, &owner_token, &helper.user_id, &manager).await;
-        give_role(&app, &owner_token, &plain.user_id, &plain_role).await;
+        // Straight into the table: this database is older than the current code, and the
+        // members route reads columns and functions a later migration adds.
+        for (user, role) in [(&helper.user_id, &manager), (&plain.user_id, &plain_role)] {
+            sqlx::query("INSERT INTO member_roles (user_id, role_id) VALUES ($1::uuid, $2::uuid)")
+                .bind(user)
+                .bind(role)
+                .execute(&db.owner)
+                .await
+                .expect("give role");
+        }
         // Someone gave @everyone manage_server. That must not turn into everyone's reports.
         sqlx::query("UPDATE roles SET permissions = permissions | 524288 WHERE is_default")
             .execute(&db.owner)

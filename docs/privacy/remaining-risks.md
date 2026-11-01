@@ -61,7 +61,7 @@ TinyComms is not an anonymity system. A person is anonymous toward some parties 
 
 | Toward | What they can learn |
 |---|---|
-| Other members | Display name, avatar, roles, when they joined and how (invite or group), **`last_seen_at` for everyone** (visible to all members through `GET /v1/members`), whether they are online, which call they are in and when, whom they reacted to, their direct conversation's read cursor, their messages and timing. An invite links a person to whoever invited them |
+| Other members | Display name, avatar, roles, when they joined and how (invite or group), **`last_seen_at` for everyone** (visible to all members through `GET /v1/members` unless the owner chose admins only or nobody at [setup](../server-setup.md); with nobody it is not recorded), whether they are online, which call they are in and when, whom they reacted to, their direct conversation's read cursor, their messages and timing. An invite links a person to whoever invited them |
 | The community's administrators | The above, plus an email address if the sign-in provider sent one (`manage_server`), the audit log, bans and reasons |
 | The community's moderators (`manage_reports`) | Every report a person filed, with who filed it, and every report about them unless the moderator is its subject; the reporter's note and the evidence their client sent. The reported person is not told who reported, but may infer it (the only other person in a direct) ([`abuse-response.md`](abuse-response.md)) |
 | Another community the same person joined | Nothing by tinyserver's design. The same email, name, avatar, writing style, join times, or a shared identity provider would link them |

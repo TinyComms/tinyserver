@@ -167,6 +167,14 @@ pub async fn posture(pool: &PgPool) -> Result<Posture, DbError> {
 }
 
 pub(crate) async fn posture_in(conn: &mut sqlx::PgConnection) -> Result<Posture, DbError> {
+    // A database that has not had the setup migration yet behaves as the server always did,
+    // instead of failing every sign-in until it is migrated.
+    let migrated: bool = sqlx::query_scalar("SELECT to_regprocedure('app_posture()') IS NOT NULL")
+        .fetch_one(&mut *conn)
+        .await?;
+    if !migrated {
+        return Ok(Posture::CONVENIENCE);
+    }
     let row: (String, String, String) = sqlx::query_as(
         "SELECT provider_profile, activity_visibility, sign_in_methods FROM app_posture()",
     )

@@ -376,7 +376,7 @@ pub(crate) async fn sign_in_in(
 ) -> Result<SignedIn, AuthError> {
     // What the owner chose at setup about what a provider may leave in a new account. Which
     // methods are accepted is decided before this, where the deployment's methods are known.
-    let posture = crate::setup::posture_in(&mut **tx).await?;
+    let posture = crate::setup::posture_in(tx).await?;
     let passkey = profile.issuer == crate::passkey::PASSKEY_ISSUER;
     // Two first sign-ins for one person at once would otherwise both make an account.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(10) || $2, 0))")
