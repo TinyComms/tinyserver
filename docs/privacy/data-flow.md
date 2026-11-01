@@ -125,7 +125,7 @@ An application token (`Authorization: Bot <token>`, 32 random bytes, hash stored
 |---|---|
 | Logs | stderr to Docker's `json-file` (10 MB times 3), an in-memory ring, optional bundle files on `SIGUSR1`. No exporter. Detail in [`telemetry-and-logging.md`](telemetry-and-logging.md) |
 | Backups | None shipped in this branch. The documented procedure is a manual `pg_dump` as the Postgres superuser; it does not cover the upload volume, Pocket ID's volume or the secrets directory. See [`migration.md`](migration.md) and finding S11 |
-| Provisioning and billing (TinyCloud) | Not built. The constraints are in [`compliance.md`](compliance.md) section 8 and [`guarantees.md`](guarantees.md) category 5 |
+| Provisioning and billing (TinyCloud) | Not built. The constraints are in [`compliance.md`](compliance.md) section 9 and [`guarantees.md`](guarantees.md) category 5 |
 | Reports and legal requests | Procedure in [`abuse-response.md`](abuse-response.md) |
 
 ## 11. Client side

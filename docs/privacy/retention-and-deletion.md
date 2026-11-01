@@ -87,7 +87,7 @@ Not reachable by any in-application deletion:
 
 ## 3. Erasure requests, backups and legal holds
 
-Technical position only. Whether any of this satisfies a legal duty is for counsel ([`compliance.md`](compliance.md) section 5).
+Technical position only. Whether any of this satisfies a legal duty is for counsel ([`compliance.md`](compliance.md) sections 6 and 7).
 
 | Issue | Engineering state | Engineering requirement |
 |---|---|---|

@@ -140,7 +140,7 @@ Third-party software, pinned to `v2.19.1-distroless` by digest. Its documentatio
 | Analytics and version check | Off (`ANALYTICS_DISABLED=true`, `VERSION_CHECK_DISABLED=true`). Pocket ID is also on the `inside` network, which has no route out | `deploy/compose.yml` |
 | Email | No SMTP is configured: no mail is sent, email is optional (`REQUIRE_USER_EMAIL=false`) and never marked verified (`EMAILS_VERIFIED=false`) | `deploy/compose.yml` |
 | Secrets | Its encryption key and the static admin API key are files in `secrets/`. The API key acts as an administrator. tinyserver holds it too, to create sign-up tokens | `deploy/README.md` |
-| Deleting a tinyserver account | Does **not** delete the Pocket ID account (section 13 and [`authentication.md`](authentication.md)) | No code path found |
+| Deleting a tinyserver account | Does **not** delete the Pocket ID account ([`authentication.md`](authentication.md) section 7) | No code path found |
 
 ## 13. Administrative tooling
 
