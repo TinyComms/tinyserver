@@ -321,6 +321,18 @@
     } else {
       post('/v1/auth/passkey/claim/peek', { token: token }).then(function (who) {
         $('who').textContent = 'This makes a passkey for ' + who.name + '.';
+        $('server-name').textContent = who.server;
+        var mark = $('server-icon');
+        if (who.icon) {
+          var img = document.createElement('img');
+          img.className = 'mark';
+          img.id = 'server-icon';
+          img.alt = '';
+          img.src = who.icon;
+          mark.replaceWith(img);
+        } else {
+          mark.textContent = (who.server.match(/[A-Za-z0-9]/) || ['T'])[0].toUpperCase();
+        }
         $('claim').hidden = false;
       }).catch(function () {
         $('who').textContent = problems.invalid_link;

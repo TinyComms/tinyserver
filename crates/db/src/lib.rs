@@ -74,9 +74,9 @@ pub use passkey::{
     credential_ids_of, display_name_of, find_credential, flag_credential, invite_usable, list_mine,
     mint_claim, new_recovery_codes, peek_claim, peek_pending, random_id, record_use, recover,
     recovery_hash, recovery_owner, regenerate_codes, remove_mine, rename_mine, retire_identities,
-    roster, session_is_recent, signup, subject_of, take_ceremony, Ceremony, Claim, Found,
-    NewCeremony, NewCredential, PasskeyError, PasskeyRow, PendingPeek, Recovery, Retired,
-    RosterRow, Signup, CEREMONY_SECS, CONTINUE_SECS, PASSKEY_ISSUER, RECOVERY_CODES,
+    roster, server_face, session_is_recent, signup, subject_of, take_ceremony, Ceremony, Claim,
+    Face, Found, NewCeremony, NewCredential, PasskeyError, PasskeyRow, PendingPeek, Recovery,
+    Retired, RosterRow, Signup, CEREMONY_SECS, CONTINUE_SECS, PASSKEY_ISSUER, RECOVERY_CODES,
 };
 pub use reports::{
     file_report, get_report, list_reports, retention_days, retention_days_from, update_report,

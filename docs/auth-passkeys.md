@@ -73,6 +73,12 @@ The sign-up screen says this in plain words next to the codes. Tell your members
 
 Signing back in on a new device does not bring back message history for end-to-end encrypted conversations: those keys belong to devices and are separate from signing in.
 
+### Where the pages live
+
+The sign-in and claim pages are served by the community's own tinyserver, at `TINYSERVER_PUBLIC_URL`, through the same tunnel as everything else on that hostname. No port is forwarded, and no second hostname is needed now that Pocket ID is gone. They are not part of `tinyclient.io`: the invite link there is only a launcher that opens the app, and a passkey is bound to the exact site that made it (section 6), so a page on another site could never make or use one for this server.
+
+Each page shows the server's own name and icon, with a small TinyServer mark, so a person can see which community they are signing in to. The server's name and icon are otherwise members-only, so the pages show them only to someone who holds a live sign-in (started from Tiny) or a claim link the owner made. A visitor who only knows the address, or has an expired state, is shown nothing about it. The icon travels inside the page as an image (`img-src data:`), never fetched from anywhere.
+
 ## 6. The relying party: do not change it later
 
 A passkey works only for the relying party id it was made for. By default that is the host of `TINYSERVER_PUBLIC_URL`, for example `chat.example.org`. If the community later moves to another host, **every passkey stops working**, and everyone needs a recovery code or a new claim link.

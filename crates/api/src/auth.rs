@@ -666,21 +666,19 @@ pub(crate) fn server_trouble() -> Response {
 /// The one stylesheet every page here carries, inline. The policy allows exactly it.
 pub(crate) const STYLE: &str =
     "body{margin:0;font:16px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;\
-color:#1d1d1f;background:#f5f5f7;display:flex;justify-content:center}\
-main{max-width:28rem;margin:4rem 1.25rem;padding:2rem;background:#fff;border-radius:12px;\
-box-shadow:0 1px 3px rgba(0,0,0,.12)}\
+color:#edeef0;background:#18191c;color-scheme:dark;display:flex;justify-content:center}\
+main{max-width:28rem;margin:4rem 1.25rem;padding:2rem;background:#1f2023;border-radius:12px;\
+border:1px solid rgba(255,255,255,.12)}\
 h1{font-size:1.4rem;margin:0 0 .75rem}p{margin:.5rem 0 1rem}\
 .choice{display:flex;flex-direction:column;gap:.75rem;margin-top:1.5rem}\
 form{margin:0}\
 .button{display:block;box-sizing:border-box;width:100%;padding:.75rem 1rem;border-radius:8px;\
-border:1px solid #0a66d8;background:#0a66d8;color:#fff;font:inherit;font-weight:600;\
+border:1px solid #2f6feb;background:#2f6feb;color:#fff;font:inherit;font-weight:600;\
 text-align:center;text-decoration:none;cursor:pointer}\
-.button.quiet{background:#fff;color:#0a66d8}\
-.step{font-weight:600;margin-top:1.5rem}.note{color:#6e6e73;font-size:.875rem}\
-.alert{color:#b3261e}\
-@media (prefers-color-scheme:dark){body{color:#f5f5f7;background:#1d1d1f}\
-main{background:#2c2c2e;box-shadow:none}.button.quiet{background:#2c2c2e;color:#6cb0ff}\
-.note{color:#a1a1a6}.alert{color:#ff8a80}}";
+.button:hover{background:#3a77ee}\
+.button.quiet{background:transparent;color:#8ab4ff;border-color:rgba(255,255,255,.18)}\
+.step{font-weight:600;margin-top:1.5rem}.note{color:#a8abb3;font-size:.875rem}\
+.alert{color:#f0655d}";
 
 /// No script, nothing loaded, only the stylesheet above, forms only to here, no framing.
 static POLICY: LazyLock<HeaderValue> = LazyLock::new(|| {

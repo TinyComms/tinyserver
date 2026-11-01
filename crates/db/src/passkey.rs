@@ -259,6 +259,25 @@ pub struct PendingPeek {
     pub invite_hash: Option<Vec<u8>>,
 }
 
+/// The server's name and icon, as the sign-in pages show them. Call it only for someone who
+/// holds a live sign-in or a claim link.
+pub struct Face {
+    pub name: String,
+    /// The icon's type and bytes, if the owner set one.
+    pub icon: Option<(String, Vec<u8>)>,
+}
+
+pub async fn server_face(pool: &PgPool) -> Result<Face, DbError> {
+    let (name, icon, icon_type): (String, Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as("SELECT name, icon, icon_type FROM app_server_face()")
+            .fetch_one(pool)
+            .await?;
+    Ok(Face {
+        name,
+        icon: icon_type.zip(icon),
+    })
+}
+
 pub async fn peek_pending(pool: &PgPool, state: &str) -> Result<Option<PendingPeek>, DbError> {
     let row: Option<(String, String, String, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT provider, verifier, nonce, invite_hash FROM auth_pending

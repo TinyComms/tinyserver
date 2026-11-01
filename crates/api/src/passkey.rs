@@ -800,6 +800,9 @@ async fn recover_finish(
 #[derive(Serialize)]
 struct Who {
     name: String,
+    /// The server's own name and icon, so the page can say which community this is for.
+    server: String,
+    icon: Option<String>,
 }
 
 async fn claim_peek(
@@ -816,7 +819,17 @@ async fn claim_peek(
         .await
         .map_err(failed)?
         .ok_or_else(|| bad("invalid_link"))?;
-    Ok(Json(Who { name }))
+    let face = db::server_face(&pool)
+        .await
+        .map_err(|error| failed(error.into()))?;
+    let icon = face.icon.map(|(content_type, bytes)| {
+        format!("data:{content_type};base64,{}", STANDARD.encode(bytes))
+    });
+    Ok(Json(Who {
+        name,
+        server: face.name,
+        icon,
+    }))
 }
 
 async fn claim_begin(
@@ -1107,16 +1120,29 @@ static SCRIPT: LazyLock<String> =
 static PAGE_STYLE: LazyLock<String> = LazyLock::new(|| {
     format!(
         "{STYLE}\
-         label{{display:block;font-weight:600;margin:1rem 0 .25rem}}\
-         input[type=text]{{box-sizing:border-box;width:100%;padding:.6rem .7rem;border-radius:8px;\
-         border:1px solid #8e8e93;font:inherit;background:transparent;color:inherit}}\
+         main{{max-width:25rem;padding:2rem 2rem 1.25rem}}\
+         .brand{{display:flex;align-items:center;gap:.9rem;margin:0 0 1.5rem}}\
+         .mark{{flex:none;width:3.25rem;height:3.25rem;border-radius:14px;overflow:hidden;\
+         display:flex;align-items:center;justify-content:center;background:#2f6feb;color:#fff;\
+         font-size:1.5rem;font-weight:700;object-fit:cover}}\
+         .brand h1{{font-size:1.35rem;line-height:1.2;margin:0;overflow-wrap:anywhere}}\
+         .kind{{margin:.15rem 0 0;color:#a8abb3;font-size:.9rem}}\
+         label{{display:block;font-weight:600;margin:0 0 .35rem}}\
+         input[type=text]{{box-sizing:border-box;width:100%;padding:.7rem .8rem;border-radius:8px;\
+         border:1px solid rgba(255,255,255,.18);font:inherit;background:#18191c;color:inherit}}\
+         input[type=text]:focus{{outline:2px solid #2f6feb;outline-offset:1px}}\
          .button[disabled]{{opacity:.5;cursor:default}}\
-         .section{{margin-top:1.75rem;padding-top:1rem;border-top:1px solid #d1d1d6}}\
+         .stack{{display:flex;flex-direction:column;gap:.75rem}}\
+         .stack p{{margin:0}}\
+         .more{{margin-top:1.25rem;font-size:.9rem;color:#a8abb3}}\
+         .more summary{{cursor:pointer;width:max-content}}\
+         .more .stack{{margin-top:.9rem}}\
          pre{{font:15px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\
-         background:#f2f2f7;padding:.75rem 1rem;border-radius:8px;overflow-x:auto;\
-         user-select:all}}\
-         @media (prefers-color-scheme:dark){{pre{{background:#1c1c1e}}\
-         .section{{border-top-color:#48484a}}}}\
+         background:#18191c;padding:.75rem 1rem;border-radius:8px;overflow-x:auto;\
+         border:1px solid rgba(255,255,255,.12);user-select:all}}\
+         .by{{display:flex;align-items:center;justify-content:center;gap:.4rem;margin-top:1.5rem;\
+         padding-top:1rem;border-top:1px solid rgba(255,255,255,.08);color:#858993;font-size:.8rem}}\
+         .by svg{{width:1.1rem;height:1.1rem}}\
          [hidden]{{display:none !important}}"
     )
 });
@@ -1130,24 +1156,82 @@ fn digest(text: &str) -> String {
 static POLICY: LazyLock<HeaderValue> = LazyLock::new(|| {
     HeaderValue::from_str(&format!(
         "default-src 'none'; style-src 'sha256-{style}'; script-src 'sha256-{script}'; \
-         connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+         img-src data:; connect-src 'self'; form-action 'none'; base-uri 'none'; \
+         frame-ancestors 'none'",
         style = digest(&PAGE_STYLE),
         script = digest(&SCRIPT),
     ))
     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"))
 });
 
-fn render(title: &str, mode: &str, state: &str, body: &str) -> Response {
+/// The Tiny mark, small, under every page.
+const LOGO: &str = "<svg viewBox=\"0 0 1024 1024\" aria-hidden=\"true\"><rect x=\"100\" y=\"100\" \
+    width=\"824\" height=\"824\" rx=\"186\" fill=\"#2f6feb\"/><g transform=\"translate(512 512) \
+    scale(1.24) translate(-512 -512)\"><path fill=\"#fff\" d=\"M422 282 H602 A160 160 0 0 1 762 \
+    442 V562 A160 160 0 0 1 602 722 H280 A18 18 0 0 1 262 704 V442 A160 160 0 0 1 422 282 \
+    Z\"/><path transform=\"translate(-22 -2)\" fill=\"none\" stroke=\"#2f6feb\" \
+    stroke-width=\"74\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M430 384 V578 \
+    Q430 624 476 624 H470 M386 488 H476 M661.5 505.5 A68 68 0 1 0 661.5 606.5\"/></g></svg>";
+
+/// The name and mark at the top of a page: the server's own icon, or its first letter.
+fn brand(face: Option<&db::Face>, kind: &str) -> String {
+    let (name, mark) = match face {
+        Some(face) => {
+            let mark = match &face.icon {
+                Some((content_type, bytes)) => format!(
+                    "<img class=\"mark\" id=\"server-icon\" alt=\"\" src=\"data:{};base64,{}\">",
+                    escape(content_type),
+                    STANDARD.encode(bytes)
+                ),
+                None => initial(&face.name),
+            };
+            (face.name.as_str(), mark)
+        }
+        // The claim page does not know yet: its script fills this in once the link is checked.
+        None => ("", initial("T")),
+    };
+    format!(
+        "<header class=\"brand\">\n{mark}\n<div>\n<h1 id=\"server-name\">{name}</h1>\n\
+         <p class=\"kind\">{kind}</p>\n</div>\n</header>",
+        name = escape(name),
+        kind = escape(kind),
+    )
+}
+
+/// A tile with the first letter, for a server with no icon.
+fn initial(name: &str) -> String {
+    let letter: String = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "T".to_string());
+    format!(
+        "<span class=\"mark\" id=\"server-icon\">{}</span>",
+        escape(&letter)
+    )
+}
+
+fn render(
+    title: &str,
+    mode: &str,
+    state: &str,
+    face: Option<&db::Face>,
+    kind: &str,
+    body: &str,
+) -> Response {
     let title = escape(title);
+    let brand = brand(face, kind);
     let page = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <meta name=\"referrer\" content=\"no-referrer\">\n<title>{title}</title>\n\
-         <style>{style}</style>\n</head>\n<body>\n\
-         <main data-mode=\"{mode}\" data-state=\"{state}\">\n<h1>{title}</h1>\n{body}\n\
+         <meta name=\"referrer\" content=\"no-referrer\">\n<meta name=\"color-scheme\" \
+         content=\"dark\">\n<meta name=\"theme-color\" content=\"#18191c\">\n\
+         <title>{title}</title>\n<style>{style}</style>\n</head>\n<body>\n\
+         <main data-mode=\"{mode}\" data-state=\"{state}\">\n{brand}\n{body}\n\
          <p id=\"status\" class=\"note\" role=\"status\" aria-live=\"polite\"></p>\n\
          <noscript><p class=\"alert\">Passkeys need JavaScript. Turn it on for this page.</p>\
-         </noscript>\n</main>\n<script>{script}</script>\n</body>\n</html>\n",
+         </noscript>\n<footer class=\"by\">{LOGO}<span>TinyServer</span></footer>\n\
+         </main>\n<script>{script}</script>\n</body>\n</html>\n",
         style = *PAGE_STYLE,
         mode = escape(mode),
         state = escape(state),
@@ -1168,14 +1252,13 @@ fn render(title: &str, mode: &str, state: &str, body: &str) -> Response {
 }
 
 /// The text shown after a passkey is made: its recovery codes, and the way on.
-const CODES: &str = "<section id=\"codes\" hidden>\n\
+const CODES: &str = "<section id=\"codes\" class=\"stack\" hidden>\n\
     <p id=\"codes-intro\"></p>\n\
     <pre id=\"codelist\"></pre>\n\
-    <div id=\"codes-ack\">\n\
+    <div id=\"codes-ack\" class=\"stack\">\n\
     <label><input type=\"checkbox\" id=\"saved\"> I saved these codes</label>\n\
-    <p class=\"note\">Each code works once. Nobody can reset your account for you: this server \
-    holds nothing that proves who you are, so a code is the only way back in if you lose \
-    your passkeys.</p>\n\
+    <p class=\"note\">Each code works once, and it is the only way back in if you lose your \
+    passkeys. Nobody can reset your account for you.</p>\n\
     </div>\n\
     <button class=\"button\" id=\"go\" type=\"button\" disabled>Continue</button>\n\
     </section>";
@@ -1200,19 +1283,10 @@ async fn signin_page(
             return server_trouble();
         }
     };
+    // Someone who started a sign-in from Tiny may see which server it is. Anyone else is shown
+    // nothing: the check above is what stands between this page and a stranger.
+    let face = db::server_face(&pool).await.ok();
     let invited = leg.invite_hash.is_some();
-    let new_here = if invited {
-        "<section class=\"section\" id=\"new\">\n\
-         <p class=\"step\">New here? You have an invite.</p>\n\
-         <label for=\"name\">The name other people will see</label>\n\
-         <input type=\"text\" id=\"name\" maxlength=\"80\" autocomplete=\"nickname\">\n\
-         <p class=\"note\">Your passkey stays on your device. This server keeps only its public \
-         half, no email and no phone number.</p>\n\
-         <button class=\"button\" id=\"signup\" type=\"button\">Create my account</button>\n\
-         </section>"
-    } else {
-        ""
-    };
     let provider = sign_in
         .provider(Some(&leg.provider))
         .map(|provider| (provider.name().to_string(), provider));
@@ -1220,45 +1294,75 @@ async fn signin_page(
         .map(|(name, provider)| {
             let url = provider.authorize_url(&state, &leg.nonce, &leg.verifier);
             format!(
-                "<section class=\"section\">\n\
-                 <a class=\"button quiet\" href=\"{url}\">Sign in with {name} instead</a>\n\
-                 </section>",
+                "<a class=\"button quiet\" href=\"{url}\">Sign in with {name} instead</a>\n",
                 url = escape(&url),
                 name = escape(&name),
             )
         })
         .unwrap_or_default();
-    let body = format!(
-        "<div id=\"form\">\n\
-         <p>Use the passkey on this device, or a security key.</p>\n\
+    // An invited person is here to make an account, so that comes first. Anyone else is here to
+    // sign in.
+    let lead = if invited {
+        "<div class=\"stack\" id=\"new\">\n\
+         <div><label for=\"name\">Your name</label>\n\
+         <input type=\"text\" id=\"name\" maxlength=\"80\" autocomplete=\"nickname\" \
+         placeholder=\"What people will call you\"></div>\n\
+         <button class=\"button\" id=\"signup\" type=\"button\">Create my account</button>\n\
+         <p class=\"note\">Your passkey stays on your device. This server keeps only its public \
+         half: no email, no phone number.</p>\n\
+         <button class=\"button quiet\" id=\"login\" type=\"button\">I already have a passkey\
+         </button>\n\
+         </div>"
+    } else {
+        "<div class=\"stack\">\n\
          <button class=\"button\" id=\"login\" type=\"button\">Sign in with a passkey</button>\n\
-         {new_here}\n\
-         <section class=\"section\">\n\
-         <details>\n<summary>I lost my passkeys</summary>\n\
-         <label for=\"code\">A recovery code</label>\n\
+         <p class=\"note\">Use the passkey on this device, or a security key.</p>\n\
+         </div>"
+    };
+    let body = format!(
+        "<div id=\"form\">\n{lead}\n{other}\
+         <details class=\"more\">\n<summary>Lost your passkeys?</summary>\n\
+         <div class=\"stack\">\n\
+         <div><label for=\"code\">A recovery code</label>\n\
          <input type=\"text\" id=\"code\" autocomplete=\"off\" autocapitalize=\"characters\" \
-         spellcheck=\"false\">\n\
-         <p class=\"note\">You make a new passkey, and the code is used up.</p>\n\
-         <button class=\"button quiet\" id=\"recover\" type=\"button\">Use a recovery code</button>\n\
-         </details>\n</section>\n\
-         {other}\n</div>\n{CODES}"
+         spellcheck=\"false\"></div>\n\
+         <button class=\"button quiet\" id=\"recover\" type=\"button\">Use a recovery code\
+         </button>\n\
+         </div>\n</details>\n</div>\n{CODES}"
     );
-    render("Sign in", "signin", &state, &body)
+    let kind = if invited { "You're invited" } else { "Sign in" };
+    render(
+        if invited { "Join" } else { "Sign in" },
+        "signin",
+        &state,
+        face.as_ref(),
+        kind,
+        &body,
+    )
 }
 
 async fn claim_page() -> Response {
     let body = format!(
-        "<div id=\"form\">\n\
+        "<div id=\"form\" class=\"stack\">\n\
          <p id=\"who\">Checking your link…</p>\n\
          <button class=\"button\" id=\"claim\" type=\"button\" hidden>Make my passkey</button>\n\
          <p class=\"note\">Your passkey stays on your device. This server keeps only its public \
          half. Your account, roles and messages stay as they are.</p>\n\
          </div>\n{CODES}\n\
-         <section id=\"done\" hidden>\n\
+         <section id=\"done\" class=\"stack\" hidden>\n\
          <p>All set. Open Tiny and sign in with your passkey.</p>\n\
          </section>"
     );
-    render("Set up your passkey", "claim", "", &body)
+    // The server's name is filled in by the script once the link is checked: until then this
+    // page does not know whether the link is real.
+    render(
+        "Set up your passkey",
+        "claim",
+        "",
+        None,
+        "Set up your passkey",
+        &body,
+    )
 }
 
 #[cfg(test)]

@@ -1576,6 +1576,8 @@ async fn the_pages_say_what_may_run_and_carry_no_secret() {
         );
         assert!(policy.contains("default-src 'none'"));
         assert!(policy.contains("connect-src 'self'"));
+        // Images only as data: the server's own icon, carried in the page, never fetched.
+        assert!(policy.contains("img-src data:"));
         assert!(!policy.contains("unsafe"));
         assert!(html.contains(&format!("data-state=\"{state}\"")));
         // An invite shows the sign-up form; the invite token itself is nowhere on the page.
@@ -1592,7 +1594,7 @@ async fn the_pages_say_what_may_run_and_carry_no_secret() {
         let (state, _) = start(&app, None).await;
         let (_, _, html) = page(&app, &format!("/v1/auth/passkey?state={state}")).await;
         assert!(!html.contains("Create my account"));
-        assert!(html.contains("I lost my passkeys"));
+        assert!(html.contains("Lost your passkeys?"));
 
         // A state that is made up, expired or badly shaped shows the expired page.
         for bad in [
@@ -2249,6 +2251,72 @@ async fn what_the_owner_chose_about_providers_does_not_touch_the_name_typed_for_
                 .expect("account");
         assert_eq!(name, "Ada Lovelace");
         assert_eq!(email, None);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_pages_name_the_server_only_to_someone_holding_a_live_sign_in_or_claim_link() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let app = passkey_app(&db);
+        // The owner names the server and gives it an icon: a PNG's signature is enough for the
+        // database, which only checks the type it is told.
+        sqlx::query(
+            "UPDATE server_settings SET name = 'Night <Shift>', icon = $1, icon_type = 'image/png',
+                    icon_sha = repeat('a', 64)",
+        )
+        .bind(&b"\x89PNG\r\n\x1a\nstand-in"[..])
+        .execute(&db.owner)
+        .await
+        .expect("name and icon");
+        let _ = owner_token;
+
+        // Someone who started a sign-in is shown which server it is, escaped, and its icon.
+        let (state, _) = start(&app, None).await;
+        let (status, _, html) = page(&app, &format!("/v1/auth/passkey?state={state}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Night &lt;Shift&gt;"), "{html}");
+        assert!(!html.contains("Night <Shift>"));
+        assert!(html.contains("src=\"data:image/png;base64,"), "{html}");
+
+        // Someone who only knows the address is shown nothing about it.
+        for bad in ["/v1/auth/passkey", "/v1/auth/passkey?state=nope"] {
+            let (_, _, html) = page(&app, bad).await;
+            assert!(!html.contains("Night"), "{bad}: {html}");
+        }
+        // The claim page, before its link is checked, names no one.
+        let (status, _, html) = page(&app, "/v1/auth/passkey/claim").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("Night") && !html.contains("data:image"),
+            "{html}"
+        );
+
+        // A real claim link names the server and the icon, with the member; a bad one nothing.
+        let member = oidc_member(&db, &owner, "ada@example.org").await;
+        let token = db::mint_claim(&db.owner, &member.user_id, 14)
+            .await
+            .expect("claim");
+        let (status, who) = Call::new(Method::POST, "/v1/auth/passkey/claim/peek")
+            .json(json!({"token": token}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{who}");
+        assert_eq!(who["server"], "Night <Shift>");
+        assert!(who["icon"]
+            .as_str()
+            .is_some_and(|icon| icon.starts_with("data:image/png;base64,")));
+        let (status, nope) = Call::new(Method::POST, "/v1/auth/passkey/claim/peek")
+            .json(json!({"token": "x".repeat(43)}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            nope.get("server").is_none() && nope.get("icon").is_none(),
+            "{nope}"
+        );
     })
     .await;
 }
