@@ -1,0 +1,58 @@
+# Passkeys only: no Pocket ID. Use it on top of compose.yml, once every member has a passkey
+# (docs/auth-passkeys.md, "Moving a community from Pocket ID"):
+#
+#   docker compose -f compose.yml -f compose.passkey.yml up -d
+#
+# What it does:
+#   * tinyserver signs people in with its own passkeys and contacts no identity provider.
+#   * Pocket ID, its data job, and its three secrets are not started or mounted. Its volume is
+#     left alone, so going back is `docker compose -f compose.yml up -d` with TINYSERVER_AUTH=both.
+#   * The auth hostname is no longer needed. Remove its public hostname from the tunnel in
+#     Cloudflare when you are sure you will not go back.
+#
+# Passkeys belong to the host of TINYSERVER_PUBLIC_URL. Keep it the same.
+#
+# Needs Docker Compose 2.24.4 or later for `!override`.
+
+services:
+  tinyserver:
+    # Starts without Pocket ID, and without its secrets.
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      tinyserver-uploads:
+        condition: service_completed_successfully
+      tinyserver-init:
+        condition: service_completed_successfully
+      clamd:
+        condition: service_healthy
+    secrets: !override []
+    environment: !override
+      TINYSERVER_AUTH: passkey
+      DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
+      BIND: 0.0.0.0:8080
+      TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
+      # Shown by the browser when it asks for a passkey.
+      TINYSERVER_PASSKEY_RP_NAME: ${TINYSERVER_PASSKEY_RP_NAME:-TinyComms}
+      TINYSERVER_SESSION_MAX_DAYS: ${TINYSERVER_SESSION_MAX_DAYS:-30}
+      TINYSERVER_MEDIA_PORT: ${TINYSERVER_MEDIA_PORT:-50000}
+      TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}
+      TINYSERVER_LAN_IP: ${TINYSERVER_LAN_IP:-}
+      TINYSERVER_MEDIA_EGRESS_KBPS: ${TINYSERVER_MEDIA_EGRESS_KBPS:-}
+      TINYSERVER_CLAMD_SOCKET: clamd:3310
+      TINYSERVER_UPLOAD_DIR: /data/uploads
+      TINYSERVER_MEDIA_HMAC_SECRET: ${TINYSERVER_MEDIA_HMAC_SECRET:?set TINYSERVER_MEDIA_HMAC_SECRET to 64 hex characters (openssl rand -hex 32)}
+      TINYSERVER_TRUSTED_PROXIES: ${TINYSERVER_TRUSTED_PROXIES:-}
+      TINYSERVER_CLIENT_IP_HEADER: ${TINYSERVER_CLIENT_IP_HEADER:-}
+      TINYSERVER_DATA_DIR: /var/lib/tinyserver
+
+  tunnel:
+    depends_on: !override
+      - tinyserver
+
+  # Not started. A profile nothing turns on keeps the services in the file without running them.
+  pocket-id:
+    profiles: ["retired-pocket-id"]
+    depends_on: !reset []
+  pocket-id-data:
+    profiles: ["retired-pocket-id"]

@@ -29,11 +29,11 @@ The compose file publishes one port: `TINYSERVER_MEDIA_PORT`, UDP and TCP, the s
 
 ## 3. Cloudflare headers and trust
 
-tinyserver reads one header: `cf-connecting-ip`, only to key the sign-in limiter, and only when the TCP peer is trusted. By default a peer is trusted if it is loopback, private, link-local, or in the carrier-grade range 100.64.0.0/10 (Tailscale uses it). `TINYSERVER_TRUSTED_PROXIES` replaces that with an explicit list of addresses or CIDR ranges, or `none`. A public peer is never believed (`limit.rs`, `trusted`, `is_local`). Findings S7 describes the previous behaviour, where any caller could rotate the header.
+tinyserver reads one header, `cf-connecting-ip` unless `TINYSERVER_CLIENT_IP_HEADER` names another (`x-real-ip`, `x-forwarded-for`: a list is read from its right), only to key the sign-in limiter, and only when the TCP peer is trusted. By default a peer is trusted if it is loopback, private, link-local, or in the carrier-grade range 100.64.0.0/10 (Tailscale uses it). `TINYSERVER_TRUSTED_PROXIES` replaces that with an explicit list of addresses or CIDR ranges, or `none`. A public peer is never believed (`limit.rs`, `trusted`, `is_local`). Findings S7 describes the previous behaviour, where any caller could rotate the header.
 
-tinyserver ignores `X-Forwarded-For`, `CF-Ray`, `CF-IPCountry` and the rest. Pocket ID is given `TRUST_PROXY=<cloudflared's fixed address>` so it reads `X-Forwarded-For` from that one peer only.
+tinyserver ignores every other header, `X-Forwarded-For` (unless it is the one named), `CF-Ray`, `CF-IPCountry` and the rest. Pocket ID is given `TRUST_PROXY=<cloudflared's fixed address>` so it reads `X-Forwarded-For` from that one peer only.
 
-If the tunnel is replaced by another proxy (say a TinyCloud edge), `TINYSERVER_TRUSTED_PROXIES` must name it, or every client behind it shares one limiter bucket (all sign-in routes then share a cap of five a minute, a self-inflicted outage).
+If the tunnel is replaced by another proxy (say a TinyCloud edge, or Caddy or nginx: `deploy/README.md`, "Without Cloudflare"), `TINYSERVER_CLIENT_IP_HEADER` must name the header it sets, `TINYSERVER_TRUSTED_PROXIES` must name it unless it is on a private address, or every client behind it shares one limiter bucket (all sign-in routes then share a cap of five a minute, a self-inflicted outage).
 
 ## 4. WebRTC and ICE
 

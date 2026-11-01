@@ -16,17 +16,20 @@ mod messages;
 mod observe;
 mod oidc;
 mod operator;
+mod passkey;
 mod reports;
 mod scan_clamd;
 mod session;
+mod setup;
 
 #[cfg(feature = "fuzz")]
 pub mod fuzz;
 
-pub use limit::trust_proxies;
+pub use limit::{client_ip_header, trust_proxies};
 pub use live::{Limits, Live};
 pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};
 pub use operator::Operator;
+pub use passkey::{claim_url, Passkeys};
 pub use scan_clamd::{engine_from_env, scanning_off, select_engine, NoScan, ScanBootError};
 
 use std::sync::Arc;
@@ -52,6 +55,7 @@ pub fn app(pool: PgPool, live: Live, sign_in: Option<SignIn>) -> Router {
 
 fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
     let operator = Operator::new(pool.clone());
+    let deployment = setup::Deployment::of(sign_in.as_ref());
     let mut routes = Router::new()
         .merge(health::routes(live.clone()))
         .merge(operator::routes())
@@ -59,6 +63,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(account::routes())
         .merge(community::routes())
         .merge(admin::routes())
+        .merge(setup::routes(deployment))
         .merge(bot::routes())
         .merge(messages::routes())
         .merge(reports::routes())

@@ -38,6 +38,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+# Pinned. The WebAuthn relying party for the built-in passkey sign-in. 0.6 does its crypto in
+# RustCrypto (crypto-glue), not OpenSSL, so it builds in the image with no system library.
+# `danger-allow-state-serialisation` lets a pending ceremony live in Postgres, so any server
+# process can finish it, and so it survives a restart. `conditional-ui` is the library's gate on
+# discoverable (username-less) sign-in. Attestation stays off: sign-in asks for none.
+webauthn-rs = { version = "=0.6.2", default-features = false, features = ["danger-allow-state-serialisation", "conditional-ui"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

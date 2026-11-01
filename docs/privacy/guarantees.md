@@ -103,7 +103,7 @@ Everything TinyCloud keeps on purpose. Each needs a reason and an end date befor
 |---|---|---|---|---|
 | G5.1 | `audit_log`: moderation and settings actions with ids and free-text reasons | Moderation record | Indefinitely, no sweep | Implemented. No expiry. `reason` is not scrubbed on account deletion |
 | G5.2 | `bans` and `ban_identities` | A ban must survive deletion and re-sign-up | Indefinitely, expired bans included | Implemented |
-| G5.3 | `memberships` including `last_seen_at`, `joined_via`; accepted invites | Operation | While a member; accepted invites indefinitely | Implemented |
+| G5.3 | `memberships` including `last_seen_at`, `joined_via`; accepted invites | Operation | While a member; accepted invites indefinitely. The owner may stop `last_seen_at` being recorded at [setup](../server-setup.md) (`activity_visibility: nobody`, tested in `crates/api/tests/setup.rs`) | Implemented |
 | G5.4 | Operator log lines at `info`: sign-in, socket open and close with `user_id`, moderation, per-call media events | Operation and incident response | `json-file` 10 MB times 3 per container, with Docker timestamps | Implemented. **This is a connection history.** Can be turned down (`TINYSERVER_LOG_LEVEL`) |
 | G5.5 | Pocket ID's audit events with client IP | The provider's own security log | 90 days by default; not verified for `v2.19.1` | Third party. Setting `AUDIT_LOG_RETENTION_DAYS` is possible |
 | G5.6 | Billing records: plan, payment token or transaction id, invoices, tax evidence | Payment, tax | Not defined | **Not built** |

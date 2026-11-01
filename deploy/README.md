@@ -88,7 +88,7 @@ There is no owner password. `tinyserver-init` runs before the server on every `u
 docker compose exec tinyserver cat /bootstrap/owner-invite
 ```
 
-It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. A later start with no owner does not write the token again. It prints that the file still works until the invite expires. Lost it, run `docker compose run --rm --entrypoint tinyserver tinyserver-init bootstrap --owner-invite` for a new one, and the old one stops working. After an owner exists, the file is removed.
+It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and sign in at Pocket ID ("I'm new here" makes their account); that person becomes the owner. The first time the owner opens the server, the app asks them to choose what the community keeps about its members (convenience or privacy, or each choice one by one: [`docs/server-setup.md`](../docs/server-setup.md)). Nothing is chosen for them. A later start with no owner does not write the token again. It prints that the file still works until the invite expires. Lost it, run `docker compose run --rm --entrypoint tinyserver tinyserver-init bootstrap --owner-invite` for a new one, and the old one stops working. After an owner exists, the file is removed.
 
 `RUST_LOG` is ignored. Set `TINYSERVER_LOG_LEVEL` (`error`, `warn`, `info`, `debug`, or `trace`; default `info`). A debug bundle is written only when the process receives `SIGUSR1`, under `/var/lib/tinyserver/logs`, and old bundles are removed on the next start. Nothing in the log path leaves the box.
 
@@ -151,6 +151,52 @@ Every member in a call sees `TINYSERVER_PUBLIC_IP` in the SDP answer. The tunnel
 Joining the `media` network gives the server a route out, which it did not have. It makes no outbound connections except to a sign-in provider outside the compose file, when one is configured; an owner who wants that enforced can add a `DOCKER-USER` rule that allows only replies.
 
 TCP streams are capped at 256 in all and 16 from one address. One that sends no STUN for a call within 5 s, or nothing at all for 30 s, is closed. A relay mode for hosts that cannot open a port comes in a later release.
+
+## Without Cloudflare
+
+Nothing in tinyserver needs Cloudflare. It is a plain HTTP server on `BIND` (inside the container, port 8080). `compose.yml` happens to carry cloudflared as the way to reach it from the internet. If you use something else, `compose.proxy.yml` turns cloudflared off and publishes port 8080 on the host's loopback for your proxy:
+
+```
+docker compose -f compose.yml -f compose.proxy.yml up -d
+```
+
+(Add `-f compose.passkey.yml` between them if you use passkeys only.) Put `TUNNEL_TOKEN=unused` in `.env`: compose reads that variable while it loads the file even though cloudflared is not started.
+
+What your front end must do:
+
+1. **End TLS** for the hostname in `TINYSERVER_PUBLIC_URL`. tinyserver does not do TLS itself, and browsers refuse passkeys on plain HTTP (only `localhost` is exempt). Keep that hostname fixed: a passkey belongs to it.
+2. **Pass WebSockets** (the live socket is `/v1/live`) and leave idle connections open.
+3. **Set one header to the client's address**, replacing whatever the client sent, and tell tinyserver its name with `TINYSERVER_CLIENT_IP_HEADER`. This keys the sign-in rate limits. Without it every member counts as the proxy's own address and shares one allowance, so recovery and claim links (8 a minute in all) lock up as soon as a few people try at once. tinyserver believes the header only from a proxy it trusts, by default any private or loopback address, so a proxy on the same host or Docker network needs nothing more; list a proxy with a public address in `TINYSERVER_TRUSTED_PROXIES`. A list such as `x-forwarded-for` is read from its right, where the proxy wrote, never the left, where the client can.
+
+Caddy, on the host (it gets and renews the certificate itself):
+
+```
+chat.example.org {
+    reverse_proxy 127.0.0.1:8080 {
+        header_up X-Real-IP {remote_host}
+    }
+}
+```
+
+with `TINYSERVER_CLIENT_IP_HEADER=x-real-ip`. nginx, in a `server` block that already ends TLS:
+
+```
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 3600s;
+}
+```
+
+with the same setting. Another tunnel (Tailscale Funnel, Pangolin, frp) works the same way: it needs a hostname, TLS, WebSockets and a header with the client's address. If it cannot set one, leave the variable unset and accept one shared allowance, which is fine for a handful of people and not for a community.
+
+Two things do not change. Calls still need their media port reached directly, forwarded on your router (see "Calls and the media port"): a proxy or tunnel carries the web pages and chat, not call audio. And with a proxy that listens on 80 and 443 you forward those instead of using a tunnel's outbound connection.
+
+Not tested here: these configurations were written from each proxy's documentation and checked only as far as `docker compose config` accepting the files and the server reading the header (`crates/api/src/limit.rs` tests). Run a sign-in through yours, and check `tinyserver` logs for "rate limited" under normal use, before relying on it.
 
 ## Upgrading
 

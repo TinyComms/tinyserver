@@ -74,6 +74,7 @@ pub struct Pending {
 }
 
 /// The verified ID token, reduced to what tinyserver keeps.
+#[derive(Clone)]
 pub struct Profile {
     pub issuer: String,
     pub subject: String,
@@ -358,34 +359,52 @@ pub async fn sign_in(
     groups: Groups,
 ) -> Result<SignedIn, AuthError> {
     let mut tx = pool.begin().await?;
+    let signed_in = sign_in_in(&mut tx, profile, invite_hash, groups).await?;
+    tx.commit().await?;
+    Ok(signed_in)
+}
+
+/// [`sign_in`] inside a transaction the caller owns and commits. On `Err` the caller must roll
+/// back: a refusal writes nothing, but an error may leave the transaction mid-way. The passkey
+/// sign-up uses this to make the account, accept the invite, and store the first credential as
+/// one unit.
+pub(crate) async fn sign_in_in(
+    tx: &mut Transaction<'_, Postgres>,
+    profile: &Profile,
+    invite_hash: Option<&[u8]>,
+    groups: Groups,
+) -> Result<SignedIn, AuthError> {
+    // What the owner chose at setup about what a provider may leave in a new account. Which
+    // methods are accepted is decided before this, where the deployment's methods are known.
+    let posture = crate::setup::posture_in(tx).await?;
+    let passkey = profile.issuer == crate::passkey::PASSKEY_ISSUER;
     // Two first sign-ins for one person at once would otherwise both make an account.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(10) || $2, 0))")
         .bind(&profile.issuer)
         .bind(&profile.subject)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     let found: Option<String> = sqlx::query_scalar(
         "SELECT user_id::text FROM user_identities WHERE issuer = $1 AND subject = $2",
     )
     .bind(&profile.issuer)
     .bind(&profile.subject)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if let Some(user_id) = &found {
         let banned: bool = sqlx::query_scalar("SELECT app_banned($1::uuid)")
             .bind(user_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
         if banned {
             return Err(AuthError::Banned);
         }
         let role: Option<String> = sqlx::query_scalar("SELECT app_member_role($1::uuid)")
             .bind(user_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
         if let Some(role) = role {
-            let role = promote(&mut tx, user_id, &role, &profile.issuer, groups).await?;
-            tx.commit().await?;
+            let role = promote(tx, user_id, &role, &profile.issuer, groups).await?;
             return Ok(SignedIn {
                 user_id: user_id.clone(),
                 role,
@@ -403,9 +422,9 @@ pub async fn sign_in(
             let user_id: String = sqlx::query_scalar(
                 "INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING id::text",
             )
-            .bind(profile_email(profile.email.as_deref()))
-            .bind(profile_name(profile))
-            .fetch_one(&mut *tx)
+            .bind(new_email(profile, posture.provider_profile, passkey))
+            .bind(new_name(profile, posture.provider_profile, passkey))
+            .fetch_one(&mut **tx)
             .await?;
             sqlx::query(
                 "INSERT INTO user_identities (user_id, issuer, subject) VALUES ($1::uuid, $2, $3)",
@@ -413,7 +432,7 @@ pub async fn sign_in(
             .bind(&user_id)
             .bind(&profile.issuer)
             .bind(&profile.subject)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             user_id
         }
@@ -422,7 +441,7 @@ pub async fn sign_in(
     let mut role = None;
     if let Some(invite_hash) = invite_hash {
         // A savepoint, so a bad invite can still fall through to the groups.
-        let mut attempt = sqlx::Acquire::begin(&mut *tx).await?;
+        let mut attempt = sqlx::Acquire::begin(&mut **tx).await?;
         let accepted: Result<String, sqlx::Error> =
             sqlx::query_scalar("SELECT app_accept_invite($1, $2::uuid)")
                 .bind(invite_hash)
@@ -448,7 +467,7 @@ pub async fn sign_in(
                     .bind(&user_id)
                     .bind(join)
                     .bind(&profile.issuer)
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut **tx)
                     .await;
             match joined {
                 Ok(role) => role,
@@ -459,8 +478,7 @@ pub async fn sign_in(
         // The account made above rolls back with the transaction.
         (None, None) => return Err(AuthError::NotMember),
     };
-    let role = promote(&mut tx, &user_id, &role, &profile.issuer, groups).await?;
-    tx.commit().await?;
+    let role = promote(tx, &user_id, &role, &profile.issuer, groups).await?;
     Ok(SignedIn {
         user_id,
         role,
@@ -675,6 +693,35 @@ fn profile_email(email: Option<&str>) -> Option<String> {
         && email.contains('@')
         && !email.chars().any(|c| c.is_whitespace() || c.is_control());
     shaped.then(|| email.to_string())
+}
+
+/// The email a new account keeps: the provider's, when the owner chose to keep it.
+fn new_email(
+    profile: &Profile,
+    kept: crate::setup::ProviderProfile,
+    passkey: bool,
+) -> Option<String> {
+    if passkey || !kept.keeps_email() {
+        return None;
+    }
+    profile_email(profile.email.as_deref())
+}
+
+/// The name a new account starts with. A passkey account's name is the one the person typed,
+/// so the owner's choice about providers does not reach it. Otherwise the provider's name,
+/// and when the owner chose not to keep the email, not the start of the email either; with
+/// neither, "Member".
+fn new_name(profile: &Profile, kept: crate::setup::ProviderProfile, passkey: bool) -> String {
+    if passkey || kept == crate::setup::ProviderProfile::Full {
+        return profile_name(profile);
+    }
+    if !kept.keeps_name() {
+        return "Member".to_string();
+    }
+    profile_name(&Profile {
+        email: None,
+        ..profile.clone()
+    })
 }
 
 /// `name`, else the email's local part, else "Member", without control characters and cut to

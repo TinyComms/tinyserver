@@ -10,6 +10,7 @@ use crate::bootstrap::normalize_name;
 use crate::community::{audit, from_sql, require, room_event, rooms_in, scope, uuid, Room, STAMP};
 use crate::outbox::emit;
 use crate::perm;
+use crate::setup::{ActivityVisibility, ProviderProfile, SignInMethods};
 use crate::{Caller, CommunityError};
 
 /// The largest icon, in bytes.
@@ -38,6 +39,15 @@ pub struct ServerSettings {
     pub file_max_bytes: i64,
     /// Zip and other archives may be stored when this is true. Default false.
     pub allow_archives: bool,
+    /// What is kept from an identity provider at first sign-in. Every member may read this: it
+    /// is a statement of what the server keeps about them.
+    pub provider_profile: ProviderProfile,
+    /// Who sees last-seen and how a member joined, and whether last-seen is kept.
+    pub activity_visibility: ActivityVisibility,
+    pub sign_in_methods: SignInMethods,
+    /// When the owner first made these choices. `None` until then, which is how a client knows
+    /// to offer them.
+    pub setup_completed_at: Option<String>,
     pub created_at: String,
     /// `off`, `optional` or `new_required`: whether new conversations may or must be end-to-end
     /// encrypted. Existing conversations are never converted.
@@ -89,6 +99,8 @@ fn settings_select() -> String {
     format!(
         "SELECT name, description, welcome, icon_sha, default_room_id::text, afk_room_id::text,
                 afk_timeout_secs, image_max_bytes, file_max_bytes, allow_archives,
+                provider_profile, activity_visibility, sign_in_methods,
+                to_char(setup_completed_at AT TIME ZONE 'UTC', '{STAMP}'),
                 to_char(created_at AT TIME ZONE 'UTC', '{STAMP}'), e2ee_text
          FROM server_settings"
     )
@@ -101,7 +113,9 @@ pub async fn get_server(pool: &PgPool, caller: &Caller) -> Result<ServerSettings
     Ok(settings)
 }
 
-async fn settings_in(tx: &mut Transaction<'_, Postgres>) -> Result<ServerSettings, CommunityError> {
+pub(crate) async fn settings_in(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<ServerSettings, CommunityError> {
     let row = sqlx::query(&settings_select())
         .fetch_optional(&mut **tx)
         .await
@@ -580,9 +594,19 @@ fn settings_from(row: &PgRow) -> Result<ServerSettings, CommunityError> {
         image_max_bytes: row.try_get(7).map_err(from_sql)?,
         file_max_bytes: row.try_get(8).map_err(from_sql)?,
         allow_archives: row.try_get(9).map_err(from_sql)?,
-        created_at: row.try_get(10).map_err(from_sql)?,
-        e2ee_text: row.try_get(11).map_err(from_sql)?,
+        provider_profile: choice(row, 10, ProviderProfile::parse)?,
+        activity_visibility: choice(row, 11, ActivityVisibility::parse)?,
+        sign_in_methods: choice(row, 12, SignInMethods::parse)?,
+        setup_completed_at: row.try_get(13).map_err(from_sql)?,
+        created_at: row.try_get(14).map_err(from_sql)?,
+        e2ee_text: row.try_get(15).map_err(from_sql)?,
     })
+}
+
+/// A column with a check constraint, read as the type it stands for.
+fn choice<T>(row: &PgRow, index: usize, parse: fn(&str) -> Option<T>) -> Result<T, CommunityError> {
+    let text: String = row.try_get(index).map_err(from_sql)?;
+    parse(&text).ok_or(CommunityError::Invalid)
 }
 
 #[cfg(test)]

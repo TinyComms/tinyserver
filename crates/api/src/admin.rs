@@ -28,6 +28,7 @@ pub const FEATURES: &[&str] = &[
     "upload_limits",
     "file_scan",
     "abuse_reports",
+    "first_run_setup",
 ];
 
 pub fn routes() -> Router<PgPool> {

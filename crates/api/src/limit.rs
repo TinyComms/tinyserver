@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -27,6 +27,26 @@ static TOKEN: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDO
 static JOIN: LazyLock<Gate> = LazyLock::new(|| Gate::new(JOIN_PER_KEY, JOIN_GLOBAL, WINDOW));
 const JOIN_PER_KEY: usize = 3;
 const JOIN_GLOBAL: usize = 30;
+/// The passkey ceremonies. A sign-in is two posts and a sign-up four, so a person who mistypes
+/// a few times still gets through; each `begin` stores a row and each `finish` checks a
+/// signature, so one address cannot make many.
+static PASSKEY: LazyLock<Gate> = LazyLock::new(|| Gate::new(30, 600, WINDOW));
+/// The calls that take something to guess or spend: a recovery code, a claim link. Tight.
+static PASSKEY_SECRET: LazyLock<Gate> = LazyLock::new(|| Gate::new(8, 120, WINDOW));
+
+/// The gate for a passkey path, and a name for the log.
+fn passkey_gate(path: &str) -> Option<(&'static Gate, &'static str)> {
+    match path {
+        "/v1/auth/passkey/recover/begin" | "/v1/auth/passkey/recover/finish" => {
+            Some((&PASSKEY_SECRET, "/v1/auth/passkey/recover"))
+        }
+        "/v1/auth/passkey/claim/peek"
+        | "/v1/auth/passkey/claim/begin"
+        | "/v1/auth/passkey/claim/finish" => Some((&PASSKEY_SECRET, "/v1/auth/passkey/claim")),
+        path if path.starts_with("/v1/auth/passkey/") => Some((&PASSKEY, "/v1/auth/passkey")),
+        _ => None,
+    }
+}
 
 struct Gate {
     per_key: usize,
@@ -77,6 +97,7 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
         (&Method::POST, "/v1/auth/start") => Some(&*START),
         (&Method::POST, "/v1/auth/token") => Some(&*TOKEN),
         (&Method::POST, "/v1/auth/join") => Some(&*JOIN),
+        (&Method::POST, path) => passkey_gate(path).map(|(gate, _)| gate),
         _ => None,
     };
     if let Some(gate) = gate {
@@ -89,7 +110,7 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
                 "/v1/auth/start" => "/v1/auth/start",
                 "/v1/auth/token" => "/v1/auth/token",
                 "/v1/auth/join" => "/v1/auth/join",
-                _ => "unknown",
+                path => passkey_gate(path).map_or("unknown", |(_, route)| route),
             };
             tracing::warn!(route, "rate limited");
             if request.uri().path() == "/v1/auth/join" {
@@ -106,10 +127,39 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
 }
 
 fn client_key(headers: &HeaderMap, peer: Option<IpAddr>) -> String {
-    let claimed = headers
-        .get("cf-connecting-ip")
+    let name = CLIENT_IP_HEADER.get_or_init(|| HeaderName::from_static(DEFAULT_CLIENT_IP_HEADER));
+    client_key_by(headers, peer, name)
+}
+
+/// The header a trusted proxy puts the client's address in, when `TINYSERVER_CLIENT_IP_HEADER`
+/// does not say otherwise: Cloudflare's.
+const DEFAULT_CLIENT_IP_HEADER: &str = "cf-connecting-ip";
+static CLIENT_IP_HEADER: OnceLock<HeaderName> = OnceLock::new();
+
+/// `TINYSERVER_CLIENT_IP_HEADER`: the header a reverse proxy puts the real client address in, such
+/// as `x-real-ip` or `x-forwarded-for`. It is believed only from a trusted proxy (see
+/// [`trust_proxies`]), and the proxy must set or overwrite it, never pass on the client's own.
+pub fn client_ip_header(name: &str) -> Result<(), String> {
+    let name = HeaderName::from_bytes(name.trim().to_ascii_lowercase().as_bytes())
+        .map_err(|_| format!("{name} is not a header name"))?;
+    CLIENT_IP_HEADER
+        .set(name)
+        .map_err(|_| "the client address header was already set".to_string())
+}
+
+/// The address a header claims. A list, as `x-forwarded-for` is, is read from its right: each
+/// proxy appends the address it saw, so only the last entry is the trusted proxy's word, and
+/// the ones before it are whatever the client sent.
+fn claimed_address(headers: &HeaderMap, name: &HeaderName) -> Option<IpAddr> {
+    headers
+        .get(name)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+}
+
+fn client_key_by(headers: &HeaderMap, peer: Option<IpAddr>, name: &HeaderName) -> String {
+    let claimed = claimed_address(headers, name);
     // A header is only a claim. It counts when the connection it arrived on is from a proxy
     // we trust. A direct caller, however it fills the header in, is keyed by who it is.
     let address = match (peer, claimed) {
@@ -164,7 +214,7 @@ fn keyed(address: IpAddr) -> String {
         })
 }
 
-/// Proxies whose `cf-connecting-ip` is believed. Unset means any private, loopback or
+/// Proxies whose client address header is believed. Unset means any private, loopback or
 /// link-local peer: cloudflared on a Docker network, a reverse proxy on the same host. A
 /// peer on the public internet is never believed.
 static TRUSTED: OnceLock<Vec<Net>> = OnceLock::new();
@@ -266,8 +316,8 @@ fn prune(hits: &mut Vec<Instant>, now: Instant, window: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_key, is_local, lock, Gate, Net};
-    use axum::http::{HeaderMap, HeaderValue};
+    use super::{client_ip_header, client_key, client_key_by, is_local, lock, Gate, Net};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use std::net::IpAddr;
     use std::time::Duration;
 
@@ -349,6 +399,76 @@ mod tests {
                 client_key(&claim("203.0.113.8"), proxy),
                 client_key(&claim("203.0.113.9"), proxy)
             );
+        }
+    }
+
+    fn header(name: &'static str, value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(name, HeaderValue::from_static(value));
+        headers
+    }
+
+    #[test]
+    fn another_proxys_header_is_read_when_the_operator_names_it() {
+        let real = HeaderName::from_static("x-real-ip");
+        let behind = ip("172.18.0.2");
+        let alone = client_key_by(&HeaderMap::new(), ip("203.0.113.8"), &real);
+        // A proxy that sets `x-real-ip` is believed about it, and Cloudflare's header is then
+        // not what counts.
+        assert_eq!(
+            client_key_by(&header("x-real-ip", "203.0.113.8"), behind, &real),
+            alone
+        );
+        assert_ne!(
+            client_key_by(&header("cf-connecting-ip", "203.0.113.8"), behind, &real),
+            alone
+        );
+        // From a public address it is only a claim, as with any header.
+        let public = ip("198.51.100.7");
+        assert_eq!(
+            client_key_by(&header("x-real-ip", "203.0.113.8"), public, &real),
+            client_key_by(&HeaderMap::new(), public, &real)
+        );
+    }
+
+    #[test]
+    fn a_forwarded_for_list_counts_by_its_last_entry_which_the_proxy_wrote() {
+        let forwarded = HeaderName::from_static("x-forwarded-for");
+        let proxy = ip("10.0.0.5");
+        let real = client_key_by(&HeaderMap::new(), ip("203.0.113.8"), &forwarded);
+        // The client sent its own list; the proxy appended who it really saw.
+        assert_eq!(
+            client_key_by(
+                &header("x-forwarded-for", "1.1.1.1, 2.2.2.2, 203.0.113.8"),
+                proxy,
+                &forwarded
+            ),
+            real
+        );
+        // So rotating what the client puts first changes nothing.
+        assert_eq!(
+            client_key_by(
+                &header("x-forwarded-for", "9.9.9.9, 203.0.113.8"),
+                proxy,
+                &forwarded
+            ),
+            real
+        );
+        // Nothing usable at the end is the proxy's own address, not a guess from the front.
+        assert_eq!(
+            client_key_by(
+                &header("x-forwarded-for", "203.0.113.8, junk"),
+                proxy,
+                &forwarded
+            ),
+            client_key_by(&HeaderMap::new(), proxy, &forwarded)
+        );
+    }
+
+    #[test]
+    fn the_client_address_header_must_be_a_header_name() {
+        for bad in ["", "not a header", "x-real-ip\r\nx: y", "caf\u{e9}"] {
+            assert!(client_ip_header(bad).is_err(), "{bad:?}");
         }
     }
 

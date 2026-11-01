@@ -200,7 +200,7 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn fatal(message: impl Into<String>) -> Self {
+    pub(crate) fn fatal(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             transient: false,
@@ -227,6 +227,8 @@ struct Shared {
     session_days: u32,
     /// `TINYSERVER_PUBLIC_URL`, without a trailing slash.
     public_url: String,
+    /// The built-in passkey sign-in, when `TINYSERVER_AUTH` turns it on.
+    passkeys: Option<crate::passkey::Passkeys>,
 }
 
 pub(crate) struct Provider {
@@ -403,8 +405,45 @@ impl SignIn {
                 providers,
                 session_days: config.session_days,
                 public_url: public_url.as_str().trim_end_matches('/').to_string(),
+                passkeys: None,
             }),
         })
+    }
+
+    /// Sign-in with passkeys only, for a community with no OpenID Connect provider.
+    pub fn passkey_only(
+        public_url: &str,
+        session_days: u32,
+        passkeys: crate::passkey::Passkeys,
+    ) -> Result<Self, ConfigError> {
+        let public_url = secure_url("TINYSERVER_PUBLIC_URL", public_url)?;
+        if !(1..=365).contains(&session_days) {
+            return Err(ConfigError::fatal(
+                "TINYSERVER_SESSION_MAX_DAYS must be 1 to 365",
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(Shared {
+                providers: Vec::new(),
+                session_days,
+                public_url: public_url.as_str().trim_end_matches('/').to_string(),
+                passkeys: Some(passkeys),
+            }),
+        })
+    }
+
+    /// Adds passkey sign-in beside the providers already configured. Both work at once.
+    #[must_use]
+    pub fn with_passkeys(mut self, passkeys: crate::passkey::Passkeys) -> Self {
+        if let Some(shared) = Arc::get_mut(&mut self.inner) {
+            shared.passkeys = Some(passkeys);
+        }
+        self
+    }
+
+    /// The passkey provider, when it is on.
+    pub(crate) fn passkeys(&self) -> Option<&crate::passkey::Passkeys> {
+        self.inner.passkeys.as_ref()
     }
 
     /// In configured order. The first is the default.
@@ -414,10 +453,13 @@ impl SignIn {
 
     /// The default provider's name.
     pub fn provider_name(&self) -> &str {
-        self.inner
-            .providers
-            .first()
-            .map_or("", |provider| provider.name.as_str())
+        match (self.inner.providers.first(), &self.inner.passkeys) {
+            // Passkeys come first when they are on: the sign-in page they open offers the
+            // provider as the other way in.
+            (_, Some(_)) => "Passkey",
+            (Some(provider), None) => provider.name.as_str(),
+            (None, None) => "",
+        }
     }
 
     /// The provider with `id`, or the first when `id` is `None`.
