@@ -45,11 +45,13 @@ pub use community::{
     NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
 pub use e2ee::{
-    active_keys, apply_commit, commit_snapshot, community_root, create_group, device_key,
-    e2ee_text_mode, group_info, handshake_after, issue_proposals, key_package_count,
-    post_e2ee_message, put_device, put_key_packages, ratchet_tree, revoke_device, server_key,
-    set_community_root, user_devices, CommitSnapshot, HandshakeRow, Issued, IssuedProposal,
-    NewE2eeMessage, Unissued, WelcomeFor,
+    active_keys, apply_commit, clear_server_private, commit_snapshot, community_root, create_group,
+    device_key, e2ee_text_mode, group_info, handshake_after, invite_capability, issue_proposals,
+    key_package_count, list_e2ee_reactions, mls_target, post_e2ee_message, post_e2ee_reaction,
+    put_device, put_key_packages, ratchet_tree, remember_server_public, revoke_device,
+    server_key_state, set_community_root, set_invite_capability, user_devices, CommitSnapshot,
+    HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage, ServerKeyRow, Unissued,
+    WelcomeFor,
 };
 pub use error::DbError;
 pub use media::prepare_icon;

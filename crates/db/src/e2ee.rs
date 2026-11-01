@@ -100,22 +100,57 @@ pub async fn put_device(
     signature_key: &[u8],
     cross_signature: Option<&[u8]>,
     label: Option<&str>,
+    capability_signature: Option<&[u8]>,
 ) -> Result<Value, MessageError> {
     uuid_arg(device_id)?;
     let mut tx = scoped(pool, caller).await?;
     let value = json_in(
         &mut tx,
-        "SELECT app_e2ee_put_device($1::uuid, $2, $3, $4)",
+        "SELECT app_e2ee_put_device($1::uuid, $2, $3, $4, $5)",
         |query| {
             query
                 .bind(device_id)
                 .bind(signature_key)
                 .bind(cross_signature)
                 .bind(label)
+                .bind(capability_signature)
         },
     )
     .await?;
     commit(tx, value).await
+}
+
+/// The capability public key of the invite this person accepted, when that invite has one.
+pub async fn invite_capability(
+    pool: &PgPool,
+    caller: &Caller,
+) -> Result<Option<Vec<u8>>, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let key: Option<Vec<u8>> = sqlx::query_scalar("SELECT app_e2ee_invite_capability()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(key)
+}
+
+/// Attaches a capability public key to an invite this person created and nobody has accepted.
+pub async fn set_invite_capability(
+    pool: &PgPool,
+    caller: &Caller,
+    invite_id: &str,
+    key: &[u8],
+) -> Result<(), MessageError> {
+    uuid_arg(invite_id)?;
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_e2ee_set_invite_capability($1::uuid, $2)")
+        .bind(invite_id)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
 }
 
 /// The signature keys of the caller's active devices.
@@ -229,20 +264,38 @@ pub async fn key_package_count(
     commit(tx, value).await
 }
 
-/// The server's external sender key, as `(public, private)`. Made by the first caller; a caller
-/// that raced it gets the stored one.
-pub async fn server_key(
-    pool: &PgPool,
-    public: &[u8],
-    private: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), DbError> {
-    let row: (Vec<u8>, Vec<u8>) =
-        sqlx::query_as("SELECT r_public, r_private FROM app_e2ee_server_key($1, $2)")
-            .bind(public)
-            .bind(private)
-            .fetch_one(pool)
+/// The external sender row, when one exists. `private` is set only until the process has copied
+/// it into the key file. This never writes the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerKeyRow {
+    pub public: Vec<u8>,
+    pub private: Option<Vec<u8>>,
+}
+
+pub async fn server_key_state(pool: &PgPool) -> Result<Option<ServerKeyRow>, DbError> {
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT r_public, r_private FROM app_e2ee_server_key_state()")
+            .fetch_optional(pool)
             .await?;
-    Ok(row)
+    Ok(row.map(|(public, private)| ServerKeyRow { public, private }))
+}
+
+/// Stores the public half only. Returns the public key that won, which is `public` unless a
+/// race stored another one first.
+pub async fn remember_server_public(pool: &PgPool, public: &[u8]) -> Result<Vec<u8>, DbError> {
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT app_e2ee_remember_server_public($1)")
+        .bind(public)
+        .fetch_one(pool)
+        .await?;
+    Ok(stored)
+}
+
+/// Clears the private half. Called only after that half is in the key file.
+pub async fn clear_server_private(pool: &PgPool) -> Result<(), DbError> {
+    sqlx::query("SELECT app_e2ee_clear_server_private()")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// What the caller may know of a conversation's group: `{e2ee, epoch, members, pending}`.
@@ -260,19 +313,51 @@ pub async fn group_info(
     commit(tx, value).await
 }
 
-/// The caller's device starts the group at epoch 0.
+/// The MLS group a conversation uses, and whether application messages must name the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsTarget {
+    pub group_id: String,
+    /// True when channels that share a viewer set share one group, so a ciphertext's
+    /// authenticated data has to name the conversation.
+    pub audience_groups: bool,
+}
+
+pub async fn mls_target(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+) -> Result<MlsTarget, MessageError> {
+    uuid_arg(conversation)?;
+    let mut tx = scoped(pool, caller).await?;
+    let row: (String, bool) =
+        sqlx::query_as("SELECT r_group::text, r_audience FROM app_e2ee_mls_target($1::uuid)")
+            .bind(conversation)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(MlsTarget {
+        group_id: row.0,
+        audience_groups: row.1,
+    })
+}
+
+/// The caller's device starts the group, or joins the one its viewers already share.
+/// `context`, when set, is 32 bytes: the group id, then the conversation id.
 pub async fn create_group(
     pool: &PgPool,
     caller: &Caller,
     conversation: &str,
     device_id: &str,
+    context: Option<&[u8]>,
 ) -> Result<(), MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
     let mut tx = scoped(pool, caller).await?;
-    sqlx::query("SELECT app_e2ee_create_group($1::uuid, $2::uuid)")
+    sqlx::query("SELECT app_e2ee_create_group($1::uuid, $2::uuid, $3)")
         .bind(conversation)
         .bind(device_id)
+        .bind(context)
         .execute(&mut *tx)
         .await
         .map_err(message_sql)?;
@@ -495,6 +580,7 @@ pub async fn apply_commit(
     ids: &[i64],
     welcomes: &[WelcomeFor],
     tree: &[Vec<u8>],
+    has_path: bool,
 ) -> Result<i64, MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
@@ -512,7 +598,7 @@ pub async fn apply_commit(
         .collect();
     let mut tx = scoped(pool, caller).await?;
     let seq: i64 = sqlx::query_scalar(
-        "SELECT app_e2ee_apply_commit($1::uuid, $2::uuid, $3, $4, $5, $6::text[]::uuid[], $7, $8)",
+        "SELECT app_e2ee_apply_commit($1::uuid, $2::uuid, $3, $4, $5, $6::text[]::uuid[], $7, $8, $9)",
     )
     .bind(conversation)
     .bind(device_id)
@@ -522,6 +608,7 @@ pub async fn apply_commit(
     .bind(devices)
     .bind(data)
     .bind(tree)
+    .bind(has_path)
     .fetch_one(&mut *tx)
     .await
     .map_err(message_sql)?;
@@ -570,6 +657,55 @@ pub async fn post_e2ee_message(
     .map_err(message_sql)?;
     tx.commit().await.map_err(message_sql)?;
     Ok(row)
+}
+
+/// Stores an opaque reaction ciphertext. The same device and client id returns the original.
+pub async fn post_e2ee_reaction(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    ciphertext: &[u8],
+    epoch: u64,
+    device_id: &str,
+    client_id: &str,
+) -> Result<Value, MessageError> {
+    uuid_arg(conversation)?;
+    uuid_arg(device_id)?;
+    let epoch = epoch_arg(epoch)?;
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_post_e2ee_reaction($1::uuid, $2, $3, $4::uuid, $5)",
+        |query| {
+            query
+                .bind(conversation)
+                .bind(ciphertext)
+                .bind(epoch)
+                .bind(device_id)
+                .bind(client_id)
+        },
+    )
+    .await?;
+    commit(tx, value).await
+}
+
+/// Reaction ciphertexts in this conversation after `after`, oldest first. No emoji, no message.
+pub async fn list_e2ee_reactions(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    after: Option<i64>,
+    limit: i32,
+) -> Result<Value, MessageError> {
+    uuid_arg(conversation)?;
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_list_e2ee_reactions($1::uuid, $2, $3)",
+        |query| query.bind(conversation).bind(after).bind(limit),
+    )
+    .await?;
+    commit(tx, value).await
 }
 
 /// The server's `e2ee_text` setting: `off`, `optional` or `new_required`.

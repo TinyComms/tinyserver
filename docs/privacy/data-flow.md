@@ -58,7 +58,7 @@ A returning member skips steps 3 and 4 (the IdP signs them in) and step 7 only f
 | 4 | S to members | The ciphertext. Members whose Remove is pending get nothing | |
 | 5 | Group changes | Public MLS handshake messages (proposals, commits, welcomes) are stored in a handshake log, and the public ratchet trees of the last 8 epochs in `e2ee_trees`. They hold no secret that opens a message | Welcomes for 30 days; proposals and commits while the group exists |
 
-Visible to S even when encrypted: who posted, which conversation, when, ciphertext size, the number and sizes of attachments, reactions (not encrypted in v1), who is in the group, which devices a person has. Not visible: text, edits, reply text, attachment contents, names and types. Source: `docs/e2ee-text.md` sections 1 and 6. Evidence: `crates/api/tests/e2ee_text.rs` `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server` (no table, log line, upload file or temporary file holds the canary), `a_group_forms_and_the_server_stores_only_ciphertext`.
+Visible to S even when encrypted: who posted, which conversation, the minute a ciphertext was stored, ciphertext size, the number and sizes of attachments, that a reaction ciphertext was posted and by which device (not the emoji, not which message), who is in the group, which devices a person has. Not visible: text, edits, reply text, attachment contents, names and types. Source: `docs/e2ee-text.md` sections 1 and 6. Evidence: `crates/api/tests/e2ee_text.rs` `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server` (no table, log line, upload file or temporary file holds the canary), `a_group_forms_and_the_server_stores_only_ciphertext`.
 
 ## 4. Attachments
 

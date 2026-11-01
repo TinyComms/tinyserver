@@ -29,8 +29,11 @@
 # age and which has age-keygen.
 #
 # A bundle holds the database (pg_dump), the uploads, Pocket ID's data (its passkeys: without it
-# nobody can sign in) and the three sign-in secrets, plus a manifest and checksums. A restore
-# replaces all four in the target and then starts it, which migrates an older bundle forward.
+# nobody can sign in), the three sign-in secrets and, when the server has one, the external
+# sender key file, plus a manifest and checksums. A restore replaces those in the target and
+# then starts it, which migrates an older bundle forward. A database dump on its own does not
+# hold that key. An older bundle has the key in the dump instead, and the new server copies it
+# out on start.
 #
 # Environment: TENANT_DIR; TENANT_COMPOSE_FILES, more compose files after deploy/compose.yml;
 # TINYSERVER_BACKUP_TMPFS, the tmpfs a backup or restore works in, default 4g;
@@ -107,6 +110,7 @@ target() {
     [ -n "$RUNTIME" ] || RUNTIME=app_runtime
     POCKETID_DIR=$(value_of "$ENV_PATH" POCKETID_DATA_DIR)
     UPLOADS_VOLUME="${PROJECT}_tinyserver_uploads"
+    KEYS_VOLUME="${PROJECT}_tinyserver_keys"
     if [ -n "$POCKETID_DIR" ]; then
         POCKETID_MOUNT=$POCKETID_DIR
     else
@@ -236,7 +240,8 @@ helper() {
         --network "${PROJECT}_inside" \
         --read-only --tmpfs "/work:size=$TMPFS_SIZE,mode=0700" --tmpfs /tmp:size=16m \
         --cap-drop ALL $capargs --security-opt no-new-privileges:true --pids-limit 128 \
-        -v "$UPLOADS_VOLUME:/v/uploads:$mode" -v "$pocket:/v/pocketid:$mode" $secrets_mount \
+        -v "$UPLOADS_VOLUME:/v/uploads:$mode" -v "$KEYS_VOLUME:/v/keys:$mode" \
+        -v "$pocket:/v/pocketid:$mode" $secrets_mount \
         -v "$(hostfile "$repo_dir/docker/postgres/init/01-roles.sh"):/v/init/01-roles.sh:ro" \
         -v "$(hostfile "$deploy_dir/compose.yml"):/v/deploy/compose.yml:ro" \
         -v "$(hostfile "$deploy_dir/scan-off.yml"):/v/deploy/scan-off.yml:ro" \
@@ -255,6 +260,10 @@ pg_dump -U "$TS_OWNER" -d "$TS_DB" -Fc -f db.dump
 schema=$(psql -U "$TS_OWNER" -d "$TS_DB" -Atc "SELECT COALESCE(max(version), 0) FROM _sqlx_migrations" 2>/dev/null || echo 0)
 tar -C /v/uploads -cf uploads.tar .
 tar -C /v/pocketid -cf pocketid.tar .
+if [ -f /v/keys/e2ee-server-key ]; then
+    cp /v/keys/e2ee-server-key e2ee-server-key
+    chmod 600 e2ee-server-key
+fi
 mkdir secrets
 for f in oidc_client_secret pocketid_api_key pocketid_encryption_key; do
     if [ -f "/v/secrets/$f" ]; then cp "/v/secrets/$f" secrets/; fi
@@ -268,8 +277,9 @@ An export of one tinyserver community. Run it yourself:
 
 1. Get tinyserver at a version at or after schema $schema, and set up deploy/ as its
    deploy/README.md says, with your own env file and passwords. Do not start it yet.
-2. Restore this bundle into it. That puts in the database, the uploads, Pocket ID data
-   and the three sign-in secrets from here, and starts the stack, which migrates it:
+2. Restore this bundle into it. That puts in the database, the uploads, Pocket ID data,
+   the three sign-in secrets and, when this bundle has one, the external sender key
+   file, and starts the stack, which migrates it:
 
      sh deploy/tenant/operator.sh restore --stack deploy/.env --in <this file> --identity <your age key>
 
@@ -325,6 +335,11 @@ POSTGRES_USER=postgres POSTGRES_DB="$TS_DB" TINYSERVER_OWNER_ROLE="$TS_OWNER" TI
 find /v/uploads -mindepth 1 -delete
 tar -C /v/uploads -xf uploads.tar
 chown -R 10001:10001 /v/uploads
+if [ -f e2ee-server-key ]; then
+    cp e2ee-server-key /v/keys/e2ee-server-key
+    chown 10001:10001 /v/keys/e2ee-server-key
+    chmod 600 /v/keys/e2ee-server-key
+fi
 find /v/pocketid -mindepth 1 -delete
 tar -C /v/pocketid -xf pocketid.tar
 chown -R 65532:65532 /v/pocketid
@@ -432,7 +447,7 @@ cmd_restore() {
     [ -f "$in" ] || die "--in FILE is needed"
     [ -f "$identity" ] || die "--identity FILE is needed"
     if [ "$yes" != yes ]; then
-        say "This replaces $NAME's database, uploads, Pocket ID data and sign-in secrets with the bundle's."
+        say "This replaces $NAME's database, uploads, Pocket ID data, sign-in secrets and external sender key with the bundle's."
         printf 'Type the name %s to go on: ' "$NAME"
         read -r answer
         [ "$answer" = "$NAME" ] || die "not restored"
@@ -505,7 +520,7 @@ cmd_delete() {
     fi
     dc down -v --remove-orphans >/dev/null 2>&1 || die "compose down for $NAME failed"
     # Volumes a helper or a one-off run made outside compose's own labels.
-    for v in tinyserver_pg pocketid_data tinyserver_uploads tinyserver_bootstrap clamav_db; do
+    for v in tinyserver_pg pocketid_data tinyserver_uploads tinyserver_bootstrap tinyserver_keys clamav_db; do
         docker volume rm -f "${PROJECT}_$v" >/dev/null 2>&1 || true
     done
     removed=

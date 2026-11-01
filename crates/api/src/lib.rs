@@ -25,6 +25,7 @@ mod setup;
 #[cfg(feature = "fuzz")]
 pub mod fuzz;
 
+pub use e2ee_text::seal_external_sender;
 pub use limit::{client_ip_header, trust_proxies};
 pub use live::{Limits, Live};
 pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};

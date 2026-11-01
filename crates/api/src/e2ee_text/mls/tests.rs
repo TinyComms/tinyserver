@@ -35,9 +35,13 @@ fn a_uuid_is_its_sixteen_bytes_and_only_in_its_own_form() {
 #[test]
 fn the_stored_server_key_is_the_one_that_was_made() {
     let (public, stored) = Signer::generate().expect("key");
-    assert!(stored.len() <= 128, "fits the column");
+    assert!(
+        (16..=128).contains(&stored.len()),
+        "fits the key file and the old column"
+    );
     let first = Signer::from_parts(public.clone(), stored.clone()).expect("load");
-    let again = Signer::from_parts(public, stored).expect("reload");
+    let again = Signer::from_stored(&stored).expect("from file");
+    assert_eq!(again.public_key(), public.as_slice());
     assert_eq!(first.external_sender(), again.external_sender());
     // A stored key that is not the public key beside it is refused.
     let (other, _) = Signer::generate().expect("key");
@@ -236,6 +240,8 @@ fn a_commit_names_the_proposals_the_server_signed_by_reference() {
 
     let meta = parse_commit(&group, 0, &committed.commit).expect("a commit");
     assert_eq!(meta.sender_leaf, 0);
+    // An Add on its own does not need an update path, and openmls omits it.
+    assert!(!meta.has_path);
     assert_eq!(
         meta.proposal_refs,
         vec![proposal_ref(&add).expect("reference")]
@@ -272,6 +278,7 @@ fn a_removal_is_committed_by_reference_and_a_removed_device_reads_nothing_after(
     a.take_proposal(&remove);
     let committed = a.commit();
     let meta = parse_commit(&group, 1, &committed.commit).expect("a commit");
+    assert!(meta.has_path, "a removal commit carries an update path");
     assert_eq!(
         meta.proposal_refs,
         vec![proposal_ref(&remove).expect("reference")]

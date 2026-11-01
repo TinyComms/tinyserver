@@ -81,7 +81,7 @@ for net in inside media edge; do
     contains "alpha's $net network is its own" "$cfg_a" "name: ${PREFIX}-alpha_$net"
     contains "bravo's $net network is its own" "$cfg_b" "name: ${PREFIX}-bravo_$net"
 done
-for vol in tinyserver_pg pocketid_data tinyserver_uploads tinyserver_bootstrap clamav_db; do
+for vol in tinyserver_pg pocketid_data tinyserver_uploads tinyserver_bootstrap tinyserver_keys clamav_db; do
     contains "alpha's volume $vol is its own" "$cfg_a" "name: ${PREFIX}-alpha_$vol"
     contains "bravo's volume $vol is its own" "$cfg_b" "name: ${PREFIX}-bravo_$vol"
 done

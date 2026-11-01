@@ -49,9 +49,17 @@ pub struct ServerSettings {
     /// to offer them.
     pub setup_completed_at: Option<String>,
     pub created_at: String,
-    /// `off`, `optional` or `new_required`: whether new conversations may or must be end-to-end
-    /// encrypted. Existing conversations are never converted.
+    /// `off`, `optional`, `new_required` or `required`: whether new conversations may or must be
+    /// end-to-end encrypted. Existing conversations are never converted.
     pub e2ee_text: String,
+    /// The most devices one encrypted group may hold. 2 to 20,000. Default 2,000.
+    pub e2ee_group_devices_max: i32,
+    /// How long unsigned proposals wait before they are signed. 0 signs at once. Otherwise 5 to
+    /// 300. Default 30.
+    pub e2ee_commit_batch_secs: i32,
+    /// When true, encrypted channels with the same viewers share one MLS group. Default false:
+    /// a group id is the conversation id.
+    pub e2ee_audience_groups: bool,
 }
 
 /// `None` leaves a field as it is. The room ids take `Some(None)` to clear.
@@ -67,6 +75,9 @@ pub struct ServerPatch {
     pub file_max_bytes: Option<i64>,
     pub allow_archives: Option<bool>,
     pub e2ee_text: Option<String>,
+    pub e2ee_group_devices_max: Option<i32>,
+    pub e2ee_commit_batch_secs: Option<i32>,
+    pub e2ee_audience_groups: Option<bool>,
 }
 
 pub struct Icon {
@@ -101,7 +112,8 @@ fn settings_select() -> String {
                 afk_timeout_secs, image_max_bytes, file_max_bytes, allow_archives,
                 provider_profile, activity_visibility, sign_in_methods,
                 to_char(setup_completed_at AT TIME ZONE 'UTC', '{STAMP}'),
-                to_char(created_at AT TIME ZONE 'UTC', '{STAMP}'), e2ee_text
+                to_char(created_at AT TIME ZONE 'UTC', '{STAMP}'), e2ee_text,
+                e2ee_group_devices_max, e2ee_commit_batch_secs, e2ee_audience_groups
          FROM server_settings"
     )
 }
@@ -156,6 +168,18 @@ pub async fn update_server(
     {
         return Err(CommunityError::Invalid);
     }
+    if patch
+        .e2ee_group_devices_max
+        .is_some_and(|max| !(2..=20_000).contains(&max))
+    {
+        return Err(CommunityError::Invalid);
+    }
+    if patch
+        .e2ee_commit_batch_secs
+        .is_some_and(|secs| secs != 0 && !(5..=300).contains(&secs))
+    {
+        return Err(CommunityError::Invalid);
+    }
     let mut tx = scope(pool, caller).await?;
     require(&mut tx, perm::MANAGE_SERVER).await?;
     sqlx::query(
@@ -169,7 +193,10 @@ pub async fn update_server(
              image_max_bytes = coalesce($9, image_max_bytes),
              file_max_bytes = coalesce($10, file_max_bytes),
              allow_archives = coalesce($11, allow_archives),
-             e2ee_text = coalesce($12, e2ee_text)",
+             e2ee_text = coalesce($12, e2ee_text),
+             e2ee_group_devices_max = coalesce($13, e2ee_group_devices_max),
+             e2ee_commit_batch_secs = coalesce($14, e2ee_commit_batch_secs),
+             e2ee_audience_groups = coalesce($15, e2ee_audience_groups)",
     )
     .bind(name.as_deref())
     .bind(description.as_deref())
@@ -183,6 +210,9 @@ pub async fn update_server(
     .bind(file_max)
     .bind(patch.allow_archives)
     .bind(patch.e2ee_text.as_deref())
+    .bind(patch.e2ee_group_devices_max)
+    .bind(patch.e2ee_commit_batch_secs)
+    .bind(patch.e2ee_audience_groups)
     .execute(&mut *tx)
     .await
     .map_err(from_sql)?;
@@ -201,6 +231,15 @@ pub async fn update_server(
         ("file_max_bytes", file_max.is_some()),
         ("allow_archives", patch.allow_archives.is_some()),
         ("e2ee_text", patch.e2ee_text.is_some()),
+        (
+            "e2ee_group_devices_max",
+            patch.e2ee_group_devices_max.is_some(),
+        ),
+        (
+            "e2ee_commit_batch_secs",
+            patch.e2ee_commit_batch_secs.is_some(),
+        ),
+        ("e2ee_audience_groups", patch.e2ee_audience_groups.is_some()),
     ] {
         if set {
             changed.insert(key.into(), Value::Bool(true));
@@ -600,6 +639,9 @@ fn settings_from(row: &PgRow) -> Result<ServerSettings, CommunityError> {
         setup_completed_at: row.try_get(13).map_err(from_sql)?,
         created_at: row.try_get(14).map_err(from_sql)?,
         e2ee_text: row.try_get(15).map_err(from_sql)?,
+        e2ee_group_devices_max: row.try_get(16).map_err(from_sql)?,
+        e2ee_commit_batch_secs: row.try_get(17).map_err(from_sql)?,
+        e2ee_audience_groups: row.try_get(18).map_err(from_sql)?,
     })
 }
 

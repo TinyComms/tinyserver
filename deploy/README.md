@@ -92,6 +92,8 @@ It is a tinyclient invite code. Paste it into tinyclient's "Join a server" and s
 
 `RUST_LOG` is ignored. Set `TINYSERVER_LOG_LEVEL` (`error`, `warn`, `info`, `debug`, or `trace`; default `info`). A debug bundle is written only when the process receives `SIGUSR1`, under `/var/lib/tinyserver/logs`, and old bundles are removed on the next start. Nothing in the log path leaves the box.
 
+The external sender private key is `/var/lib/tinyserver-keys/e2ee-server-key` on the `tinyserver_keys` volume (mode `0600`). It is not in Postgres and not on the tmpfs at `/var/lib/tinyserver`, so a container restart keeps the key clients have pinned. `operator.sh backup` and `restore` carry the file. Losing the file and the database row together stops the server from starting, rather than minting a key the clients would reject.
+
 A server from before sign-in moved to OIDC still has its owner, but that account has no provider identity and cannot sign in. Make an owner invite anyway, sign in with it, and remove the old account from the member list:
 
 ```sh

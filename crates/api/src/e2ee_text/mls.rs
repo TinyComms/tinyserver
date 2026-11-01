@@ -71,13 +71,30 @@ const MESSAGE_AAD_LABEL: &[u8] = b"tiny-e2ee-v1 msg";
 /// server stores beside it are the ones its sender signed: `"tiny-e2ee-v1 msg" 0x00 kind 0x00
 /// target_id`, the target as a lowercase hyphenated uuid, or nothing for a message.
 pub(crate) fn message_aad(kind: &str, target_id: Option<&str>) -> Vec<u8> {
+    message_aad_for(kind, target_id, None)
+}
+
+/// `message_aad`, and when `conversation` is set, a `0x00` and that conversation id after it.
+/// Audience groups turn this on so a ciphertext for one channel cannot be replayed into another
+/// that shares the group. The id is the lowercase hyphenated form.
+pub(crate) fn message_aad_for(
+    kind: &str,
+    target_id: Option<&str>,
+    conversation: Option<&str>,
+) -> Vec<u8> {
     let target = target_id.unwrap_or("");
-    let mut aad = Vec::with_capacity(MESSAGE_AAD_LABEL.len() + kind.len() + target.len() + 2);
+    let extra = conversation.map(|id| id.len() + 1).unwrap_or(0);
+    let mut aad =
+        Vec::with_capacity(MESSAGE_AAD_LABEL.len() + kind.len() + target.len() + 2 + extra);
     aad.extend_from_slice(MESSAGE_AAD_LABEL);
     aad.push(0);
     aad.extend_from_slice(kind.as_bytes());
     aad.push(0);
     aad.extend_from_slice(target.as_bytes());
+    if let Some(conversation) = conversation {
+        aad.push(0);
+        aad.extend_from_slice(conversation.as_bytes());
+    }
     aad
 }
 
@@ -224,6 +241,62 @@ pub(crate) fn key_package_ref(data: &[u8]) -> Option<Vec<u8>> {
     Some(reference.as_slice().to_vec())
 }
 
+const INVITE_CAP_LABEL: &[u8] = b"tiny-e2ee-v1 invite-cap";
+const DEVICE_CAP_LABEL: &[u8] = b"tiny-e2ee-v1 device-cap";
+
+fn signature_ok(key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    PROVIDER
+        .crypto()
+        .verify_signature(
+            SignatureScheme::ECDSA_SECP256R1_SHA256,
+            message,
+            key,
+            signature,
+        )
+        .is_ok()
+}
+
+/// The admin device signed this capability key for this invite:
+/// `"tiny-e2ee-v1 invite-cap" || invite_id || capability_key`.
+pub(crate) fn invite_capability_signed(
+    invite_id: &str,
+    capability_key: &[u8],
+    signature: &[u8],
+    device_key: &[u8],
+) -> bool {
+    let Some(invite) = uuid_bytes(invite_id) else {
+        return false;
+    };
+    if capability_key.len() != 65 {
+        return false;
+    }
+    let mut message = Vec::with_capacity(INVITE_CAP_LABEL.len() + 16 + capability_key.len());
+    message.extend_from_slice(INVITE_CAP_LABEL);
+    message.extend_from_slice(&invite);
+    message.extend_from_slice(capability_key);
+    signature_ok(device_key, &message, signature)
+}
+
+/// The invite's capability key signed this device:
+/// `"tiny-e2ee-v1 device-cap" || user_id || device_id || signature_key`.
+pub(crate) fn device_capability_signed(
+    user_id: &str,
+    device_id: &str,
+    signature_key: &[u8],
+    signature: &[u8],
+    capability_key: &[u8],
+) -> bool {
+    let (Some(user), Some(device)) = (uuid_bytes(user_id), uuid_bytes(device_id)) else {
+        return false;
+    };
+    let mut message = Vec::with_capacity(DEVICE_CAP_LABEL.len() + 32 + signature_key.len());
+    message.extend_from_slice(DEVICE_CAP_LABEL);
+    message.extend_from_slice(&user);
+    message.extend_from_slice(&device);
+    message.extend_from_slice(signature_key);
+    signature_ok(capability_key, &message, signature)
+}
+
 /// Whether `signature` is `signer_keys`' one device vouching for `new_key` as `device_id` of
 /// `user_id`: ECDSA P-256 (DER) over SHA-256 of the label, the two ids and the key.
 pub(crate) fn cross_signed(
@@ -309,6 +382,8 @@ pub(crate) struct CommitMeta {
     pub sender_leaf: u32,
     /// The proposals it applies, by reference, in its order.
     pub proposal_refs: Vec<[u8; 32]>,
+    /// The commit carries an update path.
+    pub has_path: bool,
 }
 
 /// A commit in the clear (an MLS PublicMessage) for this group at this epoch, from a member leaf,
@@ -336,9 +411,11 @@ pub(crate) fn parse_commit(
     {
         return Err(Refused::Bad);
     }
+    let (proposal_refs, has_path) = commit_references(data).ok_or(Refused::Bad)?;
     Ok(CommitMeta {
         sender_leaf: index.u32(),
-        proposal_refs: commit_references(data).ok_or(Refused::Bad)?,
+        proposal_refs,
+        has_path,
     })
 }
 
@@ -399,11 +476,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The proposal references a commit applies, read from the bytes of the MLSMessage that holds it:
-/// version, wire format, then the framed content (group id, epoch, sender, authenticated data,
-/// content type) and the commit's list of proposals. `None` if any is by value or the bytes are
-/// not that shape.
-fn commit_references(data: &[u8]) -> Option<Vec<[u8; 32]>> {
+/// The proposal references a commit applies, and whether it carries an update path. Read from the
+/// bytes of the MLSMessage that holds it: version, wire format, then the framed content (group
+/// id, epoch, sender, authenticated data, content type) and the commit (proposals, then the
+/// optional path). `None` if any proposal is by value or the bytes are not that shape.
+fn commit_references(data: &[u8]) -> Option<(Vec<[u8; 32]>, bool)> {
     let mut reader = Reader { bytes: data, at: 0 };
     if reader.u16()? != 1 || reader.u16()? != 1 {
         return None;
@@ -431,7 +508,12 @@ fn commit_references(data: &[u8]) -> Option<Vec<[u8; 32]>> {
         let hash = list.vector()?;
         references.push(<[u8; 32]>::try_from(hash).ok()?);
     }
-    Some(references)
+    let has_path = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    Some((references, has_path))
 }
 
 /// The reference of a proposal the server signed, as a commit names it: SHA-256 over
@@ -485,14 +567,14 @@ pub(crate) struct Signer {
 
 impl Signer {
     /// A new key, as `(public, stored)`. `stored` is the TLS encoding of the key pair, which is
-    /// what `e2ee_server_key.private_key` holds: openmls gives out no raw private key.
+    /// what the key file holds: openmls gives out no raw private key.
     pub fn generate() -> Option<(Vec<u8>, Vec<u8>)> {
         let keys = SignatureKeyPair::new(SUITE.signature_algorithm()).ok()?;
         let stored = keys.tls_serialize_detached().ok()?;
         Some((keys.public().to_vec(), stored))
     }
 
-    /// The key from what `generate` returned and the database kept.
+    /// The key from what `generate` returned. `stored` is the TLS encoding of the key pair.
     pub fn from_parts(public: Vec<u8>, stored: Vec<u8>) -> Option<Self> {
         let keys = SignatureKeyPair::tls_deserialize_exact_bytes(&stored).ok()?;
         if keys.public() != public.as_slice()
@@ -508,6 +590,16 @@ impl Signer {
             keys,
             sender: STANDARD.encode(sender),
         })
+    }
+
+    /// The key file's bytes. They are the same TLS encoding `generate` returns.
+    pub fn from_stored(stored: &[u8]) -> Option<Self> {
+        let keys = SignatureKeyPair::tls_deserialize_exact_bytes(stored).ok()?;
+        Self::from_parts(keys.public().to_vec(), stored.to_vec())
+    }
+
+    pub fn public_key(&self) -> &[u8] {
+        self.keys.public()
     }
 
     /// The ExternalSender a client puts in its group's `external_senders` extension at index 0.
