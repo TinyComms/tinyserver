@@ -29,7 +29,7 @@ Paths are in tinyserver unless marked `client:`.
 | S13 | Low | Dev compose published Postgres on `0.0.0.0` with known passwords | Fixed |
 | S14 | Low | Resource limits missing on most containers | Fixed |
 | S15 | Low | Migrations were not tracked as a build input | Fixed |
-| S16 | Low | `GET /v1/audit`, bans and last-seen exposure to all members (last seen) | Documented |
+| S16 | Low | Last-seen time and how a member joined are visible to every member | Documented |
 | C1 | High | `client:` Tiny text and files are plaintext to the server; local cache unencrypted | Remediation in progress |
 | C2 | High | `client:` Accepts a server `off` frame and carries on unencrypted | Fixed (opt-in require mode) |
 | C3 | Medium | `client:` Identity key written non-atomically, overwritten when unreadable | Fixed |
@@ -95,8 +95,8 @@ Paths are in tinyserver unless marked `client:`.
 
 - **Files**: `crates/api/src/limit.rs`, `crates/server/src/main.rs`.
 - **Behavior**: the key was the `cf-connecting-ip` header from whoever sent it, held as the raw address string; a direct caller could rotate the header to get a fresh allowance; a missing header shared one bucket.
-- **Remediation**: the real peer address is read from the connection; the header is believed only from a trusted proxy (`TINYSERVER_TRUSTED_PROXIES`, default private, loopback and link-local peers); the key stored is a truncated SHA-256 under a per-process random secret, IPv6 grouped by /64; windows stay 60 seconds, in memory only.
-- **Tests**: seven unit tests in `limit.rs`.
+- **Remediation**: the real peer address is read from the connection; the header is believed only from a trusted proxy (`TINYSERVER_TRUSTED_PROXIES`, default private, loopback, link-local and 100.64.0.0/10 peers); the key stored is a truncated SHA-256 under a per-process random secret, IPv6 grouped by /64; windows stay 60 seconds, in memory only.
+- **Tests**: nine unit tests in `limit.rs`.
 - **Limits**: a keyed hash of an IPv4 address is brute-forceable by anyone who holds the secret; the secret exists only in process memory. When no address is available the limiter does not fail open: callers share one bucket, which is a denial-of-service lever only for the three sign-in routes.
 
 ### S8 Medium: no account deletion; edits and deletes remain in live history (Reproduced)
@@ -161,3 +161,39 @@ Hardening details and what could not be done are in the client's `SECURITY.md`.
 - The SFU does not send one participant's address to another; the client never learns other participants' addresses.
 - Session, invite and bot tokens are 32 random bytes stored as SHA-256 hashes.
 - PKCE S256, `state`, `nonce`, exact loopback redirect matching and RFC 9207 `iss` checks are present in sign-in.
+
+## Corrections and additions from the documentation pass
+
+Made while writing the privacy documents, 2026-10-31, at `ea3cd39`. Corrections to this ledger are applied above (S7: nine tests, not seven, and the default trusted range also covers 100.64.0.0/10; S16 summary line). The items below are **Read** unless stated, and are rated by the same scale.
+
+### Not matching this branch
+
+- S2, S11 and S12 cite `deploy/tests/`, `deploy/backup/` and `deploy/tenant/`. None exists at `ea3cd39`. They are described here only as planned.
+- "Not findings", SFU addresses: established by reading `crates/sfu/src/engine.rs` (`candidates`); no test asserts it. The "no telemetry crate" statement was re-checked against both `Cargo.lock` files (server and client).
+- C4 says text E2EE keys "are stored through the OS keychain". That is the specification, not merged code.
+
+### New findings
+
+| # | Severity | Finding | Where |
+|---|---|---|---|
+| N1 | Medium | Panic and fatal-error output bypass the log redactor: no panic hook is installed and `anyhow` errors print straight to stderr | `crates/server/src/main.rs`, `log_policy.rs` |
+| N2 | Medium | The default `info` log records socket open and close with `user_id`, and Docker timestamps each line: a connection history. "No activity logs" cannot be claimed at the default level | `crates/api/src/live/socket.rs`, [`telemetry-and-logging.md`](telemetry-and-logging.md) |
+| N3 | Medium | `DELETE /v1/me` does not delete the Pocket ID account (passkeys, username, optional email, an audit log with client IPs kept 90 days by default). It also leaves `directs` rows and free-text `audit_log.reason` | `0014_account_deletion.sql`, `crates/api/src/oidc.rs` |
+| N4 | Medium | No per-user or per-address rate limit on REST writes or uploads, and no storage quota. Only the three sign-in routes and the live socket are limited | `crates/api/src/limit.rs` |
+| N5 | Low | `deploy/README.md` "Moving from Tinyauth" step 6 runs `identities` and `relink-identity` with `docker compose exec tinyserver`; since S2 that container has no `DATABASE_URL_MIGRATE`, so they fail. They must run in `tinyserver-init` | `deploy/README.md`, `deploy/compose.yml` |
+| N6 | Low | The owner invite file stays on its volume until the next `tinyserver-init` run after an owner exists, not until the owner signs up | `crates/server/src/main.rs` |
+| N7 | Low | `bans` and `ban_identities` are never swept, including expired bans; the audit log is never pruned | `app_sweep`, `crates/db/src/sweep.rs` |
+| N8 | Low | `GET /health` is unauthenticated and returns `db_role` | `crates/api/src/health.rs` |
+| N9 | Low | A binary rollback below the E2EE version could accept plaintext into an encrypted conversation unless `migrate` fails first. Relies on sqlx's default; untested | [`migration.md`](migration.md) |
+| N10 | Low | No backup tooling exists at this commit (S11 is planned only). The only procedure is an unencrypted manual `pg_dump` | `deploy/README.md` |
+
+### Documents that disagree with the code
+
+| Document | Says | Code says |
+|---|---|---|
+| `docs/logging.md` | The request span carries `req_id` | The layer never renders span fields; `req_id` is never printed |
+| `docs/logging.md`, `docs/server.md` | The owner invite is read from `/var/lib/tinyserver/owner-invite` (or `{TINYSERVER_DATA_DIR}/owner-invite`) | In compose it is `/bootstrap/owner-invite` |
+| `docs/server.md`, `docs/calls.md` | Channel events go to every member socket; channel message and reaction events use a null audience | Replaced by `0013`: a channel that can be restricted narrows the audience to its viewers |
+| `docs/server.md` | Lists no `DELETE /v1/me` and no `account.delete` audit action | Both exist (`crates/api/src/account.rs`, `0014`) |
+| `docs/calls.md` | At `trace` the WebSocket library prints whole frames | Targets other than `tinyserver`, `api` and `sfu` are capped at `warn` |
+| tinyclient `SECURITY.md` | Video and screen share on a Tiny server are not end-to-end encrypted | `crates/mediad/src/e2ee.rs` has `seal_video`, used by `tiny.rs` at `26916e9`; `docs/calls.md` and the README say sealed |
