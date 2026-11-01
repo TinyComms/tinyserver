@@ -401,11 +401,15 @@ fn the_group_itself_refuses_a_proposal_signed_for_another_epoch() {
     let (mut a, b, server, group) = pair();
     let package = parse_key_package(&b.key_package()).expect("package");
     let stale = server.add(package, &group, 5).expect("add");
-    let message = MlsMessageIn::tls_deserialize_exact_bytes(&stale).expect("message");
-    let protocol = message.try_into_protocol_message().expect("protocol");
-    let provider = &a.provider;
-    let group_ref = a.group.as_mut().expect("group");
-    assert!(group_ref.process_message(provider, protocol).is_err());
+    assert!(!a.accepts(&stale));
+    let right = server
+        .add(
+            parse_key_package(&b.key_package()).expect("package"),
+            &group,
+            0,
+        )
+        .expect("add");
+    assert!(a.accepts(&right));
 }
 
 #[test]
@@ -496,4 +500,65 @@ fn the_keys_are_p256_points() {
     let pair = SignatureKeyPair::new(SignatureScheme::ECDSA_SECP256R1_SHA256).expect("keys");
     assert_eq!(pair.public().len(), 65);
     assert_eq!(pair.public()[0], 4);
+}
+
+#[test]
+fn a_key_package_for_another_ciphersuite_is_refused() {
+    let a = Client::new(USER_A, DEVICE_A);
+    let (package, its_key) = a.key_package_other_suite();
+    // It parses, its credential is the device's, and the key is the one registered: only the
+    // ciphersuite is wrong.
+    assert!(parse_key_package(&package).is_ok());
+    assert_eq!(
+        validate_key_package(USER_A, DEVICE_A, &its_key, &package, unix_now()),
+        Err(Refused::Bad)
+    );
+}
+
+#[test]
+fn a_last_resort_key_package_is_valid_too() {
+    let a = Client::new(USER_A, DEVICE_A);
+    let now = unix_now();
+    assert!(
+        validate_key_package(USER_A, DEVICE_A, &a.signature_key(), &a.last_resort(), now).is_ok()
+    );
+    assert!(
+        validate_key_package(USER_A, DEVICE_A, &a.signature_key(), &a.key_package(), now).is_ok()
+    );
+}
+
+/// Writes real objects as the seeds of the `e2ee_handshake` fuzz target:
+///   cargo test -p api --lib write_fuzz_seeds -- --ignored
+#[test]
+#[ignore = "writes fuzz/seeds/e2ee_handshake; run it by hand when the formats change"]
+fn write_fuzz_seeds() {
+    let (mut a, mut b, server, group) = joined();
+    let c = Client::new(USER_B, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+    let add = server
+        .add(
+            parse_key_package(&c.key_package()).expect("package"),
+            &group,
+            1,
+        )
+        .expect("add");
+    let remove = server.remove(1, &group, 1).expect("remove");
+    a.take_proposals(&batch(&[&add, &remove]).expect("batch"));
+    let committed = a.commit();
+    let ciphertext = a.encrypt(b"seed");
+    let _ = &mut b;
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/e2ee_handshake");
+    std::fs::create_dir_all(&dir).expect("seed dir");
+    for (name, bytes) in [
+        ("key_package", c.key_package()),
+        ("last_resort", c.last_resort()),
+        ("commit", committed.commit),
+        ("welcome", committed.welcome.expect("welcome")),
+        ("add", add),
+        ("remove", remove),
+        ("private_message", ciphertext),
+        ("batch", batch(&[&[1, 0, 1, 0]]).expect("batch")),
+    ] {
+        std::fs::write(dir.join(name), bytes).expect("seed");
+    }
 }

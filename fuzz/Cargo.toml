@@ -52,3 +52,10 @@ path = "fuzz_targets/video_routing.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "e2ee_handshake"
+path = "fuzz_targets/e2ee_handshake.rs"
+test = false
+doc = false
+bench = false

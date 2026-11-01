@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _, VLBytes};
@@ -57,7 +59,10 @@ pub fn unix_now() -> u64 {
 fn capabilities() -> Capabilities {
     Capabilities::builder()
         .ciphersuites(vec![SUITE])
-        .extensions(vec![ExtensionType::ExternalSenders])
+        .extensions(vec![
+            ExtensionType::ExternalSenders,
+            ExtensionType::LastResort,
+        ])
         .build()
 }
 
@@ -67,12 +72,15 @@ pub struct Committed {
     pub welcome: Option<Vec<u8>>,
 }
 
+/// One device holds a group for each encrypted conversation it is in. The methods that read or
+/// change a group work on the one `use_group` named last.
 pub struct Client {
     pub provider: OpenMlsRustCrypto,
     pub keys: SignatureKeyPair,
     pub user_id: String,
     pub device_id: String,
-    pub group: Option<MlsGroup>,
+    groups: HashMap<[u8; 16], MlsGroup>,
+    current: [u8; 16],
 }
 
 impl Client {
@@ -82,8 +90,22 @@ impl Client {
             keys: SignatureKeyPair::new(SUITE.signature_algorithm()).expect("keys"),
             user_id: user_id.to_string(),
             device_id: device_id.to_string(),
-            group: None,
+            groups: HashMap::new(),
+            current: [0; 16],
         }
+    }
+
+    /// Works on the group of this conversation from now on.
+    pub fn use_group(&mut self, id: [u8; 16]) {
+        self.current = id;
+    }
+
+    pub fn has_group(&self, id: &[u8; 16]) -> bool {
+        self.groups.contains_key(id)
+    }
+
+    pub fn group_mut(&mut self) -> &mut MlsGroup {
+        self.groups.get_mut(&self.current).expect("in a group")
     }
 
     /// The 32 byte credential content: the user id then the device id.
@@ -188,23 +210,16 @@ impl Client {
             self.credential_with_key(),
         )
         .expect("group");
-        self.group = Some(group);
-    }
-
-    fn group(&mut self) -> &mut MlsGroup {
-        self.group.as_mut().expect("in a group")
+        self.groups.insert(group_id, group);
+        self.current = group_id;
     }
 
     pub fn epoch(&self) -> u64 {
-        self.group.as_ref().expect("in a group").epoch().as_u64()
+        self.groups[&self.current].epoch().as_u64()
     }
 
     pub fn leaf_index(&self) -> u32 {
-        self.group
-            .as_ref()
-            .expect("in a group")
-            .own_leaf_index()
-            .u32()
+        self.groups[&self.current].own_leaf_index().u32()
     }
 
     /// Reads a batch from the log: a TLS vector of MLSMessages, each an external proposal.
@@ -224,6 +239,19 @@ impl Client {
         out
     }
 
+    /// Whether the group accepts this message as it is: a proposal for the right epoch, say.
+    pub fn accepts(&mut self, message: &[u8]) -> bool {
+        let Ok(message) = MlsMessageIn::tls_deserialize_exact_bytes(message) else {
+            return false;
+        };
+        let Ok(protocol) = message.try_into_protocol_message() else {
+            return false;
+        };
+        let provider = &self.provider;
+        let group = self.groups.get_mut(&self.current).expect("in a group");
+        group.process_message(provider, protocol).is_ok()
+    }
+
     /// Stores each proposal of a batch, as a member does when it reads the log.
     pub fn take_proposals(&mut self, batch: &[u8]) {
         for message in Self::messages_of(batch) {
@@ -237,7 +265,7 @@ impl Client {
             .try_into_protocol_message()
             .expect("protocol message");
         let provider = &self.provider;
-        let group = self.group.as_mut().expect("in a group");
+        let group = self.groups.get_mut(&self.current).expect("in a group");
         let processed = group
             .process_message(provider, protocol)
             .expect("process proposal");
@@ -254,7 +282,7 @@ impl Client {
     pub fn commit(&mut self) -> Committed {
         let provider = &self.provider;
         let keys = &self.keys;
-        let group = self.group.as_mut().expect("in a group");
+        let group = self.groups.get_mut(&self.current).expect("in a group");
         let (commit, welcome, _) = group
             .commit_to_pending_proposals(provider, keys)
             .expect("commit");
@@ -264,11 +292,42 @@ impl Client {
         }
     }
 
+    /// The server refused or lost the commit: it is dropped, and the proposals stay stored.
+    pub fn abandon(&mut self) {
+        let provider = &self.provider;
+        self.groups
+            .get_mut(&self.current)
+            .expect("in a group")
+            .clear_pending_commit(provider.storage())
+            .expect("clear");
+    }
+
+    /// A key package for another ciphersuite (X25519 and Ed25519) with this device's credential,
+    /// and the signature key it carries.
+    pub fn key_package_other_suite(&self) -> (Vec<u8>, Vec<u8>) {
+        let suite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let keys = SignatureKeyPair::new(suite.signature_algorithm()).expect("keys");
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(self.credential_content()).into(),
+            signature_key: keys.public().into(),
+        };
+        let capabilities = Capabilities::builder().ciphersuites(vec![suite]).build();
+        let bundle = KeyPackage::builder()
+            .leaf_node_capabilities(capabilities)
+            .build(suite, &self.provider, &keys, credential)
+            .expect("key package");
+        let bytes = bundle
+            .key_package()
+            .tls_serialize_detached()
+            .expect("serialise");
+        (bytes, keys.public().to_vec())
+    }
+
     /// The server accepted the commit: the group moves to the next epoch.
     pub fn merge(&mut self) {
         let provider = &self.provider;
-        self.group
-            .as_mut()
+        self.groups
+            .get_mut(&self.current)
             .expect("in a group")
             .merge_pending_commit(provider)
             .expect("merge");
@@ -281,7 +340,7 @@ impl Client {
             .try_into_protocol_message()
             .expect("protocol message");
         let provider = &self.provider;
-        let group = self.group.as_mut().expect("in a group");
+        let group = self.groups.get_mut(&self.current).expect("in a group");
         let processed = group
             .process_message(provider, protocol)
             .expect("process commit");
@@ -305,14 +364,21 @@ impl Client {
             .build();
         let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
             .expect("welcome");
-        self.group = Some(staged.into_group(&self.provider).expect("group"));
+        let group = staged.into_group(&self.provider).expect("group");
+        let id: [u8; 16] = group
+            .group_id()
+            .as_slice()
+            .try_into()
+            .expect("a 16 byte group id");
+        self.groups.insert(id, group);
+        self.current = id;
     }
 
     /// Encrypts an application message, as an MLS PrivateMessage.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let provider = &self.provider;
         let keys = &self.keys;
-        let group = self.group.as_mut().expect("in a group");
+        let group = self.groups.get_mut(&self.current).expect("in a group");
         group
             .create_message(provider, keys, plaintext)
             .expect("encrypt")
@@ -325,7 +391,7 @@ impl Client {
         let message = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext).ok()?;
         let protocol = message.try_into_protocol_message().ok()?;
         let provider = &self.provider;
-        let group = self.group.as_mut()?;
+        let group = self.groups.get_mut(&self.current)?;
         let processed = group.process_message(provider, protocol).ok()?;
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(message) => Some(message.into_bytes()),
@@ -336,7 +402,7 @@ impl Client {
     pub fn is_member(&self, user_id: &str, device_id: &str) -> bool {
         let mut content = uuid16(user_id).to_vec();
         content.extend_from_slice(&uuid16(device_id));
-        self.group.as_ref().is_some_and(|group| {
+        self.groups.get(&self.current).is_some_and(|group| {
             group
                 .members()
                 .any(|member| member.credential.serialized_content() == content.as_slice())

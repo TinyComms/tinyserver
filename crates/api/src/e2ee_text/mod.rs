@@ -206,17 +206,18 @@ async fn register(
         None => None,
     };
     let active = db::active_keys(pool, caller).await.map_err(lift)?;
-    let stored = if active.is_empty() {
+    let stored = match cross.as_deref() {
         // The first device is trusted on first use and carries no cross signature.
-        None
-    } else {
-        let Some(signature) = cross.as_deref() else {
-            return Err(Error::CrossSignatureRequired);
-        };
-        if !mls::cross_signed(&caller.user_id, device_id, &key, signature, &active) {
-            return Err(Error::BadE2ee);
+        _ if active.is_empty() => None,
+        Some(signature) => {
+            if !mls::cross_signed(&caller.user_id, device_id, &key, signature, &active) {
+                return Err(Error::BadE2ee);
+            }
+            Some(signature)
         }
-        Some(signature)
+        // None: the database refuses, with `device_exists` if this id is already a device and
+        // `cross_signature_required` if not, so that a retry of a registration is told it landed.
+        None => None,
     };
     db::put_device(pool, caller, device_id, &key, stored, body.label.as_deref())
         .await
@@ -566,7 +567,7 @@ async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> R
             return Err(Error::BadE2ee);
         };
         let recipients = mls::welcome_recipients(data).map_err(refused)?;
-        if !recipients.iter().any(|recipient| *recipient == reference) {
+        if !recipients.contains(&reference) {
             return Err(Error::BadE2ee);
         }
         welcomes.push(WelcomeFor {

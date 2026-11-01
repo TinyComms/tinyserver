@@ -457,9 +457,8 @@ async fn add_message(
             },
         )
         .await
-        .map_err(|error| {
-            message_failed(&caller.user_id, &id, &error);
-            error
+        .inspect_err(|error| {
+            message_failed(&caller.user_id, &id, error);
         });
     }
     let message = post_message(

@@ -954,9 +954,8 @@ BEGIN
         RAISE EXCEPTION 'welcomes do not match the adds' USING ERRCODE = 'P0E15';
     END IF;
 
-    -- Proposals of epochs that are over are of no use to anyone.
-    DELETE FROM e2ee_handshake h
-    WHERE h.conversation_id = p_conv AND h.kind = 'proposals' AND h.epoch <= p_epoch;
+    -- The proposals of this epoch stay in the log: a member that has not read them yet needs them
+    -- to apply the commit, which names them by reference.
     INSERT INTO e2ee_handshake (conversation_id, kind, epoch, data)
     VALUES (p_conv, 'commit', p_epoch, p_commit)
     RETURNING seq INTO v_seq;
