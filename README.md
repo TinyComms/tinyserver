@@ -72,7 +72,7 @@ cargo run -p tinyserver -- bootstrap
 cargo run -p tinyserver -- serve
 ```
 
-`docker compose` here is the repo-root file, project name `tinyserver`. It publishes Postgres 17 on `0.0.0.0:54329` and nothing else. [`deploy/compose.yml`](deploy/compose.yml) uses the same project name for a different stack. Do not use this `.env` as that stack's environment file.
+`docker compose` here is the repo-root file, project name `tinyserver`. It publishes Postgres 17 on `127.0.0.1:54329` (this machine only) and nothing else. Its passwords are the known development ones in `.env.example`, which is why it never listens on a network address. [`deploy/compose.yml`](deploy/compose.yml) uses the same project name for a different stack. Do not use this `.env` as that stack's environment file.
 
 `.env.example` is the local default. Copy it to `.env` and keep that file to yourself. The process loads `.env` from the current directory and does not override variables already set.
 

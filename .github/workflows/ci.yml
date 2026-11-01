@@ -64,7 +64,8 @@ jobs:
         run: cargo test
 
   # The cargo-fuzz targets in fuzz/, built on nightly and run for a minute each. Apart from
-  # check, so a nightly break does not hold up a merge.
+  # check, so a nightly break does not hold up a merge. The nightly is pinned: later ones fail
+  # to compile sqlx-core (E0391, a cycle computing async drop for its Error type).
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -72,7 +73,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Toolchain
-        run: rustup toolchain install nightly --profile minimal
+        run: rustup toolchain install nightly-2026-10-01 --profile minimal
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -82,15 +83,15 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Build
-        run: cargo +nightly fuzz build
+        run: cargo +nightly-2026-10-01 fuzz build
 
       - name: Run
         run: |
-          for target in $(cargo +nightly fuzz list); do
+          for target in $(cargo +nightly-2026-10-01 fuzz list); do
             mkdir -p fuzz/corpus/$target
             seeds=fuzz/seeds/$target
             [ -d "$seeds" ] || seeds=
-            cargo +nightly fuzz run $target fuzz/corpus/$target $seeds -- -max_total_time=60
+            cargo +nightly-2026-10-01 fuzz run $target fuzz/corpus/$target $seeds -- -max_total_time=60
           done
 
       - name: Crashes

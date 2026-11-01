@@ -5,7 +5,9 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, put};
 use axum::{Json, Router};
-use db::{close_all_sessions, delete_avatar, get_avatar, rename_me, set_avatar, PgPool};
+use db::{
+    close_all_sessions, delete_account, delete_avatar, get_avatar, rename_me, set_avatar, PgPool,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::community::{caller, icon_failure, lift, ApiError};
@@ -13,7 +15,7 @@ use crate::session::Current;
 
 pub fn routes() -> Router<PgPool> {
     Router::new()
-        .route("/v1/me", patch(rename))
+        .route("/v1/me", patch(rename).delete(delete_me))
         .route(
             "/v1/me/avatar",
             put(put_avatar)
@@ -114,6 +116,30 @@ async fn avatar(
         icon.bytes,
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+struct DeleteBody {
+    confirm: String,
+}
+
+/// The phrase a client sends to delete the caller's account. Typed, so a stray DELETE cannot.
+const DELETE_CONFIRM: &str = "delete my account";
+
+/// Deletes the caller's own account: profile, identity, sessions, bots and messages. A sole
+/// owner gets `409 last_owner` and must hand the server to someone first.
+async fn delete_me(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteBody>,
+) -> Result<StatusCode, ApiError> {
+    let caller = caller(&pool, &headers).await?;
+    if body.confirm.trim() != DELETE_CONFIRM {
+        return Err(ApiError::Invalid);
+    }
+    delete_account(&pool, &caller).await.map_err(lift)?;
+    tracing::info!(user_id = %caller.user_id, "account deleted");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn sign_out_everywhere(

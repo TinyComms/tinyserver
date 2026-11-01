@@ -211,6 +211,30 @@ pub async fn close_all_sessions(pool: &PgPool, caller: &Caller) -> Result<u64, C
     Ok(ended)
 }
 
+/// Deletes the caller's own account: their name, email, picture, provider identity, sessions,
+/// bots and messages. The row stays as an empty "Deleted user" because other people's history
+/// points at it. A sole owner is refused with `LastOwner`. See `0014_account_deletion.sql` for
+/// what is removed and what a deletion cannot reach.
+pub async fn delete_account(pool: &PgPool, caller: &Caller) -> Result<(), CommunityError> {
+    if caller.role == "bot" {
+        return Err(CommunityError::Forbidden);
+    }
+    let mut tx = scope(pool, caller).await?;
+    let files: Vec<String> = sqlx::query_scalar("SELECT app_delete_account()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(from_sql)?;
+    emit(
+        &mut tx,
+        "member.removed",
+        serde_json::json!({"user_id": caller.user_id}),
+    )
+    .await?;
+    tx.commit().await.map_err(from_sql)?;
+    crate::messages::remove_files(&files);
+    Ok(())
+}
+
 /// Tells live sockets of `user_id` to check their session now. Never sent to a client.
 async fn session_ended(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

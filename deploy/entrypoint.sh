@@ -1,9 +1,14 @@
 #!/bin/sh
-# Migrate, print an owner invite while there is no owner, then serve. Once someone has signed in
-# with the invite, bootstrap does nothing. Until then a start keeps the invite printed earlier
-# while it works (24 hours) and prints a new one once it has expired; `tinyserver bootstrap
-# --owner-invite` makes a new one at any time.
+# Serve. deploy/compose.yml migrates and bootstraps in tinyserver-init, which is the only place
+# the owner role's password is, so this process starts with the runtime role alone.
+#
+# A single-container setup that still passes DATABASE_URL_MIGRATE migrates and bootstraps here,
+# as it always did. That keeps the owner role inside the serving process; the compose file does
+# not do it, and a deployment that can should not either.
 set -eu
-tinyserver migrate
-tinyserver bootstrap
+if [ -n "${DATABASE_URL_MIGRATE:-}" ]; then
+    tinyserver migrate
+    tinyserver bootstrap
+    unset DATABASE_URL_MIGRATE
+fi
 exec tinyserver serve

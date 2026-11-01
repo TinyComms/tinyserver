@@ -1,0 +1,4 @@
+# A shell script with CRLF line endings fails in the container with "bad interpreter". Windows
+# checkouts convert text files, so these two are pinned to LF.
+*.sh text eol=lf
+Dockerfile text eol=lf
