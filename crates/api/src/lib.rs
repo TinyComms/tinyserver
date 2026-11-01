@@ -14,6 +14,7 @@ pub mod media_sign;
 mod messages;
 mod observe;
 mod oidc;
+mod reports;
 mod scan_clamd;
 mod session;
 
@@ -54,7 +55,8 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(community::routes())
         .merge(admin::routes())
         .merge(bot::routes())
-        .merge(messages::routes());
+        .merge(messages::routes())
+        .merge(reports::routes());
     if let Some(live) = live {
         routes = routes.merge(live::routes(live));
     }

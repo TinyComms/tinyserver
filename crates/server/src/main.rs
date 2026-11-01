@@ -237,6 +237,21 @@ async fn serve() -> anyhow::Result<()> {
         api::trust_proxies(&spec)
             .map_err(|error| anyhow::anyhow!("TINYSERVER_TRUSTED_PROXIES: {error}"))?;
     }
+    // Days a dismissed or actioned abuse report is kept. A bad value stops the start: guessing
+    // would either keep reports longer than the operator said or delete them sooner.
+    if db::retention_days_from(
+        std::env::var("TINYSERVER_REPORT_RETENTION_DAYS")
+            .ok()
+            .as_deref(),
+    )
+    .is_none()
+    {
+        anyhow::bail!(
+            "TINYSERVER_REPORT_RETENTION_DAYS is not a whole number from {} to {}",
+            db::RETENTION_MIN_DAYS,
+            db::RETENTION_MAX_DAYS
+        );
+    }
     let url = env_var("DATABASE_URL")?;
     let bind: SocketAddr = env_var("BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -519,6 +534,7 @@ async fn sweep_every(pool: PgPool, period: Duration) {
                 idempotency_keys = swept.idempotency_keys,
                 events = swept.events,
                 logins = swept.logins,
+                reports = swept.reports,
                 "expired rows deleted"
             ),
             Ok(_) => {}

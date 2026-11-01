@@ -57,6 +57,13 @@ const DENY_EXACT: &[&str] = &[
     "vault",
     "sig",
     "detail",
+    // Abuse reports: what a reporter wrote or disclosed, and what a moderator wrote about it.
+    "evidence",
+    "evidence_text",
+    "note",
+    "notes",
+    "report_text",
+    "moderator_note",
 ];
 
 const DENY_SUFFIX: &[&str] = &["_token", "_secret", "_password", "_cookie", "_key"];
@@ -809,6 +816,32 @@ mod tests {
         match value {
             Ok(value) => value,
             Err(error) => panic!("io error: {error}"),
+        }
+    }
+
+    #[test]
+    fn abuse_report_text_never_reaches_either_sink() {
+        let policy = LogPolicy::default();
+        for sink in [Sink::Operator, Sink::Ring] {
+            for field in [
+                "evidence",
+                "EVIDENCE",
+                "evidence_text",
+                "note",
+                "notes",
+                "report_text",
+                "moderator_note",
+            ] {
+                let event = EventParts {
+                    target: "api::reports",
+                    level: Level::INFO,
+                    message: "report worked",
+                    fields: &[(field, "REPORT-MARKER-TEXT"), ("report_id", "0192")],
+                };
+                let line = line_of(render(&policy, sink, &event));
+                assert!(!line.contains("REPORT-MARKER-TEXT"), "{field}: {line}");
+                assert!(line.contains("report_id=0192"), "{field}: {line}");
+            }
         }
     }
 
