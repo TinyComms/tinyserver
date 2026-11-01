@@ -376,6 +376,11 @@ async fn serve() -> anyhow::Result<()> {
         api::trust_proxies(&spec)
             .map_err(|error| anyhow::anyhow!("TINYSERVER_TRUSTED_PROXIES: {error}"))?;
     }
+    // Which header the proxy puts the client's address in. Cloudflare's unless told otherwise.
+    if let Ok(name) = env_var("TINYSERVER_CLIENT_IP_HEADER") {
+        api::client_ip_header(&name)
+            .map_err(|error| anyhow::anyhow!("TINYSERVER_CLIENT_IP_HEADER: {error}"))?;
+    }
     // Days a dismissed or actioned abuse report is kept. A bad value stops the start: guessing
     // would either keep reports longer than the operator said or delete them sooner.
     if db::retention_days_from(

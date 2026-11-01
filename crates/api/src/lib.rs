@@ -25,7 +25,7 @@ mod setup;
 #[cfg(feature = "fuzz")]
 pub mod fuzz;
 
-pub use limit::trust_proxies;
+pub use limit::{client_ip_header, trust_proxies};
 pub use live::{Limits, Live};
 pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};
 pub use operator::Operator;

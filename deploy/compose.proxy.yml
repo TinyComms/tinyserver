@@ -1,0 +1,24 @@
+# Without Cloudflare: a reverse proxy you run (Caddy, nginx, Traefik) or any tunnel you choose
+# reaches tinyserver on 127.0.0.1:8080. Use it on top of compose.yml, and compose.passkey.yml
+# if you use that:
+#
+#   docker compose -f compose.yml -f compose.proxy.yml up -d
+#   docker compose -f compose.yml -f compose.passkey.yml -f compose.proxy.yml up -d
+#
+# What it does:
+#   * Publishes tinyserver's port 8080 on the host's loopback only, for your proxy.
+#   * Does not start cloudflared. compose.yml still reads TUNNEL_TOKEN while it loads, so put
+#     `TUNNEL_TOKEN=unused` in .env.
+#
+# Your proxy must end TLS, pass WebSockets, and set one header to the client's address, which
+# you then name in TINYSERVER_CLIENT_IP_HEADER. See "Without Cloudflare" in deploy/README.md.
+# Not run here: `docker compose config` accepts it, and no stack was brought up with it.
+
+services:
+  tinyserver:
+    # Added to the media ports already published by compose.yml.
+    ports:
+      - "127.0.0.1:8080:8080/tcp"
+
+  tunnel:
+    profiles: ["cloudflare"]

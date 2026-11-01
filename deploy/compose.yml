@@ -128,6 +128,9 @@ services:
       # Whose cf-connecting-ip the sign-in limiter believes. Unset trusts private peers, which
       # covers cloudflared here; set it to the tunnel's address to trust only the tunnel.
       TINYSERVER_TRUSTED_PROXIES: ${TINYSERVER_TRUSTED_PROXIES:-}
+      # The header your proxy puts the client's address in. Unset reads Cloudflare's
+      # cf-connecting-ip. See "Without Cloudflare" in deploy/README.md.
+      TINYSERVER_CLIENT_IP_HEADER: ${TINYSERVER_CLIENT_IP_HEADER:-}
       # Debug bundles. The image is read-only, so this is a tmpfs. The owner invite is in
       # /bootstrap, written by tinyserver-init.
       TINYSERVER_DATA_DIR: /var/lib/tinyserver

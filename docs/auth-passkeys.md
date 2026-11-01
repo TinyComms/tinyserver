@@ -189,7 +189,7 @@ Until step 7 the move can be undone by setting `TINYSERVER_AUTH=oidc` again.
 
 ## 9. Operating notes
 
-- **Rate limits.** The sign-in routes allow 30 posts a minute per address; recovery codes and claim links allow 8. The address is the connection's, or Cloudflare's header only from a trusted proxy (`docs/privacy/network.md`), kept as a keyed hash in memory for a minute.
+- **Rate limits.** The sign-in routes allow 30 posts a minute per address; recovery codes and claim links allow 8. The address is the connection's, or the header your proxy sets (Cloudflare's by default, `TINYSERVER_CLIENT_IP_HEADER` otherwise) only from a trusted proxy (`docs/privacy/network.md`), kept as a keyed hash in memory for a minute.
 - **Logs.** Never a token, challenge, credential id, recovery code, claim link, invite or name from tinyserver's own code. A test runs a sign-up, sign-in, recovery and claim with a trace-level subscriber and fails if any secret it generated appears. One thing it found: `webauthn-rs`'s core crate traces each whole registration, credential id included, at TRACE. tinyserver's log policy holds that crate at warn whatever the operator asks for (a unit test checks it), and its warnings and errors carry only fixed text, lengths and flag values. The info log has `user_id` for sign-in events, as it has for OIDC.
 - **Deletion.** `DELETE /v1/me` removes the account's passkeys, recovery codes, claim links and any ceremony in progress. A ban stays on the account.
 - **Audit.** Adding, removing and flagging a passkey, replacing codes, using a code, claiming, and the operator's claim links and retiring of identities are written to the audit log, with the account but no address.
