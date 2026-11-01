@@ -114,6 +114,18 @@ async fn deleting_an_account_removes_the_person_and_what_they_said() {
             "an edited message's first version is in the outbox"
         );
 
+        // A one-time sign-in code she has not traded yet, as if she were mid sign-in on
+        // another device when she deleted her account.
+        sqlx::query(
+            "INSERT INTO auth_codes (code_hash, user_id, client_challenge, issuer, expires_at)
+             VALUES (sha256('unredeemed'::bytea), $1::uuid, 'challenge', 'https://auth.test',
+                     now() + interval '1 minute')",
+        )
+        .bind(&ada.user_id)
+        .execute(&db.owner)
+        .await
+        .expect("auth code");
+
         // The typed phrase is required.
         let (status, _) = Call::new(Method::DELETE, "/v1/me")
             .token(&ada_token)
@@ -159,6 +171,7 @@ async fn deleting_an_account_removes_the_person_and_what_they_said() {
             ("user_identities", "user_id"),
             ("memberships", "user_id"),
             ("sessions", "user_id"),
+            ("auth_codes", "user_id"),
         ] {
             let left: i64 = sqlx::query_scalar(&format!(
                 "SELECT count(*) FROM {table} WHERE {filter} = $1::uuid"

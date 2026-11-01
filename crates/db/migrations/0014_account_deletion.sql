@@ -11,8 +11,8 @@
 --     author would be worse for the people still in the conversation.
 --   * Every message they wrote is emptied the way deleting a message empties it, and its
 --     attachments are deleted. Their files are unlinked by the caller after the commit.
---   * Their sessions, identities, memberships, reactions, read marks, bots, unused invites
---     and idempotency keys are deleted.
+--   * Their sessions, unredeemed sign-in codes, identities, memberships, reactions, read
+--     marks, bots, unused invites and idempotency keys are deleted.
 --   * Their display name is taken out of audit log rows. The rows stay, as a record that
 --     something happened, with the person's id and without who they were.
 --   * A ban survives. `ban_identities` keeps the provider identity of a banned person so that
@@ -107,6 +107,9 @@ BEGIN
     DELETE FROM invites WHERE created_by = v_user AND accepted_at IS NULL;
     DELETE FROM idempotency_keys WHERE key LIKE v_user::text || E'\n%';
     DELETE FROM sessions WHERE user_id = v_user;
+    -- A code from a sign-in that was under way. Trading it already fails without a
+    -- membership, but the row names the account until it expires.
+    DELETE FROM auth_codes WHERE user_id = v_user;
     DELETE FROM user_identities WHERE user_id = v_user;
     DELETE FROM memberships WHERE user_id = v_user;
 
