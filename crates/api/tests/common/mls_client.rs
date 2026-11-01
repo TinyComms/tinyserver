@@ -69,11 +69,21 @@ fn capabilities() -> Capabilities {
 /// The authenticated data of an application message, as tinyclient's `crates/e2ee` sets it:
 /// `"tiny-e2ee-v1 msg" 0x00 kind 0x00 target_id`.
 pub fn message_aad(kind: &str, target_id: Option<&str>) -> Vec<u8> {
+    message_aad_for(kind, target_id, None)
+}
+
+/// `message_aad`, plus `0x00` and the conversation id when a shared group has to name which
+/// channel the ciphertext is for.
+pub fn message_aad_for(kind: &str, target_id: Option<&str>, conversation: Option<&str>) -> Vec<u8> {
     let mut aad = b"tiny-e2ee-v1 msg".to_vec();
     aad.push(0);
     aad.extend_from_slice(kind.as_bytes());
     aad.push(0);
     aad.extend_from_slice(target_id.unwrap_or("").as_bytes());
+    if let Some(conversation) = conversation {
+        aad.push(0);
+        aad.extend_from_slice(conversation.as_bytes());
+    }
     aad
 }
 

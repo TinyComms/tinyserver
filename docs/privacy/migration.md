@@ -25,7 +25,7 @@ Capability discovery is `GET /v1/capabilities`: `e2ee_calls` and `e2ee_text` (bo
 |---|---|---|---|
 | Old | Old | Plaintext | Works as today |
 | Old | New | Plaintext | Unchanged |
-| Old | New | Encrypted | Listed with `e2ee: true` and empty bodies; plaintext posts are refused (`400 e2ee_required`); it shows blanks and cannot send. It cannot be tricked into a downgrade |
+| Old | New | Encrypted | Listed with `e2ee: true` and empty bodies; plaintext posts and plaintext reactions are refused (`400 e2ee_required`); it shows blanks and cannot send. It cannot be tricked into a downgrade |
 | New | Old | Any | `e2ee_text` is absent from capabilities: the client offers no encrypted conversations and labels every conversation not encrypted |
 | New | New, `e2ee_text=off` | Plaintext | No new encrypted conversations. Existing encrypted ones keep working |
 | New | New, `optional` (default) | Either | New conversations are encrypted if created with `"e2ee": true` |
@@ -83,10 +83,10 @@ If the server binary is rolled back to one that does not know encrypted conversa
 | `pocketid_data` and `secrets/pocketid_encryption_key` | Pocket ID's accounts, passkeys and signing key. Without them nobody can sign in | Yes; Pocket ID is stopped for the copy |
 | `secrets/oidc_client_secret`, `secrets/pocketid_api_key` | To start the stack; the API key acts as a Pocket ID administrator | Yes |
 | `.env` or `tenant.env` (`TINYSERVER_MEDIA_HMAC_SECRET`, database passwords, tunnel token) | To start the stack | **No.** The restore target keeps its own |
-| E2EE: the server's external sender key (text) | A row in Postgres (`e2ee_server_key`), so it moves with the database dump. Without it every client shows "external sender key changed". A backup or export carries the private key (finding N15) | Tested where it is stored: `the_servers_external_sender_is_one_key_kept_in_postgres`. Moving it to a secret file (G9) would make it a separate item to carry |
+| E2EE: the server's external sender key (text) | The public half moves with the database dump. The private half is `e2ee-server-key` on `tinyserver_keys`, copied into the age bundle when the file exists. Without that file a restored server refuses to start rather than mint a new key, and every client would otherwise show "external sender key changed". An older bundle has the private half in the dump; the new server copies it out on start | `the_servers_external_sender_is_one_key_kept_in_a_file`, `an_old_private_key_is_copied_out_of_postgres_and_not_replaced`. The bundle copy is `operator.sh` and is not run in CI |
 | `tinyserver_bootstrap` | Not needed once an owner exists | Not checked |
 
-A backup that holds the database and the secrets together lets whoever opens it read plaintext conversations and sign in as anyone. The requirement was **a key held apart from the tenant host, and destroyable**. What exists: the operator's recipient, held wherever the operator keeps it, and the tenant's own key from `keygen`, which `delete` destroys but which sits on the tenant's host (`tenants/<name>/backup.key`) until the operator moves it ([`encryption-architecture.md`](encryption-architecture.md) section 5). For E2EE conversations a backup contains message and file content only as ciphertext, plus the server's external sender private key (finding N15). No schedule, rotation or retention exists.
+A backup that holds the database and the secrets together lets whoever opens it read plaintext conversations and sign in as anyone. The requirement was **a key held apart from the tenant host, and destroyable**. What exists: the operator's recipient, held wherever the operator keeps it, and the tenant's own key from `keygen`, which `delete` destroys but which sits on the tenant's host (`tenants/<name>/backup.key`) until the operator moves it ([`encryption-architecture.md`](encryption-architecture.md) section 5). For E2EE conversations a backup contains message and file content only as ciphertext. The age bundle also carries the external sender key file when the server has written one (finding N15). A database dump by itself does not. No schedule, rotation or retention exists.
 
 ### Restore hazards
 

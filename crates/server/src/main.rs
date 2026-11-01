@@ -402,6 +402,11 @@ async fn serve() -> anyhow::Result<()> {
         .parse()
         .context("BIND is not a socket address")?;
     let pool = db::runtime_pool(&url).await?;
+    // The private half of the external sender moves out of Postgres before anything is served,
+    // so a backup taken of an idle process does not hold it. A lost key stops the start.
+    api::seal_external_sender(&pool)
+        .await
+        .map_err(|reason| anyhow::anyhow!(reason))?;
     let defaults = api::Limits::default();
     let limits = api::Limits {
         call_room_max: env_count("TINYSERVER_CALL_ROOM_MAX", defaults.call_room_max)?,

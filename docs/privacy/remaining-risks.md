@@ -79,14 +79,14 @@ What E2EE here does and does not do, for the product page and for support.
 | Limit | Detail |
 |---|---|
 | Members | Anyone in the conversation can copy, forward, screenshot or leak what they receive, and a member who is added later cannot read the past but can read the future |
-| Metadata | The server sees who is in a conversation, who posted and when, sizes, counts, reactions, presence, call membership and the audio level in calls ([`metadata.md`](metadata.md)) |
+| Metadata | The server sees who is in a conversation, who posted and when (the minute, for an encrypted message), sizes, counts, that a reaction ciphertext was stored and which device stored it, presence, call membership and the audio level in calls ([`metadata.md`](metadata.md)) |
 | Endpoints | A compromised or unlocked device reads everything it can. The local cache and the call identity key are not encrypted at rest (findings C1, C4). The OS may show notification previews |
 | First device | Trust on first use. A server present when a person first registers can substitute that device. Safety numbers compared out of band are the only defence |
 | A person with no devices | The operator can add one for them (`e2ee-text.md` section 3) |
 | Downgrade of calls | The server can turn a call to transport only, visibly. An app in "require" mode blocks instead; that mode is off by default |
 | Roster and ghost members | The server proposes members. Apps refuse unlisted or non-cross-signed ones, but the roster of a call is server-provided (finding S10). A verified safety number is the check |
 | Forgery inside a group | Calls: any member can make frames that look like another's. Text: authors are authenticated by MLS |
-| Reactions | Plaintext in v1 |
+| Reactions | Ciphertext on an encrypted conversation: no emoji and no message id. Plaintext emoji remains on a plaintext conversation. The client does not post the ciphertext yet |
 | Availability | The server can withhold, delay or drop anything. E2EE protects confidentiality and integrity, not delivery |
 | Key loss | Losing every device means a new identity and no history. There is no key backup in v1 |
 | No history for new devices | By design |

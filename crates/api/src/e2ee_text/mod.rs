@@ -6,9 +6,11 @@
 //! it keeps no key that opens a message. What each route checks is here and in the SQL of
 //! `migrations/0021` and `0022`, where the group state lives.
 
+mod key_file;
 pub(crate) mod mls;
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -62,26 +64,16 @@ impl Default for Server {
 }
 
 impl Server {
-    /// The external sender, made on first use and kept in Postgres so that it outlives the process:
-    /// a group's members pin it, and a restart must not change it.
+    /// The external sender, made on first use. The public half is in Postgres and the private
+    /// half is a file, so a restart keeps the key members pinned and a database dump cannot sign
+    /// proposals.
     async fn signer(&self, pool: &PgPool) -> Result<Arc<Signer>, Error> {
         self.signer
             .get_or_try_init(|| async {
-                let Some((public, private)) = Signer::generate() else {
-                    tracing::warn!("e2ee server key not made");
-                    return Err(Error::Unavailable);
-                };
-                let (public, private) =
-                    db::server_key(pool, &public, &private)
-                        .await
-                        .map_err(|error| {
-                            tracing::warn!(%error, "e2ee server key query failed");
-                            Error::Unavailable
-                        })?;
-                match Signer::from_parts(public, private) {
-                    Some(signer) => Ok(Arc::new(signer)),
-                    None => {
-                        tracing::warn!("e2ee server key unusable");
+                match load_signer(pool).await {
+                    Ok(signer) => Ok(Arc::new(signer)),
+                    Err(reason) => {
+                        tracing::warn!(reason, "e2ee server key unusable");
                         Err(Error::Unavailable)
                     }
                 }
@@ -97,6 +89,129 @@ impl Server {
             Err(Error::SlowDown)
         }
     }
+}
+
+/// Copies an old private half out of Postgres, or makes the key, before the process serves.
+/// A missing secret is a hard error: this does not mint a new key over one clients already pin.
+/// The reason names no key bytes.
+pub async fn seal_external_sender(pool: &PgPool) -> Result<(), &'static str> {
+    load_signer(pool).await.map(|_| ())
+}
+
+/// The file is the secret. Postgres keeps the public half. A public key with no file and no
+/// private half is a lost key, and a file that does not match the public half is refused.
+async fn load_signer(pool: &PgPool) -> Result<Signer, &'static str> {
+    let state = db::server_key_state(pool)
+        .await
+        .map_err(|_| "e2ee server key could not be read")?;
+    let path = key_file::path();
+    match state {
+        None => fresh_signer(pool, &path).await,
+        Some(row) => stored_signer(pool, &path, &row).await,
+    }
+}
+
+async fn fresh_signer(pool: &PgPool, path: &std::path::Path) -> Result<Signer, &'static str> {
+    match key_file::read(path) {
+        Ok(stored) => install_file(pool, &stored).await,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let (public, stored) = Signer::generate().ok_or("e2ee server key was not made")?;
+            match key_file::create_new(path, &stored) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let stored = key_file::read(path)
+                        .map_err(|_| "e2ee server key file could not be read")?;
+                    return install_file(pool, &stored).await;
+                }
+                Err(_) => return Err("e2ee server key file could not be written"),
+            }
+            let signer =
+                Signer::from_parts(public.clone(), stored).ok_or("e2ee server key was not made")?;
+            remember_public(pool, &public, signer.public_key()).await?;
+            Ok(signer)
+        }
+        Err(_) => Err("e2ee server key file could not be read"),
+    }
+}
+
+async fn stored_signer(
+    pool: &PgPool,
+    path: &std::path::Path,
+    row: &db::ServerKeyRow,
+) -> Result<Signer, &'static str> {
+    match key_file::read(path) {
+        Ok(stored) => {
+            let signer =
+                Signer::from_stored(&stored).ok_or("e2ee server key file is not usable")?;
+            if signer.public_key() != row.public.as_slice() {
+                return Err("e2ee server key file does not match the database");
+            }
+            if row.private.is_some() {
+                clear_private(pool).await?;
+            }
+            Ok(signer)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            copy_private_out(pool, path, row).await
+        }
+        Err(_) => Err("e2ee server key file could not be read"),
+    }
+}
+
+/// An upgrade: the private half is still in the row, and the file is not there yet.
+async fn copy_private_out(
+    pool: &PgPool,
+    path: &std::path::Path,
+    row: &db::ServerKeyRow,
+) -> Result<Signer, &'static str> {
+    let Some(stored) = row.private.as_deref() else {
+        return Err("e2ee server key file is missing and the database has no copy");
+    };
+    let signer =
+        Signer::from_stored(stored).ok_or("e2ee server key in the database is not usable")?;
+    if signer.public_key() != row.public.as_slice() {
+        return Err("e2ee server key in the database does not match its public half");
+    }
+    match key_file::create_new(path, stored) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let stored =
+                key_file::read(path).map_err(|_| "e2ee server key file could not be read")?;
+            let winner =
+                Signer::from_stored(&stored).ok_or("e2ee server key file is not usable")?;
+            if winner.public_key() != row.public.as_slice() {
+                return Err("e2ee server key file does not match the database");
+            }
+            clear_private(pool).await?;
+            return Ok(winner);
+        }
+        Err(_) => return Err("e2ee server key file could not be written"),
+    }
+    clear_private(pool).await?;
+    Ok(signer)
+}
+
+async fn install_file(pool: &PgPool, stored: &[u8]) -> Result<Signer, &'static str> {
+    let signer = Signer::from_stored(stored).ok_or("e2ee server key file is not usable")?;
+    remember_public(pool, signer.public_key(), signer.public_key()).await?;
+    clear_private(pool).await?;
+    Ok(signer)
+}
+
+async fn remember_public(pool: &PgPool, public: &[u8], expect: &[u8]) -> Result<(), &'static str> {
+    let kept = db::remember_server_public(pool, public)
+        .await
+        .map_err(|_| "e2ee server public key was not stored")?;
+    if kept.as_slice() != expect {
+        return Err("e2ee server key file does not match the database");
+    }
+    Ok(())
+}
+
+async fn clear_private(pool: &PgPool) -> Result<(), &'static str> {
+    db::clear_server_private(pool)
+        .await
+        .map_err(|_| "e2ee server key could not be cleared from the database")
 }
 
 /// A token bucket per person. Memory only; a restart forgets it.
@@ -143,8 +258,16 @@ pub fn routes() -> Router<PgPool> {
         .route("/v1/e2ee/key_packages/count", get(key_package_count))
         .route("/v1/e2ee/conversations/{id}", get(conversation))
         .route("/v1/e2ee/conversations/{id}/group", post(create_group))
+        .route(
+            "/v1/e2ee/conversations/{id}/reactions",
+            get(list_reactions).post(post_reaction),
+        )
         .route("/v1/e2ee/conversations/{id}/handshake", get(handshake))
         .route("/v1/e2ee/conversations/{id}/tree", get(ratchet_tree))
+        .route(
+            "/v1/e2ee/invites/{id}/capability",
+            put(set_invite_capability),
+        )
         .route("/v1/e2ee/community", get(community).put(set_community))
         .route(
             "/v1/e2ee/conversations/{id}/commit",
@@ -171,16 +294,13 @@ fn failed(user_id: &str, route: &'static str, error: &Error) {
     tracing::warn!(user_id, route, reason, "e2ee failed");
 }
 
-/// The group id of a conversation: its 16 byte id.
-fn group_of(conversation: &str) -> Result<[u8; 16], Error> {
-    mls::uuid_bytes(conversation).ok_or(Error::Invalid)
-}
-
 #[derive(Deserialize)]
 struct DeviceBody {
     signature_key: String,
     cross_signature: Option<String>,
     label: Option<String>,
+    #[serde(default)]
+    capability_signature: Option<String>,
 }
 
 async fn put_device(
@@ -215,9 +335,15 @@ async fn register(
         Some(text) => Some(mls::decode(text, 128).map_err(refused)?),
         None => None,
     };
+    let capability = match &body.capability_signature {
+        Some(text) => Some(mls::decode(text, 128).map_err(refused)?),
+        None => None,
+    };
     let active = db::active_keys(pool, caller).await.map_err(lift)?;
+    let invite_key = db::invite_capability(pool, caller).await.map_err(lift)?;
     let stored = match cross.as_deref() {
-        // The first device is trusted on first use and carries no cross signature.
+        // The first device is trusted on first use, unless the invite it came through carries a
+        // capability key. That key has to have signed this device.
         _ if active.is_empty() => None,
         Some(signature) => {
             if !mls::cross_signed(&caller.user_id, device_id, &key, signature, &active) {
@@ -229,9 +355,38 @@ async fn register(
         // `cross_signature_required` if not, so that a retry of a registration is told it landed.
         None => None,
     };
-    db::put_device(pool, caller, device_id, &key, stored, body.label.as_deref())
-        .await
-        .map_err(lift)
+    let stored_capability = if active.is_empty() {
+        if let Some(invite_key) = invite_key {
+            let Some(signature) = capability.as_deref() else {
+                return Err(Error::BadE2ee);
+            };
+            if !mls::device_capability_signed(
+                &caller.user_id,
+                device_id,
+                &key,
+                signature,
+                &invite_key,
+            ) {
+                return Err(Error::BadE2ee);
+            }
+            Some(signature)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    db::put_device(
+        pool,
+        caller,
+        device_id,
+        &key,
+        stored,
+        body.label.as_deref(),
+        stored_capability,
+    )
+    .await
+    .map_err(lift)
 }
 
 async fn delete_device(
@@ -346,13 +501,26 @@ async fn key_package_count(
 }
 
 /// Signs every proposal of the group that is due. The members read them from the log.
+/// The MLS group id the conversation uses, and whether a ciphertext must name the conversation.
+async fn mls_of(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+) -> Result<([u8; 16], bool), Error> {
+    let target = db::mls_target(pool, caller, conversation)
+        .await
+        .map_err(lift)?;
+    let group = mls::uuid_bytes(&target.group_id).ok_or(Error::Invalid)?;
+    Ok((group, target.audience_groups))
+}
+
 async fn issue(
     pool: &PgPool,
     server: &Server,
     caller: &Caller,
     conversation: &str,
 ) -> Result<(), Error> {
-    let group = group_of(conversation)?;
+    let (group, _) = mls_of(pool, caller, conversation).await?;
     let signer = server.signer(pool).await?;
     db::issue_proposals(pool, caller, conversation, |epoch, items| {
         sign(&signer, &group, epoch, items)
@@ -411,6 +579,10 @@ async fn conversation(
 #[derive(Deserialize)]
 struct GroupBody {
     device_id: String,
+    /// 32 bytes: the group id, then this conversation's id. Omitted when the client has no
+    /// declared binding.
+    #[serde(default)]
+    context: Option<String>,
 }
 
 async fn create_group(
@@ -423,14 +595,133 @@ async fn create_group(
     let caller = member(&pool, &headers).await?;
     server.allow(&caller.user_id)?;
     let result = async {
-        db::create_group(&pool, &caller, &id, &body.device_id)
+        let context = match body.context.as_deref() {
+            Some(text) => {
+                let bytes = mls::decode(text, 32).map_err(refused)?;
+                if bytes.len() != 32 {
+                    return Err(Error::BadE2ee);
+                }
+                Some(bytes)
+            }
+            None => None,
+        };
+        db::create_group(&pool, &caller, &id, &body.device_id, context.as_deref())
             .await
             .map_err(lift)?;
-        issue(&pool, &server, &caller, &id).await
+        let info = db::group_info(&pool, &caller, &id).await.map_err(lift)?;
+        issue(&pool, &server, &caller, &id).await?;
+        Ok(info.get("epoch").cloned().unwrap_or(json!(0)))
     }
     .await;
-    result.inspect_err(|error| failed(&caller.user_id, "group.create", error))?;
-    Ok((StatusCode::CREATED, Json(json!({ "epoch": 0 }))))
+    let epoch = result.inspect_err(|error| failed(&caller.user_id, "group.create", error))?;
+    Ok((StatusCode::CREATED, Json(json!({ "epoch": epoch }))))
+}
+
+#[derive(Deserialize)]
+struct CapabilityBody {
+    device_id: String,
+    capability_key: String,
+    signature: String,
+}
+
+async fn set_invite_capability(
+    State(pool): State<PgPool>,
+    Extension(server): Extension<Arc<Server>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CapabilityBody>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    server.allow(&caller.user_id)?;
+    let result = async {
+        let key = mls::decode(&body.capability_key, 65).map_err(refused)?;
+        if key.len() != 65 || key[0] != 4 {
+            return Err(Error::BadE2ee);
+        }
+        let signature = mls::decode(&body.signature, 128).map_err(refused)?;
+        let device_key = db::device_key(&pool, &caller, &body.device_id)
+            .await
+            .map_err(lift)?;
+        if !mls::invite_capability_signed(&id, &key, &signature, &device_key) {
+            return Err(Error::BadE2ee);
+        }
+        db::set_invite_capability(&pool, &caller, &id, &key)
+            .await
+            .map_err(lift)?;
+        Ok(())
+    }
+    .await;
+    result.inspect_err(|error| failed(&caller.user_id, "invite.capability", error))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ReactionBody {
+    device_id: String,
+    epoch: u64,
+    ciphertext: String,
+    client_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReactionQuery {
+    after: Option<i64>,
+    limit: Option<i32>,
+}
+
+async fn post_reaction(
+    State(pool): State<PgPool>,
+    Extension(server): Extension<Arc<Server>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ReactionBody>,
+) -> Result<(StatusCode, Json<Value>), Error> {
+    let caller = member(&pool, &headers).await?;
+    server.allow(&caller.user_id)?;
+    let result = async {
+        let (group, _) = mls_of(&pool, &caller, &id).await?;
+        let data = mls::decode(&body.ciphertext, mls::CIPHERTEXT_MAX).map_err(refused)?;
+        let conversation = canonical_uuid(&id).ok_or(Error::Invalid)?;
+        let aad = mls::message_aad_for("reaction", None, Some(&conversation));
+        mls::check_ciphertext(&group, body.epoch, &aad, &data).map_err(refused)?;
+        let value = db::post_e2ee_reaction(
+            &pool,
+            &caller,
+            &id,
+            &data,
+            body.epoch,
+            &body.device_id,
+            &body.client_id,
+        )
+        .await
+        .map_err(lift)?;
+        let created = value
+            .get("created")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let status = if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        Ok((status, Json(value)))
+    }
+    .await;
+    result.inspect_err(|error| failed(&caller.user_id, "reaction.post", error))
+}
+
+async fn list_reactions(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ReactionQuery>,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    db::list_e2ee_reactions(&pool, &caller, &id, query.after, query.limit.unwrap_or(50))
+        .await
+        .map(Json)
+        .map_err(lift)
+        .inspect_err(|error| failed(&caller.user_id, "reaction.list", error))
 }
 
 #[derive(Deserialize)]
@@ -594,7 +885,7 @@ async fn commit(
 /// Checks a commit against the proposals signed for its epoch, then applies it. Applying is a
 /// compare-and-swap on the epoch: of two commits for one epoch, one wins.
 async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> Result<(), Error> {
-    let group = group_of(id)?;
+    let (group, _) = mls_of(pool, caller, id).await?;
     let commit = mls::decode(&body.commit, mls::COMMIT_MAX).map_err(refused)?;
     let mut total = 0usize;
     let mut sent: HashMap<&str, Vec<u8>> = HashMap::new();
@@ -690,6 +981,7 @@ async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> R
         &ids,
         &welcomes,
         &tree,
+        meta.has_path,
     )
     .await
     .map_err(lift)?;
@@ -738,7 +1030,6 @@ pub(crate) async fn post_ciphertext(
     /// Stands in for a device the request did not name, when the database is going to refuse it
     /// for another reason before it reads the device.
     const NIL: &str = "00000000-0000-0000-0000-000000000000";
-    let group = group_of(conversation)?;
     if fields
         .reply_to
         .is_some_and(|reply| !reply.trim().is_empty())
@@ -782,7 +1073,13 @@ pub(crate) async fn post_ciphertext(
         Some(target) => Some(canonical_uuid(target).ok_or(Error::Invalid)?),
         None => None,
     };
-    let aad = mls::message_aad(kind, target.as_deref());
+    let (group, audience) = mls_of(pool, caller, conversation).await?;
+    let bound = if audience {
+        Some(canonical_uuid(conversation).ok_or(Error::Invalid)?)
+    } else {
+        None
+    };
+    let aad = mls::message_aad_for(kind, target.as_deref(), bound.as_deref());
     if let Err(refusal) = mls::check_ciphertext(&group, epoch, &aad, &data) {
         return Err(refine(pool, caller, conversation, refused(refusal)).await);
     }

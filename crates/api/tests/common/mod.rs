@@ -73,6 +73,13 @@ where
     .fetch_one(&mut connection)
     .await
     .expect("database name");
+    // One key file per database. The suite shares a process, and the mutex above is the only
+    // thing that makes this environment variable safe. Without it the secret would land in
+    // `tinyserver-data/` in the worktree.
+    let key_dir = std::env::temp_dir().join(format!("tinyserver-e2ee-{name}"));
+    let _key_cleanup = KeyCleanup(key_dir.clone());
+    std::fs::create_dir_all(&key_dir).expect("e2ee key dir");
+    std::env::set_var("TINYSERVER_E2EE_KEY_FILE", key_dir.join("key"));
     connection
         .execute(format!("CREATE DATABASE {name}").as_str())
         .await
@@ -90,6 +97,13 @@ where
         .expect("runtime pool");
 
     let migrated = db::migrate(&owner).await;
+    if migrated.is_ok() {
+        // The column default waits 30 seconds. The suite signs proposals as soon as it asks.
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 0")
+            .execute(&owner)
+            .await
+            .expect("commit batching off in tests");
+    }
     let outcome = match migrated {
         Ok(()) => Some(
             tokio::spawn(test(TestDb {
@@ -134,6 +148,16 @@ where
     }
     if let Some(Err(error)) = outcome {
         std::panic::resume_unwind(error.into_panic());
+    }
+}
+
+/// Removes the per-test external sender key file, including when the test panics.
+struct KeyCleanup(std::path::PathBuf);
+
+impl Drop for KeyCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        std::env::remove_var("TINYSERVER_E2EE_KEY_FILE");
     }
 }
 

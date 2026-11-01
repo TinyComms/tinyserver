@@ -132,8 +132,10 @@ services:
       # cf-connecting-ip. See "Without Cloudflare" in deploy/README.md.
       TINYSERVER_CLIENT_IP_HEADER: ${TINYSERVER_CLIENT_IP_HEADER:-}
       # Debug bundles. The image is read-only, so this is a tmpfs. The owner invite is in
-      # /bootstrap, written by tinyserver-init.
+      # /bootstrap, written by tinyserver-init. The external sender's private key is not on
+      # that tmpfs: a restart would lose it and every client would refuse the new one.
       TINYSERVER_DATA_DIR: /var/lib/tinyserver
+      TINYSERVER_E2EE_KEY_FILE: /var/lib/tinyserver-keys/e2ee-server-key
     tmpfs:
       - /var/lib/tinyserver:uid=10001,gid=10001,mode=0700
     secrets:
@@ -143,6 +145,8 @@ services:
       - tinyserver_uploads:/data/uploads
       # The owner invite tinyserver-init writes. Read only here.
       - tinyserver_bootstrap:/bootstrap:ro
+      # The external sender private key. Survives a restart. Not a database backup.
+      - tinyserver_keys:/var/lib/tinyserver-keys
     # The same number inside and out: the SFU advertises the port it binds. TCP is ICE-TCP,
     # for networks that block UDP.
     ports:
@@ -204,10 +208,11 @@ services:
   tinyserver-uploads:
     image: postgres:17-alpine
     user: "0:0"
-    entrypoint: ["chown", "10001:10001", "/data/uploads", "/bootstrap"]
+    entrypoint: ["chown", "10001:10001", "/data/uploads", "/bootstrap", "/var/lib/tinyserver-keys"]
     volumes:
       - tinyserver_uploads:/data/uploads
       - tinyserver_bootstrap:/bootstrap
+      - tinyserver_keys:/var/lib/tinyserver-keys
     network_mode: none
     read_only: true
     cap_drop:
@@ -375,4 +380,5 @@ volumes:
   pocketid_data:
   tinyserver_uploads:
   tinyserver_bootstrap:
+  tinyserver_keys:
   clamav_db:

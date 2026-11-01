@@ -103,6 +103,12 @@ struct ServerBody {
     allow_archives: Option<bool>,
     #[serde(default)]
     e2ee_text: Option<String>,
+    #[serde(default)]
+    e2ee_group_devices_max: Option<i32>,
+    #[serde(default)]
+    e2ee_commit_batch_secs: Option<i32>,
+    #[serde(default)]
+    e2ee_audience_groups: Option<bool>,
 }
 
 async fn server(
@@ -130,6 +136,9 @@ async fn edit_server(
         file_max_bytes: body.file_max_bytes,
         allow_archives: body.allow_archives,
         e2ee_text: body.e2ee_text,
+        e2ee_group_devices_max: body.e2ee_group_devices_max,
+        e2ee_commit_batch_secs: body.e2ee_commit_batch_secs,
+        e2ee_audience_groups: body.e2ee_audience_groups,
     };
     let settings = db::update_server(&pool, &caller, &patch)
         .await

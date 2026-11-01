@@ -16,11 +16,13 @@ use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use common::live::{connect, durable, ping, serve};
-use common::mls_client::{uuid16, Client};
+use common::mls_client::{message_aad, message_aad_for, sign_with, uuid16, Client, SUITE};
 use common::sealed::{self, framed};
 use common::{first_owner, join, run, session, Call, TestDb};
 use db::Caller;
 use http_body_util::BodyExt;
+use openmls::prelude::tls_codec::Serialize as _;
+use openmls_basic_credential::SignatureKeyPair;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -2833,6 +2835,77 @@ async fn the_setting_and_the_capability_say_what_the_server_does() {
         let (status, server) = w.send(Method::GET, "/v1/server", &member_token, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(server["e2ee_text"], "optional");
+        assert_eq!(server["e2ee_group_devices_max"], 2000);
+        assert_eq!(server["e2ee_commit_batch_secs"], 0);
+        assert_eq!(server["e2ee_audience_groups"], false);
+        let (status, _) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_commit_batch_secs": 4})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, set) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_commit_batch_secs": 30, "e2ee_audience_groups": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(set["e2ee_commit_batch_secs"], 30);
+        assert_eq!(set["e2ee_audience_groups"], true);
+        let (status, set) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_commit_batch_secs": 0, "e2ee_audience_groups": false})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(set["e2ee_commit_batch_secs"], 0);
+        assert_eq!(set["e2ee_audience_groups"], false);
+        let (status, _) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &member_token,
+                Some(json!({"e2ee_group_devices_max": 50})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_group_devices_max": 1})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_group_devices_max": 20001})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, set) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_group_devices_max": 50})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(set["e2ee_group_devices_max"], 50);
 
         // Only a manager changes it, and only to a mode that exists.
         let (status, _) = w
@@ -3124,8 +3197,8 @@ async fn old_requests_and_old_clients_keep_working() {
         assert_eq!(listed.as_array().expect("directs").len(), 2);
 
         // An old client in an encrypted conversation: it is listed, with e2ee true and empty
-        // bodies; it cannot post plaintext; it cannot edit by body; reactions work, because they
-        // are plaintext by design.
+        // bodies; it cannot post plaintext; it cannot edit by body; a plaintext reaction is
+        // refused, because the emoji and the message would be visible to the server.
         let mut p = pair(&w, "oldc").await;
         let (status, sent) = say(
             &w.app,
@@ -3176,7 +3249,11 @@ async fn old_requests_and_old_clients_keep_working() {
                 Some(json!({"emoji": "👍"})),
             )
             .await;
-        assert_eq!(status, StatusCode::OK, "{reaction}");
+        assert_eq!(
+            (status, reaction["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("e2ee_required")),
+            "{reaction}"
+        );
         let (status, _) = w
             .send(
                 Method::POST,
@@ -3420,7 +3497,7 @@ async fn state_changing_routes_are_rate_limited_per_person() {
 }
 
 #[tokio::test]
-async fn the_servers_external_sender_is_one_key_kept_in_postgres() {
+async fn the_servers_external_sender_is_one_key_kept_in_a_file() {
     run(|db| async move {
         let w = world(db).await;
         let p = pair(&w, "key").await;
@@ -3438,6 +3515,21 @@ async fn the_servers_external_sender_is_one_key_kept_in_postgres() {
             .await
             .expect("count");
         assert_eq!(stored, 1);
+        // The private half never sits in Postgres, including after a restart. A dump of the
+        // database must not be enough to sign proposals as the server.
+        let private_key: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT private_key FROM e2ee_server_key")
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("private");
+        assert!(private_key.is_none());
+        let path = std::env::var("TINYSERVER_E2EE_KEY_FILE").expect("key file");
+        let on_disk = std::fs::read(&path).expect("key on disk");
+        assert!(
+            (16..=128).contains(&on_disk.len()),
+            "the secret is the key file, {} bytes",
+            on_disk.len()
+        );
         // It is a public key and a credential, nothing else the group could be harmed by.
         assert!(unb64(&sender).len() < 120);
         // Proposals for a group are signed by it and only it, so a stored group survives a
@@ -3462,6 +3554,75 @@ async fn the_servers_external_sender_is_one_key_kept_in_postgres() {
             .send(&w.app)
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_old_private_key_is_copied_out_of_postgres_and_not_replaced() {
+    run(|db| async move {
+        let w = world(db).await;
+        let keys = SignatureKeyPair::new(SUITE.signature_algorithm()).expect("key");
+        let stored = keys.tls_serialize_detached().expect("store");
+        let public = keys.public().to_vec();
+        sqlx::query("INSERT INTO e2ee_server_key (signature_key, private_key) VALUES ($1, $2)")
+            .bind(&public)
+            .bind(&stored)
+            .execute(&w.db.owner)
+            .await
+            .expect("old key");
+        // The group is signed by that key. A new one would be a different external sender.
+        let p = pair(&w, "upgrade").await;
+        let private_key: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT private_key FROM e2ee_server_key")
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("private");
+        assert!(private_key.is_none());
+        let path = std::env::var("TINYSERVER_E2EE_KEY_FILE").expect("key file");
+        assert_eq!(std::fs::read(&path).expect("key on disk"), stored);
+        let kept: Vec<u8> = sqlx::query_scalar("SELECT signature_key FROM e2ee_server_key")
+            .fetch_one(&w.db.owner)
+            .await
+            .expect("public");
+        assert_eq!(kept, public);
+        let again = api::router(w.db.runtime.clone(), None);
+        let (_, first) = info(&w.app, &p.owner.token, &p.conv).await;
+        let (_, second) = info(&again, &p.owner.token, &p.conv).await;
+        assert_eq!(second["external_sender"], first["external_sender"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_public_key_with_no_secret_anywhere_is_not_replaced() {
+    run(|db| async move {
+        let w = world(db).await;
+        let public = vec![7u8; 65];
+        sqlx::query("INSERT INTO e2ee_server_key (signature_key, private_key) VALUES ($1, NULL)")
+            .bind(&public)
+            .execute(&w.db.owner)
+            .await
+            .expect("public only");
+        let conv = w.channel("lost", true).await;
+        let (status, body) = info(&w.app, &w.owner_token, &conv).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"], "unavailable");
+        let path = std::env::var("TINYSERVER_E2EE_KEY_FILE").expect("key file");
+        assert!(
+            std::fs::read(&path).is_err(),
+            "a lost key is not replaced with a new one"
+        );
+        let kept: Vec<u8> = sqlx::query_scalar("SELECT signature_key FROM e2ee_server_key")
+            .fetch_one(&w.db.owner)
+            .await
+            .expect("public");
+        assert_eq!(kept, public);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM e2ee_server_key")
+            .fetch_one(&w.db.owner)
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
     })
     .await;
 }
@@ -4319,6 +4480,422 @@ async fn a_suspended_community_takes_no_encrypted_post_upload_or_commit() {
                 .await
                 .expect("count");
         assert_eq!(rows, 1, "nothing was stored while suspended");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn proposals_wait_out_the_commit_batch_then_issue() {
+    run(|db| async move {
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 60")
+            .execute(&db.owner)
+            .await
+            .expect("batch");
+        let w = world(db).await;
+        let (other, other_token) = w.member("batch").await;
+        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let _other = ready(&w.app, &other.user_id, &other_token).await;
+        let conv = w.channel("batch", true).await;
+        start(&w.app, &mut owner, &conv).await;
+        let (_, waiting) = info(&w.app, &owner.token, &conv).await;
+        let pending = waiting["pending"].as_array().expect("pending");
+        assert!(!pending.is_empty(), "{waiting}");
+        assert!(
+            pending.iter().all(|item| item["issued"] == false),
+            "{waiting}"
+        );
+        sqlx::query(
+            "UPDATE e2ee_pending SET created_at = now() - interval '2 minutes'
+             WHERE conversation_id = $1::uuid",
+        )
+        .bind(&conv)
+        .execute(&w.db.owner)
+        .await
+        .expect("backdate");
+        let (_, issued) = info(&w.app, &owner.token, &conv).await;
+        let pending = issued["pending"].as_array().expect("pending");
+        assert!(
+            pending.iter().any(|item| item["issued"] == true),
+            "{issued}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_last_path_committer_is_preferred_for_the_next_batch() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (other, other_token) = w.member("hint").await;
+        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let other = ready(&w.app, &other.user_id, &other_token).await;
+        let conv = w.channel("hint", true).await;
+        start(&w.app, &mut owner, &conv).await;
+        let (_, before) = info(&w.app, &owner.token, &conv).await;
+        assert!(before["preferred_committer"].is_null(), "{before}");
+        let mut devs = [owner, other];
+        settle(&w.app, &mut devs, 0, &conv).await;
+        let [mut owner, other] = devs;
+        let (_, after_add) = info(&w.app, &owner.token, &conv).await;
+        assert!(
+            after_add["preferred_committer"].is_null(),
+            "an add commit has no path: {after_add}"
+        );
+        let (status, gone) = call(
+            &w.app,
+            Method::DELETE,
+            &format!("/v1/e2ee/devices/{}", other.id()),
+            &other.token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{gone}");
+        let _ = info(&w.app, &owner.token, &conv).await;
+        let (status, body) = commit(&w.app, &mut owner, &conv).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (third, third_token) = w.member("hint3").await;
+        let _third = ready(&w.app, &third.user_id, &third_token).await;
+        let (_, group) = info(&w.app, &owner.token, &conv).await;
+        assert_eq!(group["preferred_committer"], owner.id(), "{group}");
+        assert!(
+            group["pending"]
+                .as_array()
+                .expect("pending")
+                .iter()
+                .any(|item| item["issued"] == true),
+            "{group}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_encrypted_message_is_stamped_to_the_minute_and_ordered_by_seq() {
+    run(|db| async move {
+        let w = world(db).await;
+        let mut p = pair(&w, "coarse").await;
+        let (status, first) = say(&w.app, &mut p.owner, &p.conv, "one", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let (status, second) = say(&w.app, &mut p.owner, &p.conv, "two", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        for message in [&first, &second] {
+            let stamp = message["created_at"].as_str().expect("stamp");
+            assert!(stamp.ends_with(":00Z"), "{stamp}");
+        }
+        let first_seq = first["seq"].as_i64().expect("seq");
+        let second_seq = second["seq"].as_i64().expect("seq");
+        assert!(second_seq > first_seq, "{first_seq} then {second_seq}");
+        let (status, page) = messages(&w.app, &p.owner.token, &p.conv).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let ids: Vec<&str> = page
+            .as_array()
+            .expect("page")
+            .iter()
+            .filter(|message| message["kind"] == "message")
+            .map(|message| message["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids.last().copied(),
+            second["id"].as_str(),
+            "the later seq is last: {page}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_encrypted_reaction_is_a_ciphertext_with_no_message_and_no_emoji() {
+    run(|db| async move {
+        let w = world(db).await;
+        let mut p = pair(&w, "react").await;
+        let (status, message) = say(&w.app, &mut p.owner, &p.conv, "hi", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{message}");
+        let id = message["id"].as_str().expect("id");
+        let (status, body) = call(
+            &w.app,
+            Method::PUT,
+            &format!("/v1/messages/{id}/reactions"),
+            &p.owner.token,
+            Some(json!({"emoji": "👍"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("e2ee_required")),
+            "{body}"
+        );
+        p.owner.client.use_group(uuid16(&p.conv));
+        let ciphertext = p
+            .owner
+            .client
+            .encrypt_with_aad(message_aad_for("reaction", None, Some(&p.conv)), b"blob");
+        let (status, posted) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{}/reactions", p.conv),
+            &p.owner.token,
+            Some(json!({
+                "device_id": p.owner.id(),
+                "epoch": p.owner.client.epoch(),
+                "ciphertext": b64(&ciphertext),
+                "client_id": "r1",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        assert!(posted.get("emoji").is_none(), "{posted}");
+        assert!(posted.get("message_id").is_none(), "{posted}");
+        let (status, list) = call(
+            &w.app,
+            Method::GET,
+            &format!("/v1/e2ee/conversations/{}/reactions", p.conv),
+            &p.owner.token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let row = &list.as_array().expect("list")[0];
+        assert!(row.get("emoji").is_none(), "{row}");
+        assert!(row.get("message_id").is_none(), "{row}");
+        assert!(row.get("device_id").is_none(), "{row}");
+        assert_eq!(row["ciphertext"], posted["ciphertext"]);
+        let column: Option<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_name = 'e2ee_reaction_blobs' AND column_name = 'message_id'",
+        )
+        .fetch_optional(&w.db.owner)
+        .await
+        .expect("columns");
+        assert!(column.is_none(), "a reaction blob has no message id");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_first_device_must_carry_the_invites_capability_signature() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (user, token) = w.member("cap").await;
+        let capability = SignatureKeyPair::new(SUITE.signature_algorithm()).expect("key");
+        let updated =
+            sqlx::query("UPDATE invites SET capability_key = $1 WHERE accepted_by = $2::uuid")
+                .bind(capability.public())
+                .bind(&user.user_id)
+                .execute(&w.db.owner)
+                .await
+                .expect("capability")
+                .rows_affected();
+        assert_eq!(updated, 1, "the accepted invite");
+        let dev = Dev::new(&user.user_id, &token);
+        let (status, body) = register(&w.app, &dev).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_e2ee")),
+            "{body}"
+        );
+        let mut message = b"tiny-e2ee-v1 device-cap".to_vec();
+        message.extend_from_slice(&uuid16(dev.user()));
+        message.extend_from_slice(&uuid16(dev.id()));
+        message.extend_from_slice(&dev.client.signature_key());
+        let signature = sign_with(&dev.client.provider, &capability, &message);
+        let (status, body) = call(
+            &w.app,
+            Method::PUT,
+            &format!("/v1/e2ee/devices/{}", dev.id()),
+            &dev.token,
+            Some(json!({
+                "signature_key": dev.client.signature_key_b64(),
+                "capability_signature": b64(&signature),
+                "label": "test",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_admin_device_puts_a_capability_key_on_an_open_invite() {
+    run(|db| async move {
+        let w = world(db).await;
+        let owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let (status, invite) = w
+            .send(
+                Method::POST,
+                "/v1/invites",
+                &w.owner_token,
+                Some(json!({"role": "member"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{invite}");
+        let id = invite["id"].as_str().expect("invite");
+        let capability = SignatureKeyPair::new(SUITE.signature_algorithm()).expect("key");
+        let mut message = b"tiny-e2ee-v1 invite-cap".to_vec();
+        message.extend_from_slice(&uuid16(id));
+        message.extend_from_slice(capability.public());
+        let signature = sign_with(&owner.client.provider, &owner.client.keys, &message);
+        let (status, body) = call(
+            &w.app,
+            Method::PUT,
+            &format!("/v1/e2ee/invites/{id}/capability"),
+            &owner.token,
+            Some(json!({
+                "device_id": owner.id(),
+                "capability_key": b64(capability.public()),
+                "signature": b64(&signature),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT capability_key FROM invites WHERE id = $1::uuid")
+                .bind(id)
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("key");
+        assert_eq!(stored, capability.public());
+        sqlx::query(
+            "UPDATE invites SET accepted_by = $1::uuid, accepted_at = now() WHERE id = $2::uuid",
+        )
+        .bind(&w.owner.user_id)
+        .bind(id)
+        .execute(&w.db.owner)
+        .await
+        .expect("accept");
+        let (status, body) = call(
+            &w.app,
+            Method::PUT,
+            &format!("/v1/e2ee/invites/{id}/capability"),
+            &owner.token,
+            Some(json!({
+                "device_id": owner.id(),
+                "capability_key": b64(capability.public()),
+                "signature": b64(&signature),
+            })),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("not_found")),
+            "{body}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn channels_with_the_same_viewers_share_one_group_when_asked() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (status, set) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_audience_groups": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        let (member, member_token) = w.member("aud").await;
+        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let _member = ready(&w.app, &member.user_id, &member_token).await;
+        let alpha = w.channel("alpha", true).await;
+        let beta = w.channel("beta", true).await;
+        start(&w.app, &mut owner, &alpha).await;
+        let (status, body) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{beta}/group"),
+            &owner.token,
+            Some(json!({"device_id": owner.id()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, info_a) = info(&w.app, &owner.token, &alpha).await;
+        let (_, info_b) = info(&w.app, &owner.token, &beta).await;
+        assert_eq!(info_b["group_id"], alpha, "{info_b}");
+        assert_eq!(info_a["group_id"], info_b["group_id"]);
+        assert_eq!(info_a["epoch"], info_b["epoch"]);
+        let epoch = info_a["epoch"].as_u64().expect("epoch");
+        owner.client.use_group(uuid16(&alpha));
+        let shared = owner.client.encrypt_with_aad(
+            message_aad_for("message", None, Some(&beta)),
+            &payload("shared"),
+        );
+        let (status, posted) =
+            post_raw(&w.app, &mut owner, &beta, &shared, json!({"epoch": epoch})).await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        let bare = owner
+            .client
+            .encrypt_with_aad(message_aad("message", None), &payload("bare"));
+        let (status, refused) =
+            post_raw(&w.app, &mut owner, &beta, &bare, json!({"epoch": epoch})).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_e2ee")),
+            "{refused}"
+        );
+        let everyone = w.everyone().await;
+        let gamma = w.channel("gamma", true).await;
+        w.override_view(&gamma, &everyone, false).await;
+        let (_, before) = info(&w.app, &owner.token, &gamma).await;
+        assert!(before["epoch"].is_null(), "{before}");
+        start(&w.app, &mut owner, &gamma).await;
+        let (_, info_c) = info(&w.app, &owner.token, &gamma).await;
+        assert_eq!(info_c["group_id"], gamma, "{info_c}");
+        assert_ne!(info_c["group_id"], alpha);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_declared_context_must_name_the_group_and_the_conversation() {
+    run(|db| async move {
+        let w = world(db).await;
+        let owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let conv = w.channel("ctx", true).await;
+        let (status, body) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/group"),
+            &owner.token,
+            Some(json!({"device_id": owner.id(), "context": b64(&[0; 32])})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_e2ee")),
+            "{body}"
+        );
+        let mut bytes = uuid16(&conv).to_vec();
+        bytes.extend_from_slice(&uuid16(&conv));
+        let (status, body) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/group"),
+            &owner.token,
+            Some(json!({
+                "device_id": owner.id(),
+                "context": b64(&bytes),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, group) = info(&w.app, &owner.token, &conv).await;
+        assert_eq!(group["context"], b64(&bytes), "{group}");
+        let other = w.channel("ctx-plain", true).await;
+        let (status, body) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{other}/group"),
+            &owner.token,
+            Some(json!({"device_id": owner.id()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, group) = info(&w.app, &owner.token, &other).await;
+        assert!(group["context"].is_null(), "{group}");
     })
     .await;
 }
