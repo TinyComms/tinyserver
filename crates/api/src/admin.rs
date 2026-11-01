@@ -24,6 +24,7 @@ pub const FEATURES: &[&str] = &[
     "audit_query",
     "voice_moderation",
     "e2ee_calls",
+    "e2ee_text",
     "upload_limits",
     "file_scan",
     "abuse_reports",
@@ -58,6 +59,9 @@ pub fn routes() -> Router<PgPool> {
 struct Capabilities {
     version: &'static str,
     features: &'static [&'static str],
+    /// Whether a new conversation may or must be end-to-end encrypted: `off`, `optional` or
+    /// `new_required`. The `e2ee_text` feature says the server speaks the protocol at all.
+    e2ee_text: String,
 }
 
 async fn capabilities(
@@ -65,9 +69,14 @@ async fn capabilities(
     headers: HeaderMap,
 ) -> Result<Json<Capabilities>, ApiError> {
     caller(&pool, &headers).await?;
+    let mode = db::e2ee_text_mode(&pool).await.map_err(|error| {
+        tracing::warn!(%error, "capabilities query failed");
+        ApiError::Unavailable
+    })?;
     Ok(Json(Capabilities {
         version: env!("CARGO_PKG_VERSION"),
         features: FEATURES,
+        e2ee_text: mode,
     }))
 }
 
@@ -91,6 +100,8 @@ struct ServerBody {
     file_max_bytes: Option<i64>,
     #[serde(default)]
     allow_archives: Option<bool>,
+    #[serde(default)]
+    e2ee_text: Option<String>,
 }
 
 async fn server(
@@ -117,6 +128,7 @@ async fn edit_server(
         image_max_bytes: body.image_max_bytes,
         file_max_bytes: body.file_max_bytes,
         allow_archives: body.allow_archives,
+        e2ee_text: body.e2ee_text,
     };
     let settings = db::update_server(&pool, &caller, &patch)
         .await

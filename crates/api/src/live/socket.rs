@@ -558,6 +558,8 @@ fn typing_code(error: &db::MessageError) -> &'static str {
             tracing::warn!(%error, "typing check failed");
             "unavailable"
         }
+        // The errors of encrypted groups and posts. A typing frame is neither.
+        _ => "bad_frame",
     }
 }
 

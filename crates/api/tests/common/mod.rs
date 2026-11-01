@@ -7,8 +7,10 @@
 #![allow(dead_code)]
 
 pub mod live;
+pub mod mls_client;
 pub mod oidc;
 pub mod pocket;
+pub mod sealed;
 
 use std::future::Future;
 use std::str::FromStr;

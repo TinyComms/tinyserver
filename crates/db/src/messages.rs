@@ -61,6 +61,51 @@ pub enum MessageError {
     Blocked,
     #[error("unavailable")]
     Unavailable,
+    /// A plaintext write to an encrypted conversation, or a new plaintext conversation while the
+    /// server requires encryption. There is no fallback.
+    #[error("e2ee required")]
+    E2eeRequired,
+    /// Ciphertext for a plaintext conversation.
+    #[error("not e2ee")]
+    NotE2ee,
+    #[error("stale epoch")]
+    StaleEpoch,
+    /// A commit that does not apply exactly the proposals signed for its epoch.
+    #[error("proposals changed")]
+    ProposalsChanged,
+    #[error("no group")]
+    NoGroup,
+    #[error("group exists")]
+    GroupExists,
+    #[error("not in group")]
+    NotInGroup,
+    #[error("device exists")]
+    DeviceExists,
+    #[error("cross signature required")]
+    CrossSignatureRequired,
+    #[error("too many key packages")]
+    TooManyKeys,
+    /// A sealed upload past the per-person rate or daily volume.
+    #[error("slow down")]
+    SlowDown,
+    #[error("e2ee is off")]
+    E2eeOff,
+    #[error("bad device")]
+    BadDevice,
+    #[error("too many devices")]
+    TooManyDevices,
+    /// An MLS object that is not what it must be, or a request that does not match the group.
+    #[error("bad e2ee")]
+    BadE2ee,
+    /// An encrypted channel whose audience has more devices than one group may hold.
+    #[error("e2ee group too large")]
+    GroupTooLarge,
+    /// A client-chosen id that is already some upload's.
+    #[error("id taken")]
+    IdTaken,
+    /// A community root key is set, and a different one was given without saying to replace it.
+    #[error("root exists")]
+    RootExists,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -103,6 +148,7 @@ pub async fn create_channel(
     category_id: Option<&str>,
     topic: Option<&str>,
     position: Option<i32>,
+    e2ee: bool,
 ) -> Result<Value, MessageError> {
     if let Some(category_id) = category_id {
         if !is_uuid(category_id) {
@@ -112,13 +158,14 @@ pub async fn create_channel(
     let mut tx = scoped(pool, caller).await?;
     let value = json_in(
         &mut tx,
-        "SELECT app_create_channel($1, $2::uuid, $3, $4)",
+        "SELECT app_create_channel($1, $2::uuid, $3, $4, $5)",
         |query| {
             query
                 .bind(name)
                 .bind(category_id)
                 .bind(topic)
                 .bind(position)
+                .bind(e2ee)
         },
     )
     .await?;
@@ -189,18 +236,22 @@ pub async fn list_directs(pool: &PgPool, caller: &Caller) -> Result<Value, Messa
     commit(tx, value).await
 }
 
-/// Opens the direct conversation with `user_id`. `true` when this call created it.
+/// Opens the direct conversation with `user_id`, encrypted or not as asked: a pair may have one
+/// of each. `true` when this call created it.
 pub async fn open_direct(
     pool: &PgPool,
     caller: &Caller,
     user_id: &str,
+    e2ee: bool,
 ) -> Result<(Value, bool), MessageError> {
     let mut tx = scoped(pool, caller).await?;
-    let row: (Value, bool) = sqlx::query_as("SELECT body, created FROM app_open_direct($1::uuid)")
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(message_sql)?;
+    let row: (Value, bool) =
+        sqlx::query_as("SELECT body, created FROM app_open_direct($1::uuid, $2)")
+            .bind(user_id)
+            .bind(e2ee)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(message_sql)?;
     tx.commit().await.map_err(message_sql)?;
     Ok(row)
 }
@@ -450,6 +501,42 @@ pub async fn save_attachment(
     Ok(row)
 }
 
+/// A sealed upload: the bytes of an end-to-end encrypted attachment, stored exactly as they came.
+/// There is no type check, no sniffing, no image decode and no scan: the server cannot read
+/// them, and it does not say it can. They are written once to their final path, with no
+/// plaintext temporary file, and can only be linked into an encrypted conversation.
+pub async fn save_sealed_attachment(
+    pool: &PgPool,
+    caller: &Caller,
+    bytes: &[u8],
+    id: Option<&str>,
+) -> Result<Value, MessageError> {
+    if bytes.is_empty() || id.is_some_and(|id| !is_uuid(id)) {
+        return Err(MessageError::Invalid);
+    }
+    let size = i32::try_from(bytes.len()).map_err(|_| MessageError::TooLarge)?;
+    let mut tx = scoped(pool, caller).await?;
+    let row: Value = sqlx::query_scalar("SELECT app_save_sealed_attachment($1, $2::uuid)")
+        .bind(size)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    let Some(id) = row.get("id").and_then(Value::as_str) else {
+        return Err(MessageError::Invalid);
+    };
+    let id = id.to_string();
+    if let Err(error) = write_upload(&id, bytes) {
+        abort_upload(tx, &id).await;
+        return Err(error);
+    }
+    if let Err(error) = tx.commit().await {
+        remove_files(std::slice::from_ref(&id));
+        return Err(message_sql(error));
+    }
+    Ok(row)
+}
+
 pub async fn open_attachment(
     pool: &PgPool,
     caller: &Caller,
@@ -494,7 +581,7 @@ fn person(caller: &Caller) -> Result<(), MessageError> {
     }
 }
 
-async fn scoped<'a>(
+pub(crate) async fn scoped<'a>(
     pool: &'a PgPool,
     caller: &Caller,
 ) -> Result<Transaction<'a, Postgres>, MessageError> {
@@ -502,12 +589,15 @@ async fn scoped<'a>(
     scope(pool, caller).await.map_err(from_community)
 }
 
-async fn commit(tx: Transaction<'_, Postgres>, value: Value) -> Result<Value, MessageError> {
+pub(crate) async fn commit(
+    tx: Transaction<'_, Postgres>,
+    value: Value,
+) -> Result<Value, MessageError> {
     tx.commit().await.map_err(message_sql)?;
     Ok(value)
 }
 
-async fn json_in<'a, F>(
+pub(crate) async fn json_in<'a, F>(
     tx: &mut Transaction<'a, Postgres>,
     sql: &'a str,
     bind: F,
@@ -539,7 +629,7 @@ fn from_community(error: CommunityError) -> MessageError {
     }
 }
 
-fn message_sql(error: sqlx::Error) -> MessageError {
+pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
     let Some(database) = error.as_database_error() else {
         return MessageError::Database(DbError::from(error));
     };
@@ -557,6 +647,24 @@ fn message_sql(error: sqlx::Error) -> MessageError {
         "P0423" => MessageError::Scanning,
         "P0403" => MessageError::Blocked,
         "P0503" => MessageError::Unavailable,
+        "P0E01" => MessageError::E2eeRequired,
+        "P0E02" => MessageError::NotE2ee,
+        "P0E03" => MessageError::StaleEpoch,
+        "P0E04" => MessageError::ProposalsChanged,
+        "P0E05" => MessageError::NoGroup,
+        "P0E06" => MessageError::GroupExists,
+        "P0E07" => MessageError::NotInGroup,
+        "P0E08" => MessageError::DeviceExists,
+        "P0E09" => MessageError::CrossSignatureRequired,
+        "P0E10" => MessageError::TooManyKeys,
+        "P0E11" => MessageError::SlowDown,
+        "P0E12" => MessageError::E2eeOff,
+        "P0E13" => MessageError::BadDevice,
+        "P0E14" => MessageError::TooManyDevices,
+        "P0E15" => MessageError::BadE2ee,
+        "P0E16" => MessageError::GroupTooLarge,
+        "P0E17" => MessageError::IdTaken,
+        "P0E18" => MessageError::RootExists,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
@@ -567,6 +675,10 @@ fn channel_patch(value: &Value) -> Result<Value, MessageError> {
     let Some(obj) = value.as_object() else {
         return Err(MessageError::Invalid);
     };
+    // Whether a channel is encrypted is fixed when it is made, never changed.
+    if obj.contains_key("e2ee") {
+        return Err(MessageError::Invalid);
+    }
     let mut patch = Map::new();
     if let Some(name) = obj.get("name") {
         if !name.is_string() {
@@ -605,7 +717,7 @@ fn channel_patch(value: &Value) -> Result<Value, MessageError> {
     Ok(Value::Object(patch))
 }
 
-fn blank_to_none(value: Option<&str>) -> Option<&str> {
+pub(crate) fn blank_to_none(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
@@ -619,7 +731,7 @@ fn uuid_list(ids: &[String]) -> Result<Option<Vec<String>>, MessageError> {
     Ok(Some(ids.to_vec()))
 }
 
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {
         return false;
@@ -718,7 +830,7 @@ fn file_path(id: &str) -> Result<PathBuf, MessageError> {
     Ok(PathBuf::from(upload_dir()).join(id))
 }
 
-fn write_upload(id: &str, bytes: &[u8]) -> Result<(), MessageError> {
+pub(crate) fn write_upload(id: &str, bytes: &[u8]) -> Result<(), MessageError> {
     let path = file_path(id)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(MessageError::Store)?;
@@ -744,7 +856,7 @@ async fn set_scan(
     Ok(())
 }
 
-async fn abort_upload(tx: Transaction<'_, Postgres>, id: &str) {
+pub(crate) async fn abort_upload(tx: Transaction<'_, Postgres>, id: &str) {
     remove_files(&[id.to_string()]);
     let _ = tx.rollback().await;
 }

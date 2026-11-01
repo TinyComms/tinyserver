@@ -1,5 +1,5 @@
 //! HTTP surface. Health, sign-in, session, account, server settings, roles, rooms, people,
-//! invites, bans, messages, the audit log, and the live socket.
+//! invites, bans, messages, end-to-end encrypted text, the audit log, and the live socket.
 //! Call media does not enter this crate; it talks to `sfu` over channels.
 
 mod account;
@@ -7,6 +7,7 @@ mod admin;
 mod auth;
 mod bot;
 mod community;
+mod e2ee_text;
 mod health;
 mod limit;
 mod live;
@@ -60,7 +61,8 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(admin::routes())
         .merge(bot::routes())
         .merge(messages::routes())
-        .merge(reports::routes());
+        .merge(reports::routes())
+        .merge(e2ee_text::routes());
     if let Some(live) = live {
         routes = routes.merge(live::routes(live));
     }
@@ -77,6 +79,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .layer(middleware::from_fn(harden))
         .layer(Extension(operator))
         .layer(Extension(installed_engine()))
+        .layer(Extension(Arc::new(e2ee_text::Server::default())))
         .with_state(pool)
 }
 

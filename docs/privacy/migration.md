@@ -1,6 +1,6 @@
 # Compatibility and migration
 
-What happens to existing plaintext, to old and new clients and servers, to the schema, and to backups, when text and attachment E2EE is introduced and when a community moves hosts. Sources: [`../e2ee-text.md`](../e2ee-text.md) section 9, [`../calls.md`](../calls.md) "Compatibility", `crates/db/src/migrate.rs`, `crates/db/migrations/`, `deploy/compose.yml`, `deploy/README.md`, tinyclient `docs/architecture.md` (read only). Status words are in [`README.md`](README.md). Text E2EE is **in progress**: everything about it here is the specification.
+What happens to existing plaintext, to old and new clients and servers, to the schema, and to backups, when text and attachment E2EE is introduced and when a community moves hosts. Sources: [`../e2ee-text.md`](../e2ee-text.md) section 9, [`../calls.md`](../calls.md) "Compatibility", `crates/db/src/migrate.rs`, `crates/db/migrations/`, `deploy/compose.yml`, `deploy/README.md`, tinyclient `docs/architecture.md` (read only). Status words are in [`README.md`](README.md). Text E2EE: the server side is implemented and tested (#23); the client is on tinyclient main (#126, #127), read there, not run here.
 
 ## 1. Existing plaintext
 
@@ -17,9 +17,9 @@ A plaintext conversation in a community that also has encrypted ones is not prot
 
 ## 2. Old and new, client and server
 
-Capability discovery is `GET /v1/capabilities`: `e2ee_calls` (implemented) and `e2ee_text` (specified). A server from before capabilities answers 404.
+Capability discovery is `GET /v1/capabilities`: `e2ee_calls` and `e2ee_text` (both implemented; `e2ee_text` reports `off`, `optional`, `new_required` or `required`, tested by `the_setting_and_the_capability_say_what_the_server_does`). A server from before capabilities answers 404.
 
-### Text and attachments (specified)
+### Text and attachments (server #23; client tinyclient #126, #127)
 
 | Client | Server | Conversation | Result |
 |---|---|---|---|
@@ -45,7 +45,7 @@ The downgrade is by design and visible. It is also what a hostile server does ([
 
 ### A hazard: a downgrade through rollback
 
-If the server binary is rolled back to one that does not know encrypted conversations after some exist, the old code still sees ordinary `messages` and `channels` rows and would accept a plaintext `body` post from an old client into a conversation that other members' devices treat as encrypted. A new client talking to that server sees no `e2ee_text` capability and labels every conversation not encrypted, so it would not warn. The specification's rollback is a setting (`e2ee_text=off`), not a binary downgrade, and says so. What actually stops a binary downgrade is the migration check in section 3: the init container's `tinyserver migrate` should fail (and the stack not start) when the database holds migrations the binary does not have. That relies on `sqlx` 0.8's default (`ignore_missing` off, so an applied migration absent from the binary is an error). **Not tested in this repository.** The legacy single-container entrypoint (`deploy/entrypoint.sh`) also migrates first when `DATABASE_URL_MIGRATE` is set; `tinyserver serve` alone does not check.
+If the server binary is rolled back to one that does not know encrypted conversations after some exist, the old code still sees ordinary `messages` and `channels` rows and would accept a plaintext `body` post from an old client into a conversation that other members' devices treat as encrypted, **if the schema were rolled back too**. Against the new schema it cannot: the runtime role has only `SELECT` on `messages`, `app_post_message` and `app_edit_message` are replaced in place by `0022` and refuse a body for an encrypted conversation in Postgres, and `app_create_channel` and `app_open_direct` are dropped and recreated with a new signature, so an old binary cannot create conversations at all (read; not tested with an old binary, finding N9). A new client talking to that server sees no `e2ee_text` capability and labels every conversation not encrypted, so it would not warn. The specification's rollback is a setting (`e2ee_text=off`), not a binary downgrade, and says so. What actually stops a binary downgrade is the migration check in section 3: the init container's `tinyserver migrate` should fail (and the stack not start) when the database holds migrations the binary does not have. That relies on `sqlx` 0.8's default (`ignore_missing` off, so an applied migration absent from the binary is an error). **Not tested in this repository.** The legacy single-container entrypoint (`deploy/entrypoint.sh`) also migrates first when `DATABASE_URL_MIGRATE` is set; `tinyserver serve` alone does not check.
 
 ## 3. Schema migrations
 
@@ -55,7 +55,7 @@ If the server binary is rolled back to one that does not know encrypted conversa
 | When it runs | In the `tinyserver-init` container on every `docker compose up`, before the server (`depends_on: service_completed_successfully`). The serving container has no owner credentials (finding S2) |
 | Build input | `crates/db/build.rs` makes `migrations/` a cargo input so a new file cannot be missing from a cached build (finding S15) |
 | Main at `c4ae28b` | Ends at `0016_operator.sql` (`0015_abuse_reports.sql`, `0016_operator.sql` came with #20) |
-| E2EE migrations | The specification says `0020`–`0029` (devices, key packages, handshake log, conversation flag, sealed uploads). They are not on main. `0017`–`0019` are unused on main; other branches may use them. **Check for number and content collisions when branches merge**: an out-of-order or duplicate version fails the run |
+| E2EE migrations | `0020_e2ee_text_core.sql` (settings, conversation flag, devices, key packages, server key, upload ledger), `0021_e2ee_text_groups.sql` (groups, leaves, pending proposals, handshake log, trees), `0022_e2ee_text_messages.sql` (ciphertext posts and edits, sealed uploads, delete, `app_delete_account` keeping `0014` and #20's sign-in code deletion), `0023_e2ee_community_root.sql`. `0017`–`0019` are unused; other branches may use them. **Check for number and content collisions when branches merge**: an out-of-order or duplicate version fails the run |
 | Locking | `sqlx` takes an advisory lock while migrating; the server is not running during init, so no live traffic competes. Time on a large database was **not measured** (P17 in [`performance.md`](performance.md)) |
 | Data migrations | `0013` rewrites event audiences from now on (new rows only); `0014` adds a trigger and a function; neither rewrites existing rows. `0015` adds `manage_reports` to every non-default role that already had `manage_server` (`upgrading_grants_manage_reports_to_owners_and_manage_server_roles_only`); `0016` inserts the single `operator_state` row. The E2EE migrations must not touch existing plaintext |
 | Expand and contract | Not practised. An old binary against a new schema is not supported: it either fails the migrate check or runs against columns it ignores |
@@ -66,7 +66,7 @@ If the server binary is rolled back to one that does not know encrypted conversa
 |---|---|---|
 | A bad server image, no schema change in it | Redeploy the older image; `up` reruns init; migrate is a no-op | None |
 | A bad server image whose migrations are already applied | Not supported by `migrate`. Options: roll forward with a fix; or restore a database backup taken before the upgrade, and lose everything written since | Data loss since the backup. Restores have their own hazards (section 5) |
-| Turn text E2EE off | `e2ee_text=off` (specified): no new encrypted conversations. Existing encrypted conversations stay readable by clients and **cannot be reopened for plaintext**. There is no downgrade path by design | Users keep what they have; no data is made readable to the server |
+| Turn text E2EE off | `e2ee_text=off` (implemented, `the_setting_and_the_capability_say_what_the_server_does`): no new encrypted conversations. Existing encrypted conversations stay readable by clients and **cannot be reopened for plaintext**. There is no downgrade path by design | Users keep what they have; no data is made readable to the server |
 | Turn call E2EE off | Not a server setting. A room's `e2ee_required` can be cleared; the call is transport-only whenever any app cannot encrypt | Visible in the apps |
 | A client | Client upgrades change local schema: `chat.sqlite` has `PRAGMA user_version` (4) and "a version change drops and refills the cache" (client `docs/architecture.md`). **For an encrypted conversation a dropped cache is permanent loss of readable history**: MLS deletes message keys after use (RFC 9420's deletion schedule), so a client that loses its cached plaintext cannot decrypt the same ciphertext again unless it kept past message secrets, and a re-added device cannot read earlier messages. How long tinyclient retains them was not checked | Engineering requirement: an encrypted cache must survive client schema changes, with a migration and a test; a client rollback must not drop it |
 
@@ -83,10 +83,10 @@ If the server binary is rolled back to one that does not know encrypted conversa
 | `pocketid_data` and `secrets/pocketid_encryption_key` | Pocket ID's accounts, passkeys and signing key. Without them nobody can sign in | Yes; Pocket ID is stopped for the copy |
 | `secrets/oidc_client_secret`, `secrets/pocketid_api_key` | To start the stack; the API key acts as a Pocket ID administrator | Yes |
 | `.env` or `tenant.env` (`TINYSERVER_MEDIA_HMAC_SECRET`, database passwords, tunnel token) | To start the stack | **No.** The restore target keeps its own |
-| E2EE: the server's external sender key (text) | Without it every client shows "external sender key changed". Its storage location is not specified | Not applicable on main; not verified |
+| E2EE: the server's external sender key (text) | A row in Postgres (`e2ee_server_key`), so it moves with the database dump. Without it every client shows "external sender key changed". A backup or export carries the private key (finding N15) | Tested where it is stored: `the_servers_external_sender_is_one_key_kept_in_postgres`. Moving it to a secret file (G9) would make it a separate item to carry |
 | `tinyserver_bootstrap` | Not needed once an owner exists | Not checked |
 
-A backup that holds the database and the secrets together lets whoever opens it read plaintext conversations and sign in as anyone. The requirement was **a key held apart from the tenant host, and destroyable**. What exists: the operator's recipient, held wherever the operator keeps it, and the tenant's own key from `keygen`, which `delete` destroys but which sits on the tenant's host (`tenants/<name>/backup.key`) until the operator moves it ([`encryption-architecture.md`](encryption-architecture.md) section 5). For E2EE conversations a backup would contain only ciphertext (specified, not on main). No schedule, rotation or retention exists.
+A backup that holds the database and the secrets together lets whoever opens it read plaintext conversations and sign in as anyone. The requirement was **a key held apart from the tenant host, and destroyable**. What exists: the operator's recipient, held wherever the operator keeps it, and the tenant's own key from `keygen`, which `delete` destroys but which sits on the tenant's host (`tenants/<name>/backup.key`) until the operator moves it ([`encryption-architecture.md`](encryption-architecture.md) section 5). For E2EE conversations a backup contains message and file content only as ciphertext, plus the server's external sender private key (finding N15). No schedule, rotation or retention exists.
 
 ### Restore hazards
 
@@ -96,7 +96,7 @@ A backup that holds the database and the secrets together lets whoever opens it 
 | Accounts deleted after the backup reappear, with their messages | Defeats `DELETE /v1/me` | Keep a minimal ledger of deleted account ids and replay it after a restore ([`retention-and-deletion.md`](retention-and-deletion.md)). **Not built** (N11) |
 | Restoring over held data | Overwrites what a legal hold keeps | `restore` refuses under the operator's hold or a held report (`deploy/tests/hooks.sh`) |
 | Event sequence | Clients holding a `seq` higher than the restored `outbox` get `resync` (`since` above the newest seq closes with `4002`; `docs/calls.md`) | None. Behaviour documented |
-| MLS group rolled back to an earlier epoch | Specified: clients detect an epoch that went backwards and refuse to continue; the group is rebuilt (new group, welcome, history not carried) | Test needed; part of the in-progress work |
+| MLS group rolled back to an earlier epoch | Specified: clients detect an epoch that went backwards and refuse to continue; the group is rebuilt (new group, welcome, history not carried) | The client detects it and freezes the group (tinyclient `an_epoch_that_goes_backwards_is_detected_and_freezes_the_group`, not run here); rebuilding the group is not covered by a test. The server cannot detect its own rollback |
 | Pocket ID restored to a different time than tinyserver | `(issuer, subject)` pairs can disagree: accounts created or removed on one side only | Restore both from the same instant, or reconcile with `tinyserver identities` and `relink-identity` |
 | Upload volume and database at different times | Missing files give `404` on download; orphan files stay | Take them together |
 | Restored backup of a deleted tenant | Resurrects data the customer asked to delete | Retention horizon and key destruction. A backup encrypted to the tenant's key alone cannot be restored after `delete` unless an escrow copy of the key survives (`hooks.sh`) |

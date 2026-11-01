@@ -48,3 +48,10 @@ pub fn live_frame(data: &[u8]) {
         }
     }
 }
+
+/// The parsers of what a member of an end-to-end encrypted conversation sends as bytes: key
+/// packages, commits, welcomes, application message frames, proposal references and cross
+/// signatures. Any bytes, and the same bytes as base64 text.
+pub fn e2ee_handshake(data: &[u8]) {
+    crate::e2ee_text::fuzz_handshake(data);
+}

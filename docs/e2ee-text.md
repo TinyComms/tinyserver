@@ -1,6 +1,12 @@
 # End-to-end encrypted text and attachments
 
-Status: **specification, version 1. Not implemented on main.** No code in this repository encrypts text or attachments yet: message bodies and attachments are stored and served in plaintext. The server side is planned for `crates/api/src/e2ee_text/` and new migrations; the client side for tinyclient's `crates/e2ee` and the Tiny adapter. Once that code merges, where this document and the code disagree, the code is wrong or this document is out of date: open an issue. Calls already have end-to-end encryption (`docs/calls.md`); this is the same family of design for stored text.
+Status: **version 1. The server side is implemented and tested on main; the client side is merged on tinyclient main and is in no release yet.**
+
+- **Built (server):** `crates/api/src/e2ee_text/` and `crates/db/migrations/0020`–`0023`: devices and cross-signatures, key packages, one MLS group per encrypted conversation with the server as delivery service and external sender, membership kept in step with permissions, ciphertext posts and edits bound to their authenticated data, no downgrade either way, sealed uploads, ratchet trees served apart from the Welcome, a device cap per group, the `required` mode, the community root key and its signed policy, and refusal of every encrypted write while the community is suspended. The tests are in section 11; `crates/api/tests/e2ee_text.rs` passes.
+- **Built (client):** tinyclient main: #126 (`0c405dc`, the `crates/e2ee` crate) and #127 (`89188e8`, the Tiny adapter), in no release yet. Its own account of what it does and does not do is tinyclient's `docs/e2ee-text-client.md`. The client checks that a hostile server can only be stopped by (cross-signatures, the pinned external sender key, an epoch going backwards, sealed files matching their message) are asserted by tinyclient's tests, named in section 11 and in `docs/privacy/guarantees.md`; they were not run from this repository. Not done in the client: pinning the community root key, fetching ratchet trees from the tree endpoint, creating an encrypted channel (it starts encrypted direct messages only), padding sealed files, and sealing chatd's own message store, which keeps opened text in plaintext.
+- **Left to do:** G2 to G5 and G7 to G9 in section 8, encrypted reactions, and the client items listed above.
+
+Where this document and the code disagree, the code is wrong or this document is out of date: open an issue. Calls already have end-to-end encryption (`docs/calls.md`); this is the same family of design for stored text. What can and cannot be promised from this is in `docs/privacy/guarantees.md` (G1.3 to G1.7).
 
 Nothing here is "implemented" until its tests pass. Section 11 lists the tests that stand for each property, and section 12 says what is not covered.
 
@@ -34,6 +40,8 @@ Each conversation (channel or direct) has an `e2ee` flag, fixed at creation and 
 
 **Who is in the group is decided by permission, not by who asks.** The desired device set of a conversation is every active device of every user who can view it (channel `view_channel`, or the two people of a direct). When that set changes (a member joins, leaves, is kicked or banned, deletes their account, loses `view_channel` through a role or an override, or adds or revokes a device) the server records external proposals: Remove for leaves no longer wanted, Add for wanted devices with a claimed key package. Any member device that sees pending proposals commits them. The first valid commit for an epoch wins (compare-and-swap on the epoch); the rest are refused as stale. Until a removed member's Remove is committed, the server already stops delivering that conversation's ciphertext to them (the same audience narrowing as `0013`) and refuses their posts, so a removed member loses access to *future ciphertext they could fetch* immediately and to *future keys* at the next commit.
 
+**Size.** One group holds at most `e2ee_group_devices_max` devices (a server setting, 2,000 by default, 2 to 20,000). An encrypted channel whose audience already has more devices than that is not created (`400 e2ee_group_too_large`). A channel that grows past it later keeps working for the devices in its group; the others wait, and `GET /v1/e2ee/conversations/{id}` says how many (`waiting`). One commit adds at most as many devices as keeps the copies of its Welcome under the 4 MiB limit (`app_e2ee_adds_per_commit`: 94 into an empty group, 57 at 100 leaves, 8 at 1,000, 4 at 2,000), so the server issues Adds in batches of that size and the rest follow at the next epoch. A commit must apply every proposal issued for its epoch (it cannot drop one it refuses), so a client that refuses an Add cannot commit until it can accept it; the server never withdraws an issued proposal.
+
 Honest limit: if no member device is online, the commit waits. Messages sent in that epoch are still encrypted to the old member set, including to the person being removed, who cannot be sent them by the server but could have kept a key from before. Clients therefore commit pending removals before they send, and refuse to send into an epoch that has a pending Remove.
 
 **Joining.** A joining device gets a Welcome and reads **nothing from before it was added**: a new member and a new device never decrypt history. Their client shows "Messages from before you joined can't be read."
@@ -43,6 +51,22 @@ Honest limit: if no member device is online, the commit waits. Messages sent in 
 ## 5. Wire protocol
 
 All routes need a person's bearer session. Bots are refused. Binary values are standard base64. Every request that changes state is rate limited per user.
+
+**Encodings** (tinyclient's `crates/e2ee` writes exactly these):
+
+| Value | Bytes |
+|---|---|
+| key package | TLS `KeyPackage` (not wrapped in an MLSMessage) |
+| proposals (`handshake` row of kind `proposals`) | a TLS vector (variable-length prefix) of `MLSMessage`s, each a `PublicMessage` external Add or Remove proposal signed by the server |
+| commit | TLS `MLSMessage` holding a `PublicMessage` commit, proposals by reference only |
+| welcome | TLS `MLSMessage` holding the `Welcome` (not a bare `Welcome`). One commit makes one Welcome; the client posts the same bytes once for each device it adds |
+| ratchet tree | TLS `RatchetTree` (openmls `RatchetTreeIn`), the public tree of the epoch the commit makes |
+| application message | TLS `MLSMessage` holding a `PrivateMessage` of content type application |
+| `external_sender` | TLS `ExternalSender` (65 byte P-256 key, basic credential `tinyserver`); the pin is the key |
+| `signature_key` | 65 byte uncompressed P-256 point |
+| `cross_signature` | DER ECDSA P-256 over SHA-256 of `"tiny-e2ee-v1 device-add" ‖ user_id(16) ‖ device_id(16) ‖ signature_key(65)` |
+
+Handshake and tree messages are plaintext MLS (`PURE_PLAINTEXT` for handshakes) so the server can check them; application messages are always `PrivateMessage`.
 
 ### Devices and key packages
 
@@ -60,12 +84,22 @@ A key package is claimed once by the server when it builds an Add proposal and d
 
 | Route | Body → result |
 |---|---|
-| `GET /v1/e2ee/conversations/{id}` | → `{e2ee, epoch, external_sender, members:[{user_id, device_id}], pending}`. |
+| `GET /v1/e2ee/conversations/{id}` | → `{e2ee, epoch, external_sender, members:[{user_id, device_id, leaf_index}], pending:[{op, user_id, device_id, issued}], device_cap, waiting, trees:[epoch]}`. `waiting` counts devices that may use the conversation and are neither in the group nor pending (over the cap, past this epoch's share of Adds, or with no key package). `trees` lists the epochs whose ratchet tree can be fetched. |
 | `POST /v1/e2ee/conversations/{id}/group` | `{device_id}` → `201`. The first member device starts the group at epoch 0 when none exists (`409` otherwise). It then fetches pending proposals and commits them. |
 | `GET /v1/e2ee/conversations/{id}/handshake?after=<seq>&device_id=` | → `[{seq, kind: "proposals"\|"commit"\|"welcome", epoch, data}]` in order. A `welcome` is only returned to the device it is for. |
-| `POST /v1/e2ee/conversations/{id}/commit` | `{device_id, epoch, commit, welcomes:[{device_id, data}]}` → `204`, or `409 stale_epoch`, or `400 bad_e2ee`. The commit must be a public message for this group at `epoch` from the sender's own leaf, must apply the pending proposals, and must carry a Welcome for every added device. |
+| `POST /v1/e2ee/conversations/{id}/commit` | `{device_id, epoch, commit, welcomes:[{device_id, data}], ratchet_tree?}` → `204`, or `409 stale_epoch` / `409 proposals_changed`, or `400 bad_e2ee`. The commit must be a public message for this group at `epoch` from the sender's own leaf, must apply exactly the proposals issued for the epoch, each once, by reference, and must carry a Welcome for every added device, naming that device's key package. At most 100 welcomes, 1 MiB each, 4 MiB together; a commit is at most 4 MiB. `ratchet_tree`, at most 8 MiB, is the public tree of the epoch the commit makes (openmls `StagedCommit::export_ratchet_tree` before merging); the server checks that it parses and that its signatures and parent hashes hold, and keeps it for 8 epochs. |
+| `GET /v1/e2ee/conversations/{id}/tree?device_id=&epoch=` | → `200 application/octet-stream`, the TLS `RatchetTree` of `epoch`, for a device in the group that joined at or before it. `404` if the committer sent none or it is older than 8 epochs. A device that joins from a Welcome without the ratchet tree extension fetches this and checks it against the tree hash in the Welcome's GroupInfo (openmls does, given the tree). A committer should leave the tree out of the Welcome (`use_ratchet_tree_extension(false)`) and upload it once the group is past a few hundred devices: the Welcome then stays small whatever the group's size. |
 
-Live events on the socket: `e2ee.handshake {conversation_id, seq}`, `e2ee.keys_low {device_id, remaining}`, `e2ee.device {user_id, device_id, op: "added"|"revoked"}`. They carry no key material.
+### Community root key
+
+| Route | Body → result |
+|---|---|
+| `GET /v1/e2ee/community` | → `{root_key, policy, policy_signature, version, updated_at}`, base64; nulls and `version: 0` when none is set. Any member. |
+| `PUT /v1/e2ee/community` | `{root_key, policy, policy_signature, replace?}` → `200` with the same shape. Needs `manage_server`. `root_key` is a 65 byte P-256 key the owner's device made; `policy_signature` is DER ECDSA P-256 over SHA-256 of `"tiny-e2ee-v1 community-policy" ‖ policy`, checked by the server (`400 bad_e2ee` otherwise). A policy under the same root is an update (`version` + 1). A different root is `409 root_exists` unless `replace: true`. |
+
+The server stores both as given and reads nothing in the policy; its format is the clients'. Members pin the root on first sight; a client in a community whose signed policy says encrypted only refuses to post plaintext whatever the server's `e2ee_text` says, and a changed root (`e2ee.community {version, root_changed: true}` to everyone, and an audit row) is a loud warning that stops sending until the person acknowledges it. The root does not yet certify admin devices or invites: the invite capability keys that would stop the server admitting a person on its own are future work (section 8).
+
+Live events on the socket: `e2ee.handshake {conversation_id, seq}`, `e2ee.community {version, root_changed}`, `e2ee.keys_low {device_id, remaining}`, `e2ee.device {user_id, device_id, op: "added"|"revoked"}`. They carry no key material.
 
 ### Messages
 
@@ -76,7 +110,9 @@ For an encrypted conversation, `POST /v1/conversations/{id}/messages` takes exac
   "kind": "message" | "edit", "target_id": "<message id, for an edit>", "attachment_ids": ["…"] }
 ```
 
-and refuses with `400 e2ee_required` any request that has a `body`. `client_id` is unique per sender device and conversation (`409` replays, idempotent: the original is returned). A plaintext post to an encrypted conversation is never accepted, and a `ciphertext` post to a plaintext conversation is `400 not_e2ee`. There is no fallback.
+and refuses with `400 e2ee_required` any request that has a `body`.
+
+**Authenticated data.** The MLS authenticated data of every application message is `"tiny-e2ee-v1 msg" 0x00 kind 0x00 target_id`, with `target_id` the lowercase hyphenated uuid of the target for an edit and empty for a message. It is in the clear in a `PrivateMessage` and covered by its AEAD and the sender's signature. The server refuses (`400 bad_e2ee`) a post whose `kind` and `target_id` are not the ones the authenticated data names, and a receiver refuses a row whose stored `kind` and `target_id` disagree with it. So a server, or anyone who can write its database, cannot turn an edit into a message or point it at another message without the receivers noticing. `client_id` is unique per sender device and conversation (`409` replays, idempotent: the original is returned). A plaintext post to an encrypted conversation is never accepted, and a `ciphertext` post to a plaintext conversation is `400 not_e2ee`. There is no fallback.
 
 A message the server returns has `e2ee: true`, `ciphertext`, `epoch`, `device_id`, `kind`, `body: ""`, and the usual `id`, `author_id`, `created_at`, `deleted_at`. Edits are separate `kind: "edit"` rows pointing at `target_id`, which the server only checks was written by the same user and not deleted. The client folds them. Delete is the existing `DELETE /v1/messages/{id}`: the author only, it removes the ciphertext and the attachments and tombstones the row. There is no moderator delete in v1.
 
@@ -93,17 +129,17 @@ The plaintext inside the MLS application message is JSON, UTF-8, at most 16 KiB:
 
 ### Attachments
 
-`POST /v1/media` with the form field `sealed=1` stores the body as an opaque blob: no content sniffing, no image decoding, no clamd scan, `kind = "sealed"`, name and type are fixed server-side to `sealed` and `application/octet-stream`. The size limit is the server's file limit. The server never writes a plaintext temporary file for it: the body is written once, as received. A sealed blob can be attached only to an encrypted conversation, by id, through `attachment_ids`. Download authorization is the existing conversation check.
+`POST /v1/media` with the form field `sealed=1` stores the body as an opaque blob: no content sniffing, no image decoding, no clamd scan, `kind = "sealed"`, name and type are fixed server-side to `sealed` and `application/octet-stream`. The size limit is the server's file limit. The server never writes a plaintext temporary file for it: the body is written once, as received, to its final path. The only check of its contents is its framing (below), so the route is not a free host for any file; anything else is `400 invalid`. The form may carry `id`, a uuid the client made before it sealed the blob: the upload then gets that id (`409 id_taken` if it exists). A sealed blob can be attached only to an encrypted conversation, by id, through `attachment_ids`. Download authorization is the existing conversation check.
 
-The blob is: a header `"TNYA1"` ‖ 1 byte log2 chunk size (16 for 64 KiB) ‖ 7 byte random nonce prefix, then STREAM-encrypted chunks (AES-256-GCM, 32-bit big-endian counter, last-chunk flag), with the attachment's id and the header as associated data for the first chunk. The client checks `sha256` of what it downloaded before it decrypts, and decrypts as a stream so a large file is never held whole in memory. The key lives only inside the message.
+The blob is: a header `"TNYA1"` ‖ 1 byte log2 chunk size (16 for 64 KiB; 10 to 20 accepted) ‖ 7 byte random nonce prefix, then STREAM-encrypted chunks (AES-256-GCM, RustCrypto `EncryptorBE32`: nonce = prefix ‖ 32-bit big-endian counter ‖ last-chunk flag), every chunk but the last exactly one chunk of plaintext plus its 16 byte tag, the last 0 to one chunk plus its tag. The first chunk's associated data is the header followed by a context: `conversation_id(16) ‖ attachment_id(16)` when the client chose the id, else empty. The server cannot check the context (it is inside the AEAD); a client that chose the id must open with it, and so a blob moved to another message or conversation does not open. The client checks `sha256` of what it downloaded before it decrypts, and decrypts as a stream so a large file is never held whole in memory. The key lives only inside the message.
 
 Validations that remain possible on the server: size, per-user upload rate and daily volume, orphan cleanup, that the id belongs to the uploader and is linked once, and that it is only linked into an encrypted conversation. Validations that are not possible: file type, malware, image parsing. The server must not claim to scan sealed files. Clients protect themselves: they detect the real type after decrypting, never open a file automatically, decode images with limits on dimensions and memory, and warn on executable types.
 
 ## 6. Storage
 
-The server stores, for an encrypted message: ids, timestamps, `epoch`, `device_id`, `kind`, `target_id`, the ciphertext, and for each attachment its id, ciphertext size and uploader. `messages.body` is the empty string. The `last_message` preview of an encrypted channel is empty. Group state is the handshake log (public MLS handshake messages), the device and key package tables, and the external sender key. No table holds a key that opens a message.
+The server stores, for an encrypted message: ids, timestamps, `epoch`, `device_id`, `kind`, `target_id`, the ciphertext, and for each attachment its id, ciphertext size and uploader. `messages.body` is the empty string. The `last_message` preview of an encrypted channel is empty, the outbox and live events carry the ciphertext only, and a deleted message loses its ciphertext in the outbox too. No log line carries a ciphertext, a key package, a commit, a Welcome, a proposal, a tree or a key (`crates/server/src/log_policy.rs`). Group state is the handshake log (public MLS handshake messages), the public ratchet trees of recent epochs, the device and key package tables, and the external sender key. No table holds a key that opens a message, and no table, log line or file holds plaintext of an encrypted message: a test says a canary through every encrypted path and looks for it everywhere.
 
-The client stores MLS state through the OS keychain-protected key, and caches decrypted messages encrypted with a per-install key kept in the OS keychain, never with the key in the same file.
+The client (tinyclient #127, `docs/e2ee-text-client.md` there) keeps its state key and cache key in the account's keychain item and stores MLS state sealed under the state key, and caches decrypted messages encrypted with a per-install key kept in the OS keychain, never with the key in the same file. chatd's general message store (SQLite) still keeps the opened text of encrypted conversations in plaintext, as it does for every network; sealing it is open in the client.
 
 ## 7. What a person sees
 
@@ -115,6 +151,23 @@ The client stores MLS state through the OS keychain-protected key, and caches de
 
 ## 8. Known gaps
 
+Open work, with the labels other documents use (they follow TinyCloud's `design/security.md` sections 2 and 3; G1, large groups, is done, section 4):
+
+| Label | Gap | Where the work is |
+|---|---|---|
+| G2 | Groups per permission audience, a commit batching window and committer selection. Until then a group is capped at `e2ee_group_devices_max` devices (section 4) | Server and client |
+| G3 | Invite capability keys: an invite's secret in the URL fragment, certified by an admin device that chains to the community root | Client first, then an invite column on the server |
+| G4 | The first-device capability signature, so a first device proves the invite it came through | Client first, then a device column on the server |
+| G5 | Binding the group to its conversation in a GroupContext extension | Client; the server only passes it through |
+| G7 | Padding of sealed blobs. Message text is already padded to buckets by the client (tinyclient `messages_are_padded_to_buckets_so_the_server_sees_short_medium_or_long`); sealed files are not | Client |
+| G8 | Coarse timestamps | Client and schema |
+| G9 | The server's external sender private key is a row in Postgres (`e2ee_server_key`), so it is in every backup; move it to a secret file | Server |
+| | Encrypted reactions | Client and schema |
+| | `e2ee_group_devices_max` is settable only in SQL, not through `PATCH /v1/server` | Server |
+| | An uploaded ratchet tree is checked for its own signatures, not against the epoch (the server cannot see the GroupInfo); a bad tree stops only a joiner, who checks the tree hash | By design |
+
+The rest of this section is what the design does not protect against even when that work is done, or until it is:
+
 - **Reactions** are plaintext in v1 (emoji, message, user). They reveal who reacted to which message id, not what the message says.
 - **Mentions and search** work only on the client, on decrypted text.
 - **The server's external sender key** can add a ghost device only if clients accept an Add whose credential has no cross-signed device behind it; they do not. Clients still must check, so a client bug removes this protection.
@@ -122,6 +175,8 @@ The client stores MLS state through the OS keychain-protected key, and caches de
 - **A first device is trust on first use.** A malicious server that is present when a person first registers could substitute the key of that first device; verifying safety numbers out of band is the only defence.
 - **Compromised endpoint** reads everything the device can.
 - **Removal latency** as described in section 4.
+- **Membership is the server's word.** A malicious server can create an account, grant it `view_channel`, and it joins with its own first device; cross-signing does not help against a new person. The community root key and its signed policy are on the server (`/v1/e2ee/community`), but the client does not pin or check them yet; the rest of the fix is G3 and G4 above (`design/security.md` section 2.8 in tinycloud) and is not in this version.
+- **Group size** is capped (section 4) until groups per permission audience exist.
 
 ## 9. Compatibility and migration
 
@@ -131,17 +186,25 @@ The client stores MLS state through the OS keychain-protected key, and caches de
 | Old client, new server, encrypted conversation | listed with `e2ee: true` and empty bodies; plaintext posts are refused with `400 e2ee_required`; it shows blanks and cannot send. It cannot be tricked into a downgrade. |
 | New client, old server | `GET /v1/capabilities` lacks `e2ee_text`; the client offers no encrypted conversations and labels every conversation not encrypted |
 | Existing conversations | stay plaintext, labelled; **never converted in place** |
-| New encrypted conversations | created with `"e2ee": true` on `POST /v1/channels` and `POST /v1/directs`. Server setting `e2ee_text`: `off`, `optional` (default) or `new_required` (new conversations must be encrypted) |
+| New encrypted conversations | created with `"e2ee": true` on `POST /v1/channels` and `POST /v1/directs`. Server setting `e2ee_text` (`PATCH /v1/server`, shown in `GET /v1/capabilities`): `off`, `optional` (default), `new_required` (new conversations must be encrypted), or `required`: as `new_required`, and the server takes no plaintext text at all, so an old plaintext conversation is read-only (posts and edits are `400 e2ee_required`) and plaintext uploads are refused. Bots post plaintext, so they cannot post under `required`. |
 
 To move a community to encryption: create encrypted channels, tell people, and let an owner delete the plaintext ones (deleting a channel hard-deletes its messages, and the outbox scrub of `0014` covers edits). `tinyserver` does not offer an automatic converter: converting would copy plaintext into ciphertext made by the server, which would give the server the keys.
 
-Rollback: set `e2ee_text` to `off`. Existing encrypted conversations stay readable by clients and cannot be reopened for plaintext; there is no downgrade path by design. Backups of an encrypted conversation contain only ciphertext.
+Rollback: set `e2ee_text` to `off`. Existing encrypted conversations stay readable by clients and cannot be reopened for plaintext; there is no downgrade path by design. Backups of an encrypted conversation contain only ciphertext and public handshake state, plus the server's external sender private key (G9): it opens nothing, but whoever restores it can sign proposals as the server.
 
 Backup restore: a restored database restores ciphertext and the handshake log; a restore to an earlier time can roll a group back to an earlier epoch than the clients hold. Clients detect an epoch that went backwards and refuse to continue the group: the group is rebuilt (new group, welcome, history not carried).
 
 ## 10. Performance
 
-MLS group cost grows with log n of devices for commits and is constant for application messages. A commit for a 1,000-device group is a few KiB. The server parses public handshake messages and does no cryptography on application messages. Large communities should use channels with a bounded device count or accept commit latency; benchmark numbers are in `docs/privacy/benchmarks.md` and are measured, not estimated.
+Measured by tinyclient's `crates/e2ee` with openmls 0.8.2 (Ryzen 9 5900X, `docs/e2ee-core-notes.md` section 4 in tinyclient), for a group grown by joins:
+
+| | 10 devices | 100 | 1,000 |
+|---|---|---|---|
+| commit adding a few devices | 450 B | 247 B | 382 B |
+| its Welcome, ratchet tree inside | 4.3 KB | 28 KB | 277 KB |
+| commit removing one device | 1.7 KB | 12.4 KB | 117 KB |
+
+A commit is small in a healed tree and is not in a tree grown by joins: devices added by commits without an update path are unmerged leaves, and a commit with a path encrypts to each of them. It shrinks as members commit with a path. A Welcome with the tree inside grows by about 280 bytes a device, and every added device gets a copy of it, which is why the server batches Adds (section 4), raises the commit limit to 4 MiB, and serves the tree apart from the Welcome. Message cost is independent of message size and grows with the group (milliseconds per message at 1,000 devices, dominated by openmls storing its secret tree). The server parses public handshake messages, verifies an uploaded tree's signatures (one ECDSA verification a leaf), and does no cryptography on application messages.
 
 ## 11. Tests that stand for the properties
 
@@ -157,10 +220,17 @@ Server (`crates/api/tests/e2ee_text.rs` and unit tests under `e2ee_text/`):
 - device revocation queues Remove and ends delivery to that device
 - unauthorized cross-conversation: another conversation's group, handshake and attachments are not readable
 - malformed MLS and oversized payloads are refused without panic, and a fuzz target exists
-- sealed upload: no sniff, no scan, no plaintext temp file, size and rate limits, only linkable into an encrypted conversation
-- migration: old and new clients against old and new servers, as in section 9
+- sealed upload: no sniff, no scan, no plaintext temp file, framing checked, size and rate limits, only linkable into an encrypted conversation, a client-chosen id once only, opened only with its context
+- the canary: said through a message, a reply, an edit, a direct message, a sealed file and its name, and a deleted message, it is in no table, log line, upload file or file under the temporary directory
+- the stored kind and target must be the ones in the message's authenticated data
+- a joiner fetches a ratchet tree the server checked and kept apart from the Welcome; a bad tree refuses the commit
+- the device cap: a channel over it is not made, a group stops at it and says how many wait, and Adds per commit shrink as the group grows
+- `required`: no plaintext post, edit, conversation or upload; encrypted ones go on
+- the community root: set only by a manager with a signature by the key it names, the same for every member, a new root only with `replace` and announced to everyone
+- suspension: in read-only and offline mode no encrypted post, sealed upload, key package or commit is taken
+- migration: an old client and old request shapes against the new server, as in section 9 (`old_requests_and_old_clients_keep_working`); a new client against an old server is the client's test
 
-Client (`crates/e2ee`): real openmls groups with 3 and 20 devices, add, remove, epoch change; a removed device cannot decrypt a later message; a new device cannot decrypt an earlier one; replay and tamper rejection; attachment encryption round trip, truncation, reorder, bit flip, wrong key; AES-GCM known-answer vectors from NIST and Wycheproof; property tests on the envelope codec and on chunk boundaries.
+Client (tinyclient `crates/e2ee` from #126 and the Tiny adapter from #127; not run from this repository). Those that stand for a client check against a hostile server: `an_add_of_a_device_that_is_not_cross_signed_is_rejected`, `a_forged_cross_signature_does_not_get_a_device_added`, `a_device_the_server_invented_is_rejected`, `the_first_device_is_trusted_on_first_use_and_the_rest_must_chain_to_it`, `proposals_not_signed_by_the_pinned_server_key_are_invalid`, `a_changed_server_key_is_reported_and_blocks_until_accepted`, `an_epoch_that_goes_backwards_is_detected_and_freezes_the_group`, `a_new_identity_is_reported_and_needs_the_person_to_agree`, `an_encrypted_conversation_is_labelled_its_rows_never_read_the_servers_body_and_nothing_goes_plain`, `a_sealed_file_opens_with_its_entry_only_in_its_conversation`, `an_opened_sealed_file_must_be_what_its_message_says`. The end-to-end `adapters::tiny::e2ee::live` test against a real tinyserver is ignored unless sessions are supplied. As specified: real openmls groups with 3 and 20 devices, add, remove, epoch change; a removed device cannot decrypt a later message; a new device cannot decrypt an earlier one; replay and tamper rejection; attachment encryption round trip, truncation, reorder, bit flip, wrong key; AES-GCM known-answer vectors from NIST and Wycheproof; property tests on the envelope codec and on chunk boundaries.
 
 ## 12. Not covered by tests or verified
 

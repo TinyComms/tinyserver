@@ -8,6 +8,7 @@ mod auth;
 mod bootstrap;
 mod bot;
 mod community;
+mod e2ee;
 mod error;
 mod media;
 mod messages;
@@ -41,13 +42,20 @@ pub use community::{
     AuditQuery, AuditRow, Caller, CommunityError, Invite, InviteIssued, InviteOptions, Member,
     NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
+pub use e2ee::{
+    active_keys, apply_commit, commit_snapshot, community_root, create_group, device_key,
+    e2ee_text_mode, group_info, handshake_after, issue_proposals, key_package_count,
+    post_e2ee_message, put_device, put_key_packages, ratchet_tree, revoke_device, server_key,
+    set_community_root, user_devices, CommitSnapshot, HandshakeRow, Issued, IssuedProposal,
+    NewE2eeMessage, Unissued, WelcomeFor,
+};
 pub use error::DbError;
 pub use media::prepare_icon;
 pub use messages::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
     list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
-    save_attachment, scan_timeout, set_channel_override, toggle_reaction, typing_recipients,
-    update_channel, AttachmentFile, MessageError, NewAttachment,
+    save_attachment, save_sealed_attachment, scan_timeout, set_channel_override, toggle_reaction,
+    typing_recipients, update_channel, AttachmentFile, MessageError, NewAttachment,
 };
 pub use migrate::migrate;
 pub use moderation::{

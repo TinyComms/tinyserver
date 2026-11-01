@@ -47,6 +47,9 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
     crate::messages::remove_files(&orphans);
     let attachments = i64::try_from(orphans.len()).unwrap_or(i64::MAX);
     let reports = crate::reports::expire_reports(pool).await?;
+    // Expired key packages, old welcomes and old sealed-upload ledger rows. Not counted above:
+    // none of it is a row a person made.
+    sqlx::query("SELECT app_e2ee_sweep()").execute(pool).await?;
     Ok(Swept {
         sessions,
         invites,

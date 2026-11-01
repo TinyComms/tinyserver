@@ -31,6 +31,18 @@ const DENY_EXACT: &[&str] = &[
     "file_name",
     "media",
     "ciphertext",
+    // End-to-end encrypted text: public MLS objects and keys. None is secret to the server, but
+    // none belongs in a log either.
+    "key_package",
+    "key_packages",
+    "commit",
+    "welcome",
+    "welcomes",
+    "proposal",
+    "proposals",
+    "handshake",
+    "cross_signature",
+    "external_sender",
     "password",
     "authorization",
     "cookie",
@@ -862,6 +874,55 @@ mod tests {
         assert!(!line.contains("hello"));
         assert!(!line.contains("access_token"));
         assert!(line.contains("user_id=018f"));
+    }
+
+    #[test]
+    fn drops_what_end_to_end_encrypted_text_could_carry() {
+        let event = EventParts {
+            target: "api::e2ee_text",
+            level: Level::WARN,
+            message: "e2ee failed",
+            fields: &[
+                ("ciphertext", "AAECAwQF"),
+                ("key_package", "AAEAAQ"),
+                ("key_packages", "AAEAAQ"),
+                ("commit", "AAEAAQ"),
+                ("welcome", "AAEAAQ"),
+                ("welcomes", "AAEAAQ"),
+                ("proposal", "AAEAAQ"),
+                ("proposals", "AAEAAQ"),
+                ("handshake", "AAEAAQ"),
+                ("cross_signature", "MEUCIQ"),
+                ("signature_key", "BAECAw"),
+                ("external_sender", "AEEE"),
+                ("user_id", "018f"),
+                ("route", "commit"),
+                ("reason", "stale_epoch"),
+            ],
+        };
+        for sink in [Sink::Operator, Sink::Ring] {
+            let line = line_of(render(&LogPolicy::default(), sink, &event));
+            for secret in ["AAECAwQF", "AAEAAQ", "MEUCIQ", "BAECAw", "AEEE"] {
+                assert!(!line.contains(secret), "{line}");
+            }
+            for name in [
+                "ciphertext=",
+                "key_package",
+                "commit=",
+                "welcome",
+                "proposal",
+                "handshake=",
+                "cross_signature",
+                "signature_key",
+                "external_sender",
+            ] {
+                assert!(!line.contains(name), "{line}");
+            }
+            // What says what happened stays.
+            assert!(line.contains("user_id=018f"), "{line}");
+            assert!(line.contains("route=commit"), "{line}");
+            assert!(line.contains("reason=stale_epoch"), "{line}");
+        }
     }
 
     #[test]

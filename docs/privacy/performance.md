@@ -2,7 +2,7 @@
 
 What the privacy design costs in CPU, memory, bandwidth, storage and latency, where the cost comes from, and what is not yet measured. **This file contains no measured numbers except the few hand measurements already in `docs/calls.md`, quoted with their caveats.** Every other number is arithmetic from a stated parameter, labelled as such. The measured values are to be filled in by a benchmarking pass into [`benchmarks.md`](benchmarks.md) (referenced by [`../e2ee-text.md`](../e2ee-text.md) section 10; it does not exist yet) and into the TODO tables below.
 
-Status words are in [`README.md`](README.md). Text and attachment E2EE is **in progress**: its costs here are derived from the specification, not observed.
+Status words are in [`README.md`](README.md). Text and attachment E2EE: the server side is implemented (#23). Its costs here are derived from the design, except the sizes tinyclient measured, which [`../e2ee-text.md`](../e2ee-text.md) section 10 quotes; server CPU and latency were not measured.
 
 ## 1. What is measured today
 
@@ -28,7 +28,7 @@ The compose file starts, per community: Postgres, tinyserver, Pocket ID, clamd, 
 | cloudflared | 256 MB | |
 | `tinyserver-init` (transient) | 256 MB | |
 
-The long-running limits sum to about 5.5 GiB. Actual resident use was not measured. The point for a hosting plan from about $10 a month: **clamd alone is the largest single memory line per tenant**, and it exists to scan plaintext uploads. Sealed uploads (specified) are not scanned, but plaintext uploads, and every community that does not use E2EE, still need it. [`tenancy.md`](tenancy.md) does not share a scanner across tenants (a shared service is shared plaintext). Instead `deploy/scan-off.yml`, or `tenant.sh new --scan none`, runs a community with no clamd (`TINYSERVER_SCAN_ENGINE=none`): every upload is marked clean unscanned and the server warns at start. That removes the largest memory line but lets any plaintext file through, so it is meant only where attachments are sealed, which is not on main yet. Not measured.
+The long-running limits sum to about 5.5 GiB. Actual resident use was not measured. The point for a hosting plan from about $10 a month: **clamd alone is the largest single memory line per tenant**, and it exists to scan plaintext uploads. Sealed uploads (#23) are not scanned, but plaintext uploads, and every community that does not use E2EE, still need it. [`tenancy.md`](tenancy.md) does not share a scanner across tenants (a shared service is shared plaintext). Instead `deploy/scan-off.yml`, or `tenant.sh new --scan none`, runs a community with no clamd (`TINYSERVER_SCAN_ENGINE=none`): every upload is marked clean unscanned and the server warns at start. That removes the largest memory line but lets any plaintext file through, so it is meant only where attachments are sealed, which is not on main yet. Not measured.
 
 ### 2.2 Per active member
 
@@ -39,18 +39,18 @@ The long-running limits sum to about 5.5 GiB. Actual resident use was not measur
 | Writes: each message is a `messages` row and an `outbox` row (full message JSON, kept 24 hours) | Write amplification of about two rows per message plus index updates. Not measured |
 | Sign-in: one pending row and one code row, a few round trips to Pocket ID | Not measured |
 
-### 2.3 Text E2EE (derived from the specification)
+### 2.3 Text E2EE
 
 | Effect | Reasoning | Status |
 |---|---|---|
-| Application messages cost the server no cryptography; it stores the ciphertext | `e2ee-text.md` section 10 | Specified |
-| The server parses public handshake messages (key packages, commits) | CPU per commit grows with the group; not measured | Specified |
-| Commit size grows with log of the device count; `e2ee-text.md` says "a few KiB" for 1,000 devices | A claim in the specification, not measured here | **Unverified** |
+| Application messages cost the server no cryptography; it stores the ciphertext | `e2ee-text.md` section 10; the post route parses the MLS framing only to check the authenticated data | Implemented. Not measured |
+| The server parses public handshake messages (key packages, commits) and verifies an uploaded ratchet tree (one ECDSA verification a leaf) | CPU per commit grows with the group; not measured | Implemented. Not measured |
+| Commit size depends on how the tree grew: in a 1,000 device group grown by joins a Remove is 117 KB and a Welcome with the tree inside 277 KB (tinyclient's measurement, quoted in `e2ee-text.md` section 10). The server accepts commits up to 4 MiB, serves the tree apart from the Welcome, caps a group at 2,000 devices by default and shrinks Adds per commit as the group grows | Measured by the client, not here | Implemented; sizes measured by the client only |
 | The group is made of **devices**, not people: every active device of every user who can view the conversation | A channel with 200 members who each have 2 devices is a 400 leaf group. Each member change is a commit with an Add per new device and a Welcome per new device | Derived |
 | **Key package consumption** | Joining a community puts the new device into every encrypted channel it can view. One key package is claimed per group joined. Up to 50 packages are uploaded at a time and the server falls back to a `last_resort` package when the pool is empty. A community with more than 50 encrypted channels exhausts a fresh device's pool on its first sync | Derived from `e2ee-text.md` sections 4 and 5. Consequence for the last-resort package's reuse is a cryptographic question for review |
 | **Commit latency** | A Remove or Add is not effective until some member device commits. If no member is online it waits; clients commit pending removals before they send | Specified. Time to effect not measured |
-| **Ciphertext size** | A plaintext message is limited to 4000 characters; the MLS plaintext envelope to 16 KiB; the encrypted size adds the MLS framing and AEAD tag. The maximum ciphertext the server accepts is not stated in the specification | **Needs a limit and a measurement** |
-| Server-side cost that disappears | The 200 character `last_message` preview of an encrypted channel is empty; no server-side search | Specified |
+| **Ciphertext size** | A plaintext message is limited to 4000 characters; the MLS plaintext envelope to 16 KiB; the encrypted size adds the MLS framing and AEAD tag. The server accepts at most 32 KiB of ciphertext (`messages.ciphertext`, `0022`) | Limit set; overhead not measured |
+| Server-side cost that disappears | The 200 character `last_message` preview of an encrypted channel is empty; no server-side search | Implemented |
 
 ### 2.4 Attachments
 
