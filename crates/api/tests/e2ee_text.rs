@@ -272,6 +272,8 @@ struct World {
 
 async fn world(db: TestDb) -> World {
     logs();
+    // The operator's suspension is read again on every request, so a test sees it at once.
+    std::env::set_var("TINYSERVER_OPERATOR_REFRESH_MS", "0");
     let owner = first_owner(&db).await;
     let owner_token = session(&db, &owner.user_id).await;
     let app = api::router(db.runtime.clone(), None);
@@ -4254,6 +4256,69 @@ async fn the_community_root_key_signs_the_policy_and_a_new_root_is_loud() {
                 .await
                 .expect("audit");
         assert_eq!(audited, 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_suspended_community_takes_no_encrypted_post_upload_or_commit() {
+    run(|db| async move {
+        let _dir = upload_dir();
+        let w = world(db).await;
+        let mut p = pair(&w, "held").await;
+        let (status, before) = say(&w.app, &mut p.owner, &p.conv, "before", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{before}");
+        for (mode, error) in [
+            (db::Mode::ReadOnly, "read_only"),
+            (db::Mode::Offline, "suspended"),
+        ] {
+            db::set_operator_mode(&w.db.owner, mode, Some("held"))
+                .await
+                .expect("suspend");
+            let (status, body) = say(&w.app, &mut p.owner, &p.conv, "during", json!({})).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::SERVICE_UNAVAILABLE, Some(error)),
+                "{body}"
+            );
+            let (status, body) = upload_sealed(&w.app, &p.owner.token, &framed(b"during")).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::SERVICE_UNAVAILABLE, Some(error)),
+                "{body}"
+            );
+            let (status, body) = upload_packages(&w.app, &p.owner, 1).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::SERVICE_UNAVAILABLE, Some(error)),
+                "{body}"
+            );
+            let (status, body) = call(
+                &w.app,
+                Method::POST,
+                &format!("/v1/e2ee/conversations/{}/commit", p.conv),
+                &p.owner.token,
+                Some(json!({
+                    "device_id": p.owner.id(), "epoch": 1, "commit": b64(b"x"), "welcomes": [],
+                })),
+            )
+            .await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::SERVICE_UNAVAILABLE, Some(error)),
+                "{body}"
+            );
+        }
+        db::set_operator_mode(&w.db.owner, db::Mode::Normal, None)
+            .await
+            .expect("resume");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM messages WHERE channel_id = $1::uuid")
+                .bind(&p.conv)
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("count");
+        assert_eq!(rows, 1, "nothing was stored while suspended");
     })
     .await;
 }
