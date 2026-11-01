@@ -39,6 +39,9 @@ pub struct ServerSettings {
     /// Zip and other archives may be stored when this is true. Default false.
     pub allow_archives: bool,
     pub created_at: String,
+    /// `off`, `optional` or `new_required`: whether new conversations may or must be end-to-end
+    /// encrypted. Existing conversations are never converted.
+    pub e2ee_text: String,
 }
 
 /// `None` leaves a field as it is. The room ids take `Some(None)` to clear.
@@ -53,6 +56,7 @@ pub struct ServerPatch {
     pub image_max_bytes: Option<i64>,
     pub file_max_bytes: Option<i64>,
     pub allow_archives: Option<bool>,
+    pub e2ee_text: Option<String>,
 }
 
 pub struct Icon {
@@ -85,7 +89,7 @@ fn settings_select() -> String {
     format!(
         "SELECT name, description, welcome, icon_sha, default_room_id::text, afk_room_id::text,
                 afk_timeout_secs, image_max_bytes, file_max_bytes, allow_archives,
-                to_char(created_at AT TIME ZONE 'UTC', '{STAMP}')
+                to_char(created_at AT TIME ZONE 'UTC', '{STAMP}'), e2ee_text
          FROM server_settings"
     )
 }
@@ -131,6 +135,13 @@ pub async fn update_server(
     let afk_room = room_choice(&patch.afk_room_id)?;
     let image_max = upload_limit(patch.image_max_bytes)?;
     let file_max = upload_limit(patch.file_max_bytes)?;
+    if patch
+        .e2ee_text
+        .as_deref()
+        .is_some_and(|mode| !matches!(mode, "off" | "optional" | "new_required"))
+    {
+        return Err(CommunityError::Invalid);
+    }
     let mut tx = scope(pool, caller).await?;
     require(&mut tx, perm::MANAGE_SERVER).await?;
     sqlx::query(
@@ -143,7 +154,8 @@ pub async fn update_server(
              afk_timeout_secs = coalesce($8, afk_timeout_secs),
              image_max_bytes = coalesce($9, image_max_bytes),
              file_max_bytes = coalesce($10, file_max_bytes),
-             allow_archives = coalesce($11, allow_archives)",
+             allow_archives = coalesce($11, allow_archives),
+             e2ee_text = coalesce($12, e2ee_text)",
     )
     .bind(name.as_deref())
     .bind(description.as_deref())
@@ -156,6 +168,7 @@ pub async fn update_server(
     .bind(image_max)
     .bind(file_max)
     .bind(patch.allow_archives)
+    .bind(patch.e2ee_text.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(from_sql)?;
@@ -173,6 +186,7 @@ pub async fn update_server(
         ("image_max_bytes", image_max.is_some()),
         ("file_max_bytes", file_max.is_some()),
         ("allow_archives", patch.allow_archives.is_some()),
+        ("e2ee_text", patch.e2ee_text.is_some()),
     ] {
         if set {
             changed.insert(key.into(), Value::Bool(true));
@@ -567,6 +581,7 @@ fn settings_from(row: &PgRow) -> Result<ServerSettings, CommunityError> {
         file_max_bytes: row.try_get(8).map_err(from_sql)?,
         allow_archives: row.try_get(9).map_err(from_sql)?,
         created_at: row.try_get(10).map_err(from_sql)?,
+        e2ee_text: row.try_get(11).map_err(from_sql)?,
     })
 }
 

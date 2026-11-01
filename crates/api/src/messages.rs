@@ -13,8 +13,8 @@ use axum::{Extension, Json, Router};
 use db::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
     list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
-    save_attachment, set_channel_override, toggle_reaction, update_channel, Caller, MessageError,
-    NewAttachment, PgPool, ScanEngine,
+    save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction, update_channel,
+    Caller, MessageError, NewAttachment, PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,6 +24,9 @@ use crate::media_sign;
 
 /// A file plus its multipart headers. A little over the largest cap an admin may set.
 const UPLOAD_BODY: usize = db::UPLOAD_MAX as usize + 1024 * 1024;
+
+/// A message post: the largest ciphertext as base64, and the fields around it.
+const MESSAGE_BODY: usize = 48 * 1024;
 
 pub fn routes() -> Router<PgPool> {
     let media = Router::new()
@@ -42,7 +45,10 @@ pub fn routes() -> Router<PgPool> {
         .route("/v1/directs", get(directs).post(add_direct))
         .route(
             "/v1/conversations/{id}/messages",
-            get(messages).post(add_message),
+            // A ciphertext post is up to 20 KiB, 27 KiB as base64.
+            get(messages)
+                .post(add_message)
+                .layer(DefaultBodyLimit::max(MESSAGE_BODY)),
         )
         .route(
             "/v1/messages/{id}",
@@ -63,11 +69,15 @@ struct ChannelBody {
     category_id: Option<String>,
     topic: Option<String>,
     position: Option<i32>,
+    /// End-to-end encrypted, fixed for the life of the channel. Absent is plaintext.
+    e2ee: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct DirectBody {
     user_id: String,
+    /// The encrypted direct with this person rather than the plaintext one.
+    e2ee: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +92,12 @@ struct PostBody {
     reply_to: Option<String>,
     client_id: Option<String>,
     attachment_ids: Option<Vec<String>>,
+    // An encrypted conversation takes these and no body. See docs/e2ee-text.md.
+    ciphertext: Option<String>,
+    epoch: Option<u64>,
+    device_id: Option<String>,
+    kind: Option<String>,
+    target_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,7 +134,7 @@ struct ErrorBody {
     error: &'static str,
 }
 
-enum Error {
+pub(crate) enum Error {
     Unauthorized,
     Forbidden,
     Banned,
@@ -131,6 +147,21 @@ enum Error {
     Blocked,
     Unavailable,
     ServiceUnavailable,
+    E2eeRequired,
+    NotE2ee,
+    StaleEpoch,
+    ProposalsChanged,
+    NoGroup,
+    GroupExists,
+    NotInGroup,
+    DeviceExists,
+    CrossSignatureRequired,
+    TooManyKeys,
+    SlowDown,
+    E2eeOff,
+    BadDevice,
+    TooManyDevices,
+    BadE2ee,
 }
 
 impl IntoResponse for Error {
@@ -148,12 +179,27 @@ impl IntoResponse for Error {
             Self::Blocked => (StatusCode::FORBIDDEN, "blocked"),
             Self::Unavailable => (StatusCode::INTERNAL_SERVER_ERROR, "unavailable"),
             Self::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            Self::E2eeRequired => (StatusCode::BAD_REQUEST, "e2ee_required"),
+            Self::NotE2ee => (StatusCode::BAD_REQUEST, "not_e2ee"),
+            Self::StaleEpoch => (StatusCode::CONFLICT, "stale_epoch"),
+            Self::ProposalsChanged => (StatusCode::CONFLICT, "proposals_changed"),
+            Self::NoGroup => (StatusCode::CONFLICT, "no_group"),
+            Self::GroupExists => (StatusCode::CONFLICT, "group_exists"),
+            Self::NotInGroup => (StatusCode::FORBIDDEN, "not_in_group"),
+            Self::DeviceExists => (StatusCode::CONFLICT, "device_exists"),
+            Self::CrossSignatureRequired => (StatusCode::BAD_REQUEST, "cross_signature_required"),
+            Self::TooManyKeys => (StatusCode::BAD_REQUEST, "too_many_keys"),
+            Self::SlowDown => (StatusCode::TOO_MANY_REQUESTS, "slow_down"),
+            Self::E2eeOff => (StatusCode::BAD_REQUEST, "e2ee_off"),
+            Self::BadDevice => (StatusCode::BAD_REQUEST, "bad_device"),
+            Self::TooManyDevices => (StatusCode::BAD_REQUEST, "too_many_devices"),
+            Self::BadE2ee => (StatusCode::BAD_REQUEST, "bad_e2ee"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
 }
 
-fn message_reason(error: &Error) -> &'static str {
+pub(crate) fn message_reason(error: &Error) -> &'static str {
     match error {
         Error::Unauthorized => "unauthorized",
         Error::Forbidden => "forbidden",
@@ -166,6 +212,21 @@ fn message_reason(error: &Error) -> &'static str {
         Error::Scanning => "scanning",
         Error::Blocked => "blocked",
         Error::Unavailable | Error::ServiceUnavailable => "unavailable",
+        Error::E2eeRequired => "e2ee_required",
+        Error::NotE2ee => "not_e2ee",
+        Error::StaleEpoch => "stale_epoch",
+        Error::ProposalsChanged => "proposals_changed",
+        Error::NoGroup => "no_group",
+        Error::GroupExists => "group_exists",
+        Error::NotInGroup => "not_in_group",
+        Error::DeviceExists => "device_exists",
+        Error::CrossSignatureRequired => "cross_signature_required",
+        Error::TooManyKeys => "too_many_keys",
+        Error::SlowDown => "slow_down",
+        Error::E2eeOff => "e2ee_off",
+        Error::BadDevice => "bad_device",
+        Error::TooManyDevices => "too_many_devices",
+        Error::BadE2ee => "bad_e2ee",
     }
 }
 
@@ -179,7 +240,7 @@ fn upload_failed(user_id: &str, error: &Error, bytes: usize) {
     tracing::warn!(user_id, reason, bytes, "upload failed");
 }
 
-fn lift(error: MessageError) -> Error {
+pub(crate) fn lift(error: MessageError) -> Error {
     match error {
         MessageError::Forbidden => Error::Forbidden,
         MessageError::Banned => Error::Banned,
@@ -191,6 +252,21 @@ fn lift(error: MessageError) -> Error {
         MessageError::Scanning => Error::Scanning,
         MessageError::Blocked => Error::Blocked,
         MessageError::Unavailable => Error::ServiceUnavailable,
+        MessageError::E2eeRequired => Error::E2eeRequired,
+        MessageError::NotE2ee => Error::NotE2ee,
+        MessageError::StaleEpoch => Error::StaleEpoch,
+        MessageError::ProposalsChanged => Error::ProposalsChanged,
+        MessageError::NoGroup => Error::NoGroup,
+        MessageError::GroupExists => Error::GroupExists,
+        MessageError::NotInGroup => Error::NotInGroup,
+        MessageError::DeviceExists => Error::DeviceExists,
+        MessageError::CrossSignatureRequired => Error::CrossSignatureRequired,
+        MessageError::TooManyKeys => Error::TooManyKeys,
+        MessageError::SlowDown => Error::SlowDown,
+        MessageError::E2eeOff => Error::E2eeOff,
+        MessageError::BadDevice => Error::BadDevice,
+        MessageError::TooManyDevices => Error::TooManyDevices,
+        MessageError::BadE2ee => Error::BadE2ee,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -219,11 +295,11 @@ fn from_api(error: ApiError) -> Error {
     }
 }
 
-async fn member(pool: &PgPool, headers: &HeaderMap) -> Result<Caller, Error> {
+pub(crate) async fn member(pool: &PgPool, headers: &HeaderMap) -> Result<Caller, Error> {
     caller(pool, headers).await.map_err(from_api)
 }
 
-fn signed(mut value: Value) -> Json<Value> {
+pub(crate) fn signed(mut value: Value) -> Json<Value> {
     media_sign::overlay(&mut value);
     Json(value)
 }
@@ -249,6 +325,7 @@ async fn add_channel(
         body.category_id.as_deref(),
         body.topic.as_deref(),
         body.position,
+        body.e2ee.unwrap_or(false),
     )
     .await
     .map_err(lift)?;
@@ -314,7 +391,7 @@ async fn add_direct(
     Json(body): Json<DirectBody>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
     let caller = member(&pool, &headers).await?;
-    let (direct, created) = open_direct(&pool, &caller, &body.user_id)
+    let (direct, created) = open_direct(&pool, &caller, &body.user_id, body.e2ee.unwrap_or(false))
         .await
         .map_err(lift)?;
     let status = if created {
@@ -356,6 +433,35 @@ async fn add_message(
 ) -> Result<(StatusCode, Json<Value>), Error> {
     let caller = member(&pool, &headers).await?;
     let attachments = body.attachment_ids.unwrap_or_default();
+    // Any of these says the request is ciphertext. There is no mixing it with a body.
+    if body.ciphertext.is_some()
+        || body.epoch.is_some()
+        || body.device_id.is_some()
+        || body.kind.is_some()
+        || body.target_id.is_some()
+    {
+        return crate::e2ee_text::post_ciphertext(
+            &pool,
+            &caller,
+            &id,
+            crate::e2ee_text::PostFields {
+                ciphertext: body.ciphertext.as_deref(),
+                epoch: body.epoch,
+                device_id: body.device_id.as_deref(),
+                kind: body.kind.as_deref(),
+                target_id: body.target_id.as_deref(),
+                client_id: body.client_id.as_deref(),
+                reply_to: body.reply_to.as_deref(),
+                attachments: &attachments,
+                has_body: body.body.is_some(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            message_failed(&caller.user_id, &id, &error);
+            error
+        });
+    }
     let message = post_message(
         &pool,
         &caller,
@@ -479,18 +585,21 @@ async fn upload(
         }
     };
     let bytes = body.len();
-    let upload = parse_upload(content_type, &body).map_err(|error| {
+    let parsed = parse_upload(content_type, &body).map_err(|error| {
         let error = lift(error);
         upload_failed(&caller.user_id, &error, bytes);
         error
     })?;
-    let saved = save_attachment(&pool, &caller, &upload, &engine)
-        .await
-        .map_err(|error| {
-            let error = lift(error);
-            upload_failed(&caller.user_id, &error, bytes);
-            error
-        })?;
+    let saved = match parsed {
+        Parsed::Plain(upload) => save_attachment(&pool, &caller, &upload, &engine).await,
+        // Opaque bytes: no type check, no decode, no scan, and so no engine.
+        Parsed::Sealed(sealed) => save_sealed_attachment(&pool, &caller, &sealed).await,
+    }
+    .map_err(|error| {
+        let error = lift(error);
+        upload_failed(&caller.user_id, &error, bytes);
+        error
+    })?;
     Ok((StatusCode::CREATED, signed(saved)))
 }
 
@@ -566,13 +675,20 @@ fn content_disposition(name: &str, inline: bool) -> String {
     format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
-fn parse_upload(content_type: &str, body: &[u8]) -> Result<NewAttachment, MessageError> {
+/// What a multipart upload is: a file to check and scan, or sealed bytes to store as they are.
+enum Parsed {
+    Plain(NewAttachment),
+    Sealed(Vec<u8>),
+}
+
+fn parse_upload(content_type: &str, body: &[u8]) -> Result<Parsed, MessageError> {
     let boundary = boundary(content_type).ok_or(MessageError::Invalid)?;
     let parts = split_parts(body, &boundary).ok_or(MessageError::Invalid)?;
     if parts.is_empty() || parts.len() > 8 {
         return Err(MessageError::Invalid);
     }
     let mut file: Option<NewAttachment> = None;
+    let mut sealed = false;
     let mut width = None;
     let mut height = None;
     let mut duration = None;
@@ -580,14 +696,12 @@ fn parse_upload(content_type: &str, body: &[u8]) -> Result<NewAttachment, Messag
         let parsed = parse_part(part).ok_or(MessageError::Invalid)?;
         match parsed.name.as_str() {
             "file" => {
-                let Some(name) = parsed.filename else {
-                    return Err(MessageError::Invalid);
-                };
-                if file.is_some() || name.is_empty() {
+                // The name is read after the loop: a sealed upload has none worth reading.
+                if file.is_some() {
                     return Err(MessageError::Invalid);
                 }
                 file = Some(NewAttachment {
-                    name,
+                    name: parsed.filename.unwrap_or_default(),
                     mime: parsed
                         .mime
                         .unwrap_or_else(|| "application/octet-stream".to_string()),
@@ -597,6 +711,7 @@ fn parse_upload(content_type: &str, body: &[u8]) -> Result<NewAttachment, Messag
                     duration: None,
                 });
             }
+            "sealed" => sealed = field_sealed(&parsed.body)?,
             "width" => width = Some(field_i32(&parsed.body)?),
             "height" => height = Some(field_i32(&parsed.body)?),
             "duration" => duration = Some(field_i32(&parsed.body)?),
@@ -604,10 +719,25 @@ fn parse_upload(content_type: &str, body: &[u8]) -> Result<NewAttachment, Messag
         }
     }
     let mut file = file.ok_or(MessageError::Invalid)?;
+    if sealed {
+        return Ok(Parsed::Sealed(file.bytes));
+    }
+    if file.name.is_empty() {
+        return Err(MessageError::Invalid);
+    }
     file.width = width;
     file.height = height;
     file.duration = duration;
-    Ok(file)
+    Ok(Parsed::Plain(file))
+}
+
+/// `sealed=1` is sealed; `0` is not; anything else is not a form this server knows.
+fn field_sealed(body: &[u8]) -> Result<bool, MessageError> {
+    match std::str::from_utf8(body).map(str::trim) {
+        Ok("1") => Ok(true),
+        Ok("0") => Ok(false),
+        _ => Err(MessageError::Invalid),
+    }
 }
 
 fn field_i32(body: &[u8]) -> Result<i32, MessageError> {
@@ -755,7 +885,7 @@ fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_upload;
+    use super::{parse_upload, Parsed};
 
     #[test]
     fn a_multipart_body_keeps_the_file_and_its_size() {
@@ -770,7 +900,11 @@ Content-Disposition: form-data; name=\"width\"\r\n\
 \r\n\
 12\r\n\
 --abc--\r\n";
-        let upload = parse_upload("multipart/form-data; boundary=abc", body).expect("parse");
+        let Parsed::Plain(upload) =
+            parse_upload("multipart/form-data; boundary=abc", body).expect("parse")
+        else {
+            panic!("a plain upload");
+        };
         assert_eq!(upload.name, "wave.gif");
         assert_eq!(upload.mime, "image/gif");
         assert_eq!(upload.bytes, b"GIF89a");
