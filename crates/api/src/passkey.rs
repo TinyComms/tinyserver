@@ -1095,7 +1095,13 @@ struct PageQuery {
 }
 
 /// The one script every page carries. Fixed text, named in the policy by its hash.
-const SCRIPT: &str = include_str!("passkey.js");
+///
+/// A browser turns every CRLF in an inline script into LF before it hashes it for the policy. A
+/// checkout that converts line endings (Windows) would give the file CRLFs, the hash here would
+/// not be the browser's, and the page's script would be blocked. So the text is made LF-only
+/// before it is hashed and before it is sent.
+static SCRIPT: LazyLock<String> =
+    LazyLock::new(|| include_str!("passkey.js").replace("\r\n", "\n"));
 
 /// The pages' stylesheet: the shared one and what these pages add.
 static PAGE_STYLE: LazyLock<String> = LazyLock::new(|| {
@@ -1126,7 +1132,7 @@ static POLICY: LazyLock<HeaderValue> = LazyLock::new(|| {
         "default-src 'none'; style-src 'sha256-{style}'; script-src 'sha256-{script}'; \
          connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
         style = digest(&PAGE_STYLE),
-        script = digest(SCRIPT),
+        script = digest(&SCRIPT),
     ))
     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"))
 });
@@ -1145,7 +1151,7 @@ fn render(title: &str, mode: &str, state: &str, body: &str) -> Response {
         style = *PAGE_STYLE,
         mode = escape(mode),
         state = escape(state),
-        script = SCRIPT,
+        script = *SCRIPT,
     );
     (
         StatusCode::OK,
@@ -1258,8 +1264,8 @@ async fn claim_page() -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_url, creation_options, display_name, label, page_url, request_options, shaped,
-        POLICY, SCRIPT,
+        claim_url, creation_options, digest, display_name, label, page_url, request_options,
+        shaped, POLICY, SCRIPT,
     };
     use serde_json::json;
 
@@ -1332,6 +1338,15 @@ mod tests {
         let adjusted = request_options(&library);
         assert!(adjusted.get("mediation").is_none());
         assert_eq!(adjusted["publicKey"]["challenge"], "x");
+    }
+
+    #[test]
+    fn the_script_the_policy_names_is_the_text_a_browser_hashes() {
+        // A browser reads every CRLF in an inline script as LF before it hashes it, so a script
+        // with CRLFs (a checkout that converts line endings) would be blocked by its own policy.
+        assert!(!SCRIPT.contains('\r'));
+        let policy = POLICY.to_str().unwrap_or("");
+        assert!(policy.contains(&format!("script-src 'sha256-{}'", digest(&SCRIPT))));
     }
 
     #[test]

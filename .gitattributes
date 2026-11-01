@@ -2,3 +2,5 @@
 # checkouts convert text files, so these two are pinned to LF.
 *.sh text eol=lf
 Dockerfile text eol=lf
+# The sign-in page's script is hashed into its Content-Security-Policy; see passkey.rs.
+crates/api/src/passkey.js text eol=lf
