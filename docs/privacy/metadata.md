@@ -12,7 +12,7 @@ Reading the columns:
 
 ## 1. PostgreSQL
 
-Database `tinyserver`. The API connects as `app_runtime` (`NOSUPERUSER NOBYPASSRLS`). Tables that have row-level security are marked RLS. `users`, `sessions` and `idempotency_keys` have none: `0001_init.sql` states "Identity has no RLS", and `app_runtime` can read them in full, so the limits on who sees an email or an avatar are in the application's queries, not in the database. Postgres runs with no disk-level or column-level encryption in this stack.
+Database `tinyserver` (`tenant_<name>` for a tenant made by `deploy/tenant/tenant.sh`). The API connects as `app_runtime` (`NOSUPERUSER NOBYPASSRLS`; for a tenant, `<name>_runtime`, a member of the NOLOGIN group `app_runtime`). Tables that have row-level security are marked RLS. `users`, `sessions` and `idempotency_keys` have none: `0001_init.sql` states "Identity has no RLS", and `app_runtime` can read them in full, so the limits on who sees an email or an avatar are in the application's queries, not in the database. Postgres runs with no disk-level or column-level encryption in this stack.
 
 | Table | Columns that matter | Form | Readable by | Kept | E2EE |
 |---|---|---|---|---|---|
@@ -39,9 +39,13 @@ Database `tinyserver`. The API connects as `app_runtime` (`NOSUPERUSER NOBYPASSR
 | `ban_identities` | `issuer`, `subject`, `user_id` | Plaintext | Not readable by members. App, owner role, host | Kept after the banned person deletes their account, on purpose, so a ban survives | No |
 | `bots` | `name`, `token_hash`, `scopes`, `permissions`, `created_by`, `revoked_at`. RLS | Hash | `manage_server` holders | Revoked rows stay | n/a |
 | `server_settings` | Name, description, welcome text, icon bytes (up to 256 KiB), limits | Plaintext | Every member | Until changed | No |
+| `reports` (`0015`) | `kind`, `category`, `reporter_id`, `reported_user_id`, `message_id`, `channel_id`, `direct_id`, `note` (up to 2000), `evidence` (up to 32 KiB, always `evidence_unverified`), `status`, `preserve`, `preserved_by`, `linked_audit_ids`, timestamps. RLS (`reports_select`); the runtime role cannot write it | Plaintext. Never a copy of a message body; `evidence` is whatever the reporter's client sent | `manage_reports` holders, except on reports about themselves. Not the reporter, not the reported person. Owner role, host | Resolved: `TINYSERVER_REPORT_RETENTION_DAYS` (default 90). Open: until triaged. Held: until released. Account deletion strips note and evidence as in [`abuse-response.md`](abuse-response.md) | No. Evidence from an encrypted conversation is plaintext the reporter disclosed |
+| `report_notes` (`0015`) | `report_id`, `author_id`, `body` (up to 2000), `created_at`. RLS | Plaintext | As the report | With the report; deleted from unheld reports about a person who deletes their account | No |
+| `operator_state` (`0016`) | One row: `mode`, `notice`, `since`, `legal_hold`, `legal_hold_since` | Plaintext | Runtime role: read only. Members: mode and notice through `GET /v1/status`, never the hold. Owner role writes | Current state | n/a |
+| `operator_events` (`0016`) | `at`, `action` (suspend, resume, hold, release), `mode`, `reason` (up to 500) | Plaintext. No actor | Owner role and host only; the runtime role has no privilege on it | **Indefinitely** | n/a |
 | `_sqlx_migrations` | Migration versions and checksums | | | | n/a |
 
-**What is not in any table:** passwords (dropped in `0004`), IP addresses, user agents, device names, phone numbers, call history (who joined which call, for how long), message read receipts in channels beyond one cursor per person, location. A case-insensitive search of the fourteen migrations for column definitions named `ip`, `*_ip`, `*address`, `user_agent`, `agent`, `device*`, `phone*`, `location`, `country`, `city`, or of type `inet` or `cidr`, finds none (2026-10-31); no test asserts it. The E2EE specification adds device, key package and handshake tables (migrations `0020`–`0029`, not in this branch). Their content is specified in `e2ee-text.md` section 6: device ids and public signing keys, key packages, the public handshake log, the server's external sender key. They hold no key that opens a message.
+**What is not in any table:** passwords (dropped in `0004`), IP addresses, user agents, device names, phone numbers, call history (who joined which call, for how long), message read receipts in channels beyond one cursor per person, location. A case-insensitive search of the sixteen migrations for column definitions named `ip`, `*_ip`, `*address`, `user_agent`, `agent`, `device*`, `phone*`, `location`, `country`, `city`, or of type `inet` or `cidr`, finds none (2026-10-31 for `0001`–`0014`, 2026-11-01 for `0015` and `0016`); no test asserts it. The report rate limit is counted per reporter in the database, not per address. The E2EE specification adds device, key package and handshake tables (migrations `0020`–`0029`, not on main). Their content is specified in `e2ee-text.md` section 6: device ids and public signing keys, key packages, the public handshake log, the server's external sender key. They hold no key that opens a message.
 
 **Write-ahead log and dead rows.** Postgres keeps deleted and edited data in WAL and in dead tuples until checkpoints and vacuum clear them, and in any base backup or snapshot that covers that time. `DELETE /v1/me` and message deletes cannot reach these (`0014_account_deletion.sql`, "What this does not do"). Retention of WAL archives: none configured in this repository.
 
@@ -74,11 +78,20 @@ All of it is readable by the host and by a code-execution flaw in the process. N
 | `pocketid_data` (or `POCKETID_DATA_DIR`) | Pocket ID's SQLite database, signing key, uploads | See section 12 | Host | Until destroyed | n/a |
 | `deploy/secrets/` (or `TINYSERVER_SECRETS_DIR`) | `oidc_client_secret`, `pocketid_api_key`, `pocketid_encryption_key`. The directory is 0700, the files 0444 so containers can read them as their own users | Plaintext | Host. Any process on the host that can traverse the directory; the files are world-readable inside it | Until deleted | n/a |
 | `deploy/.env` | Database passwords, `TUNNEL_TOKEN`, `TINYSERVER_MEDIA_HMAC_SECRET`, public URLs and IPs | Plaintext | Host | | n/a |
+| `deploy/tenant/tenants/<name>/` (or `TENANT_DIR`) | `tenant.env` (mode 0600: database superuser, owner and runtime passwords, tunnel token, media signing key, limits) and `secrets/` as above, per tenant | Plaintext | Host | Until `operator.sh delete`, which `shred -u`s the files and removes the directory | n/a |
+| `tenants/<name>/backup.key`, `backup.recipient` | The tenant's age identity from `operator.sh keygen`, mode 0600, and its public recipient | Plaintext private key | Host | Until moved or `delete` shreds it. **On the same host as the data it protects** | n/a |
 | `clamav_db` | ClamAV signature database | Public data | Host | | n/a |
 
 ## 4. Backups
 
-**None ship in this branch.** [`../../deploy/README.md`](../../deploy/README.md) documents one manual `pg_dump -U postgres tinyserver` (in the Tinyauth migration steps). It is unencrypted, covers none of the other volumes, and is run as the Postgres superuser. Finding S11 plans `deploy/backup/`; that directory is not in this branch and is not described here. Whatever backup TinyCloud makes inherits the form of the data it copies: **plaintext messages and attachments today**. See [`migration.md`](migration.md) and [`retention-and-deletion.md`](retention-and-deletion.md).
+| What | Contents | Form | Readable by | Kept |
+|---|---|---|---|---|
+| `operator.sh backup` bundle (#20) | `pg_dump -Fc` of the whole database (section 1, reports included), the upload volume, Pocket ID's data, the three secrets, a manifest and checksums. Not `tenant.env` | age-encrypted to the `--recipient`s and to the tenant's key if `keygen` made one. **Inside, plaintext messages and attachments today** | Holders of a matching identity: the operator, and anyone with host root while `backup.key` is on the host | Wherever the operator writes it, as long as it is kept. No schedule or expiry |
+| `operator.sh export` bundle | The same, plus the compose file, `01-roles.sh` and a README | age-encrypted only to the owner's recipients | The owner | The owner's choice |
+| Working copy during a backup or restore | The plaintext bundle | A tmpfs (`TINYSERVER_BACKUP_TMPFS`, 4g by default) in a throwaway container on the community's internal network, no route out | Host, process memory | The life of the helper container |
+| Manual `pg_dump -U postgres tinyserver` in [`../../deploy/README.md`](../../deploy/README.md)'s Tinyauth steps | The database only | **Unencrypted** | Whoever has the file | Until deleted |
+
+Tests: `deploy/tests/hooks.sh` (Docker and `age`; not in CI). See [`migration.md`](migration.md) section 5, [`retention-and-deletion.md`](retention-and-deletion.md) and [`findings.md`](findings.md) S11, N11.
 
 ## 5. Logs
 
@@ -153,6 +166,7 @@ The `tinyserver` binary's commands (`crates/server/src/main.rs`):
 | `bootstrap --owner-invite` | same | A new single-use owner invite **even when an owner exists**; earlier unused owner invites stop working | `bootstrap`, `invite.revoke` |
 | `identities` | same | Prints every account's user id, display name, issuer and subject to the terminal | No |
 | `relink-identity` | same | Moves an account's `(issuer, subject)` | `identity.relink`, null actor |
+| `operator status`, `suspend --read-only` or `--offline --notice TEXT`, `resume`, `hold [--reason TEXT]`, `release` | `DATABASE_URL_MIGRATE` | Reads or writes `operator_state`; every change adds an `operator_events` row with no actor. Run by `deploy/tenant/operator.sh` in a one-off init container | Not in `audit_log` |
 | `serve` | `DATABASE_URL` (`app_runtime`) | The server | n/a |
 
 `DATABASE_URL_MIGRATE` exists only in the `tinyserver-init` container (finding S2). The commands that need it are therefore run as `docker compose run --rm --entrypoint tinyserver tinyserver-init <command>`. [`../../deploy/README.md`](../../deploy/README.md) step 6 of "Moving from Tinyauth" and its upgrade section give these commands (finding N5, fixed). Direct SQL as `app_owner` is possible for anyone with the password and bypasses row-level security and the audit log.

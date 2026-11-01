@@ -2,7 +2,7 @@
 
 A summary of what is encrypted, with what, who holds each key, and when it is made, rotated and lost. It links to the two specifications instead of repeating them: [`../calls.md`](../calls.md) ("End-to-end encryption") for calls and [`../e2ee-text.md`](../e2ee-text.md) for text and attachments. Where they disagree with this file, they win and this file is wrong.
 
-Status words are in [`README.md`](README.md). **Calls: implemented and tested. Text and attachments: specified, implementation in progress elsewhere, not merged in this branch, nothing about them is verified here.** TLS and DTLS-SRTP are transport encryption and are listed only so the boundary is clear.
+Status words are in [`README.md`](README.md). **Calls: implemented and tested. Text and attachments: specification, not implemented on main (`c4ae28b`); implementation in progress elsewhere, nothing about them is verified here. Backups: encrypted with age by `deploy/tenant/operator.sh` (#20).** TLS and DTLS-SRTP are transport encryption and are listed only so the boundary is clear.
 
 ## 1. The layers
 
@@ -14,7 +14,8 @@ Status words are in [`README.md`](README.md). **Calls: implemented and tested. T
 | DAVE end-to-end encryption of call frames (MLS group per room call) | The SFU and its operator, Cloudflare, the network | The other participants' apps | Implemented; downgradable by the server, visibly |
 | MLS end-to-end encryption of text, edits, replies (group per conversation) | The server, its operator, its database, backups, Cloudflare | Members' devices | **In progress** |
 | Sealed attachments (AES-256-GCM STREAM, key in the MLS message) | Same | Members' devices | **In progress** |
-| Postgres, volumes, backups | A stolen disk | Not encrypted by this stack. Whatever disk encryption the host has | No stack-level encryption; plaintext today for text and attachments |
+| Postgres and volumes | A stolen disk | Not encrypted by this stack. Whatever disk encryption the host has (on TinyCloud, the cell's fscrypt key, per [`tenancy.md`](tenancy.md); not in this repository) | No stack-level encryption; plaintext today for text and attachments |
+| Backup and export bundles (age; `age1` X25519, `ssh-ed25519` or `ssh-rsa` recipients) | Whoever holds the file without a matching identity | Whoever holds an identity for one of the recipients | Implemented: `deploy/tenant/operator.sh backup`, `export`; `deploy/tests/hooks.sh` (no plaintext in the file, another key cannot open it). The bundle's contents are plaintext text and attachments inside the encryption |
 
 ## 2. Calls (implemented)
 
@@ -87,7 +88,9 @@ Everything in this section is the specification in [`../e2ee-text.md`](../e2ee-t
 | Attachment key | The sender's client | Inside the MLS message, so only members | | One per attachment | Anyone who had the message can open the blob |
 | Session token | tinyserver | Hash in `sessions`; raw token in the client's keychain and in server memory for a live socket | The OS keychain on the client | Per sign-in | Revoke; 30 day expiry |
 | Postgres, upload volume | Not encrypted by this stack | n/a | Host disk encryption, if any | n/a | n/a |
-| Backup encryption key | Not built | n/a | n/a | n/a | Finding S11 |
+| Operator's backup recipient (age) | The operator, outside this repository | Wherever the operator keeps the identity | The operator | Not handled by the tooling | Its holder reads every backup encrypted to it, which is what makes a backup restorable after the host is lost |
+| Tenant backup key (age) | `operator.sh keygen` | `tenants/<name>/backup.key`, mode 0600, **on the same host as the tenant's data**; `backup.recipient` beside it | File permissions; the operator is told to keep an escrow copy, encrypted to a recovery key, off the host | None; `keygen` refuses if a key exists | `operator.sh delete` shreds the host copy (`shred -u` where available; on a journaling or copy-on-write filesystem that is not a guarantee). After that, a backup encrypted to this key alone cannot be opened, unless an escrow copy survives (`deploy/tests/hooks.sh`). While the key is on the host, host root can open those backups. Finding S11 |
+| Owner's export recipients (age) | The owner | The owner | The owner | n/a | The operator's key cannot open an export (`deploy/tests/hooks.sh`) |
 
 ## 6. What the server keeps deciding
 
@@ -106,5 +109,6 @@ E2EE removes the server's ability to read, not its ability to decide. It still: 
 | Server cannot read text or attachments of an encrypted conversation | **In progress** | Specified; not verified |
 | Existing conversations are protected | **Not done**, by design | `e2ee-text.md` section 9 |
 | New devices need cross-signing | **In progress** | Specified; tests listed in `e2ee-text.md` section 11, not run here |
-| Backups contain only ciphertext for encrypted conversations | **In progress**; no backup tool exists | |
+| Backups are encrypted at rest | Implemented, tested (shell check, not in CI) | `operator.sh backup`; `deploy/tests/hooks.sh`. Limits in section 5 |
+| Backups contain only ciphertext for encrypted conversations | **In progress** (depends on text E2EE); today every bundle holds plaintext text and attachments inside the age encryption | |
 | Independent review of any of the above | Not done | [`remaining-risks.md`](remaining-risks.md) |

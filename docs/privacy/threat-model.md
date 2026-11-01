@@ -4,7 +4,7 @@ Who can attack tinyserver and tinyclient, what each of them can reach today, and
 
 Read [`README.md`](README.md) for the status words (implemented, in progress, designed, not done, not verified). The findings that led to the fixes cited here are in [`findings.md`](findings.md). What is still unreviewed is in [`remaining-risks.md`](remaining-risks.md).
 
-**State of the code this describes:** branch `hardening/privacy-docs` on top of `ea3cd39` in tinyserver, and tinyclient at `26916e9` (read only). Text and attachment end-to-end encryption (E2EE) is specified in [`../e2ee-text.md`](../e2ee-text.md) and **in progress** elsewhere. It is not merged in this branch. Every statement below that depends on it says so.
+**State of the code this describes:** tinyserver `origin/main` at `c4ae28b` (first written on `ea3cd39`; re-checked after #20 added abuse reports, operator suspension and legal hold, tenants and encrypted backups), and tinyclient at `26916e9` (read only). Text and attachment end-to-end encryption (E2EE) is specified in [`../e2ee-text.md`](../e2ee-text.md) and **in progress** elsewhere: specification, not implemented on main. Every statement below that depends on it says so.
 
 ## 1. What is protected
 
@@ -109,7 +109,7 @@ Everything on the machine is available to whoever controls it: disk, memory, net
 
 | Reads | Notes |
 |---|---|
-| The Postgres volume, WAL, and every backup, including plaintext message bodies | Disk encryption by the provider protects only a stolen disk, not a running VM |
+| The Postgres volume, WAL, and every backup, including plaintext message bodies | Disk encryption by the provider protects only a stolen disk, not a running VM. `operator.sh` backups are age-encrypted, but a tenant's `backup.key` is on the same host until moved, so host root opens those too |
 | The upload volume: plaintext attachment files, named by random UUID | Names and types are in Postgres |
 | Process memory of tinyserver: bearer tokens held per live socket, the OIDC client secret, the Pocket ID API key, the media HMAC secret, call SDP and ICE credentials, the MLS external sender key, the debug ring | |
 | The Docker log files (`json-file`, 10 MB times 3 per container) | Operator log lines carry user ids and timestamps (see [`telemetry-and-logging.md`](telemetry-and-logging.md)) |
@@ -129,6 +129,9 @@ Code-level capabilities of anyone with shell access to the stack (read from `dep
 | Sign in as any member | `app_owner` has `BYPASSRLS` and can insert a `sessions` row with a token hash it chose. Or mint a Pocket ID one-time login link for that user with the Pocket ID API key (`secrets/pocketid_api_key`, an admin key, per `deploy/README.md`). Neither leaves an audit row in tinyserver |
 | Learn every account's identity | `tinyserver identities` prints each user id, display name, issuer and subject |
 | Rewrite which provider identity belongs to which account | `tinyserver relink-identity` (audited as `identity.relink` with a null actor) |
+| Suspend, resume, hold or release a community | `tinyserver operator` with the owner password, through `deploy/tenant/operator.sh` (`0016_operator.sql`). Written to `operator_events` with the reason and no actor; members see the mode and notice, never a hold |
+| Take, restore or delete a whole community | `operator.sh backup`, `export`, `restore`, `delete`. A backup encrypted to the operator's recipient is readable by the operator; a restore can roll a community back to an earlier time, deleted accounts included ([`findings.md`](findings.md) N11). None of it leaves a row in tinyserver |
+| Read every abuse report | The owner role bypasses the `reports_select` policy. Reporters, evidence and moderators' notes are readable ([`abuse-response.md`](abuse-response.md), "What this does not do") |
 | Read everything in 3.6 | Host access |
 
 These are the reason the plaintext-today state cannot support the sentence "the operator cannot read your messages". For E2EE conversations the specification closes the impersonation path for a person who already has a device: a new device must carry a cross-signature from an existing one, and clients verify it themselves (`docs/e2ee-text.md` section 3). It does not close it for a person's first device or for a person with no devices (trust on first use), and it does not help calls (finding S10).
@@ -137,7 +140,7 @@ These are the reason the plaintext-today state cannot support the sentence "the 
 
 ### 3.8 Another tenant
 
-Out of scope of this repository to enforce. [`tenancy.md`](tenancy.md) is the isolation contract. The properties this repository provides toward it: database name and roles are per cluster (finding S12), the media port is per instance, secrets are per stack. A shared Postgres cluster would collide on roles (finding S12), which is why the contract asks for a stack per tenant.
+[`tenancy.md`](tenancy.md) is the isolation contract, and #20 provides the stack side of it (finding S12): `deploy/tenant/tenant.sh` gives each tenant its own compose project, internal `/24` network, media port, Postgres cluster, database and tenant-named roles with their own passwords, secrets and limits; `docker/postgres/init/01-roles.sh` gives PUBLIC no CONNECT; every container but clamd has a read-only root. `deploy/tests/isolation.sh` checks that no name resolves and no address connects across two tenants, and `roles.sh` that two tenants in one cluster cannot reach each other's database (both need Docker; not in CI, not run for this pass). Out of scope of this repository: the shared kernel (an escape reaches every tenant), per-tenant UID ranges, cgroups, nftables, dropping 169.254.169.254, and disk encryption, all of which the host must provide.
 
 ### 3.9 The identity provider
 
@@ -187,13 +190,15 @@ The product goal is "enforceable by architecture". This table says which parts o
 | The server cannot read text and attachments of an E2EE conversation | MLS groups per conversation, sealed uploads | **In progress**, not verified |
 | The server cannot read text of existing conversations | Nothing | **Not done**: existing conversations stay plaintext, never converted in place |
 | A member sees only channels they may view | Row-level security, definer functions, outbox audience (`0013`) | Implemented, tested |
-| The runtime role cannot bypass row-level security or change schema | `app_runtime` is `NOSUPERUSER NOBYPASSRLS`; owner password only in `tinyserver-init` | Implemented; compose check by hand |
+| The runtime role cannot bypass row-level security or change schema | `app_runtime` is `NOSUPERUSER NOBYPASSRLS`; owner password only in `tinyserver-init` | Implemented, tested (`deploy/tests/isolation.sh`, `roles.sh`; shell checks, Docker, not in CI) |
 | No passwords, no password database | `0004_oidc.sql` drops `password_hash`; sign-in is OIDC | Implemented |
 | Tokens are not stored | `sessions.token_hash`, `invites.token_hash`, `bots.token_hash`, `auth_*` store SHA-256 | Implemented (schema); no test asserts it |
-| No IP address in the database | No column holds one (`0001`..`0014`) | Implemented (schema); no test asserts it |
+| No IP address in the database | No column holds one (`0001`..`0016`) | Implemented (schema); no test asserts it |
 | IP address not in default logs | `peer` field dropped on the operator sink; ring only with `TINYSERVER_LOG_PEER_IP=on` | Implemented, tested (`peer_is_operator_blind_and_ring_gated`) |
 | No routine inspection of private communications | Cryptography for E2EE conversations; **policy only** elsewhere | Partly. See 3.7 |
-| Ability to act on abuse reports, suspend a community | Control plane and procedures | Not built here. See [`abuse-response.md`](abuse-response.md), [`tenancy.md`](tenancy.md) |
+| Moderators can act on abuse reports without the server reading conversations | In-community reports holding ids and only what the reporter's client sends; RLS hides a report from its subject (`0015`) | Implemented, tested (`crates/api/tests/reports.rs`) |
+| The operator can suspend a community without reading it | `tinyserver operator suspend` (`0016`) | Implemented, tested (`crates/api/tests/operator.rs`) |
+| TinyCloud receives and acts on reports and legal process | Control plane and procedures | Not in this repository. See [`abuse-response.md`](abuse-response.md), [`compliance.md`](compliance.md) |
 
 ## 5. Scenarios walked through
 
@@ -203,7 +208,7 @@ The product goal is "enforceable by architecture". This table says which parts o
 
 **C. Operator adds itself to a call as a member.** It needs a key package with a credential holding the 8 byte MLS id of a roster name. Apps refuse a proposal to add anyone the call's roster does not name (`docs/calls.md`), but the roster is server-provided (S10). Verified safety numbers are the defence.
 
-**D. Database or backup stolen.** Today: all plaintext text, member list, emails, avatars, audit log. Session and invite tokens are hashes of 32 random bytes and cannot be replayed. Pocket ID's SQLite is in another volume (`pocketid_data`) with its key in `secrets/`; both would need to be taken. After E2EE: text of encrypted conversations is ciphertext, and a restore older than the clients' state is detected by clients (specified).
+**D. Database or backup stolen.** A bundle from `operator.sh backup` is age-encrypted; the case below is a thief who also has a matching identity (the operator's, or the tenant's `backup.key` from the same host), or a raw volume. Today: all plaintext text, member list, emails, avatars, audit log, abuse reports with their evidence. Session and invite tokens are hashes of 32 random bytes and cannot be replayed. Pocket ID's SQLite is in another volume (`pocketid_data`) with its key in `secrets/`; both would need to be taken. After E2EE: text of encrypted conversations is ciphertext, and a restore older than the clients' state is detected by clients (specified).
 
 **E. Cloudflare account compromised.** The attacker can serve its own origin for the hostname and collect sign-in codes. It can also read traffic to the real origin. Sealed content is safe; metadata and bearer tokens are not.
 

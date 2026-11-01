@@ -48,7 +48,7 @@ A returning member skips steps 3 and 4 (the IdP signs them in) and step 7 only f
 | 4 | Edit | `PATCH /v1/messages/{id}`. A trigger (`0014`) rewrites the earlier outbox rows to the new text so a reconnecting socket is not replayed the old one | Plaintext | `messages.edited_at`; old text is gone from the table and outbox, but not from WAL, dead rows or backups |
 | 5 | Delete | `DELETE /v1/messages/{id}`: body cleared, attachments and reactions removed, files unlinked, `deleted_at` set. The row stays | | The tombstone: author, `created_at`, `deleted_at` |
 
-### Specified (an encrypted conversation, **in progress**)
+### Specified (an encrypted conversation, **in progress**; specification, not implemented on main)
 
 | # | From to | What | Form |
 |---|---|---|---|
@@ -76,7 +76,7 @@ Visible to S even when encrypted: who posted, which conversation, when, cipherte
 
 Uploads nobody attached within an hour are deleted by the sweep (every 10 minutes). Evidence: `crates/api/tests/messages.rs` (`an_eicar_upload_is_blocked`, `a_message_cannot_name_an_unscanned_attachment`, `a_scanning_attachment_download_is_locked`, `a_bad_hmac_is_refused`).
 
-### Specified (sealed upload, **in progress**)
+### Specified (sealed upload, **in progress**; specification, not implemented on main)
 
 The client encrypts the file with AES-256-GCM in the STREAM construction under a random key held only inside the MLS message, and posts `sealed=1`. S stores the blob once, as received, with fixed name `sealed` and type `application/octet-stream`. No sniffing, no image decoding, **no virus scan**: the specification states the server must not claim to scan sealed files. Size, rate, orphan cleanup and "only linkable into an encrypted conversation" are still enforced. Source: `docs/e2ee-text.md` section 5.
 
@@ -108,12 +108,14 @@ The SFU learns each participant's address from the first STUN check and keeps it
 | Ban | `bans` (reason, banned_by, expiry) and `ban_identities` (issuer, subject of every identity the person signed in with) | The banned person's sockets close with `4003` |
 | Call kick, share end, server mute, move | `audit_log` | |
 | Call joins and leaves, speaking, mute | Not stored | |
+| Report filed, triaged, annotated, linked to an enforcement action, held or released, expired | `reports`, `report_notes`; `audit_log` `report.*` rows with ids and transitions, never text, and no actor on `report.create` (`0015`) | Nobody: no live event. Visible only to `manage_reports` holders other than the subject |
+| Community suspended, resumed, held, released | `operator_state`, `operator_events` (`0016`) | Members see the mode and notice on `GET /v1/status` and in `503` replies; never the hold |
 
 The audit log is not pruned by any sweep. Names in audit responses are joined at read time from `users`, so deleting an account changes them to "Deleted user" (`0014` also strips `display_name`, `name` and `email` keys from `audit_log.detail`).
 
 ## 8. Account deletion (`DELETE /v1/me`)
 
-C sends `{"confirm": "delete my account"}`. S calls `app_delete_account()` in one transaction. What it removes and what it cannot reach is in [`retention-and-deletion.md`](retention-and-deletion.md). It does **not** contact the IdP: the Pocket ID account, its passkeys, username, email and audit events stay until a Pocket ID administrator removes them. This is a gap, not a design: nothing in `crates/api/src/oidc.rs` calls an IdP delete endpoint.
+C sends `{"confirm": "delete my account"}`. S calls `app_delete_account()` in one transaction. What it removes and what it cannot reach is in [`retention-and-deletion.md`](retention-and-deletion.md). It does **not** contact the IdP: the Pocket ID account, its passkeys, username, email and audit events stay until a Pocket ID administrator removes them. This is a gap, not a design: nothing in `crates/api/src/oidc.rs` calls an IdP delete endpoint. A trigger from `0015` also removes the person's link from every report they filed, and from reports that are not held their note and evidence, and the evidence and notes of reports about them ([`abuse-response.md`](abuse-response.md), "Account deletion"). Deletion runs in read-only mode (`read_only_still_lets_a_person_sign_out_and_delete_their_account`) and is not blocked by a legal hold: no request path in `crates/api` reads `legal_hold` (read, not tested).
 
 ## 9. Bots
 
@@ -124,9 +126,12 @@ An application token (`Authorization: Bot <token>`, 32 random bytes, hash stored
 | Flow | State |
 |---|---|
 | Logs | stderr to Docker's `json-file` (10 MB times 3), an in-memory ring, optional bundle files on `SIGUSR1`. No exporter. Detail in [`telemetry-and-logging.md`](telemetry-and-logging.md) |
-| Backups | None shipped in this branch. The documented procedure is a manual `pg_dump` as the Postgres superuser; it does not cover the upload volume, Pocket ID's volume or the secrets directory. See [`migration.md`](migration.md) and finding S11 |
-| Provisioning and billing (TinyCloud) | Not built. The constraints are in [`compliance.md`](compliance.md) section 9 and [`guarantees.md`](guarantees.md) category 5 |
-| Reports and legal requests | Procedure in [`abuse-response.md`](abuse-response.md) |
+| Backups | `deploy/tenant/operator.sh backup` (#20): a helper container on the community's internal network, with no route out, runs `pg_dump` as the owner role and tars the uploads, Pocket ID's data (Pocket ID stopped for the copy) and `secrets/` into a tmpfs; the stream is piped to `age` (on the host's PATH, or `TINYSERVER_AGE_IMAGE` in a container with `--network none`) and written only as ciphertext, to the file and recipients the operator names. `restore` is the reverse into a target stack. Where the file goes next is the operator's. See [`migration.md`](migration.md) section 5 and finding S11. The manual `pg_dump` in `deploy/README.md`'s Tinyauth steps is still unencrypted |
+| Export to the owner | `operator.sh export`: the same bundle, encrypted only to the owner's recipients, plus the compose file, `01-roles.sh` and a README |
+| Suspension and hold | `tinyserver operator` in a one-off init container writes `operator_state` as the owner role; the server reads it at most every `TINYSERVER_OPERATOR_REFRESH_MS` (default 2000) and answers `503 read_only` or `503 suspended`. `GET /v1/status` gives anyone the mode and notice, never the hold (`0016_operator.sql`, `crates/api/src/operator.rs`, `crates/api/tests/operator.rs`) |
+| Provisioning and billing (TinyCloud) | Not in this repository. `deploy/tenant/tenant.sh` makes a tenant's environment on a host; nothing here calls it, bills, or maps a tenant to a payer. The constraints are in [`compliance.md`](compliance.md) section 9 and [`guarantees.md`](guarantees.md) category 5 |
+| Abuse reports | Member's client to `POST /v1/reports`: kind, target id, category, optional note and optional `evidence` (text the client chose to disclose; the server cannot verify it and never copies the message body). Stored in `reports` and `report_notes`, readable through RLS only by `manage_reports` holders other than the subject; `report.*` audit rows carry ids, never text; no live event (`0015_abuse_reports.sql`, [`abuse-response.md`](abuse-response.md)) |
+| Legal requests | No intake in the code. See [`compliance.md`](compliance.md) |
 
 ## 11. Client side
 

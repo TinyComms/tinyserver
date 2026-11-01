@@ -79,7 +79,7 @@ Found while writing this inventory. They are listed in the final report so the o
 | cloudflared | It maintains the tunnel to Cloudflare, which is the service's purpose. Other data it may report to Cloudflare was not reviewed. `--no-autoupdate` is set | `deploy/compose.yml` |
 | Docker, host OS | Outside this repository | |
 | tinyclient | No telemetry, no crash upload. Logs stay on the machine. It asks GitHub for the latest release, asks Wikipedia for the summary of a linked article, and talks to the networks the person signs in to | Client `SECURITY.md` ("There is no telemetry and no crash upload"), `docs/architecture.md`. The GitHub endpoint was not located in the client source; **not verified** |
-| TinyCloud control plane, billing, support tooling | Not built | |
+| TinyCloud control plane, billing, support tooling | Not in this repository | |
 
 ## 6. Engineering requirements before advertising "no activity logs"
 

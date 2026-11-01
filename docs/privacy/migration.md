@@ -54,10 +54,10 @@ If the server binary is rolled back to one that does not know encrypted conversa
 | Mechanism | `sqlx::migrate!("./migrations")`, run by `tinyserver migrate` as `app_owner` (`crates/db/src/migrate.rs`). Files are `NNNN_name.sql`, forward only. **There are no down migrations** |
 | When it runs | In the `tinyserver-init` container on every `docker compose up`, before the server (`depends_on: service_completed_successfully`). The serving container has no owner credentials (finding S2) |
 | Build input | `crates/db/build.rs` makes `migrations/` a cargo input so a new file cannot be missing from a cached build (finding S15) |
-| This branch | Ends at `0014_account_deletion.sql` |
-| E2EE migrations | The specification says `0020`–`0029` (devices, key packages, handshake log, conversation flag, sealed uploads). They are not in this branch. The numbers `0015`–`0019` are not used here; other branches may use them. **Check for number and content collisions when branches merge**: an out-of-order or duplicate version fails the run |
+| Main at `c4ae28b` | Ends at `0016_operator.sql` (`0015_abuse_reports.sql`, `0016_operator.sql` came with #20) |
+| E2EE migrations | The specification says `0020`–`0029` (devices, key packages, handshake log, conversation flag, sealed uploads). They are not on main. `0017`–`0019` are unused on main; other branches may use them. **Check for number and content collisions when branches merge**: an out-of-order or duplicate version fails the run |
 | Locking | `sqlx` takes an advisory lock while migrating; the server is not running during init, so no live traffic competes. Time on a large database was **not measured** (P17 in [`performance.md`](performance.md)) |
-| Data migrations | `0013` rewrites event audiences from now on (new rows only); `0014` adds a trigger and a function; neither rewrites existing rows. The E2EE migrations must not touch existing plaintext |
+| Data migrations | `0013` rewrites event audiences from now on (new rows only); `0014` adds a trigger and a function; neither rewrites existing rows. `0015` adds `manage_reports` to every non-default role that already had `manage_server` (`upgrading_grants_manage_reports_to_owners_and_manage_server_roles_only`); `0016` inserts the single `operator_state` row. The E2EE migrations must not touch existing plaintext |
 | Expand and contract | Not practised. An old binary against a new schema is not supported: it either fails the migrate check or runs against columns it ignores |
 
 ## 4. Rollback
@@ -72,32 +72,35 @@ If the server binary is rolled back to one that does not know encrypted conversa
 
 ## 5. Backups and restores
 
-**No backup tooling exists in this branch** (finding S11 plans `deploy/backup/`, which is not here). The only documented procedure is one manual `pg_dump -U postgres tinyserver` (`deploy/README.md`, Tinyauth steps), unencrypted and as the superuser. Everything below is what a backup and restore must cover. It is a requirement list, not a description of behaviour.
+**`deploy/tenant/operator.sh backup`, `export` and `restore`** (#20, finding S11; usage in `deploy/tenant/README.md`, promises in [`tenancy.md`](tenancy.md)). A backup is one age file, encrypted to the `--recipient`s given and to the tenant's own key if `keygen` made one; the plaintext is assembled in a tmpfs inside a throwaway container with no route out and never written to the host's disk. `restore` checks the bundle's checksums before touching anything, refuses under a legal hold, replaces the target's database, uploads, Pocket ID data and secrets, re-owns every object to the target's own roles, and starts the stack, which migrates an older bundle forward. Checked by `deploy/tests/hooks.sh` (Docker and `age`; not in CI, not run for this pass). The manual `pg_dump -U postgres tinyserver` in `deploy/README.md`'s Tinyauth steps still exists and is unencrypted.
 
-### What a tenant backup must contain
+### What a backup contains
 
-| Store | Why | Form today |
+| Store | Why | In the bundle? |
 |---|---|---|
-| Postgres database | Everything in [`metadata.md`](metadata.md) section 1 | Plaintext text and attachment metadata |
-| `tinyserver_uploads` | Attachment bytes | Plaintext files |
-| `pocketid_data` and `secrets/pocketid_encryption_key` | Pocket ID's accounts, passkeys and signing key. Useless without the key. Without them nobody can sign in | Mixed |
-| `secrets/oidc_client_secret`, `secrets/pocketid_api_key`, `.env` (`TINYSERVER_MEDIA_HMAC_SECRET`, passwords, tunnel token) | To start the stack | Plaintext. Highest sensitivity |
-| E2EE: the server's external sender key (text) | Without it every client shows "external sender key changed" (the spec makes clients warn on a change). Its storage location is not specified | Not verified |
-| `tinyserver_bootstrap` | Not needed once an owner exists | |
+| Postgres database | Everything in [`metadata.md`](metadata.md) section 1 | Yes, `pg_dump -Fc` as the owner role. Plaintext text and attachment metadata inside the encryption |
+| `tinyserver_uploads` | Attachment bytes | Yes. Plaintext files inside the encryption |
+| `pocketid_data` and `secrets/pocketid_encryption_key` | Pocket ID's accounts, passkeys and signing key. Without them nobody can sign in | Yes; Pocket ID is stopped for the copy |
+| `secrets/oidc_client_secret`, `secrets/pocketid_api_key` | To start the stack; the API key acts as a Pocket ID administrator | Yes |
+| `.env` or `tenant.env` (`TINYSERVER_MEDIA_HMAC_SECRET`, database passwords, tunnel token) | To start the stack | **No.** The restore target keeps its own |
+| E2EE: the server's external sender key (text) | Without it every client shows "external sender key changed". Its storage location is not specified | Not applicable on main; not verified |
+| `tinyserver_bootstrap` | Not needed once an owner exists | Not checked |
 
-A backup that contains the database and the secrets together lets whoever holds it read plaintext conversations and sign in as anyone. **Backups must be encrypted with a key held apart from the tenant host, and the key must be destroyable** (see [`retention-and-deletion.md`](retention-and-deletion.md) section 3). For E2EE conversations, a backup contains only ciphertext (specified).
+A backup that holds the database and the secrets together lets whoever opens it read plaintext conversations and sign in as anyone. The requirement was **a key held apart from the tenant host, and destroyable**. What exists: the operator's recipient, held wherever the operator keeps it, and the tenant's own key from `keygen`, which `delete` destroys but which sits on the tenant's host (`tenants/<name>/backup.key`) until the operator moves it ([`encryption-architecture.md`](encryption-architecture.md) section 5). For E2EE conversations a backup would contain only ciphertext (specified, not on main). No schedule, rotation or retention exists.
 
 ### Restore hazards
 
 | Hazard | Effect | Requirement |
 |---|---|---|
-| Sessions revoked after the backup reappear | A token that was signed out or banned since is valid again until expiry | After a restore, delete all `sessions` rows (everyone signs in again), and re-apply bans |
-| Accounts deleted after the backup reappear, with their messages | Defeats `DELETE /v1/me` | Keep a minimal ledger of deleted account ids and replay it after a restore ([`retention-and-deletion.md`](retention-and-deletion.md)) |
+| Sessions revoked after the backup reappear | A token that was signed out or banned since is valid again until expiry | After a restore, delete all `sessions` rows (everyone signs in again), and re-apply bans. **`restore` does neither** ([`findings.md`](findings.md) N11) |
+| Accounts deleted after the backup reappear, with their messages | Defeats `DELETE /v1/me` | Keep a minimal ledger of deleted account ids and replay it after a restore ([`retention-and-deletion.md`](retention-and-deletion.md)). **Not built** (N11) |
+| Restoring over held data | Overwrites what a legal hold keeps | `restore` refuses under the operator's hold or a held report (`deploy/tests/hooks.sh`) |
 | Event sequence | Clients holding a `seq` higher than the restored `outbox` get `resync` (`since` above the newest seq closes with `4002`; `docs/calls.md`) | None. Behaviour documented |
 | MLS group rolled back to an earlier epoch | Specified: clients detect an epoch that went backwards and refuse to continue; the group is rebuilt (new group, welcome, history not carried) | Test needed; part of the in-progress work |
 | Pocket ID restored to a different time than tinyserver | `(issuer, subject)` pairs can disagree: accounts created or removed on one side only | Restore both from the same instant, or reconcile with `tinyserver identities` and `relink-identity` |
 | Upload volume and database at different times | Missing files give `404` on download; orphan files stay | Take them together |
-| Restored backup of a deleted tenant | Resurrects data the customer asked to delete | Retention horizon and key destruction |
+| Restored backup of a deleted tenant | Resurrects data the customer asked to delete | Retention horizon and key destruction. A backup encrypted to the tenant's key alone cannot be restored after `delete` unless an escrow copy of the key survives (`hooks.sh`) |
+| Clients ahead of the server's MLS state for calls | A call's group no longer matches | Clients rejoin ([`tenancy.md`](tenancy.md), "Known limits") |
 
 ## 6. Provider and host moves
 
@@ -105,7 +108,8 @@ A backup that contains the database and the secrets together lets whoever holds 
 |---|---|
 | Tinyauth to Pocket ID (existing) | The issuer stays, every subject changes. Each account is moved by `tinyserver relink-identity`. Since finding S2's change removed `DATABASE_URL_MIGRATE` from the server container, these run as `docker compose run --rm --entrypoint tinyserver tinyserver-init identities`, as `deploy/README.md` step 6 says (finding N5) |
 | Self-hosted to TinyCloud | The hostname changes, so the origin in every client, every invite code (`tc1.` embeds the origin) and every session changes: everyone signs in again at the new origin. If the IdP is recreated, subjects change (relink). E2EE: group ids are conversation ids and stay; **the server's text external sender key must move with the data** or clients show their strongest warning. The media IP and port change (clients get them in each SDP) |
-| TinyCloud to self-hosted, or to another provider | The same, plus: export tooling does not exist. A community can take a database dump and the volumes. A tenant's secrets are TinyCloud's to hand over |
+| Between tenants or hosts run by the same operator | `operator.sh backup` then `restore` into the new target: a move that works between tenants with different role names and into a plain stack (`hooks.sh`). The source still exists, with the same secrets, until `delete` |
+| TinyCloud to self-hosted, or to another provider | The same, plus: `operator.sh export` gives the owner the bundle encrypted only to the owner's recipients, with the compose file, `01-roles.sh` and a README for `restore --stack` (`hooks.sh`: the operator's key cannot open it). The tunnel token and database passwords are not in it; the new host makes its own |
 | Pocket ID to another provider | A new issuer is a new set of accounts (`two_providers_make_two_identities_for_one_subject`). Existing accounts are re-pointed by `relink-identity` with `--issuer` |
 | Cloudflare to another front | `TINYSERVER_TRUSTED_PROXIES` must name the new proxy or all sign-in routes share one limiter bucket ([`network.md`](network.md) section 3) |
 
@@ -115,7 +119,7 @@ A backup that contains the database and the secrets together lets whoever holds 
 |---|---|
 | Test that `migrate` fails when the database is ahead of the binary | Engineering requirement |
 | Down-migration policy or an expand-and-contract rule | Engineering decision |
-| Backup tool with encryption, a deletion ledger and a restore runbook | Engineering requirement (S11) |
+| Backup tool with encryption: built (`operator.sh`). A deletion ledger, clearing sessions on restore, a schedule and a retention period: not built | Engineering requirement (S11, N11) |
 | Client cache survives upgrades for E2EE conversations | Engineering requirement |
 | Where the text external sender key is stored, and how it is exported | Specification gap |
-| Export and import of a community between providers | Not built |
+| Export and import of a community between providers | Built as `operator.sh export` and `restore --stack`; the receiving provider must run this stack's compose file |

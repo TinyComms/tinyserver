@@ -8,7 +8,7 @@ How a community handles abuse without TinyCloud, or anyone else, reading private
 2. There is no hidden monitoring and no decryption mechanism or backdoor. The server holds no key that decrypts an end-to-end encrypted conversation ([`../e2ee-text.md`](../e2ee-text.md)). A report cannot make it hold one.
 3. What a moderator knows about a conversation is what a member of it chose to tell them. A report carries evidence only if the reporter's own client sends it.
 4. Enforcement metadata (who was reported, what became of it, what was done) is kept apart from communications: separate tables, separate permission, separate retention, and a log that carries ids and transitions and never text.
-5. Suspending a community is something TinyCloud can do as the host. It acts on the community as a whole and needs no access to what is in it. Nothing in this repository implements suspension, because it is an operator action on the deployment (stopping the tenant's containers, see [`tenancy.md`](tenancy.md)), not a server feature.
+5. Suspending a community is something TinyCloud can do as the host. It acts on the community as a whole and needs no access to what is in it. `tinyserver operator suspend --read-only` or `--offline` (`0016_operator.sql`, `deploy/tenant/operator.sh`, tested in `crates/api/tests/operator.rs`) does it from the owner role in the init container, with a notice members see; the serving process can read the state and cannot change it. See [`tenancy.md`](tenancy.md) and [`../server.md`](../server.md#operator-suspension-and-legal-hold).
 6. This is not a claim that encryption removes legal duties. It does not. It changes what an operator is able to hand over: for an end-to-end encrypted conversation, ciphertext and the metadata the server needs to route it; for a plaintext conversation, what the database holds. Legal duties, and how requests are received and answered, are a matter for TinyCloud's policy and counsel and are outside this repository.
 
 ## What is implemented here
@@ -77,7 +77,7 @@ Every state change writes a row, in the same transaction as the change: `report.
 - A person who is the subject of reports loses, from every report about them that is **not** held, the evidence, the reporter's note and the moderators' notes. The report row stays, so the community keeps a record that a report was made and what it led to, without the material. Being deleted does not let a person erase a report that an owner has placed on hold.
 - A report on hold is never changed by anyone's deletion, except that a deleted reporter's link is removed.
 - The tombstone itself holds no name, email or picture, so an id left on a report identifies no one.
-- Deleted accounts do not reach existing backups. See [`../../deploy/backup/README.md`](../../deploy/backup/README.md).
+- Deleted accounts do not reach existing backups, and a restore of an older backup brings them back ([`findings.md`](findings.md) N11, [`tenancy.md`](tenancy.md)).
 
 ### Logs
 

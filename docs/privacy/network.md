@@ -103,7 +103,7 @@ The cost model for TinyCloud ([`performance.md`](performance.md)) therefore has 
 
 ## 8. A hosted tenant's address
 
-In a managed deployment the SDP shows a TinyCloud-controlled IPv4 address and a port per tenant (finding S12: the media port is per instance). The address and port reveal no more than the tenant exists on that host. If several tenants share an IP, the port number distinguishes them to any observer of the media path. Whether hosts, IPs and ports should be shared, rotated or fronted by a relay is an open design question for [`tenancy.md`](tenancy.md).
+In a managed deployment the SDP shows a TinyCloud-controlled IPv4 address and a port per tenant: `deploy/tenant/tenant.sh` gives each tenant `50000 + index` by default and refuses a port another tenant in the same directory has, and `deploy/tests/isolation.sh` checks each tenant publishes its own port and not the other's ([`tenancy.md`](tenancy.md)). The address and port reveal no more than the tenant exists on that host. If several tenants share an IP, the port number distinguishes them to any observer of the media path. Whether hosts and IPs should be shared, rotated or fronted by a relay is still open; [`tenancy.md`](tenancy.md) does not decide it.
 
 ## 9. What can never be hidden from the hosting provider
 

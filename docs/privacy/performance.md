@@ -28,7 +28,7 @@ The compose file starts, per community: Postgres, tinyserver, Pocket ID, clamd, 
 | cloudflared | 256 MB | |
 | `tinyserver-init` (transient) | 256 MB | |
 
-The long-running limits sum to about 5.5 GiB. Actual resident use was not measured. The point for a hosting plan from about $10 a month: **clamd alone is the largest single memory line per tenant**, and it exists to scan plaintext uploads. Sealed uploads (specified) are not scanned, but plaintext uploads, and every community that does not use E2EE, still need it. Whether to share one scanner across tenants is a question for [`tenancy.md`](tenancy.md), because a shared service is shared plaintext.
+The long-running limits sum to about 5.5 GiB. Actual resident use was not measured. The point for a hosting plan from about $10 a month: **clamd alone is the largest single memory line per tenant**, and it exists to scan plaintext uploads. Sealed uploads (specified) are not scanned, but plaintext uploads, and every community that does not use E2EE, still need it. [`tenancy.md`](tenancy.md) does not share a scanner across tenants (a shared service is shared plaintext). Instead `deploy/scan-off.yml`, or `tenant.sh new --scan none`, runs a community with no clamd (`TINYSERVER_SCAN_ENGINE=none`): every upload is marked clean unscanned and the server warns at start. That removes the largest memory line but lets any plaintext file through, so it is meant only where attachments are sealed, which is not on main yet. Not measured.
 
 ### 2.2 Per active member
 
@@ -112,7 +112,7 @@ Everything in the "Result" column is **TODO, not measured**. Each row needs: the
 | P15 | Bandwidth overhead of DAVE on a real Opus stream at 32 kb/s | Packet capture | Computed value in section 2.5 | TODO |
 | P16 | DAVE seal and open latency added on the client | `mediad` benchmark | | TODO |
 | P17 | Time to run `migrate` on databases of 1 million and 10 million messages | Test database | | TODO |
-| P18 | Backup size and time for a tenant at P6 sizes | Backup tool (not built) | | TODO |
+| P18 | Backup size and time for a tenant at P6 sizes | `deploy/tenant/operator.sh backup`; the staging tmpfs defaults to 4g (`TINYSERVER_BACKUP_TMPFS`); whether that bounds a large tenant was not checked | | TODO |
 | P19 | Smallest memory and CPU allotment per tenant that holds a 50 member community without limit kills | Soak test | | TODO |
 | P20 | Cost model: a table of per-tenant monthly cost for egress, storage, memory and tunnel at three community sizes | Compute from P1 to P19 and the provider's prices | | TODO |
 

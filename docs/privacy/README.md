@@ -2,7 +2,7 @@
 
 How TinyComms (tinyserver, the community server, and tinyclient, the desktop app) handles private communication, and what a managed service built on it (TinyCloud) can and cannot honestly promise. Written to be true: every claim cites code, a test, a document or says "not verified". Read [`guarantees.md`](guarantees.md) first if you need to know what may be said to a customer; read [`threat-model.md`](threat-model.md) first if you need to know who the adversaries are.
 
-State described: tinyserver branch `hardening/privacy-docs` (on `ea3cd39`), tinyclient `26916e9` (read only), 2026-10-31.
+State described: tinyserver `origin/main` at `c4ae28b` (#20: abuse reports, operator suspension and legal hold, tenants, encrypted backups), first written on `ea3cd39` on 2026-10-31 and re-checked against `c4ae28b` on 2026-11-01; tinyclient `26916e9` (read only). The TinyCloud control plane (provisioning, billing, staff tooling) is not in this repository.
 
 ## Status words
 
@@ -13,7 +13,7 @@ Used the same way in every document here.
 | Implemented, tested | The code does it and a named test fails if it stops |
 | Implemented | The code does it; no test asserts it |
 | Designed | Written down, not built |
-| In progress | Being built elsewhere, **not merged in this branch**. Text and attachment end-to-end encryption (E2EE) is the main case: it is specified in [`../e2ee-text.md`](../e2ee-text.md) and nothing about it is verified here |
+| In progress | Being built elsewhere, **not merged on main** (`c4ae28b`). Text and attachment end-to-end encryption (E2EE) is the main case: it is specified in [`../e2ee-text.md`](../e2ee-text.md) and nothing about it is verified here |
 | Not done | Neither designed nor built |
 | Not verified | Could not be checked; the document says what was and was not looked at |
 
@@ -45,11 +45,11 @@ Used the same way in every document here.
 | [`compliance.md`](compliance.md) | Technical readiness for US and EU duties, each item split into an engineering requirement and a question for counsel. No legal conclusions | Yes |
 | [`remaining-risks.md`](remaining-risks.md) | What needs independent review, residual attack surface, assumptions, limits of anonymity and of E2EE | Yes |
 | [`findings.md`](findings.md) | The ledger of security and privacy findings and their status, with the corrections from this pass | Existing |
-| [`abuse-response.md`](abuse-response.md) | Reports, suspension, legal process | **Written separately** (another branch). Linked, not written here |
-| [`tenancy.md`](tenancy.md) | The per-tenant isolation contract | **Written separately.** Linked, not written here |
+| [`abuse-response.md`](abuse-response.md) | In-community abuse reports: what a report holds, who sees it, retention, the owner's hold, logs | From #20. Two lines corrected here (suspension, a dead link; [`findings.md`](findings.md)) |
+| [`tenancy.md`](tenancy.md) | The per-tenant isolation contract, the operator's hooks (suspend, hold, backup, export, restore, delete) and their limits | From #20 |
 | `benchmarks.md` | Measured performance numbers | **Not written yet.** Referenced by [`../e2ee-text.md`](../e2ee-text.md) and [`performance.md`](performance.md) |
 
-Links to `abuse-response.md`, `tenancy.md` and `benchmarks.md` resolve only after those files are merged.
+The link to `benchmarks.md` does not resolve yet.
 
 ## Reading order
 
@@ -61,17 +61,17 @@ Links to `abuse-response.md`, `tenancy.md` and `benchmarks.md` resolve only afte
 
 ## Existing documents these build on
 
-[`../server.md`](../server.md) (API and permissions), [`../calls.md`](../calls.md) (live socket, SFU, call E2EE), [`../logging.md`](../logging.md), [`../e2ee-text.md`](../e2ee-text.md) (text E2EE specification), [`../../deploy/README.md`](../../deploy/README.md) (running a community). tinyclient's `SECURITY.md`, `docs/logging.md` and `docs/architecture.md` were read from the client repository and are cited by name.
+[`../server.md`](../server.md) (API and permissions), [`../calls.md`](../calls.md) (live socket, SFU, call E2EE), [`../logging.md`](../logging.md), [`../e2ee-text.md`](../e2ee-text.md) (text E2EE specification, not implemented on main), [`../../deploy/README.md`](../../deploy/README.md) (running a community), [`../../deploy/tenant/README.md`](../../deploy/tenant/README.md) (tenants and the operator's hooks), [`../../deploy/tests/README.md`](../../deploy/tests/README.md) (what the shell checks check). tinyclient's `SECURITY.md`, `docs/logging.md` and `docs/architecture.md` were read from the client repository and are cited by name.
 
 ## What is verified and what is not
 
-Verified by reading: the fourteen migrations, `crates/api`, `crates/server`, `crates/sfu` and `deploy/compose.yml` at this commit, and the test names cited. Not run: the test suite and the compose stack were not executed for this pass. A test named in these documents was confirmed to exist and to assert what is said, by reading it; that is not the same as a green run.
+Verified by reading: the sixteen migrations, `crates/api`, `crates/server`, `crates/sfu`, `deploy/compose.yml`, `deploy/tenant/` and `deploy/tests/` at `c4ae28b`, and the test names cited. Not run: the test suite, the shell checks in `deploy/tests/` and the compose stack were not executed for this pass, and CI runs `cargo test` but not `deploy/tests/`. A test named in these documents was confirmed to exist and to assert what is said, by reading it; that is not the same as a green run.
 
 Not verified anywhere in this set: Pocket ID's behaviour beyond its published documentation, Cloudflare's policies, the contents of Postgres, Pocket ID, clamd and cloudflared logs, tinyclient behaviour beyond its own documents and the files cited, and anything that depends on unmerged E2EE code. [`remaining-risks.md`](remaining-risks.md) section 6 lists them.
 
 ## Errors found in existing documents
 
-[`findings.md`](findings.md) (last section) lists where `docs/logging.md`, `docs/server.md`, `docs/calls.md`, `deploy/README.md` and tinyclient's `SECURITY.md` disagree with the code. They were reported, not edited, because they are outside this directory.
+[`findings.md`](findings.md) (last section) lists where `docs/logging.md`, `docs/server.md`, `docs/calls.md`, `deploy/README.md` and tinyclient's `SECURITY.md` disagree with the code. Each row says whether it was fixed in this set (`docs/server.md`, `docs/calls.md`, `docs/e2ee-text.md`, `abuse-response.md`) or only reported.
 
 ## Maintenance
 
