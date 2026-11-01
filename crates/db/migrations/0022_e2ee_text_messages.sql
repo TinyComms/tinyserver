@@ -909,6 +909,8 @@ BEGIN
     DELETE FROM invites WHERE created_by = v_user AND accepted_at IS NULL;
     DELETE FROM idempotency_keys WHERE key LIKE v_user::text || E'\n%';
     DELETE FROM sessions WHERE user_id = v_user;
+    -- A code from a sign-in that was under way names the account until it expires (as 0014).
+    DELETE FROM auth_codes WHERE user_id = v_user;
     DELETE FROM user_identities WHERE user_id = v_user;
     DELETE FROM memberships WHERE user_id = v_user;
 
