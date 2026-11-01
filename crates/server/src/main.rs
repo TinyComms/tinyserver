@@ -230,6 +230,13 @@ fn join_code(origin: &str, token: &str) -> Option<String> {
 
 async fn serve() -> anyhow::Result<()> {
     api::engine_from_env().context("refusing to serve without a scan engine")?;
+    // Whose `cf-connecting-ip` is believed. Unset: any private or loopback peer, which is the
+    // tunnel on the Docker network. `none`: nobody's, and every client counts as its own
+    // connection. A public address is never believed, whatever this says it trusts by default.
+    if let Ok(spec) = env_var("TINYSERVER_TRUSTED_PROXIES") {
+        api::trust_proxies(&spec)
+            .map_err(|error| anyhow::anyhow!("TINYSERVER_TRUSTED_PROXIES: {error}"))?;
+    }
     let url = env_var("DATABASE_URL")?;
     let bind: SocketAddr = env_var("BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -527,13 +534,17 @@ async fn axum_serve(
     app: axum::Router,
     live: api::Live,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown().await;
-            live.close();
-        })
-        .await
-        .context("server stopped")?;
+    // Connect info gives the sign-in limiter the peer it is really talking to.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown().await;
+        live.close();
+    })
+    .await
+    .context("server stopped")?;
     Ok(())
 }
 

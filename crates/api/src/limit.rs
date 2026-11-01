@@ -2,16 +2,18 @@
 //! `token` tries a one-time code, and each `join` may ask the provider for a sign-up link.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 const PER_KEY: usize = 5;
 /// No password hashing sits behind these any more, so the shared cap is looser than the
@@ -78,7 +80,11 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
         _ => None,
     };
     if let Some(gate) = gate {
-        if !gate.allow(&client_key(request.headers())) {
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip());
+        if !gate.allow(&client_key(request.headers(), peer)) {
             let route = match request.uri().path() {
                 "/v1/auth/start" => "/v1/auth/start",
                 "/v1/auth/token" => "/v1/auth/token",
@@ -99,23 +105,154 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
     next.run(request).await
 }
 
-fn client_key(headers: &HeaderMap) -> String {
-    let Some(value) = headers
+fn client_key(headers: &HeaderMap, peer: Option<IpAddr>) -> String {
+    let claimed = headers
         .get("cf-connecting-ip")
         .and_then(|value| value.to_str().ok())
-    else {
-        return "direct".to_string();
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    // A header is only a claim. It counts when the connection it arrived on is from a proxy
+    // we trust. A direct caller, however it fills the header in, is keyed by who it is.
+    let address = match (peer, claimed) {
+        (Some(peer), Some(claimed)) if trusted(peer) => Some(claimed),
+        (Some(peer), _) => Some(peer),
+        // No peer address at all: a test calling the router directly.
+        (None, claimed) => claimed,
     };
-    let value = value.trim();
-    let shaped = value.len() <= 64
-        && !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_hexdigit() || character == '.' || character == ':');
-    if shaped {
-        value.to_string()
-    } else {
-        "direct".to_string()
+    address.map_or_else(|| "direct".to_string(), keyed)
+}
+
+/// The key a client is counted under. The address itself is never stored: the map holds a
+/// truncated SHA-256 of it under a secret made when the process starts and never written
+/// anywhere, so a memory dump or a debugger shows buckets and not addresses. IPv6 counts by
+/// its /64, which is what one subscriber holds, so one person cannot spend a whole prefix.
+///
+/// This is a privacy measure and not a secrecy one. There are only 2^32 IPv4 addresses, so
+/// anyone who holds the secret can find which address made a bucket. The secret exists only
+/// in this process's memory, and a bucket lasts one minute.
+fn keyed(address: IpAddr) -> String {
+    static SECRET: LazyLock<[u8; 32]> = LazyLock::new(|| {
+        let mut secret = [0u8; 32];
+        // Without randomness a fixed secret would make the key guessable, which is the one
+        // outcome worse than a failed start. The process cannot sign anyone in either.
+        getrandom::fill(&mut secret).expect("the operating system's random source");
+        secret
+    });
+    let address = match address {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(*SECRET);
+    match address {
+        IpAddr::V4(v4) => {
+            hasher.update([4]);
+            hasher.update(v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            hasher.update([6]);
+            hasher.update(&v6.octets()[..8]);
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .fold(String::with_capacity(16), |mut text, byte| {
+            use std::fmt::Write;
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
+/// Proxies whose `cf-connecting-ip` is believed. Unset means any private, loopback or
+/// link-local peer: cloudflared on a Docker network, a reverse proxy on the same host. A
+/// peer on the public internet is never believed.
+static TRUSTED: OnceLock<Vec<Net>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Net {
+    address: IpAddr,
+    bits: u8,
+}
+
+impl Net {
+    fn contains(self, candidate: IpAddr) -> bool {
+        let (left, right) = match (self.address, candidate) {
+            (IpAddr::V4(left), IpAddr::V4(right)) => {
+                (u128::from(u32::from(left)), u128::from(u32::from(right)))
+            }
+            (IpAddr::V6(left), IpAddr::V6(right)) => (u128::from(left), u128::from(right)),
+            _ => return false,
+        };
+        let width = if self.address.is_ipv4() { 32 } else { 128 };
+        if self.bits == 0 {
+            return true;
+        }
+        let shift = u32::from(width - self.bits);
+        left >> shift == right >> shift
+    }
+}
+
+/// `TINYSERVER_TRUSTED_PROXIES`: addresses or CIDR ranges, comma separated. `none` trusts no
+/// proxy, so every client is keyed by its own connection.
+pub fn trust_proxies(spec: &str) -> Result<(), String> {
+    let mut nets = Vec::new();
+    for part in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if part.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        let (address, bits) = part
+            .split_once('/')
+            .map_or((part, None), |(a, b)| (a, Some(b)));
+        let address: IpAddr = address
+            .parse()
+            .map_err(|_| format!("{part} is not an address or range"))?;
+        let width = if address.is_ipv4() { 32 } else { 128 };
+        let bits = match bits {
+            None => width,
+            Some(bits) => bits
+                .parse::<u8>()
+                .ok()
+                .filter(|bits| *bits <= width)
+                .ok_or_else(|| format!("{part} has a bad prefix length"))?,
+        };
+        nets.push(Net { address, bits });
+    }
+    TRUSTED
+        .set(nets)
+        .map_err(|_| "trusted proxies were already set".to_string())
+}
+
+fn trusted(peer: IpAddr) -> bool {
+    let peer = match peer {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    match TRUSTED.get() {
+        Some(nets) => nets.iter().any(|net| net.contains(peer)),
+        None => is_local(peer),
+    }
+}
+
+fn is_local(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // Carrier-grade NAT space, which Tailscale uses.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                // fc00::/7 unique local, fe80::/10 link local.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -129,8 +266,9 @@ fn prune(hits: &mut Vec<Instant>, now: Instant, window: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_key, lock, Gate};
+    use super::{client_key, is_local, lock, Gate, Net};
     use axum::http::{HeaderMap, HeaderValue};
+    use std::net::IpAddr;
     use std::time::Duration;
 
     #[test]
@@ -161,16 +299,107 @@ mod tests {
         assert_eq!(lock(&gate.keys).len(), 1);
     }
 
-    #[test]
-    fn a_client_address_is_the_cloudflare_header_or_one_shared_bucket() {
+    fn claim(address: &'static str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        assert_eq!(client_key(&headers), "direct");
-        headers.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.8"));
-        assert_eq!(client_key(&headers), "203.0.113.8");
-        headers.insert(
-            "cf-connecting-ip",
-            HeaderValue::from_static("not an address"),
+        headers.insert("cf-connecting-ip", HeaderValue::from_static(address));
+        headers
+    }
+
+    fn ip(address: &str) -> Option<IpAddr> {
+        Some(address.parse().expect("address"))
+    }
+
+    #[test]
+    fn no_address_at_all_is_one_shared_bucket() {
+        assert_eq!(client_key(&HeaderMap::new(), None), "direct");
+        assert_eq!(client_key(&claim("not an address"), None), "direct");
+        assert_eq!(client_key(&claim("203.0.113.8; drop"), None), "direct");
+    }
+
+    #[test]
+    fn a_direct_caller_cannot_choose_its_bucket_by_filling_in_the_header() {
+        // Whoever connects from the public internet is counted as itself, so rotating the
+        // header does not get a fresh allowance.
+        let from = ip("198.51.100.7");
+        let first = client_key(&claim("203.0.113.1"), from);
+        let second = client_key(&claim("203.0.113.2"), from);
+        assert_eq!(first, second);
+        assert_eq!(first, client_key(&HeaderMap::new(), from));
+        assert_ne!(first, client_key(&HeaderMap::new(), ip("198.51.100.8")));
+    }
+
+    #[test]
+    fn a_private_proxy_is_believed_about_who_is_behind_it() {
+        // cloudflared on the Docker network, a reverse proxy on the same host.
+        for proxy in [
+            "172.30.53.10",
+            "10.0.0.5",
+            "192.168.1.9",
+            "127.0.0.1",
+            "::1",
+            "fd00::2",
+        ] {
+            let proxy = ip(proxy);
+            assert_eq!(
+                client_key(&claim("203.0.113.8"), proxy),
+                client_key(&HeaderMap::new(), ip("203.0.113.8")),
+                "{proxy:?}"
+            );
+            assert_ne!(
+                client_key(&claim("203.0.113.8"), proxy),
+                client_key(&claim("203.0.113.9"), proxy)
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_does_not_contain_the_address() {
+        for address in ["203.0.113.8", "2001:db8:1:2:3:4:5:6"] {
+            let key = client_key(&HeaderMap::new(), ip(address));
+            assert_eq!(key.len(), 16, "{key}");
+            assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "{key}");
+            for part in address.split(['.', ':']) {
+                assert!(
+                    part.len() < 4 || !key.contains(part),
+                    "{key} holds a piece of {address}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_subscriber_is_one_bucket_across_a_v6_prefix_and_a_v4_mapped_address() {
+        assert_eq!(
+            client_key(&HeaderMap::new(), ip("2001:db8:1:2:aaaa::1")),
+            client_key(&HeaderMap::new(), ip("2001:db8:1:2:bbbb::9"))
         );
-        assert_eq!(client_key(&headers), "direct");
+        assert_ne!(
+            client_key(&HeaderMap::new(), ip("2001:db8:1:2::1")),
+            client_key(&HeaderMap::new(), ip("2001:db8:1:3::1"))
+        );
+        assert_eq!(
+            client_key(&HeaderMap::new(), ip("::ffff:203.0.113.8")),
+            client_key(&HeaderMap::new(), ip("203.0.113.8"))
+        );
+    }
+
+    #[test]
+    fn a_proxy_range_matches_its_prefix_and_nothing_else() {
+        let net = Net {
+            address: "203.0.113.0".parse().expect("address"),
+            bits: 24,
+        };
+        assert!(net.contains("203.0.113.200".parse().expect("address")));
+        assert!(!net.contains("203.0.114.1".parse().expect("address")));
+        assert!(!net.contains("::1".parse().expect("address")));
+        let all = Net {
+            address: "0.0.0.0".parse().expect("address"),
+            bits: 0,
+        };
+        assert!(all.contains("8.8.8.8".parse().expect("address")));
+        assert!(is_local("100.127.101.103".parse().expect("address")));
+        assert!(!is_local("100.128.0.1".parse().expect("address")));
+        assert!(!is_local("8.8.8.8".parse().expect("address")));
+        assert!(!is_local("2606:4700::1".parse().expect("address")));
     }
 }
