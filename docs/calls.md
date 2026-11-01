@@ -75,6 +75,7 @@ Close codes:
 | `4002` | `resync` | Refetch rooms, members, and invites, then reconnect without `since` |
 | `4003` | `removed` | Stop. The account is no longer a member: removed or banned. |
 | `4008` | `replaced` | Another device of the same person took the place. Do not reconnect in a loop. |
+| `4010` | `suspended` | The operator took the community offline. Read `GET /v1/status` for the notice, and reconnect only once it says `normal`. |
 | `4029` | `slow_down` | Reconnect after a pause |
 
 Browsers cannot set the `Authorization` header on a WebSocket, so a hostile page cannot open this socket with someone's session. No `Origin` check is needed.

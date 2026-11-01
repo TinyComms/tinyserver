@@ -69,6 +69,8 @@ Upgrading from the three fixed roles: `owner` became the owner flag, `admin` the
 | `last_owner` | 409 | Demoting, kicking, or banning the last owner |
 | `idempotency_conflict` | 409 | `Idempotency-Key` reused with a different body |
 | `slow_down` | 429 | Filing a report past 10 in an hour or 50 in a day |
+| `read_only` | 503 | The operator suspended the community read-only, and this route writes. The body has `mode` and `notice`. |
+| `suspended` | 503 | The operator took the community offline. Every route but `/health` and `/v1/status` answers this, with `mode` and `notice`. |
 
 Community routes return `500` `unavailable` when the database call fails. That is separate from the scanner's `503` `unavailable`.
 
@@ -280,6 +282,8 @@ Archives (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused unless `all
 
 `serve` refuses to start unless `TINYSERVER_CLAMD_SOCKET` is set, except when that variable is unset and `TINYSERVER_ALLOW_FAKE_SCAN=1`. If the socket is set, the fake scanner is not used. The socket is `host:port`. A filesystem path works on Unix only. On Windows a path is a startup error. Compose sets `TINYSERVER_CLAMD_SOCKET=clamd:3310` and `TINYSERVER_UPLOAD_DIR=/data/uploads` and does not publish port 3310.
 
+`TINYSERVER_SCAN_ENGINE` is `clamd`, the default and all of the above, or `none`. `none` turns server-side scanning off for a community whose files are sealed on the sending device, where the server could only scan ciphertext: every upload is marked `clean` without being scanned, and `serve` logs a warning when it starts. `none` with `TINYSERVER_CLAMD_SOCKET` also set is a startup error, so a half-changed setting does not run. `deploy/scan-off.yml` is the compose file for it; it also stops clamd running. On a community whose files are not sealed it lets any file through.
+
 The scanner is clamd plus three yara-x rules compiled into the process (`lnk_header`, `html_prefix`, `vba_stream`). There is no rules file and no separate content router. A yara hit is `blocked` before clamd is asked. clamd down, a socket timeout, or any IO error is unavailable even when yara is clean. The fake scanner blocks the EICAR test string and calls everything else clean.
 
 Each scan may run up to `TINYSERVER_SCAN_TIMEOUT_MS` (unset, `0`, or unparseable means 8000; the hard cap is 15000). Three scans run at once. Waiting for a free slot uses the same deadline. Past it, the upload is `503 unavailable` and nothing is committed.
@@ -335,6 +339,20 @@ The bot calls the API with `Authorization: Bot <token>`. The prefix is exact. `B
 `GET /v1/me` for a bot is the shape under Capabilities and me. `GET /v1/live` takes the same `Bot` header. `ready.online` is empty without `members.read`. `ready.calls` is empty without `rooms.read`. A bot with neither, or with only `rooms.write`, stays connected, answers `ping`, and receives no room or member payload.
 
 `rooms.read` lists rooms and receives `room.*` plus `call.joined`, `call.left`, and `call.state`. `members.read` lists members and receives `member.*` and `presence`. `rooms.write` creates, renames, and deletes rooms and receives none of those payloads by itself. A bot does not receive message, direct, typing, or read frames, and it cannot post them. Any client frame whose type starts with `call.` is `forbidden`. Revocation closes the socket with `4001 session_ended` on the next credential check, every 60 seconds.
+
+## Operator suspension and legal hold
+
+`migrations/0016_operator.sql`. One row, `operator_state`, that the runtime role may read and only the owner role may write, through `tinyserver operator` in the init container. Every change is a row in `operator_events`, which the runtime role cannot read.
+
+| Command | Effect |
+| --- | --- |
+| `tinyserver operator status [--json]` | The mode, notice, since, hold, and the number of reports owners put on hold |
+| `tinyserver operator suspend --read-only --notice TEXT` | Reads, signing in and out, `DELETE /v1/me`, and `POST /v1/reports` still work. Every other write is `503 read_only`. On the live socket, `call.join`, `call.offer`, `typing` and the moderation frames get `error {code: "read_only"}`; calls already running go on until they end. |
+| `tinyserver operator suspend --offline --notice TEXT` | Only `GET /health` and `GET /v1/status` answer; everything else is `503 suspended`. Open live sockets close with `4010 suspended` at their next session check, within a minute. |
+| `tinyserver operator resume` | Normal again. The notice is cleared. |
+| `tinyserver operator hold [--reason TEXT]` / `release` | A legal hold. Resolved reports stop expiring, and `deploy/tenant/operator.sh` refuses to delete or overwrite the community. The reason is kept in `operator_events` only. |
+
+The notice is 1 to 500 characters with no control characters but new lines. `GET /v1/status`, with no session, is `{"mode": "normal" | "read_only" | "offline", "notice", "since"}`. It never says whether there is a hold. The server reads the row at most every `TINYSERVER_OPERATOR_REFRESH_MS` (2000 by default; `0` reads it for every request), so a change reaches every request within that; when the row cannot be read the last state read is kept.
 
 ## Bootstrap
 

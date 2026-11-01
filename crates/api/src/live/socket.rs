@@ -26,6 +26,8 @@ pub(crate) enum Close {
     Unavailable,
     TextOnly,
     TooBig,
+    /// The operator took the community offline.
+    Suspended,
 }
 
 impl Close {
@@ -41,6 +43,7 @@ impl Close {
             Self::Unavailable => (1011, "unavailable"),
             Self::TextOnly => (1003, "text_only"),
             Self::TooBig => (1009, "too_big"),
+            Self::Suspended => (4010, "suspended"),
         };
         CloseFrame {
             code,
@@ -302,8 +305,12 @@ async fn serve(
             }
             () = tokio::time::sleep_until(seen + limits.idle) => Err(End::Close(Close::Idle)),
             _ = recheck.tick() => {
-                if !me.is_bot() { hub.saw(&me.user_id); }
-                check(hub, me).await
+                if hub.operator.current().await.mode == db::Mode::Offline {
+                    Err(End::Close(Close::Suspended))
+                } else {
+                    if !me.is_bot() { hub.saw(&me.user_id); }
+                    check(hub, me).await
+                }
             }
         };
         if let Err(end) = step {
@@ -432,6 +439,16 @@ async fn receive(
         let reply = Out::Error {
             reference: incoming.reference.as_ref(),
             code: "forbidden",
+        };
+        return send(hub, socket, reply.text()).await;
+    }
+    if !crate::operator::read_only_frame_allowed(&incoming.kind)
+        && hub.operator.current().await.mode != db::Mode::Normal
+    {
+        frame_refused(&me.user_id, asking.conn, "read_only");
+        let reply = Out::Error {
+            reference: incoming.reference.as_ref(),
+            code: "read_only",
         };
         return send(hub, socket, reply.text()).await;
     }

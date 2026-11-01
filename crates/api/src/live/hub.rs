@@ -39,6 +39,8 @@ pub(crate) struct Hub {
     pub media: Option<sfu::Media>,
     /// People connected since `last_seen_at` was last written.
     seen: Mutex<HashSet<String>>,
+    /// The operator's suspension, for what a socket may still do.
+    pub operator: crate::Operator,
 }
 
 #[derive(Default)]
@@ -139,6 +141,7 @@ impl Hub {
         let (ephemeral, _) = broadcast::channel(BACKLOG);
         let (stop, _) = watch::channel(false);
         let hub = Arc::new(Self {
+            operator: crate::Operator::new(pool.clone()),
             pool,
             limits,
             events,

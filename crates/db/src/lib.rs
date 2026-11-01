@@ -13,6 +13,7 @@ mod media;
 mod messages;
 mod migrate;
 mod moderation;
+mod operator;
 mod outbox;
 pub mod perm;
 mod reports;
@@ -52,6 +53,10 @@ pub use migrate::migrate;
 pub use moderation::{
     ban, call_access, end_share, kick_from_call, list_bans, moderate_call, move_in_call,
     room_permissions, touch_seen, unban, Ban, CallAccess,
+};
+pub use operator::{
+    clean_notice, held_reports, operator_state, set_legal_hold, set_operator_mode, Mode,
+    OperatorError, OperatorState, NOTICE_MAX,
 };
 pub use outbox::{outbox_after, outbox_bounds, OutboxBounds, OutboxRow, WAKE_CHANNEL};
 pub use reports::{

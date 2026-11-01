@@ -3,6 +3,11 @@
 //! `TINYSERVER_CLAMD_SOCKET` is `host:port` (TCP) or, on Unix, a filesystem path. The rules
 //! compile once. A yara hit is blocked before clamd is asked. clamd down, a socket timeout, or
 //! any IO error is unavailable, including when yara is clean.
+//!
+//! `TINYSERVER_SCAN_ENGINE=none` turns server-side scanning off, for a deployment where every
+//! file is sealed on the sending device and the server could only scan ciphertext. Every upload
+//! then passes the gate unscanned. Unset, or `clamd`, is the scanning above. `none` with a
+//! clamd socket set is refused, so a half-changed configuration does not start.
 
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -44,6 +49,10 @@ pub enum ScanBootError {
     NeedsTcp(String),
     /// The built-in yara rules did not compile.
     Rules(String),
+    /// `TINYSERVER_SCAN_ENGINE` is not `clamd` or `none`.
+    UnknownEngine(String),
+    /// `TINYSERVER_SCAN_ENGINE=none` and a clamd socket at once.
+    NoneWithSocket,
 }
 
 impl std::fmt::Display for ScanBootError {
@@ -57,6 +66,13 @@ impl std::fmt::Display for ScanBootError {
                 "TINYSERVER_CLAMD_SOCKET must be host:port on Windows, not {socket}"
             ),
             Self::Rules(error) => write!(f, "yara rules failed to compile: {error}"),
+            Self::UnknownEngine(engine) => write!(
+                f,
+                "TINYSERVER_SCAN_ENGINE is {engine}; it is clamd (the default) or none"
+            ),
+            Self::NoneWithSocket => f.write_str(
+                "TINYSERVER_SCAN_ENGINE is none but TINYSERVER_CLAMD_SOCKET is set; unset one",
+            ),
         }
     }
 }
@@ -194,11 +210,47 @@ pub fn scan_engine(
 /// `TINYSERVER_CLAMD_SOCKET` selects clamd. `TINYSERVER_ALLOW_FAKE_SCAN=1` allows [`FakeEngine`]
 /// only when that socket is unset.
 pub fn engine_from_env() -> Result<Arc<dyn ScanEngine>, ScanBootError> {
+    let engine = std::env::var("TINYSERVER_SCAN_ENGINE").ok();
     let socket = std::env::var("TINYSERVER_CLAMD_SOCKET").ok();
     let allow_fake = std::env::var("TINYSERVER_ALLOW_FAKE_SCAN")
         .ok()
         .is_some_and(|value| value.trim() == "1");
-    scan_engine(socket.as_deref(), allow_fake)
+    select_engine(engine.as_deref(), socket.as_deref(), allow_fake)
+}
+
+/// `engine` is `TINYSERVER_SCAN_ENGINE`: unset, empty or `clamd` is [`scan_engine`]; `none` is
+/// [`NoScan`].
+pub fn select_engine(
+    engine: Option<&str>,
+    socket: Option<&str>,
+    allow_fake: bool,
+) -> Result<Arc<dyn ScanEngine>, ScanBootError> {
+    let engine = engine.map(str::trim).unwrap_or_default();
+    match engine.to_ascii_lowercase().as_str() {
+        "" | "clamd" => scan_engine(socket, allow_fake),
+        "none" => {
+            if socket.is_some_and(|socket| !socket.trim().is_empty()) {
+                return Err(ScanBootError::NoneWithSocket);
+            }
+            Ok(Arc::new(NoScan))
+        }
+        _ => Err(ScanBootError::UnknownEngine(engine.to_string())),
+    }
+}
+
+/// No scanning: every file is clean. Only for files sealed before they reach the server.
+pub struct NoScan;
+
+impl ScanEngine for NoScan {
+    fn scan(&self, _bytes: &[u8], _mime: &str, _kind: &str) -> ScanVerdict {
+        ScanVerdict::Clean
+    }
+}
+
+/// True when `TINYSERVER_SCAN_ENGINE` turns scanning off. For the start-up warning.
+pub fn scanning_off() -> bool {
+    std::env::var("TINYSERVER_SCAN_ENGINE")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("none"))
 }
 
 fn rules() -> Result<&'static yara_x::Rules, ScanBootError> {
@@ -283,8 +335,42 @@ fn tcp_port(value: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamd_verdict, scan_engine, ScanBootError};
+    use super::{clamd_verdict, scan_engine, select_engine, ScanBootError};
     use db::ScanVerdict;
+
+    const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+
+    #[test]
+    fn the_engine_defaults_to_clamd_and_none_turns_scanning_off() {
+        // Unset and `clamd` are today's behaviour: no socket and no fake flag will not start.
+        for engine in [None, Some(""), Some("clamd"), Some(" CLAMD ")] {
+            assert!(matches!(
+                select_engine(engine, None, false),
+                Err(ScanBootError::Unconfigured)
+            ));
+        }
+        // The fake engine still blocks EICAR; scanning off lets it through.
+        let fake = select_engine(None, None, true).expect("fake");
+        assert!(matches!(
+            fake.scan(EICAR, "text/plain", "file"),
+            ScanVerdict::Blocked { .. }
+        ));
+        let off = select_engine(Some("none"), None, false).expect("none");
+        assert!(matches!(
+            off.scan(EICAR, "text/plain", "file"),
+            ScanVerdict::Clean
+        ));
+        assert!(matches!(
+            select_engine(Some("none"), Some("clamd:3310"), false),
+            Err(ScanBootError::NoneWithSocket)
+        ));
+        // An empty socket is unset, as compose passes it.
+        assert!(select_engine(Some("none"), Some(" "), false).is_ok());
+        let Err(error) = select_engine(Some("yara"), None, true) else {
+            panic!("an unknown engine starts");
+        };
+        assert!(error.to_string().contains("TINYSERVER_SCAN_ENGINE"));
+    }
 
     #[test]
     fn the_socket_deadline_is_the_scan_timeout_and_not_open() {
