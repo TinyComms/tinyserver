@@ -33,14 +33,18 @@ use url::Url;
 use crate::oidc::{Provider, SignIn};
 
 pub fn routes(sign_in: SignIn) -> Router<PgPool> {
-    Router::new()
+    let mut routes = Router::new()
         .route("/v1/auth/config", get(config))
         .route("/v1/auth/start", post(start))
         .route("/v1/auth/join", get(join).post(join_new))
         .route("/v1/auth/callback", get(callback))
         .route("/v1/auth/token", post(token))
-        .route("/v1/auth/backchannel-logout", post(backchannel_logout))
-        .layer(Extension(sign_in))
+        .route("/v1/auth/backchannel-logout", post(backchannel_logout));
+    // Only when TINYSERVER_AUTH turns passkeys on: otherwise these paths do not exist.
+    if sign_in.passkeys().is_some() {
+        routes = routes.merge(crate::passkey::routes());
+    }
+    routes.layer(Extension(sign_in))
 }
 
 #[derive(Serialize)]
@@ -129,16 +133,21 @@ impl IntoResponse for AuthApiError {
 }
 
 async fn config(Extension(sign_in): Extension<SignIn>) -> Response {
+    // `methods` stays `["oidc"]`: tinyclient runs the same browser flow for either, and an older
+    // one must not meet a value it does not know.
+    let passkey = sign_in.passkeys().map(|_| ProviderEntry {
+        id: crate::passkey::PROVIDER_ID,
+        name: "Passkey",
+    });
     Json(Config {
         methods: ["oidc"],
         provider_name: sign_in.provider_name(),
-        providers: sign_in
-            .providers()
-            .iter()
-            .map(|provider| ProviderEntry {
+        providers: passkey
+            .into_iter()
+            .chain(sign_in.providers().iter().map(|provider| ProviderEntry {
                 id: provider.id(),
                 name: provider.name(),
-            })
+            }))
             .collect(),
     })
     .into_response()
@@ -154,9 +163,21 @@ async fn start(
         AuthApiError::BadRequest
     })?;
     let invite = body.invite.as_deref().filter(|invite| !invite.is_empty());
-    let Some(provider) = sign_in.provider(body.provider.as_deref()) else {
-        auth_refused("/v1/auth/start", "provider_missing");
-        return Err(AuthApiError::BadRequest);
+    // With passkeys on, sign-in opens the passkey page unless the client names a provider.
+    let passkey_page = sign_in.passkeys().is_some()
+        && body
+            .provider
+            .as_deref()
+            .is_none_or(|id| id == crate::passkey::PROVIDER_ID);
+    let provider = if passkey_page {
+        // The provider that stays the way in beside it, if one is configured.
+        sign_in.provider(None)
+    } else {
+        let Some(provider) = sign_in.provider(body.provider.as_deref()) else {
+            auth_refused("/v1/auth/start", "provider_missing");
+            return Err(AuthApiError::BadRequest);
+        };
+        Some(provider)
     };
     let reason = if !loopback_redirect(&body.redirect_uri) {
         "bad_redirect"
@@ -175,12 +196,22 @@ async fn start(
         auth_refused("/v1/auth/start", reason);
         return Err(AuthApiError::BadRequest);
     }
-    let begun = provider.begin();
+    // With no provider at all the verifier and nonce have no use; the row still needs them.
+    let begun = match provider {
+        Some(provider) => provider.begin(),
+        None => crate::oidc::Begun {
+            authorize_url: String::new(),
+            state: db::random_id(),
+            verifier: "-".to_string(),
+            nonce: "-".to_string(),
+        },
+    };
+    let provider_id = provider.map_or(crate::passkey::PROVIDER_ID, |provider| provider.id());
     db::save_pending(
         &pool,
         &db::PendingLogin {
             state: &begun.state,
-            provider: provider.id(),
+            provider: provider_id,
             verifier: &begun.verifier,
             nonce: &begun.nonce,
             client_redirect: &body.redirect_uri,
@@ -194,10 +225,25 @@ async fn start(
         tracing::warn!(%error, "pending sign-in not saved");
         AuthApiError::Unavailable
     })?;
+    if passkey_page {
+        tracing::info!(
+            provider = provider_id,
+            invite = invite.is_some(),
+            "sign-in started"
+        );
+        return Ok(Json(Started {
+            authorize_url: crate::passkey::page_url(sign_in.public_url(), &begun.state),
+        }));
+    }
     // Someone with an invite may have no account at the provider yet. A provider that makes
     // accounts gets the question first, here.
-    let ask = invite.is_some() && provider.makes_accounts();
-    tracing::info!(provider = %provider.id(), invite = invite.is_some(), ask, "sign-in started");
+    let ask = provider.is_some_and(|provider| invite.is_some() && provider.makes_accounts());
+    tracing::info!(
+        provider = provider_id,
+        invite = invite.is_some(),
+        ask,
+        "sign-in started"
+    );
     let authorize_url = if ask {
         join_url(sign_in.public_url(), &begun.state)
     } else {
@@ -538,32 +584,39 @@ async fn backchannel_logout(
     Ok(StatusCode::OK)
 }
 
-enum Outcome {
+pub(crate) enum Outcome {
     Code(String),
     Error(&'static str),
 }
 
-/// `302` to tinyclient's loopback listener with the one-time code or an error, and its state.
-fn back_to_client(redirect: &str, client_state: &str, outcome: Outcome) -> Response {
-    // Checked by `loopback_redirect` before it was stored.
-    let Ok(mut url) = Url::parse(redirect) else {
-        return expired();
-    };
+/// Where tinyclient's loopback listener is told the result: the one-time code or an error, and
+/// the client's own state. `None` when the stored redirect is not a URL, which
+/// `loopback_redirect` rules out before it is stored.
+pub(crate) fn client_url(redirect: &str, client_state: &str, outcome: &Outcome) -> Option<String> {
+    let mut url = Url::parse(redirect).ok()?;
     {
         let mut pairs = url.query_pairs_mut();
-        match &outcome {
+        match outcome {
             Outcome::Code(code) => pairs.append_pair("code", code),
             Outcome::Error(error) => pairs.append_pair("error", error),
         };
         pairs.append_pair("state", client_state);
     }
-    match HeaderValue::from_str(url.as_str()) {
+    Some(url.to_string())
+}
+
+/// `302` to tinyclient's loopback listener with the one-time code or an error, and its state.
+fn back_to_client(redirect: &str, client_state: &str, outcome: Outcome) -> Response {
+    let Some(url) = client_url(redirect, client_state, &outcome) else {
+        return expired();
+    };
+    match HeaderValue::from_str(&url) {
         Ok(location) => (StatusCode::FOUND, [(header::LOCATION, location)]).into_response(),
         Err(_) => expired(),
     }
 }
 
-fn expired() -> Response {
+pub(crate) fn expired() -> Response {
     page(
         StatusCode::BAD_REQUEST,
         "Sign-in expired",
@@ -571,7 +624,7 @@ fn expired() -> Response {
     )
 }
 
-fn server_trouble() -> Response {
+pub(crate) fn server_trouble() -> Response {
     page(
         StatusCode::INTERNAL_SERVER_ERROR,
         "Sign-in failed",
@@ -580,7 +633,8 @@ fn server_trouble() -> Response {
 }
 
 /// The one stylesheet every page here carries, inline. The policy allows exactly it.
-const STYLE: &str = "body{margin:0;font:16px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;\
+pub(crate) const STYLE: &str =
+    "body{margin:0;font:16px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;\
 color:#1d1d1f;background:#f5f5f7;display:flex;justify-content:center}\
 main{max-width:28rem;margin:4rem 1.25rem;padding:2rem;background:#fff;border-radius:12px;\
 box-shadow:0 1px 3px rgba(0,0,0,.12)}\
@@ -704,7 +758,7 @@ pub(crate) fn slow_down_page() -> Response {
     )
 }
 
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
@@ -739,7 +793,7 @@ fn loopback_redirect(redirect: &str) -> bool {
 }
 
 /// The client's own state: 16 to 128 characters from the URL unreserved set.
-fn client_state_shaped(state: &str) -> bool {
+pub(crate) fn client_state_shaped(state: &str) -> bool {
     (16..=128).contains(&state.len())
         && state
             .bytes()

@@ -27,6 +27,26 @@ static TOKEN: LazyLock<Gate> = LazyLock::new(|| Gate::new(PER_KEY, GLOBAL, WINDO
 static JOIN: LazyLock<Gate> = LazyLock::new(|| Gate::new(JOIN_PER_KEY, JOIN_GLOBAL, WINDOW));
 const JOIN_PER_KEY: usize = 3;
 const JOIN_GLOBAL: usize = 30;
+/// The passkey ceremonies. A sign-in is two posts and a sign-up four, so a person who mistypes
+/// a few times still gets through; each `begin` stores a row and each `finish` checks a
+/// signature, so one address cannot make many.
+static PASSKEY: LazyLock<Gate> = LazyLock::new(|| Gate::new(30, 600, WINDOW));
+/// The calls that take something to guess or spend: a recovery code, a claim link. Tight.
+static PASSKEY_SECRET: LazyLock<Gate> = LazyLock::new(|| Gate::new(8, 120, WINDOW));
+
+/// The gate for a passkey path, and a name for the log.
+fn passkey_gate(path: &str) -> Option<(&'static Gate, &'static str)> {
+    match path {
+        "/v1/auth/passkey/recover/begin" | "/v1/auth/passkey/recover/finish" => {
+            Some((&PASSKEY_SECRET, "/v1/auth/passkey/recover"))
+        }
+        "/v1/auth/passkey/claim/peek"
+        | "/v1/auth/passkey/claim/begin"
+        | "/v1/auth/passkey/claim/finish" => Some((&PASSKEY_SECRET, "/v1/auth/passkey/claim")),
+        path if path.starts_with("/v1/auth/passkey/") => Some((&PASSKEY, "/v1/auth/passkey")),
+        _ => None,
+    }
+}
 
 struct Gate {
     per_key: usize,
@@ -77,6 +97,7 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
         (&Method::POST, "/v1/auth/start") => Some(&*START),
         (&Method::POST, "/v1/auth/token") => Some(&*TOKEN),
         (&Method::POST, "/v1/auth/join") => Some(&*JOIN),
+        (&Method::POST, path) => passkey_gate(path).map(|(gate, _)| gate),
         _ => None,
     };
     if let Some(gate) = gate {
@@ -89,7 +110,7 @@ pub async fn guard(request: Request<Body>, next: Next) -> Response {
                 "/v1/auth/start" => "/v1/auth/start",
                 "/v1/auth/token" => "/v1/auth/token",
                 "/v1/auth/join" => "/v1/auth/join",
-                _ => "unknown",
+                path => passkey_gate(path).map_or("unknown", |(_, route)| route),
             };
             tracing::warn!(route, "rate limited");
             if request.uri().path() == "/v1/auth/join" {

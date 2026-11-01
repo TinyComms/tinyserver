@@ -16,6 +16,7 @@ mod messages;
 mod observe;
 mod oidc;
 mod operator;
+mod passkey;
 mod reports;
 mod scan_clamd;
 mod session;
@@ -27,6 +28,7 @@ pub use limit::trust_proxies;
 pub use live::{Limits, Live};
 pub use oidc::{ConfigError, ProviderConfig, SignIn, SignInConfig, SignupConfig};
 pub use operator::Operator;
+pub use passkey::{claim_url, Passkeys};
 pub use scan_clamd::{engine_from_env, scanning_off, select_engine, NoScan, ScanBootError};
 
 use std::sync::Arc;

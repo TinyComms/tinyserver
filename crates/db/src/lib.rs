@@ -68,13 +68,6 @@ pub use operator::{
     OperatorError, OperatorState, NOTICE_MAX,
 };
 pub use outbox::{outbox_after, outbox_bounds, OutboxBounds, OutboxRow, WAKE_CHANNEL};
-pub use reports::{
-    file_report, get_report, list_reports, retention_days, retention_days_from, update_report,
-    Filed, NewReport, Person, ReportDetail, ReportError, ReportNote, ReportPatch, ReportQuery,
-    ReportSummary, CATEGORIES as REPORT_CATEGORIES, EVIDENCE_MAX as REPORT_EVIDENCE_MAX,
-    KINDS as REPORT_KINDS, NOTE_MAX as REPORT_NOTE_MAX, RETENTION_DEFAULT_DAYS, RETENTION_MAX_DAYS,
-    RETENTION_MIN_DAYS, STATUSES as REPORT_STATUSES,
-};
 pub use passkey::{
     begin_ceremony, begin_continue, claim, claim_hash, claim_link_for_me, codes_left,
     credential_ids_of, display_name_of, find_credential, flag_credential, invite_usable, list_mine,
@@ -83,6 +76,13 @@ pub use passkey::{
     roster, session_is_recent, signup, subject_of, take_ceremony, Ceremony, Claim, Found,
     NewCeremony, NewCredential, PasskeyError, PasskeyRow, PendingPeek, Recovery, Retired,
     RosterRow, Signup, CEREMONY_SECS, CONTINUE_SECS, PASSKEY_ISSUER, RECOVERY_CODES,
+};
+pub use reports::{
+    file_report, get_report, list_reports, retention_days, retention_days_from, update_report,
+    Filed, NewReport, Person, ReportDetail, ReportError, ReportNote, ReportPatch, ReportQuery,
+    ReportSummary, CATEGORIES as REPORT_CATEGORIES, EVIDENCE_MAX as REPORT_EVIDENCE_MAX,
+    KINDS as REPORT_KINDS, NOTE_MAX as REPORT_NOTE_MAX, RETENTION_DEFAULT_DAYS, RETENTION_MAX_DAYS,
+    RETENTION_MIN_DAYS, STATUSES as REPORT_STATUSES,
 };
 pub use roles::{
     create_role, delete_role, list_roles, order_roles, update_role, NewRole, Role, RolePatch,
