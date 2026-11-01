@@ -1,6 +1,6 @@
 # End-to-end encrypted text and attachments
 
-Status: **specification, version 1.** The server side lives in `crates/api/src/e2ee_text/` and `crates/db/migrations/0020`–`0029`; the client side in tinyclient's `crates/e2ee` and the Tiny adapter. Where this document and the code disagree, the code is wrong or this document is out of date: open an issue. Calls already have end-to-end encryption (`docs/calls.md`); this is the same family of design for stored text.
+Status: **specification, version 1. Not implemented on main.** No code in this repository encrypts text or attachments yet: message bodies and attachments are stored and served in plaintext. The server side is planned for `crates/api/src/e2ee_text/` and new migrations; the client side for tinyclient's `crates/e2ee` and the Tiny adapter. Once that code merges, where this document and the code disagree, the code is wrong or this document is out of date: open an issue. Calls already have end-to-end encryption (`docs/calls.md`); this is the same family of design for stored text.
 
 Nothing here is "implemented" until its tests pass. Section 11 lists the tests that stand for each property, and section 12 says what is not covered.
 
