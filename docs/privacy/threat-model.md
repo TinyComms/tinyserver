@@ -4,7 +4,7 @@ Who can attack tinyserver and tinyclient, what each of them can reach today, and
 
 Read [`README.md`](README.md) for the status words (implemented, in progress, designed, not done, not verified). The findings that led to the fixes cited here are in [`findings.md`](findings.md). What is still unreviewed is in [`remaining-risks.md`](remaining-risks.md).
 
-**State of the code this describes:** tinyserver `origin/main` at `c4ae28b` (first written on `ea3cd39`; re-checked after #20 added abuse reports, operator suspension and legal hold, tenants and encrypted backups), and tinyclient at `26916e9` (read only). Text and attachment end-to-end encryption (E2EE) is specified in [`../e2ee-text.md`](../e2ee-text.md) and **in progress** elsewhere: specification, not implemented on main. Every statement below that depends on it says so.
+**State of the code this describes:** tinyserver `origin/main` at `c4ae28b` (first written on `ea3cd39`; re-checked after #20 added abuse reports, operator suspension and legal hold, tenants and encrypted backups), and tinyclient at `26916e9` (read only). Text and attachment end-to-end encryption (E2EE) is specified in [`../e2ee-text.md`](../e2ee-text.md); its server side is implemented and tested (#23), and its client side is on tinyclient's `hardening/e2ee-core`, not merged. Every statement below that depends on it says so.
 
 ## 1. What is protected
 
@@ -88,7 +88,7 @@ Roles are enforced in Postgres (`docs/server.md` "Permissions"), and the owner f
 | Kick, ban, time out, move, mute, end a share | Audited |
 | Read all plaintext messages in channels they can view (they are members) | Not audited |
 | Create bots with `members.read` and `rooms.read` scopes that see occupancy and presence | `bot.create` is audited |
-| See nothing of other members' E2EE conversations they are not part of. **In progress**, not verified | n/a |
+| See nothing of other members' E2EE conversations they are not part of. Server side implemented, tested (`e2ee_text.rs` `nothing_of_another_conversation_is_reachable`, `a_device_reads_only_its_own_welcome_and_nothing_from_before_it_joined`) | n/a |
 
 A moderator cannot delete another member's message in an encrypted conversation (specified: there is no moderator delete in v1, `docs/e2ee-text.md` section 5). That is an abuse-handling cost of E2EE; see [`abuse-response.md`](abuse-response.md).
 
@@ -97,11 +97,11 @@ A moderator cannot delete another member's message in an encrypted conversation 
 | Can | Cannot |
 |---|---|
 | Read every HTTP request and WebSocket frame for the chat and auth hostnames: the `Authorization` bearer token, all plaintext JSON, uploaded files, the IP address of each client, and timing and sizes | See media on the media port (it is not proxied) |
-| Replay or alter traffic, and impersonate the origin to clients, because it holds the TLS certificate for the hostname | Read E2EE ciphertext (**in progress**) or call frames sealed by DAVE. It never receives the media port's traffic, but see the note below on signaling |
+| Replay or alter traffic, and impersonate the origin to clients, because it holds the TLS certificate for the hostname | Read the content of an encrypted conversation (server side implemented, client not verified) or call frames sealed by DAVE. It never receives the media port's traffic, but see the note below on signaling |
 | Learn the DTLS fingerprints in call signaling | |
 | Block or throttle the hostname | |
 
-A session token seen by Cloudflare is a bearer credential for up to 30 days (`TINYSERVER_SESSION_MAX_DAYS`, default 30). Nothing in the application binds a token to a device or an address (`sessions` has no such column; `0001_init.sql`, `0004_oidc.sql`). This matters if the Cloudflare account, or the tunnel token (`TUNNEL_TOKEN`), is compromised: whoever controls the hostname can serve their own origin for it and receive whatever clients send, bearer tokens included. E2EE-sealed content is outside that reach (calls today; text **in progress**). A transport-only call is not: the DTLS fingerprint that authenticates the media connection travels in the signaling Cloudflare carries, so whoever controls signaling can substitute their own endpoint. Not tested.
+A session token seen by Cloudflare is a bearer credential for up to 30 days (`TINYSERVER_SESSION_MAX_DAYS`, default 30). Nothing in the application binds a token to a device or an address (`sessions` has no such column; `0001_init.sql`, `0004_oidc.sql`). This matters if the Cloudflare account, or the tunnel token (`TUNNEL_TOKEN`), is compromised: whoever controls the hostname can serve their own origin for it and receive whatever clients send, bearer tokens included. E2EE-sealed content is outside that reach (calls today; text on the server side, client not merged). A transport-only call is not: the DTLS fingerprint that authenticates the media connection travels in the signaling Cloudflare carries, so whoever controls signaling can substitute their own endpoint. Not tested.
 
 ### 3.6 The hosting provider (cloud, colo, or whoever has the hypervisor)
 
@@ -115,7 +115,7 @@ Everything on the machine is available to whoever controls it: disk, memory, net
 | The Docker log files (`json-file`, 10 MB times 3 per container) | Operator log lines carry user ids and timestamps (see [`telemetry-and-logging.md`](telemetry-and-logging.md)) |
 | Packet metadata on every network interface, including the media port: client IPs, ports, sizes, timing | Cannot be hidden by anything the application does ([`network.md`](network.md) section 9) |
 
-Without E2EE the provider can read what the server can read. With E2EE (text **in progress**; calls implemented) it can read only metadata, plus anything it takes from a client.
+Without E2EE the provider can read what the server can read. With E2EE (calls implemented; text implemented on the server, client not merged) it can read only metadata, plus anything it takes from a client.
 
 ### 3.7 TinyCloud staff (the operator)
 
@@ -134,7 +134,7 @@ Code-level capabilities of anyone with shell access to the stack (read from `dep
 | Read every abuse report | The owner role bypasses the `reports_select` policy. Reporters, evidence and moderators' notes are readable ([`abuse-response.md`](abuse-response.md), "What this does not do") |
 | Read everything in 3.6 | Host access |
 
-These are the reason the plaintext-today state cannot support the sentence "the operator cannot read your messages". For E2EE conversations the specification closes the impersonation path for a person who already has a device: a new device must carry a cross-signature from an existing one, and clients verify it themselves (`docs/e2ee-text.md` section 3). It does not close it for a person's first device or for a person with no devices (trust on first use), and it does not help calls (finding S10).
+These are the reason plaintext conversations cannot support the sentence "the operator cannot read your messages". For E2EE conversations the design closes the impersonation path for a person who already has a device: a later device must carry a cross-signature from an active one, the server refuses one without (`a_later_device_needs_a_cross_signature_from_an_active_one`), and clients verify it themselves (`docs/e2ee-text.md` section 3; client not verified). It does not close it for a person's first device, for a person with no devices (trust on first use), or for a new person the server admits (G3, G4 in `e2ee-text.md` section 8, open), and it does not help calls (finding S10).
 
 **Operational controls** (separate roles, access logging, two-person approval, no shell access to tenants' data volumes) are an engineering and policy decision for TinyCloud that this repository does not implement. They are not guarantees. Anything that depends on them goes into category 2 of [`guarantees.md`](guarantees.md), never category 1.
 
@@ -144,7 +144,7 @@ These are the reason the plaintext-today state cannot support the sentence "the 
 
 ### 3.9 The identity provider
 
-Pocket ID in the compose file, or any OIDC provider the operator configures. An IdP that is compromised, or whose administrator is hostile, can issue an ID token for any `(issuer, subject)` and so sign in as any existing member, or as a new person if the community admits by group claim (`TINYSERVER_OIDC_MEMBER_GROUPS`). Signing in never grants decryption ([`deploy/README.md`](../../deploy/README.md)); in an E2EE conversation a person signing in as someone else gets a new device that other members see as new (specified).
+Pocket ID in the compose file, or any OIDC provider the operator configures. An IdP that is compromised, or whose administrator is hostile, can issue an ID token for any `(issuer, subject)` and so sign in as any existing member, or as a new person if the community admits by group claim (`TINYSERVER_OIDC_MEMBER_GROUPS`). Signing in never grants decryption ([`deploy/README.md`](../../deploy/README.md)); in an E2EE conversation a person signing in as someone else gets a new device that other members see as new (client behaviour, not verified).
 
 Pocket ID is third-party software. Its own data (usernames, optional email, passkey public keys, an audit log with client IP addresses kept 90 days by default) is described in [`authentication.md`](authentication.md) and [`metadata.md`](metadata.md).
 
@@ -156,7 +156,7 @@ Pocket ID is third-party software. Its own data (usernames, optional email, pass
 | The `media` network, including clamd, and from there the internet (`media` has a route out) | Other containers' filesystems; the root filesystem is read only and all capabilities are dropped (`deploy/compose.yml`) |
 | The Pocket ID API key (a mounted secret): it can create Pocket ID accounts and sign-up tokens | |
 
-Row-level security does not contain this. A flaw that executes arbitrary SQL as `app_runtime` reads and writes every table (finding S2, limits). Defence in depth available: resource limits (finding S14), egress rule on the host, and sealing of message content (**in progress**), which makes the stored data ciphertext.
+Row-level security does not contain this. A flaw that executes arbitrary SQL as `app_runtime` reads and writes every table (finding S2, limits). Defence in depth available: resource limits (finding S14), egress rule on the host, and sealing of message content (server side implemented and tested in #23; client not merged), which makes the stored data ciphertext.
 
 ### 3.11 A compromised or hostile client device
 
@@ -164,7 +164,7 @@ Reads everything that device can: its keychain items (sessions per network, E2EE
 
 ### 3.12 Legal process and seizure
 
-A valid order served on TinyCloud, on the hosting provider, on Cloudflare or on the payment processor can reach what each of them holds. What TinyCloud holds is exactly the data in [`metadata.md`](metadata.md). What it can say is bounded by that inventory: it cannot produce message text of an E2EE conversation (**in progress**), and it can produce everything else in the table. The technical readiness questions are in [`compliance.md`](compliance.md), and the process for reports and orders in [`abuse-response.md`](abuse-response.md). No legal conclusion is drawn here.
+A valid order served on TinyCloud, on the hosting provider, on Cloudflare or on the payment processor can reach what each of them holds. What TinyCloud holds is exactly the data in [`metadata.md`](metadata.md). What it can say is bounded by that inventory: it cannot produce message text of an E2EE conversation (server side implemented and tested in #23; client not merged), and it can produce everything else in the table. The technical readiness questions are in [`compliance.md`](compliance.md), and the process for reports and orders in [`abuse-response.md`](abuse-response.md). No legal conclusion is drawn here.
 
 ### 3.13 Other third parties
 
@@ -187,7 +187,7 @@ The product goal is "enforceable by architecture". This table says which parts o
 | Property | Enforced by | Status |
 |---|---|---|
 | The server cannot hear an end-to-end call | MLS between apps; server is delivery service and external sender, holds no group secret (`crates/api/src/live/e2ee.rs`) | Implemented; downgrade by the server is possible and shown by clients (S4) |
-| The server cannot read text and attachments of an E2EE conversation | MLS groups per conversation, sealed uploads | **In progress**, not verified |
+| The server cannot read text and attachments of an E2EE conversation | MLS groups per conversation, sealed uploads | Server: implemented, tested (`a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server`). Client: not verified |
 | The server cannot read text of existing conversations | Nothing | **Not done**: existing conversations stay plaintext, never converted in place |
 | A member sees only channels they may view | Row-level security, definer functions, outbox audience (`0013`) | Implemented, tested |
 | The runtime role cannot bypass row-level security or change schema | `app_runtime` is `NOSUPERUSER NOBYPASSRLS`; owner password only in `tinyserver-init` | Implemented, tested (`deploy/tests/isolation.sh`, `roles.sh`; shell checks, Docker, not in CI) |
@@ -202,17 +202,17 @@ The product goal is "enforceable by architecture". This table says which parts o
 
 ## 5. Scenarios walked through
 
-**A. Operator wants to read a particular DM, today.** Reads `messages.body` with `app_owner` or from a backup. Nothing prevents it, and it leaves no trace. After text E2EE is merged and the conversation was created encrypted: the operator has ciphertext, `author_id`, timestamps and sizes. It can add a ghost device only by becoming a person who has no device (first-device trust on first use), or by a cross-signed device, which needs a key it does not hold; clients show new devices and changed safety numbers.
+**A. Operator wants to read a particular DM, today.** Reads `messages.body` with `app_owner` or from a backup. Nothing prevents it, and it leaves no trace. For a conversation created encrypted (server side in #23; the client must also ship): the operator has ciphertext, `author_id`, timestamps, sizes and reactions. It can add a ghost device only by becoming a person who has no device (first-device trust on first use), or by a cross-signed device, which needs a key it does not hold; clients show new devices and changed safety numbers. It can still admit a new account of its own to the conversation (G3, G4, open).
 
 **B. Operator wants to listen to a call.** Must send `off` frames or claim someone cannot encrypt. Every client in the call displays that the call is "encrypted to the server" and names who it says cannot encrypt. A client in `required` mode (opt-in, off by default, finding S4) blocks instead. So: detectable by a person watching, not preventable by the server.
 
 **C. Operator adds itself to a call as a member.** It needs a key package with a credential holding the 8 byte MLS id of a roster name. Apps refuse a proposal to add anyone the call's roster does not name (`docs/calls.md`), but the roster is server-provided (S10). Verified safety numbers are the defence.
 
-**D. Database or backup stolen.** A bundle from `operator.sh backup` is age-encrypted; the case below is a thief who also has a matching identity (the operator's, or the tenant's `backup.key` from the same host), or a raw volume. Today: all plaintext text, member list, emails, avatars, audit log, abuse reports with their evidence. Session and invite tokens are hashes of 32 random bytes and cannot be replayed. Pocket ID's SQLite is in another volume (`pocketid_data`) with its key in `secrets/`; both would need to be taken. After E2EE: text of encrypted conversations is ciphertext, and a restore older than the clients' state is detected by clients (specified).
+**D. Database or backup stolen.** A bundle from `operator.sh backup` is age-encrypted; the case below is a thief who also has a matching identity (the operator's, or the tenant's `backup.key` from the same host), or a raw volume. Today: all plaintext text, member list, emails, avatars, audit log, abuse reports with their evidence. Session and invite tokens are hashes of 32 random bytes and cannot be replayed. Pocket ID's SQLite is in another volume (`pocketid_data`) with its key in `secrets/`; both would need to be taken. For conversations created encrypted (#23): their text and sealed files are ciphertext, but the bundle also holds the server's external sender private key (finding N15) and all metadata; a restore older than the clients' state is detected by clients (client behaviour, not verified).
 
 **E. Cloudflare account compromised.** The attacker can serve its own origin for the hostname and collect sign-in codes. It can also read traffic to the real origin. Sealed content is safe; metadata and bearer tokens are not.
 
-**F. A person's device is stolen unlocked.** Everything on it, including a live session. `DELETE /v1/sessions` ends sessions; devices are revoked with `DELETE /v1/e2ee/devices/{id}` (specified). History already on the device stays readable to the thief.
+**F. A person's device is stolen unlocked.** Everything on it, including a live session. `DELETE /v1/sessions` ends sessions; devices are revoked with `DELETE /v1/e2ee/devices/{id}` (`a_revoked_device_is_removed_and_gets_nothing_more`). History already on the device stays readable to the thief.
 
 ## 6. Assumptions
 

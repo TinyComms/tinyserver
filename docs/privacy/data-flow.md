@@ -2,7 +2,7 @@
 
 What moves where, who handles it on the way, and what is written down. One table per flow. "Form" is plaintext, TLS-only (the receiving party decrypts it), sealed (only the endpoints can read it) or hash (a one-way digest is kept, not the value).
 
-Read with [`metadata.md`](metadata.md) (every place data rests), [`network.md`](network.md) (addresses) and [`threat-model.md`](threat-model.md) (who the parties are). Status words are explained in [`README.md`](README.md). **Text and attachment E2EE is in progress**; where it changes a flow, the flow is shown twice, "today" and "specified" ([`../e2ee-text.md`](../e2ee-text.md)).
+Read with [`metadata.md`](metadata.md) (every place data rests), [`network.md`](network.md) (addresses) and [`threat-model.md`](threat-model.md) (who the parties are). Status words are explained in [`README.md`](README.md). **Text and attachment E2EE: the server side is implemented and tested (#23); the client side is not merged.** Where it changes a flow, the flow is shown twice, a plaintext conversation and an encrypted one ([`../e2ee-text.md`](../e2ee-text.md)). Steps the client performs are the specification, not verified here.
 
 Parties: **C** = tinyclient on a person's device. **CF** = Cloudflare. **S** = tinyserver (HTTP, live socket, SFU in one process). **DB** = Postgres. **IdP** = Pocket ID (or another OIDC provider). **AV** = clamd. **FS** = the upload volume.
 
@@ -48,17 +48,17 @@ A returning member skips steps 3 and 4 (the IdP signs them in) and step 7 only f
 | 4 | Edit | `PATCH /v1/messages/{id}`. A trigger (`0014`) rewrites the earlier outbox rows to the new text so a reconnecting socket is not replayed the old one | Plaintext | `messages.edited_at`; old text is gone from the table and outbox, but not from WAL, dead rows or backups |
 | 5 | Delete | `DELETE /v1/messages/{id}`: body cleared, attachments and reactions removed, files unlinked, `deleted_at` set. The row stays | | The tombstone: author, `created_at`, `deleted_at` |
 
-### Specified (an encrypted conversation, **in progress**; specification, not implemented on main)
+### An encrypted conversation (server implemented and tested, #23; client steps specified, not verified)
 
 | # | From to | What | Form |
 |---|---|---|---|
 | 1 | C encrypts | An MLS application message (RFC 9420) holding JSON `{v, text, reply_to, attachments[], sent_at}` | Sealed. Only group members' devices have keys |
-| 2 | C to S via CF | `{ciphertext, epoch, device_id, client_id, kind, target_id?, attachment_ids?}`. A request with a `body` is refused (`400 e2ee_required`) | CF and S see ciphertext and these fields |
-| 3 | S to DB | `messages` row with `body = ''`, `ciphertext`, `epoch`, `device_id`, `kind`, and the outbox row | Ciphertext at rest |
+| 2 | C to S via CF | `{ciphertext, epoch, device_id, client_id, kind, target_id?, attachment_ids?}`. A request with a `body` is refused (`400 e2ee_required`), and so is one whose `kind` or `target_id` differ from the message's authenticated data | CF and S see ciphertext and these fields |
+| 3 | S to DB | `messages` row with `body = ''`, `ciphertext`, `epoch`, `device_id`, `kind`, and the outbox row (ciphertext only; the `last_message` preview is empty) | Ciphertext at rest |
 | 4 | S to members | The ciphertext. Members whose Remove is pending get nothing | |
-| 5 | Group changes | Public MLS handshake messages (proposals, commits, welcomes) are stored in a handshake log. They hold no secret that opens a message | |
+| 5 | Group changes | Public MLS handshake messages (proposals, commits, welcomes) are stored in a handshake log, and the public ratchet trees of the last 8 epochs in `e2ee_trees`. They hold no secret that opens a message | Welcomes for 30 days; proposals and commits while the group exists |
 
-Visible to S even when encrypted: who posted, which conversation, when, ciphertext size, the number and sizes of attachments, reactions (not encrypted in v1), who is in the group, which devices a person has. Not visible: text, edits, reply text, attachment contents, names and types. Source: `docs/e2ee-text.md` sections 1 and 6.
+Visible to S even when encrypted: who posted, which conversation, when, ciphertext size, the number and sizes of attachments, reactions (not encrypted in v1), who is in the group, which devices a person has. Not visible: text, edits, reply text, attachment contents, names and types. Source: `docs/e2ee-text.md` sections 1 and 6. Evidence: `crates/api/tests/e2ee_text.rs` `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server` (no table, log line, upload file or temporary file holds the canary), `a_group_forms_and_the_server_stores_only_ciphertext`.
 
 ## 4. Attachments
 
@@ -76,15 +76,15 @@ Visible to S even when encrypted: who posted, which conversation, when, cipherte
 
 Uploads nobody attached within an hour are deleted by the sweep (every 10 minutes). Evidence: `crates/api/tests/messages.rs` (`an_eicar_upload_is_blocked`, `a_message_cannot_name_an_unscanned_attachment`, `a_scanning_attachment_download_is_locked`, `a_bad_hmac_is_refused`).
 
-### Specified (sealed upload, **in progress**; specification, not implemented on main)
+### Sealed upload (server implemented and tested, #23; client steps specified, not verified)
 
-The client encrypts the file with AES-256-GCM in the STREAM construction under a random key held only inside the MLS message, and posts `sealed=1`. S stores the blob once, as received, with fixed name `sealed` and type `application/octet-stream`. No sniffing, no image decoding, **no virus scan**: the specification states the server must not claim to scan sealed files. Size, rate, orphan cleanup and "only linkable into an encrypted conversation" are still enforced. Source: `docs/e2ee-text.md` section 5.
+The client encrypts the file with AES-256-GCM in the STREAM construction under a random key held only inside the MLS message, and posts `sealed=1`. S writes the blob once, as received, to its final path, with fixed name `sealed` and type `application/octet-stream`: no temporary file, so finding S9 does not apply. No sniffing, no image decoding, **no virus scan**, and the server must not claim to scan sealed files. The only content check is the blob's framing. The client may choose the upload id, so the blob's first chunk can be bound to `conversation_id ‖ attachment_id`. Size, rate, orphan cleanup and "only linkable into an encrypted conversation" are still enforced. Source: `docs/e2ee-text.md` section 5. Evidence: `e2ee_text.rs` `a_sealed_upload_is_opaque_and_stored_as_it_came`, `sealed_uploads_have_a_size_limit_and_a_rate`, `an_orphaned_sealed_upload_is_swept_with_its_file`.
 
 ## 5. Live events (the outbox)
 
 Every change is an `outbox` row written in the transaction that made it. S's single dispatcher reads rows after a wake (`LISTEN app_wake`), sends them through an in-process broadcast, and each socket filters by audience and permissions. Kept 24 hours, then deleted (`app_sweep`, every 10 minutes). A reconnecting client replays from `?since=`. Source: `docs/calls.md` "Outbox and LISTEN/NOTIFY".
 
-What an outbox payload holds today: member objects (user id, display name, role, avatar hash), room and channel objects (name, topic, overrides), and full message objects with plaintext bodies. `0014` deletes the outbox rows that carry a deleted account's `member.*` events and rewrites message events when a message is edited or deleted. Evidence: `deleting_an_account_removes_the_person_and_what_they_said`.
+What an outbox payload holds today: member objects (user id, display name, role, avatar hash), room and channel objects (name, topic, overrides), and full message objects: plaintext bodies for plaintext conversations, ciphertext only for encrypted ones (removed from the outbox when the message is deleted). `0014` deletes the outbox rows that carry a deleted account's `member.*` events and rewrites message events when a message is edited or deleted. Evidence: `deleting_an_account_removes_the_person_and_what_they_said`.
 
 ## 6. A call
 

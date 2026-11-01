@@ -1,6 +1,12 @@
 # End-to-end encrypted text and attachments
 
-Status: **specification, version 1.** The server side lives in `crates/api/src/e2ee_text/` and `crates/db/migrations/0020`–`0023`; the client side in tinyclient's `crates/e2ee` and the Tiny adapter. Where this document and the code disagree, the code is wrong or this document is out of date: open an issue. Calls already have end-to-end encryption (`docs/calls.md`); this is the same family of design for stored text.
+Status: **version 1. The server side is implemented and tested on main; the client side is not merged.**
+
+- **Built (server):** `crates/api/src/e2ee_text/` and `crates/db/migrations/0020`–`0023`: devices and cross-signatures, key packages, one MLS group per encrypted conversation with the server as delivery service and external sender, membership kept in step with permissions, ciphertext posts and edits bound to their authenticated data, no downgrade either way, sealed uploads, ratchet trees served apart from the Welcome, a device cap per group, the `required` mode, the community root key and its signed policy, and refusal of every encrypted write while the community is suspended. The tests are in section 11; `crates/api/tests/e2ee_text.rs` passes.
+- **Not merged (client):** tinyclient's `crates/e2ee` and the Tiny adapter, on its `hardening/e2ee-core` branch. Until it ships, no conversation is encrypted in practice, and every property that rests on a client check against a hostile server (sections 3, 8 and 9) is unverified.
+- **Left to do:** G2 to G5 and G9 in section 8, encrypted reactions, coarse timestamps and padding.
+
+Where this document and the code disagree, the code is wrong or this document is out of date: open an issue. Calls already have end-to-end encryption (`docs/calls.md`); this is the same family of design for stored text. What can and cannot be promised from this is in `docs/privacy/guarantees.md` (G1.3 to G1.7).
 
 Nothing here is "implemented" until its tests pass. Section 11 lists the tests that stand for each property, and section 12 says what is not covered.
 
@@ -133,7 +139,7 @@ Validations that remain possible on the server: size, per-user upload rate and d
 
 The server stores, for an encrypted message: ids, timestamps, `epoch`, `device_id`, `kind`, `target_id`, the ciphertext, and for each attachment its id, ciphertext size and uploader. `messages.body` is the empty string. The `last_message` preview of an encrypted channel is empty, the outbox and live events carry the ciphertext only, and a deleted message loses its ciphertext in the outbox too. No log line carries a ciphertext, a key package, a commit, a Welcome, a proposal, a tree or a key (`crates/server/src/log_policy.rs`). Group state is the handshake log (public MLS handshake messages), the public ratchet trees of recent epochs, the device and key package tables, and the external sender key. No table holds a key that opens a message, and no table, log line or file holds plaintext of an encrypted message: a test says a canary through every encrypted path and looks for it everywhere.
 
-The client stores MLS state through the OS keychain-protected key, and caches decrypted messages encrypted with a per-install key kept in the OS keychain, never with the key in the same file.
+The client (not merged, see the status) stores MLS state through the OS keychain-protected key, and caches decrypted messages encrypted with a per-install key kept in the OS keychain, never with the key in the same file.
 
 ## 7. What a person sees
 
@@ -145,6 +151,23 @@ The client stores MLS state through the OS keychain-protected key, and caches de
 
 ## 8. Known gaps
 
+Open work, with the labels other documents use (they follow TinyCloud's `design/security.md` sections 2 and 3; G1, large groups, is done, section 4):
+
+| Label | Gap | Where the work is |
+|---|---|---|
+| G2 | Groups per permission audience, a commit batching window and committer selection. Until then a group is capped at `e2ee_group_devices_max` devices (section 4) | Server and client |
+| G3 | Invite capability keys: an invite's secret in the URL fragment, certified by an admin device that chains to the community root | Client first, then an invite column on the server |
+| G4 | The first-device capability signature, so a first device proves the invite it came through | Client first, then a device column on the server |
+| G5 | Binding the group to its conversation in a GroupContext extension | Client; the server only passes it through |
+| G7 | Padding of ciphertexts and sealed blobs | Client and schema |
+| G8 | Coarse timestamps | Client and schema |
+| G9 | The server's external sender private key is a row in Postgres (`e2ee_server_key`), so it is in every backup; move it to a secret file | Server |
+| | Encrypted reactions | Client and schema |
+| | `e2ee_group_devices_max` is settable only in SQL, not through `PATCH /v1/server` | Server |
+| | An uploaded ratchet tree is checked for its own signatures, not against the epoch (the server cannot see the GroupInfo); a bad tree stops only a joiner, who checks the tree hash | By design |
+
+The rest of this section is what the design does not protect against even when that work is done, or until it is:
+
 - **Reactions** are plaintext in v1 (emoji, message, user). They reveal who reacted to which message id, not what the message says.
 - **Mentions and search** work only on the client, on decrypted text.
 - **The server's external sender key** can add a ghost device only if clients accept an Add whose credential has no cross-signed device behind it; they do not. Clients still must check, so a client bug removes this protection.
@@ -152,7 +175,7 @@ The client stores MLS state through the OS keychain-protected key, and caches de
 - **A first device is trust on first use.** A malicious server that is present when a person first registers could substitute the key of that first device; verifying safety numbers out of band is the only defence.
 - **Compromised endpoint** reads everything the device can.
 - **Removal latency** as described in section 4.
-- **Membership is the server's word.** A malicious server can create an account, grant it `view_channel`, and it joins with its own first device; cross-signing does not help against a new person. The fix needs client work (invite capability keys and a community root key, `design/security.md` section 2.8 in tinycloud) and is not in this version.
+- **Membership is the server's word.** A malicious server can create an account, grant it `view_channel`, and it joins with its own first device; cross-signing does not help against a new person. The community root key and its signed policy are on the server (`/v1/e2ee/community`); the rest of the fix is G3 and G4 above (`design/security.md` section 2.8 in tinycloud) and is not in this version.
 - **Group size** is capped (section 4) until groups per permission audience exist.
 
 ## 9. Compatibility and migration
@@ -167,7 +190,7 @@ The client stores MLS state through the OS keychain-protected key, and caches de
 
 To move a community to encryption: create encrypted channels, tell people, and let an owner delete the plaintext ones (deleting a channel hard-deletes its messages, and the outbox scrub of `0014` covers edits). `tinyserver` does not offer an automatic converter: converting would copy plaintext into ciphertext made by the server, which would give the server the keys.
 
-Rollback: set `e2ee_text` to `off`. Existing encrypted conversations stay readable by clients and cannot be reopened for plaintext; there is no downgrade path by design. Backups of an encrypted conversation contain only ciphertext.
+Rollback: set `e2ee_text` to `off`. Existing encrypted conversations stay readable by clients and cannot be reopened for plaintext; there is no downgrade path by design. Backups of an encrypted conversation contain only ciphertext and public handshake state, plus the server's external sender private key (G9): it opens nothing, but whoever restores it can sign proposals as the server.
 
 Backup restore: a restored database restores ciphertext and the handshake log; a restore to an earlier time can roll a group back to an earlier epoch than the clients hold. Clients detect an epoch that went backwards and refuse to continue the group: the group is rebuilt (new group, welcome, history not carried).
 
@@ -204,7 +227,8 @@ Server (`crates/api/tests/e2ee_text.rs` and unit tests under `e2ee_text/`):
 - the device cap: a channel over it is not made, a group stops at it and says how many wait, and Adds per commit shrink as the group grows
 - `required`: no plaintext post, edit, conversation or upload; encrypted ones go on
 - the community root: set only by a manager with a signature by the key it names, the same for every member, a new root only with `replace` and announced to everyone
-- migration: old and new clients against old and new servers, as in section 9
+- suspension: in read-only and offline mode no encrypted post, sealed upload, key package or commit is taken
+- migration: an old client and old request shapes against the new server, as in section 9 (`old_requests_and_old_clients_keep_working`); a new client against an old server is the client's test
 
 Client (`crates/e2ee`): real openmls groups with 3 and 20 devices, add, remove, epoch change; a removed device cannot decrypt a later message; a new device cannot decrypt an earlier one; replay and tamper rejection; attachment encryption round trip, truncation, reorder, bit flip, wrong key; AES-GCM known-answer vectors from NIST and Wycheproof; property tests on the envelope codec and on chunk boundaries.
 

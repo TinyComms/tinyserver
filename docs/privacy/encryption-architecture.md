@@ -2,7 +2,7 @@
 
 A summary of what is encrypted, with what, who holds each key, and when it is made, rotated and lost. It links to the two specifications instead of repeating them: [`../calls.md`](../calls.md) ("End-to-end encryption") for calls and [`../e2ee-text.md`](../e2ee-text.md) for text and attachments. Where they disagree with this file, they win and this file is wrong.
 
-Status words are in [`README.md`](README.md). **Calls: implemented and tested. Text and attachments: specification, not implemented on main (`c4ae28b`); implementation in progress elsewhere, nothing about them is verified here. Backups: encrypted with age by `deploy/tenant/operator.sh` (#20).** TLS and DTLS-SRTP are transport encryption and are listed only so the boundary is clear.
+Status words are in [`README.md`](README.md). **Calls: implemented and tested. Text and attachments: the server side is implemented and tested (#23, `crates/api/tests/e2ee_text.rs`); the client side is on tinyclient's `hardening/e2ee-core`, not merged and not verified here. Backups: encrypted with age by `deploy/tenant/operator.sh` (#20).** TLS and DTLS-SRTP are transport encryption and are listed only so the boundary is clear.
 
 ## 1. The layers
 
@@ -12,10 +12,10 @@ Status words are in [`README.md`](README.md). **Calls: implemented and tested. T
 | Cloudflare tunnel (cloudflared to Cloudflare) | A network observer between host and Cloudflare | Cloudflare | In use |
 | DTLS-SRTP between client and SFU | A network observer on the media path | The SFU (it decrypts) | Implemented (`crates/sfu`) |
 | DAVE end-to-end encryption of call frames (MLS group per room call) | The SFU and its operator, Cloudflare, the network | The other participants' apps | Implemented; downgradable by the server, visibly |
-| MLS end-to-end encryption of text, edits, replies (group per conversation) | The server, its operator, its database, backups, Cloudflare | Members' devices | **In progress** |
-| Sealed attachments (AES-256-GCM STREAM, key in the MLS message) | Same | Members' devices | **In progress** |
-| Postgres and volumes | A stolen disk | Not encrypted by this stack. Whatever disk encryption the host has (on TinyCloud, the cell's fscrypt key, per [`tenancy.md`](tenancy.md); not in this repository) | No stack-level encryption; plaintext today for text and attachments |
-| Backup and export bundles (age; `age1` X25519, `ssh-ed25519` or `ssh-rsa` recipients) | Whoever holds the file without a matching identity | Whoever holds an identity for one of the recipients | Implemented: `deploy/tenant/operator.sh backup`, `export`; `deploy/tests/hooks.sh` (no plaintext in the file, another key cannot open it). The bundle's contents are plaintext text and attachments inside the encryption |
+| MLS end-to-end encryption of text, edits, replies (group per conversation) | The server, its operator, its database, backups, Cloudflare | Members' devices | Server: implemented, tested. Client: not verified |
+| Sealed attachments (AES-256-GCM STREAM, key in the MLS message) | Same | Members' devices | Server: implemented, tested. Client: not verified |
+| Postgres and volumes | A stolen disk | Not encrypted by this stack. Whatever disk encryption the host has (on TinyCloud, the cell's fscrypt key, per [`tenancy.md`](tenancy.md); not in this repository) | No stack-level encryption; plaintext for plaintext conversations, ciphertext for encrypted ones |
+| Backup and export bundles (age; `age1` X25519, `ssh-ed25519` or `ssh-rsa` recipients) | Whoever holds the file without a matching identity | Whoever holds an identity for one of the recipients | Implemented: `deploy/tenant/operator.sh backup`, `export`; `deploy/tests/hooks.sh` (no plaintext in the file, another key cannot open it). Inside the encryption the bundle holds plaintext conversations in plaintext, encrypted ones as ciphertext, and the text external sender private key (finding N15) |
 
 ## 2. Calls (implemented)
 
@@ -41,34 +41,35 @@ Tests that stand for these properties (server side): `crates/api/tests/e2ee.rs` 
 
 What no test shows: that no group secret ever reaches the server (it follows from the protocol and from the module's state, which has no field for one; `e2ee.rs` header and structs), and that an app really drops a clear frame during an E2EE call (client behaviour, per client `SECURITY.md`).
 
-## 3. Text (specified, in progress)
+## 3. Text (server implemented, client not merged)
 
-Everything in this section is the specification in [`../e2ee-text.md`](../e2ee-text.md). None of it is verified here.
+This section summarises [`../e2ee-text.md`](../e2ee-text.md). Rows about what the server does are implemented and tested by `crates/api/tests/e2ee_text.rs` (#23). Rows about what clients do are the specification and are not verified here.
 
-| Item | Specification |
+| Item | Detail |
 |---|---|
 | Protocol | MLS, same ciphersuite as calls, with `openmls` in tinyclient |
 | Group | One MLS group per encrypted conversation (channel or direct); the group id is the 16 byte conversation id; members are devices. Created with `"e2ee": true`; the flag never clears. **Existing conversations stay plaintext and are never converted in place** |
 | Device | One install of tinyclient signed in to an account. Random UUID device id; a P-256 signing key made on the device and never sent anywhere. The MLS credential is 32 bytes: user id then device id. The server refuses a key package whose credential is not the caller's |
-| Cross-signing | A person's first device is trusted on first use. Each later device carries an ECDSA P-256 cross-signature from an active device over `"tiny-e2ee-v1 device-add" || user_id || device_id || signature_key`. Clients verify the chain themselves. A server cannot add a device to an account that has devices without the person's own device approving it |
-| Server key | A **persistent** P-256 key (`e2ee_server_key`, generated at first start) used as MLS external sender to sign Add and Remove proposals only. Clients pin it on first sight and warn if it changes. Where it is stored is not stated in the specification (a database row is implied): so a database copy gives the key to its holder. Not verified |
-| Membership | The desired device set is every active device of every user who can view the conversation. The server records external proposals when that changes; any member device commits them. The first valid commit for an epoch wins. A removed member stops receiving ciphertext at once; loses future keys at the next commit. If no member device is online the commit waits |
+| Cross-signing | A person's first device is trusted on first use. Each later device carries an ECDSA P-256 cross-signature from an active device over `"tiny-e2ee-v1 device-add" || user_id || device_id || signature_key`. Clients verify the chain themselves. The server refuses a later device without a valid cross-signature (`a_later_device_needs_a_cross_signature_from_an_active_one`); against a hostile server only the clients' check counts. A new person is not covered (G3, G4 in `e2ee-text.md` section 8) |
+| Server key | A **persistent** P-256 key (`e2ee_server_key`, generated at first start) used as MLS external sender to sign Add and Remove proposals only. Clients pin it on first sight and warn if it changes. Stored as a row in Postgres, private key included (`the_servers_external_sender_is_one_key_kept_in_postgres`): a database copy or backup gives the key to its holder (finding N15). Moving it to a secret file is G9 |
+| Membership | The desired device set is every active device of every user who can view the conversation. The server records external proposals when that changes; any member device commits them. The first valid commit for an epoch wins. A removed member stops receiving ciphertext at once; loses future keys at the next commit. If no member device is online the commit waits. A group holds at most `e2ee_group_devices_max` devices (default 2,000); the rest wait and the count is reported |
 | New members and devices | Read nothing from before they were added |
 | History | Not re-encrypted on removal; removed members keep what they have |
-| Message | `ciphertext` (MLS PrivateMessage) plus `epoch`, `device_id`, `client_id`, `kind` (`message` or `edit`), optional `target_id` and `attachment_ids`. The server refuses a plaintext body to an encrypted conversation and a ciphertext to a plaintext one: no fallback |
+| Message | `ciphertext` (MLS PrivateMessage) plus `epoch`, `device_id`, `client_id`, `kind` (`message` or `edit`), optional `target_id` and `attachment_ids`. The server refuses a plaintext body to an encrypted conversation and a ciphertext to a plaintext one: no fallback. It also refuses a post whose `kind` and `target_id` differ from the message's MLS authenticated data |
 | Inside the ciphertext | JSON, UTF-8, at most 16 KiB: `v`, `text`, `reply_to`, `attachments[]` (id, key, name, mime, bytes, sha256, width, height), `sent_at` |
 | Client storage | MLS state through a key in the OS keychain; decrypted cache encrypted with a per-install keychain key, not in the same file |
 | Restore of the database to an earlier time | Clients detect an epoch that went backwards and refuse to continue; the group is rebuilt, history not carried |
-| Rollback | `e2ee_text=off` stops new encrypted conversations; existing encrypted ones stay readable by clients and cannot be reopened for plaintext |
+| Server setting | `e2ee_text`: `off` stops new encrypted conversations (existing ones stay readable by clients and cannot be reopened for plaintext); `required` refuses every plaintext post, edit, conversation and upload (`under_required_the_server_takes_no_plaintext_at_all`) |
+| Community root key | An owner's device publishes a P-256 root key and a policy it signed (`GET`/`PUT /v1/e2ee/community`); the server checks the signature, and replacing the root is audited and announced to every member. Clients pin it (client, not verified) |
 
-## 4. Attachments (specified, in progress)
+## 4. Attachments (server implemented, client not merged)
 
-| Item | Specification |
+| Item | Detail |
 |---|---|
 | Cipher | AES-256-GCM in the STREAM construction (RustCrypto `aead::stream`), 64 KiB chunks, random 256 bit key per attachment |
-| Blob | Header `TNYA1` ‖ log2 chunk size ‖ 7 byte nonce prefix, then chunks; attachment id and header as associated data for the first chunk |
+| Blob | Header `TNYA1` ‖ log2 chunk size ‖ 7 byte nonce prefix, then chunks. Associated data for the first chunk: the header and `conversation_id ‖ attachment_id` when the client chose the upload's id, else the header alone |
 | Where the key lives | Only inside the MLS message (`attachments[].key`) |
-| Upload | `POST /v1/media` with `sealed=1`: stored once as received, name and type fixed to `sealed` and `application/octet-stream`; no sniffing, no decoding, **no virus scan**; linkable only into an encrypted conversation |
+| Upload | `POST /v1/media` with `sealed=1`: stored once as received, name and type fixed to `sealed` and `application/octet-stream`; no sniffing, no decoding, **no virus scan**, no temporary file; the only content check is the blob's framing; linkable only into an encrypted conversation (`a_sealed_upload_is_opaque_and_stored_as_it_came`) |
 | Integrity | The client checks `sha256` of the downloaded ciphertext before decrypting, and decrypts as a stream |
 | Server can still check | Size, per-user rate and daily volume, orphan cleanup, that the id belongs to the uploader and is linked once |
 | Server cannot check | File type, malware, image parsing. Clients must sniff after decrypting, never open automatically, decode images with limits |
@@ -81,8 +82,9 @@ Everything in this section is the specification in [`../e2ee-text.md`](../e2ee-t
 | Call identity key (P-256) | tinyclient, first call | Plaintext file on the device | File permissions only | No rotation is described in the client `SECURITY.md` | Impersonation in later calls until peers re-verify; a new install is a new identity |
 | Call group secrets, frame keys | The apps, per epoch | App memory | n/a | Every join and leave | Epoch compromise exposes that epoch's frames |
 | Server external sender key, calls | tinyserver, at start | Server memory | n/a | At restart | Lets its holder propose members; clients refuse names not on the roster |
-| Server external sender key, text | tinyserver, first start | **Not specified** | n/a | Not specified | As above, plus a new key makes clients warn |
-| Device signing key (text, P-256) | tinyclient, per device | OS keychain (specified) | The OS | Not specified | Revoke the device (`DELETE /v1/e2ee/devices/{id}`); other members see the change |
+| Server external sender key, text | tinyserver, first start | A row in Postgres (`e2ee_server_key`), so also every backup and export | Database access control only | None | Lets its holder sign Add proposals; clients refuse a device that is not cross-signed. A new key makes clients warn (finding N15, G9) |
+| Device signing key (text, P-256) | tinyclient, per device | OS keychain (specified, client not verified); the server holds only the public key | The OS | Not specified | Revoke the device (`DELETE /v1/e2ee/devices/{id}`); other members see the change |
+| Community root key (P-256) | An owner's device | The device (client, not verified); the server holds the public key and the signed policy | | Only with `replace`, audited and announced | A new root makes clients warn |
 | Key packages | tinyclient | Server holds public key packages until claimed | | Up to 50 uploaded; one claimed per Add; a last-resort package is never deleted | An exhausted pool falls back to the last resort package; the device is flagged `low_keys` |
 | MLS group secrets (text) | The devices | Device storage, keychain-protected | | Every commit | Lost device cannot read new messages after removal; old ones it already holds stay |
 | Attachment key | The sender's client | Inside the MLS message, so only members | | One per attachment | Anyone who had the message can open the blob |
@@ -106,9 +108,9 @@ E2EE removes the server's ability to read, not its ability to decide. It still: 
 |---|---|---|
 | Server cannot decode call audio | Implemented | Section 2 tests; downgrade possible and shown |
 | Server cannot decode call video | Implemented in the client; server does not read NAL headers | Client code at `26916e9`; `SECURITY.md` disagrees; not verified by a call |
-| Server cannot read text or attachments of an encrypted conversation | **In progress** | Specified; not verified |
+| Server cannot read text or attachments of an encrypted conversation | Server: implemented, tested. Client: not verified | `e2ee_text.rs` `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server`, `there_is_no_downgrade_in_either_direction` |
 | Existing conversations are protected | **Not done**, by design | `e2ee-text.md` section 9 |
-| New devices need cross-signing | **In progress** | Specified; tests listed in `e2ee-text.md` section 11, not run here |
+| New devices need cross-signing | Server check: implemented, tested. Client: not verified. New person: not done (G3, G4) | `a_later_device_needs_a_cross_signature_from_an_active_one` |
 | Backups are encrypted at rest | Implemented, tested (shell check, not in CI) | `operator.sh backup`; `deploy/tests/hooks.sh`. Limits in section 5 |
-| Backups contain only ciphertext for encrypted conversations | **In progress** (depends on text E2EE); today every bundle holds plaintext text and attachments inside the age encryption | |
+| Backups contain only ciphertext for encrypted conversations | Implemented for message and attachment content (they are stored only as ciphertext); the bundle also holds the external sender private key and all metadata | Follows from the canary test over every table and upload file; no backup was opened to check |
 | Independent review of any of the above | Not done | [`remaining-risks.md`](remaining-risks.md) |

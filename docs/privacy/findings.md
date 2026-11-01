@@ -6,7 +6,7 @@ Audit of tinyserver at `bbe1cd7` and tinyclient at `26916e9` (both `origin/main`
 - **Read**: confirmed by reading the cited code, with no failing test written first.
 - **Reported**: found by an audit pass over the code and not independently re-checked. Treat as likely, not proven.
 
-Severity is exposure if the flaw is abused by the party named, not likelihood. `Status` is what `origin/main` does about it at `c4ae28b` (#20: abuse reports, operator hooks and tenants), re-checked by reading on 2026-11-01. A finding is only "Fixed" when a test fails without the fix, or, for S13 and S14, when it was checked by running the containers. The shell checks in `deploy/tests/` start real containers; they were read for this pass, not run, and CI does not run them. `client:` statuses describe tinyclient's `hardening/privacy-architecture` branch, which is not merged and was not re-run here.
+Severity is exposure if the flaw is abused by the party named, not likelihood. `Status` is what `origin/main` does about it at `c4ae28b` (#20: abuse reports, operator hooks and tenants), re-checked by reading on 2026-11-01, plus #23 (the server side of text E2EE) for S3, S9, C1, N9, N15 and N16. A finding is only "Fixed" when a test fails without the fix, or, for S13 and S14, when it was checked by running the containers. The shell checks in `deploy/tests/` start real containers; they were read for this pass, not run, and CI does not run them. `client:` statuses describe tinyclient's `hardening/privacy-architecture` branch, which is not merged and was not re-run here.
 
 Paths are in tinyserver unless marked `client:`.
 
@@ -16,13 +16,13 @@ Paths are in tinyserver unless marked `client:`.
 |---|---|---|---|
 | S1 | High | Private-channel messages reach every member's socket | Fixed |
 | S2 | High | The serving container holds the database owner credentials | Fixed; checked by `deploy/tests/isolation.sh` |
-| S3 | High | Text messages and attachments are plaintext to the server | Remediation in progress, see `docs/e2ee-text.md` |
+| S3 | High | Text messages and attachments are plaintext to the server | Server side fixed for conversations created encrypted (#23, `crates/api/tests/e2ee_text.rs`); client not verified; plaintext conversations, existing ones included, stay plaintext |
 | S4 | High | A server, or one old client, can turn call E2EE off with no check by the others | Mitigated client-side (opt-in), residual risk documented |
 | S5 | Medium | Invite token stored in `idempotency_keys` | Fixed |
 | S6 | Medium | Every member can read every member's email | Fixed |
 | S7 | Medium | Rate-limit key is a forgeable header, raw IPs held in memory | Fixed |
 | S8 | Medium | No account deletion; edit and delete leave text in the outbox | Fixed |
-| S9 | Medium | Plaintext attachments hit disk before the scan verdict | Open; sealed uploads (specified in `docs/e2ee-text.md`, not built) would remove it for encrypted conversations |
+| S9 | Medium | Plaintext attachments hit disk before the scan verdict | Fixed for sealed uploads (#23): written once to the final path, no temporary file, no plaintext (`e2ee_text.rs` `a_sealed_upload_is_opaque_and_stored_as_it_came`, and the canary test scans the temporary directory). Open for plaintext uploads |
 | S10 | Medium | Call identity: any member can be impersonated by the server (8-byte ids, server-attested roster) | Documented, residual |
 | S11 | Medium | No backup story, no encrypted backups | Partly fixed: `deploy/tenant/operator.sh backup`, `restore` and `export`, encrypted with age (`deploy/tests/hooks.sh`). No schedule; a restore replays no deletions (N11) |
 | S12 | Medium | No per-tenant isolation contract or checks | Fixed for the stack: [`tenancy.md`](tenancy.md), `deploy/tenant/tenant.sh`, per-tenant roles in `docker/postgres/init/01-roles.sh`, `deploy/tests/isolation.sh` and `roles.sh`. Kernel, UID ranges, cgroups, nftables and disk encryption are the host's; no TinyCloud control plane is in this repository |
@@ -30,7 +30,7 @@ Paths are in tinyserver unless marked `client:`.
 | S14 | Low | Resource limits missing on most containers | Fixed |
 | S15 | Low | Migrations were not tracked as a build input | Fixed |
 | S16 | Low | Last-seen time and how a member joined are visible to every member | Documented |
-| C1 | High | `client:` Tiny text and files are plaintext to the server; local cache unencrypted | Open; remediation in progress elsewhere, not merged |
+| C1 | High | `client:` Tiny text and files are plaintext to the server; local cache unencrypted | Open; the server side is in #23; the client side is on tinyclient's `hardening/e2ee-core`, not merged |
 | C2 | High | `client:` Accepts a server `off` frame and carries on unencrypted | Fixed (opt-in require mode) |
 | C3 | Medium | `client:` Identity key written non-atomically, overwritten when unreadable | Fixed |
 | C4 | Medium | `client:` Identity key is plaintext on disk, not in the OS keychain | Open, see limits |
@@ -64,8 +64,9 @@ Paths are in tinyserver unless marked `client:`.
 - **Files**: `crates/db/migrations/0008_messages.sql` (`messages.body`, `attachments`), `crates/db/src/messages.rs`, `crates/api/src/messages.rs`.
 - **Behavior**: message bodies are plaintext columns, attachment bytes are plaintext files in the upload volume, names and types are plaintext, and the 200 character last-message preview is built from the body.
 - **Exposure**: anyone with read access to Postgres, its backups or write-ahead log, the upload volume, or the server's memory reads every conversation.
-- **Remediation** (specification, not implemented on main): see `docs/e2ee-text.md`: per-conversation MLS groups, ciphertext-only storage, client-side sealed attachments, explicit per-conversation `e2ee` flag, no downgrade, no in-place conversion of existing history.
-- **Limits**: see the "What this does not protect" section of that document.
+- **Remediation** (server side in #23, migrations `0020` to `0023`, `crates/api/src/e2ee_text/`): see `docs/e2ee-text.md`: per-conversation MLS groups, ciphertext-only storage, client-side sealed attachments, explicit per-conversation `e2ee` flag, no downgrade, no in-place conversion of existing history, and a `required` mode that refuses plaintext.
+- **Tests**: `crates/api/tests/e2ee_text.rs`: `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server` (no table, log line, upload file or temporary file holds a canary sent only through encrypted paths; controls show the scans find plaintext), `there_is_no_downgrade_in_either_direction`, `under_required_the_server_takes_no_plaintext_at_all`. The client (tinyclient `crates/e2ee`) is not verified here.
+- **Limits**: only conversations created encrypted; metadata, reactions and sizes stay visible; see `docs/e2ee-text.md` section 8.
 
 ### S4 High: a server or one old client can disable call E2EE (Read)
 
@@ -143,7 +144,7 @@ Paths are in tinyserver unless marked `client:`.
 
 - **Files**: `client:crates/chatd/src/adapters/tiny/messages.rs`, `upload.rs`, `store.rs`, `blobs.rs`.
 - **Behavior**: `post_message` sends `{"body": text}`; uploads are plaintext multipart; `chat.sqlite` is plain SQLite with `LIKE` search and plaintext drafts; downloaded media is plaintext on disk.
-- **Remediation**: the client implements the protocol in `docs/e2ee-text.md`.
+- **Remediation**: the client implements the protocol in `docs/e2ee-text.md`. The server side it talks to is in #23.
 - **Limits**: the local cache of an end-to-end conversation protects only against someone who gets the file without the OS user's keychain. A person with their own logged-in session can read it.
 
 ### C2, C3 (Read)
@@ -188,12 +189,14 @@ Made while writing the privacy documents, 2026-10-31, at `ea3cd39`. Corrections 
 | N6 | Low | The owner invite file stays on its volume until the next `tinyserver-init` run after an owner exists, not until the owner signs up. Documented in `deploy/README.md`: run `up` once more after the owner signs in | `crates/server/src/main.rs` |
 | N7 | Low | `bans` and `ban_identities` are never swept, including expired bans; the audit log is never pruned | `app_sweep`, `crates/db/src/sweep.rs` |
 | N8 | Low | `GET /health` is unauthenticated and returns `db_role` | `crates/api/src/health.rs` |
-| N9 | Low | A binary rollback below the E2EE version could accept plaintext into an encrypted conversation unless `migrate` fails first. Relies on sqlx's default; untested | [`migration.md`](migration.md) |
+| N9 | Low | A binary rollback below the E2EE version could accept plaintext into an encrypted conversation unless `migrate` fails first. Relies on sqlx's default; untested. **Narrowed by #23**: the runtime role has only `SELECT` on `messages`, and the definer functions it must post through refuse a body for an encrypted conversation in Postgres (`0022`), so an old binary against the new schema is refused as well (read; not tested with an old binary) | [`migration.md`](migration.md) |
 | N10 | Low | No backup tooling existed at `ea3cd39`. **Superseded** by S11's remediation in #20. The manual `pg_dump` in `deploy/README.md`'s Tinyauth steps is still unencrypted | `deploy/README.md`, `deploy/tenant/operator.sh` |
 | N11 | Medium | A restore brings back accounts deleted, sessions signed out and messages deleted after the backup was taken: `restore` replays no deletions and does not clear `sessions` | `deploy/tenant/operator.sh` (`cmd_restore`) |
 | N12 | Medium | The legal hold covers less than "preservation" suggests. The operator's hold stops report expiry and `operator.sh delete` and `restore`; an owner's `preserve` on a report does the same for that report and makes `on_hold` true. Neither stops `DELETE /v1/me`, a message delete or a channel delete. A held report keeps its own note and evidence, not the message it names: the message can still be emptied, and `message_id` and `channel_id` go null when the row goes | `0015_abuse_reports.sql`, `0016_operator.sql`, `operator.sh` (`on_hold`) |
 | N13 | Low | `operator_events` records the action, mode and hold reason, not who ran it. Operator reads of tenant data (the database, a backup) leave no record at all | `0016_operator.sql` |
 | N14 | Low | `operator.sh delete` removes volumes without shredding them (the blocks stay on a disk without per-tenant encryption) and does not remove the Cloudflare tunnel, its DNS records or backups held elsewhere. With `--stack` it leaves `.env` in place | `deploy/tenant/operator.sh` (`cmd_delete`) |
+| N15 | Medium | The server's MLS external sender private key is a row in Postgres (`e2ee_server_key`), so the owner role, every backup and every export hold it. It opens no message, but whoever holds it can sign an Add proposal; only the clients' cross-signature check stops a device added that way. Tested where it is (`e2ee_text.rs` `the_servers_external_sender_is_one_key_kept_in_postgres`); moving it to a secret file is open (G9 in `docs/e2ee-text.md`) | `0020_e2ee_text_core.sql` |
+| N16 | Low | `e2ee_devices.label` stores an optional device label of up to 80 characters sent by the client. It survives revocation and account deletion (`app_delete_account` in `0022` revokes devices and deletes their key packages and welcomes, not the rows) | `0020_e2ee_text_core.sql`, `0022_e2ee_text_messages.sql` |
 
 ### Documents that disagree with the code
 
