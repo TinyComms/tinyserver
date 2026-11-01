@@ -37,6 +37,20 @@ services:
       retries: 12
       start_period: 10s
     restart: unless-stopped
+    # The image starts as root to own its data directory, then drops to the postgres user. It
+    # needs these five to do that and nothing else.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${TINYSERVER_PG_PIDS_LIMIT:-256}
+    mem_limit: ${TINYSERVER_PG_MEM_LIMIT:-1g}
     networks:
       - inside
     logging: *logging
@@ -53,11 +67,15 @@ services:
         condition: service_healthy
       tinyserver-uploads:
         condition: service_completed_successfully
+      tinyserver-init:
+        condition: service_completed_successfully
       clamd:
         condition: service_healthy
     environment:
+      # The serving process holds the runtime role only. The owner role, which can change the
+      # schema and bypasses row-level security, lives in tinyserver-init and nowhere else, so
+      # a flaw in this process cannot reach it.
       DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
-      DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
       BIND: 0.0.0.0:8080
       # The address people type into tinyclient. The sign-in callback is under it.
       TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
@@ -100,6 +118,8 @@ services:
       - pocketid_api_key
     volumes:
       - tinyserver_uploads:/data/uploads
+      # The owner invite tinyserver-init writes. Read only here.
+      - tinyserver_bootstrap:/bootstrap:ro
     # The same number inside and out: the SFU advertises the port it binds. TCP is ICE-TCP,
     # for networks that block UDP.
     ports:
@@ -111,18 +131,58 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # A community that runs away with memory, processes, or CPU stops at these, not at the
+    # host. Raise them for a large community; they are not a promise of how much it needs.
+    pids_limit: ${TINYSERVER_PIDS_LIMIT:-512}
+    mem_limit: ${TINYSERVER_MEM_LIMIT:-1g}
+    cpus: ${TINYSERVER_CPUS:-2}
     networks:
       - inside
       - media
     logging: *logging
 
-  # Gives the upload volume to tinyserver's user, 10001, once. The image has no shell to do it.
+  # Migrates the schema and, while there is no owner, writes the owner invite. This is the only
+  # place the owner role's password is. It runs to the end before tinyserver starts and again
+  # on every `up`, as the same unprivileged user, with no route out, and then it is gone.
+  tinyserver-init:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: tinyserver:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tinyserver-uploads:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-c", "tinyserver migrate && tinyserver bootstrap"]
+    environment:
+      DATABASE_URL_MIGRATE: postgres://app_owner:${APP_OWNER_PASSWORD}@postgres:5432/tinyserver
+      TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
+      TINYSERVER_DATA_DIR: /bootstrap
+    volumes:
+      - tinyserver_bootstrap:/bootstrap
+    # The inside network has no route out. It reaches Postgres and nothing else.
+    networks:
+      - inside
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    logging: *logging
+
+  # Gives the upload and bootstrap volumes to tinyserver's user, 10001, once. The image has no
+  # shell to do it.
   tinyserver-uploads:
     image: postgres:17-alpine
     user: "0:0"
-    entrypoint: ["chown", "10001:10001", "/data/uploads"]
+    entrypoint: ["chown", "10001:10001", "/data/uploads", "/bootstrap"]
     volumes:
       - tinyserver_uploads:/data/uploads
+      - tinyserver_bootstrap:/bootstrap
     network_mode: none
     read_only: true
     cap_drop:
@@ -144,6 +204,11 @@ services:
     volumes:
       - clamav_db:/var/lib/clamav
     restart: unless-stopped
+    # ClamAV holds its signature set in memory, about 1.5 GiB loaded. Below this it is killed.
+    pids_limit: 128
+    mem_limit: ${TINYSERVER_CLAMD_MEM_LIMIT:-3g}
+    security_opt:
+      - no-new-privileges:true
     # media, not the internal network: freshclam needs a route out, and tinyserver is already here.
     networks:
       - media
@@ -236,6 +301,13 @@ services:
       - tinyserver
       - pocket-id
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
     networks:
       inside:
         # Fixed, so Pocket ID can trust its forwarded-for header and nothing else's.
@@ -266,4 +338,5 @@ volumes:
   tinyserver_pg:
   pocketid_data:
   tinyserver_uploads:
+  tinyserver_bootstrap:
   clamav_db:
