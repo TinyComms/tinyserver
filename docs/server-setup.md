@@ -193,6 +193,8 @@ applied. The reply:
 Refusals are `409` with `error` one of `passkeys_unavailable`, `owner_needs_passkey`,
 `members_without_passkey` (plus `count`). A refusal changes nothing, including setup's "done".
 
+To give the owner a passkey (`owner_needs_passkey`), a client calls `POST /v1/me/passkeys/link`, which returns `{"url"}` to open in the system browser. That call needs a session made in the last 10 minutes; an older one gets `403 recent_sign_in_required`, and the owner signs in again first.
+
 Applying is audited `setup.apply` (the choices, the two counts, `allow_lockout`; never a name or an
 address) and emits `server.updated`, so every connected client learns the new choices. The same
 route changes the choices later; `setup_completed_at` keeps the first time.
