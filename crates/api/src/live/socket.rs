@@ -774,7 +774,11 @@ async fn call_offer(hub: &Hub, me: &Me, asking: &mut Asking<'_>, sdp: Option<&st
     let Some(call_id) = hub.call_of(&me.user_id) else {
         return Err("not_found");
     };
-    let answer = media.offer(&call_id, sdp).await.map_err(media_code)?;
+    let answer = media.offer(&call_id, sdp).await.map_err(|refused| {
+        let code = media_code(refused);
+        tracing::info!(call_id, code, "call offer refused");
+        code
+    })?;
     hub.call_media(&me.user_id, &answer);
     Ok(Done::Answer(answer))
 }

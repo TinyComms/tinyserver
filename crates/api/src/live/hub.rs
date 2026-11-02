@@ -599,6 +599,14 @@ impl Hub {
         let change = people
             .calls
             .set_media(user_id, &answer.call_id, answer.camera, answer.share);
+        tracing::info!(
+            call_id = %answer.call_id,
+            seat_call_id = ?people.calls.call_of(user_id),
+            camera = answer.camera,
+            share = answer.share,
+            told = change.is_some(),
+            "call media"
+        );
         self.tell(&mut people, change);
     }
 
