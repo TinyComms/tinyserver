@@ -152,8 +152,8 @@ fn presets(deployment: Deployment) -> Value {
             "unavailable": if privacy_available {
                 Value::Null
             } else {
-                json!("This server was started without passkey sign-in. Choose privacy with \
-                       \"sign_in_methods\": \"any\" to take the rest.")
+                json!("Needs passkey sign-in, which this server doesn't have turned on. You can \
+                       still choose the other private options one by one below.")
             }
         }
     ])
