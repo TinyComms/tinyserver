@@ -127,8 +127,12 @@ jobs:
           key: fuzz-${{ runner.os }}-nightly-2026-10-01-${{ hashFiles('fuzz/Cargo.lock', 'crates/*/Cargo.toml') }}
           restore-keys: fuzz-${{ runner.os }}-nightly-2026-10-01-
 
+      # The cache has the binary but not cargo's record of installing it, so install only when
+      # the restored one is missing or another version.
       - name: cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.2
+        run: |
+          cargo fuzz --version 2>/dev/null | grep -qx 'cargo-fuzz 0.13.2' ||
+            cargo install cargo-fuzz --locked --force --version 0.13.2
 
       - name: Build
         run: cargo +nightly-2026-10-01 fuzz build
