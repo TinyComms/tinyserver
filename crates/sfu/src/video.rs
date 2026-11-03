@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 /// Nominal camera bitrates from `docs/calls.md`, in kb/s. The upload budget plans with them.
 pub(crate) const HIGH_KBPS: u64 = 1200;
 pub(crate) const LOW_KBPS: u64 = 350;
-/// The nominal screen share bitrate, in kb/s.
-pub(crate) const SHARE_KBPS: u64 = 2500;
+/// The nominal screen share bitrate, in kb/s: a desktop's share at its best, 1440p at 60 fps.
+pub(crate) const SHARE_KBPS: u64 = 8000;
 /// One forwarded audio stream with its headers, in kb/s, for the upload budget.
 pub(crate) const AUDIO_KBPS: u64 = 50;
 /// A listener on `l` moves up to `h` at this much room for video, and back down below
@@ -684,12 +684,13 @@ mod tests {
         let all = ceiling(None, 100, 100, 100);
         assert!(all.share);
         assert_eq!(all.camera, Quality::High);
-        // Two share viewers and one camera viewer, the sharer, with three audio streams.
-        let roomy = ceiling(Some(6400), 3, 2, 1);
+        // Two share viewers (8,000 each) and one camera viewer, the sharer, with three audio
+        // streams (150): the cameras fit above 16,150.
+        let roomy = ceiling(Some(17_400), 3, 2, 1);
         assert_eq!((roomy.share, roomy.camera), (true, Quality::High));
-        let tight = ceiling(Some(5500), 3, 2, 1);
+        let tight = ceiling(Some(16_600), 3, 2, 1);
         assert_eq!((tight.share, tight.camera), (true, Quality::Low));
-        let shares_only = ceiling(Some(5200), 3, 2, 1);
+        let shares_only = ceiling(Some(16_200), 3, 2, 1);
         assert_eq!(
             (shares_only.share, shares_only.camera),
             (true, Quality::Off)

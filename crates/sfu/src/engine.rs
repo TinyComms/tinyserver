@@ -2055,8 +2055,10 @@ pub(crate) fn rtc_config(
     config
 }
 
-/// H.264 constrained baseline, level 3.1: enough for 1280×720 at 30 fps.
-pub(crate) const H264_PROFILE: u32 = 0x42e01f;
+/// H.264 constrained baseline, level 5.1: enough for 2560×1440 at 60 fps, a desktop share at
+/// its best. The level is negotiable (RFC 6184 §8.2.2): a client that still offers level 3.1
+/// matches this payload all the same, as `client.rs`'s stand-in does.
+pub(crate) const H264_PROFILE: u32 = 0x42e033;
 const H264_PT: u8 = 108;
 const H264_RTX_PT: u8 = 109;
 

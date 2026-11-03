@@ -141,7 +141,7 @@ impl Config {
             audio_kbps: 192,
             camera_high_kbps: 2400,
             camera_low_kbps: 700,
-            share_kbps: 5000,
+            share_kbps: 12_000,
             egress_kbps: None,
             bwe_start_kbps: Some(1000),
             layer_hold: Duration::from_secs(5),
