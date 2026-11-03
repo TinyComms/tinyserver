@@ -59,7 +59,7 @@ if [ -f "$root/AGENTS.md" ]; then
     host=$(sed -n 's/^Community host: `\([^`]*\)`.*/\1/p' "$root/AGENTS.md" | head -1)
     dir=$(sed -n 's/^Community dir: `\([^`]*\)`.*/\1/p' "$root/AGENTS.md" | head -1)
 fi
-build=$(sed -n 's/^Build host: `\([^`]*\)`.*//p' "$root/AGENTS.md" | head -1)
+build=$(sed -n 's/^Build host: `\([^`]*\)`.*/\1/p' "$root/AGENTS.md" | head -1)
 build=${build:-atomicstudio}
 
 echo "tinyserver deploy cut ($( [ -n "$apply" ] && echo apply || echo dry run ))"
