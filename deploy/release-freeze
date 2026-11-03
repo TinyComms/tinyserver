@@ -1,0 +1,4 @@
+# Deploy freeze for tinyserver, read by deploy/release-cut.sh.
+# One inclusive date range per line: YYYY-MM-DD YYYY-MM-DD.
+# Dates are the local date of the Windows machine the deploy runs from (Zeppelin).
+# No deploy while today falls inside a range, unless Justin says "ship through the freeze".
