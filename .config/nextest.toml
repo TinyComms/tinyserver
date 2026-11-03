@@ -1,0 +1,18 @@
+# cargo-nextest runs every test in a process of its own. The integration tests already isolate
+# themselves: each one creates its own database, tinyserver_test_<uuid>, migrates it, and drops
+# it. What they share inside one process is the environment (the upload directory, the HMAC
+# secret, the key file), which is why crates/api/tests/common holds a mutex across a test. A
+# process per test makes that environment private, so the tests run side by side and nothing
+# here has to be put in a test group.
+#
+#   cargo nextest run --profile ci
+
+[profile.ci]
+# Report every failure in one run, not the first.
+fail-fast = false
+# No test is known to be flaky. A retry would hide one that becomes so.
+retries = 0
+failure-output = "immediate-final"
+# Say which test is slow after a minute and end it after five, so a hung call does not hold the
+# job until its timeout.
+slow-timeout = { period = "60s", terminate-after = 5 }

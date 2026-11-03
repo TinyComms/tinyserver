@@ -1,0 +1,21 @@
+# Runs the image CI published instead of building one on this host. Add it after
+# deploy/compose.yml and name the image:
+#
+#   TINYSERVER_IMAGE=ghcr.io/tinycomms/tinyserver:<commit sha> \
+#     docker compose -f compose.yml -f compose.image.yml up -d --pull always
+#
+# or set TINYSERVER_IMAGE in the environment file. Every push to main that passes check is
+# published as :<sha> and :main. Name the sha, so the host runs exactly the commit you chose and
+# going back is naming the previous one. The binary carries its migrations, so there is no
+# source tree on the host to get out of step with it.
+#
+# Without this file, compose.yml builds tinyserver:local from the checkout, as before.
+
+services:
+  tinyserver:
+    image: ${TINYSERVER_IMAGE:?set TINYSERVER_IMAGE to ghcr.io/tinycomms/tinyserver:<sha>}
+    build: !reset null
+
+  tinyserver-init:
+    image: ${TINYSERVER_IMAGE:?set TINYSERVER_IMAGE to ghcr.io/tinycomms/tinyserver:<sha>}
+    build: !reset null

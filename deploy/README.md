@@ -226,6 +226,17 @@ docker compose up -d --build --remove-orphans
 
 `tinyserver-init` applies any new migrations and exits before the server starts. If it fails, the server does not start; `docker compose logs tinyserver-init` says why. Going back to an older release means restoring that backup: an older binary refuses a database that has migrations it does not know.
 
+### Running a published image
+
+Every push to main that passes CI is published as `ghcr.io/tinycomms/tinyserver:<sha>` and `:main`. [`compose.image.yml`](compose.image.yml) runs that image instead of building `tinyserver:local` from the checkout, for `tinyserver` and `tinyserver-init`. Name the sha, not `:main`, so the host runs the commit you chose and going back is naming the one before:
+
+```sh
+docker compose exec -T postgres pg_dump -U postgres tinyserver > backups/before-upgrade.sql
+TINYSERVER_IMAGE=ghcr.io/tinycomms/tinyserver:<sha>   docker compose -f compose.yml -f compose.image.yml up -d --pull always --remove-orphans
+```
+
+`TINYSERVER_IMAGE` can live in the environment file instead. The binary carries its migrations, so nothing from the source tree has to be copied for it; the checkout is still where compose.yml, the Pocket ID setup and the Postgres init script come from. A tenant adds the file with `TENANT_COMPOSE_FILES`. If the package is private, `docker login ghcr.io` on the host first with a token that can read packages.
+
 ### Upgrading to the release with `tinyserver-init`
 
 The release that moved the database owner password out of the serving container changes these things for an existing install. The steps above are all that is needed; nothing has to be set by hand.

@@ -1,0 +1,73 @@
+# The server image. ci.yml calls this after check passes on main, with `push`, and it publishes
+# ghcr.io/tinycomms/tinyserver:<sha> and :main. A pull request that changes how the image is
+# built (the Dockerfile, the manifests, the toolchain, the entrypoint) builds it here without
+# pushing, so a broken image shows up before the merge and not on the host.
+#
+# The layer cache is in GHCR, at :buildcache, not in the Actions cache. The Rust caches already
+# take most of the repository's 10 GB there, and an image cache would push them out.
+
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - rust-toolchain.toml
+      - deploy/entrypoint.sh
+      - .github/workflows/image.yml
+
+# Write, because a called workflow cannot raise what it declares here and main's run pushes. A
+# pull request's run does not push, and one from a fork gets a read-only token anyway.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/tinycomms/tinyserver
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # One build per pull request at a time. On main they queue, so each commit that passes is
+    # published and :main ends on the newest.
+    concurrency:
+      group: image-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      # A pull request logs in too, to read the layer cache while the package is private. One
+      # from a fork has no token for it; its build starts cold, and still runs.
+      - uses: docker/login-action@v3
+        if: inputs.push || github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ inputs.push == true }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          # Only main writes the cache. mode=max keeps the cargo-chef dependency layer, which is
+          # most of the build.
+          cache-to: ${{ inputs.push && format('type=registry,ref={0}:buildcache,mode=max', env.IMAGE) || '' }}

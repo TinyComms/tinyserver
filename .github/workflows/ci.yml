@@ -1,12 +1,27 @@
 # Format, lint, and test. The integration tests run against Postgres 17 with the same
 # app_owner and app_runtime roles that docker/postgres/init/01-roles.sh makes in production.
+# A push to main that passes also publishes the server image to GHCR (image.yml).
 
 name: ci
 
+# Changes to docs alone run nothing. main has no required status checks, so a skipped run does
+# not hold up a merge; if it ever gets them, take these filters out.
 on:
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
   pull_request:
+    paths-ignore: ["docs/**", "**/*.md"]
+  # The long fuzz run, once a night, on main.
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+# A new push to a branch or pull request cancels the run still going for the one before. On main
+# every run finishes, because each one may publish an image.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -16,6 +31,7 @@ env:
 
 jobs:
   check:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -40,7 +56,19 @@ jobs:
       - name: Toolchain
         run: rustup component add rustfmt clippy
 
+      # Before the cache, which takes a minute to restore, so a formatting mistake fails in
+      # seconds. Format and clippy stay in this job: a lint job of its own would need the same
+      # 2.7 GB cache, or a second one, to keep clippy at its 20 seconds.
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Saved from main only. Pull requests restore main's cache and leave no copy of their own,
+      # which kept two of these in the repository's 10 GB.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@nextest
 
       - name: Database roles
         env:
@@ -54,36 +82,74 @@ jobs:
           command -v psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
           sh docker/postgres/init/01-roles.sh
 
-      - name: Format
-        run: cargo fmt --all --check
-
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test
+      - name: Build tests
+        run: cargo nextest run --profile ci --no-run
 
-  # The cargo-fuzz targets in fuzz/, built on nightly and run for a minute each. Apart from
-  # check, so a nightly break does not hold up a merge. The nightly is pinned: later ones fail
-  # to compile sqlx-core (E0391, a cycle computing async drop for its Error type).
+      # A process per test, so they run in parallel; .config/nextest.toml says why that is safe.
+      # nextest does not run doctests. The crates have none; add `cargo test --doc` with the first.
+      - name: Test
+        run: cargo nextest run --profile ci
+
+  # The cargo-fuzz targets in fuzz/, built on nightly. Apart from check, so a nightly break does
+  # not hold up a merge, though the build has caught a compile error check did not. Each target
+  # runs 10 seconds on a pull request, a minute on main, and five minutes on the nightly run.
+  # The nightly is pinned: later ones fail to compile sqlx-core (E0391, a cycle computing async
+  # drop for its Error type).
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && 10 || github.event_name == 'schedule' && 300 || 60 }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Toolchain
         run: rustup toolchain install nightly-2026-10-01 --profile minimal
 
-      - uses: Swatinem/rust-cache@v2
+      # Not Swatinem/rust-cache. cargo fuzz builds for an explicit target, into
+      # fuzz/target/x86_64-unknown-linux-gnu/release, and rust-cache takes that triple directory
+      # for a profile and deletes the release directory inside it before saving. Every run then
+      # compiled all 213 crates again on a cache hit. This keeps the whole directory. The key
+      # moves when a dependency does; the workspace crates rebuild on every run either way.
+      - name: Restore cache
+        id: cache
+        uses: actions/cache/restore@v4
         with:
-          workspaces: fuzz
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            fuzz/target/
+          key: fuzz-${{ runner.os }}-nightly-2026-10-01-${{ hashFiles('fuzz/Cargo.lock', 'crates/*/Cargo.toml') }}
+          restore-keys: fuzz-${{ runner.os }}-nightly-2026-10-01-
 
+      # The cache has the binary but not cargo's record of installing it, so install only when
+      # the restored one is missing or another version.
       - name: cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: |
+          cargo fuzz --version 2>/dev/null | grep -qx 'cargo-fuzz 0.13.2' ||
+            cargo install cargo-fuzz --locked --force --version 0.13.2
 
       - name: Build
         run: cargo +nightly-2026-10-01 fuzz build
+
+      # Saved before the run, so a crash still leaves the build for the next one. From main only,
+      # like check's.
+      - name: Save cache
+        if: github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            fuzz/target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Run
         run: |
@@ -91,7 +157,7 @@ jobs:
             mkdir -p fuzz/corpus/$target
             seeds=fuzz/seeds/$target
             [ -d "$seeds" ] || seeds=
-            cargo +nightly-2026-10-01 fuzz run $target fuzz/corpus/$target $seeds -- -max_total_time=60
+            cargo +nightly-2026-10-01 fuzz run $target fuzz/corpus/$target $seeds -- -max_total_time=$FUZZ_SECONDS
           done
 
       - name: Crashes
@@ -100,3 +166,15 @@ jobs:
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
+
+  # After check passes on main: build the image and push ghcr.io/tinycomms/tinyserver:<sha> and
+  # :main. A host runs that image instead of building one (deploy/compose.image.yml).
+  image:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      push: true

@@ -99,6 +99,8 @@ sh pocket-id/setup.sh <first-admin-username>
 docker compose up -d
 ```
 
+To run the image CI published for a commit instead of building on the host, see [Running a published image](deploy/README.md#running-a-published-image).
+
 `setup.sh` writes `deploy/secrets` (mode `0700`, secret files `0444`), starts Pocket ID, and registers the OIDC client `tinyserver`. The username is the first Pocket ID admin. The script prints a one-time link `${AUTH_PUBLIC_URL}/lc/<token>`, good for an hour.
 
 The first container start migrates and, while there is no owner, prints one owner invite to the logs. Paste the code into tinyclient. A later start does not print that token again. With an owner, bootstrap prints nothing.
@@ -135,6 +137,7 @@ Source is [TinyComms/tinyserver](https://github.com/TinyComms/tinyserver). The a
 | [`docker-compose.yml`](docker-compose.yml) | Local Postgres 17 on port `54329`. First boot runs [`docker/postgres/init/01-roles.sh`](docker/postgres/init/01-roles.sh) |
 | [`deploy`](deploy) | Community compose, Pocket ID setup, and the entrypoint that migrates, bootstraps, and serves. See [`deploy/README.md`](deploy/README.md) |
 | [`docs`](docs) | [`calls.md`](docs/calls.md) and [`server.md`](docs/server.md) |
-| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Format, clippy, `cargo test`, and the nightly fuzz job |
-| [`Dockerfile`](Dockerfile) | Release build of the `tinyserver` binary |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Format, clippy, tests under cargo-nextest ([`.config/nextest.toml`](.config/nextest.toml)), the fuzz job, and on main the image |
+| [`.github/workflows/image.yml`](.github/workflows/image.yml) | Builds the image; on main pushes `ghcr.io/tinycomms/tinyserver:<sha>` and `:main` |
+| [`Dockerfile`](Dockerfile) | Release build of the `tinyserver` binary, dependencies cached in their own layer by cargo-chef |
 | [`rust-toolchain.toml`](rust-toolchain.toml) | `stable`. The fuzz job installs nightly itself |
