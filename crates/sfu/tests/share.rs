@@ -168,8 +168,9 @@ async fn an_ended_share_stays_off_until_the_sharer_starts_it_again() {
 #[tokio::test]
 async fn the_upload_budget_keeps_the_share_and_drops_cameras() {
     let mut config = config();
-    // Six audio streams and two share viewers fit, and the sharer's camera does not.
-    config.egress_kbps = Some(5400);
+    // Six audio streams (300) and two share viewers (16,000) fit, and the sharer's camera
+    // (350 more for its low layer) does not.
+    config.egress_kbps = Some(16_400);
     let mut sfu = start(config);
     let a = join(&mut sfu, "r", "a", b'A').await;
     let b = join(&mut sfu, "r", "b", b'B').await;
