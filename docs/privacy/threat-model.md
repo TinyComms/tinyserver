@@ -188,7 +188,7 @@ The product goal is "enforceable by architecture". This table says which parts o
 |---|---|---|
 | The server cannot hear an end-to-end call | MLS between apps; server is delivery service and external sender, holds no group secret (`crates/api/src/live/e2ee.rs`) | Implemented; downgrade by the server is possible and shown by clients (S4) |
 | The server cannot read text and attachments of an E2EE conversation | MLS groups per conversation, sealed uploads | Implemented, tested: server `a_canary_said_only_through_encrypted_paths_is_nowhere_on_the_server`; client tinyclient `an_encrypted_conversation_is_labelled_its_rows_never_read_the_servers_body_and_nothing_goes_plain` (not run here) |
-| The server cannot read text of existing conversations | Nothing | **Not done**: existing conversations stay plaintext, never converted in place |
+| The server cannot read text already stored in a conversation that is later upgraded | Nothing for those rows. New posts after `POST /v1/conversations/{id}/e2ee` are MLS ciphertext | **Not done** for the old rows: they stay plaintext. New messages and files after the upgrade are covered by the row above |
 | A member sees only channels they may view | Row-level security, definer functions, outbox audience (`0013`) | Implemented, tested |
 | The runtime role cannot bypass row-level security or change schema | `app_runtime` is `NOSUPERUSER NOBYPASSRLS`; owner password only in `tinyserver-init` | Implemented, tested (`deploy/tests/isolation.sh`, `roles.sh`; shell checks, Docker, not in CI) |
 | No passwords, no password database | `0004_oidc.sql` drops `password_hash`; sign-in is OIDC | Implemented |

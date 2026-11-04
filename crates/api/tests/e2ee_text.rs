@@ -4899,3 +4899,211 @@ async fn a_declared_context_must_name_the_group_and_the_conversation() {
     })
     .await;
 }
+
+/// A plaintext conversation becomes encrypted in place. The messages already stored stay
+/// plaintext, a new plaintext post is refused, and there is no way back.
+#[tokio::test]
+async fn a_plaintext_conversation_upgrades_in_place_and_keeps_its_old_messages() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (peer, _peer_token) = w.member("rek").await;
+        let (outsider, outsider_token) = w.member("out").await;
+        let channel = w.channel("was-plain", false).await;
+        let (status, sent) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{channel}/messages"),
+                &w.owner_token,
+                Some(json!({"body": "kept in the clear"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{sent}");
+
+        let (status, upgraded) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{channel}/e2ee"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{upgraded}");
+        assert_eq!(upgraded["e2ee"], true);
+        assert_eq!(upgraded["plaintext_history"], true);
+
+        let (status, refused) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{channel}/messages"),
+                &w.owner_token,
+                Some(json!({"body": "too late"})),
+            )
+            .await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("e2ee_required")),
+            "{refused}"
+        );
+        let (status, page) = w
+            .send(
+                Method::GET,
+                &format!("/v1/conversations/{channel}/messages?limit=10"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let rows = page.as_array().expect("messages");
+        assert_eq!(rows.len(), 1, "{page}");
+        assert_eq!(rows[0]["body"], "kept in the clear");
+        assert_eq!(rows[0]["e2ee"], false);
+
+        let (status, again) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{channel}/e2ee"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again["e2ee"], true);
+        let (status, patched) = w
+            .send(
+                Method::PATCH,
+                &format!("/v1/channels/{channel}"),
+                &w.owner_token,
+                Some(json!({"e2ee": false})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{patched}");
+        let (status, still) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{channel}/e2ee"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(still["e2ee"], true, "{still}");
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, direct) = w
+            .send(
+                Method::POST,
+                "/v1/directs",
+                &w.owner_token,
+                Some(json!({"user_id": peer.user_id, "e2ee": false})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        assert_eq!(direct["e2ee"], false);
+        let direct_id = direct["id"].as_str().expect("direct").to_string();
+        let (status, said) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{direct_id}/messages"),
+                &w.owner_token,
+                Some(json!({"body": "before"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        let (status, sealed) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{direct_id}/e2ee"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{sealed}");
+        assert_eq!(sealed["e2ee"], true);
+        assert_eq!(sealed["plaintext_history"], true);
+        let (status, hidden) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{direct_id}/e2ee"),
+                &outsider_token,
+                None,
+            )
+            .await;
+        assert_eq!(
+            (status, hidden["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("not_found")),
+            "{hidden}"
+        );
+        let _ = outsider;
+
+        let (other, _) = w.member("twin").await;
+        let (status, encrypted) = w
+            .send(
+                Method::POST,
+                "/v1/directs",
+                &w.owner_token,
+                Some(json!({"user_id": other.user_id, "e2ee": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{encrypted}");
+        let (status, plain) = w
+            .send(
+                Method::POST,
+                "/v1/directs",
+                &w.owner_token,
+                Some(json!({"user_id": other.user_id, "e2ee": false})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{plain}");
+        let plain_id = plain["id"].as_str().expect("plain direct").to_string();
+        let (status, twin) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{plain_id}/e2ee"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(
+            (status, twin["error"].as_str()),
+            (StatusCode::CONFLICT, Some("e2ee_twin")),
+            "{twin}"
+        );
+
+        let (status, _) = w
+            .send(
+                Method::PATCH,
+                "/v1/server",
+                &w.owner_token,
+                Some(json!({"e2ee_text": "off"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let fresh = w.channel("stays-plain", false).await;
+        let (status, off) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{fresh}/e2ee"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(
+            (status, off["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("e2ee_off")),
+            "{off}"
+        );
+        let (status, kept) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{channel}/e2ee"),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert_eq!(
+            kept["e2ee"], true,
+            "turning the setting off does not open an encrypted chat"
+        );
+    })
+    .await;
+}

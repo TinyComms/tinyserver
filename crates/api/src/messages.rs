@@ -14,7 +14,7 @@ use db::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
     list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
     save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction, update_channel,
-    Caller, MessageError, NewAttachment, PgPool, ScanEngine,
+    upgrade_conversation, Caller, MessageError, NewAttachment, PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -59,6 +59,10 @@ pub fn routes() -> Router<PgPool> {
             axum::routing::put(react).delete(unreact),
         )
         .route("/v1/conversations/{id}/read", axum::routing::post(read))
+        .route(
+            "/v1/conversations/{id}/e2ee",
+            axum::routing::post(upgrade_e2ee),
+        )
         .route("/v1/media/{id}", get(download))
         .merge(media)
 }
@@ -165,6 +169,7 @@ pub(crate) enum Error {
     GroupTooLarge,
     IdTaken,
     RootExists,
+    E2eeTwin,
 }
 
 impl IntoResponse for Error {
@@ -200,6 +205,7 @@ impl IntoResponse for Error {
             Self::GroupTooLarge => (StatusCode::BAD_REQUEST, "e2ee_group_too_large"),
             Self::IdTaken => (StatusCode::CONFLICT, "id_taken"),
             Self::RootExists => (StatusCode::CONFLICT, "root_exists"),
+            Self::E2eeTwin => (StatusCode::CONFLICT, "e2ee_twin"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -236,6 +242,7 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::GroupTooLarge => "e2ee_group_too_large",
         Error::IdTaken => "id_taken",
         Error::RootExists => "root_exists",
+        Error::E2eeTwin => "e2ee_twin",
     }
 }
 
@@ -279,6 +286,7 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::GroupTooLarge => Error::GroupTooLarge,
         MessageError::IdTaken => Error::IdTaken,
         MessageError::RootExists => Error::RootExists,
+        MessageError::E2eeTwin => Error::E2eeTwin,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -567,6 +575,24 @@ async fn read(
             error
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// One-way: a plaintext conversation becomes end-to-end encrypted. What was already stored stays
+/// readable by the server. Already encrypted is the same conversation again.
+async fn upgrade_e2ee(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    upgrade_conversation(&pool, &caller, &id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, &id, &error);
+            error
+        })
 }
 
 async fn upload(
