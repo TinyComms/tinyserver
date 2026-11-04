@@ -82,13 +82,13 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
             json!({
                 "provider_profile": "full",
                 "activity_visibility": "everyone",
-                "sign_in_methods": "any",
+                "sign_in_methods": "provider",
             })
         );
-        // No sign-in is configured in this app: no passkeys and no provider.
+        // Passkeys are always on; no provider is configured in this app.
         assert_eq!(
             setup["deployment"],
-            json!({"passkeys": false, "sso": false})
+            json!({"passkeys": true, "sso": false})
         );
         assert_eq!(setup["counts"]["members"], 1);
 
@@ -98,10 +98,9 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
             .map(|p| p["id"].as_str().expect("id"))
             .collect();
         assert_eq!(ids, ["convenience", "privacy"]);
-        // Privacy asks for passkey sign-in, which this server does not run.
         assert_eq!(presets[0]["available"], true);
-        assert_eq!(presets[1]["available"], false);
-        assert!(presets[1]["unavailable"].is_string());
+        assert_eq!(presets[1]["available"], true);
+        assert!(presets[1]["unavailable"].is_null());
 
         let choices = setup["choices"].as_array().expect("choices");
         let ids: Vec<&str> = choices
@@ -200,7 +199,7 @@ async fn keeping_what_you_have_finishes_setup_and_changes_nothing() {
         assert_eq!(applied["last_seen_cleared"], 0);
         assert_eq!(applied["settings"]["provider_profile"], "full");
         assert_eq!(applied["settings"]["activity_visibility"], "everyone");
-        assert_eq!(applied["settings"]["sign_in_methods"], "any");
+        assert_eq!(applied["settings"]["sign_in_methods"], "provider");
         assert!(applied["settings"]["setup_completed_at"].is_string());
 
         let (_, setup) = get_setup(&app, &owner_token).await;
@@ -215,7 +214,7 @@ async fn keeping_what_you_have_finishes_setup_and_changes_nothing() {
         assert_eq!(status, StatusCode::OK, "{server}");
         assert_eq!(server["provider_profile"], "full");
         assert_eq!(server["activity_visibility"], "everyone");
-        assert_eq!(server["sign_in_methods"], "any");
+        assert_eq!(server["sign_in_methods"], "provider");
         assert!(server["setup_completed_at"].is_string());
 
         // Emails were not touched.
@@ -249,37 +248,6 @@ async fn a_choice_that_is_not_one_of_the_options_is_refused() {
         }
         let (_, setup) = get_setup(&app, &token).await;
         assert_eq!(setup["needed"], true, "a refused request finished setup");
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn the_privacy_preset_is_refused_where_there_are_no_passkeys_unless_that_one_choice_is_left_out(
-) {
-    run(|db| async move {
-        let owner = first_owner(&db).await;
-        let token = session(&db, &owner.user_id).await;
-        let app = app(&db);
-
-        let (status, body) = put_setup(&app, &token, json!({"preset": "privacy"})).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["error"], "passkeys_unavailable");
-        // All or nothing: the refusal left the other two choices as they were.
-        let (_, setup) = get_setup(&app, &token).await;
-        assert_eq!(setup["current"]["provider_profile"], "full");
-        assert_eq!(setup["current"]["activity_visibility"], "everyone");
-        assert_eq!(setup["needed"], true);
-
-        let (status, body) = put_setup(
-            &app,
-            &token,
-            json!({"preset": "privacy", "sign_in_methods": "any"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["settings"]["provider_profile"], "none");
-        assert_eq!(body["settings"]["activity_visibility"], "nobody");
-        assert_eq!(body["settings"]["sign_in_methods"], "any");
     })
     .await;
 }

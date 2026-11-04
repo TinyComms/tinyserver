@@ -34,7 +34,7 @@ pub(crate) struct Deployment {
 impl Deployment {
     pub(crate) fn of(sign_in: Option<&SignIn>) -> Self {
         Self {
-            passkeys: sign_in.is_some_and(|sign_in| sign_in.passkeys().is_some()),
+            passkeys: true,
             sso: sign_in.is_some_and(|sign_in| !sign_in.providers().is_empty()),
         }
     }
@@ -228,12 +228,11 @@ impl ApplyBody {
 async fn apply(
     State(pool): State<PgPool>,
     headers: HeaderMap,
-    Extension(deployment): Extension<Deployment>,
     body: Result<Json<ApplyBody>, JsonRejection>,
 ) -> Result<Json<db::Applied>, SetupFailure> {
     let caller = caller(&pool, &headers).await?;
     let Json(body) = body.map_err(|_| SetupFailure::Api(ApiError::Invalid))?;
-    let applied = db::apply_setup(&pool, &caller, &body.change(), deployment.passkeys).await?;
+    let applied = db::apply_setup(&pool, &caller, &body.change()).await?;
     tracing::info!(
         user_id = %caller.user_id,
         provider_profile = applied.settings.provider_profile.as_str(),
@@ -249,9 +248,10 @@ async fn apply(
 /// A refusal, with the reason the owner can act on.
 enum SetupFailure {
     Api(ApiError),
-    PasskeysUnavailable,
     OwnerNeedsPasskey,
     MembersWithoutPasskey(i32),
+    OwnerNeedsProvider,
+    MembersWithoutProvider(i32),
 }
 
 impl From<ApiError> for SetupFailure {
@@ -264,9 +264,10 @@ impl From<SetupError> for SetupFailure {
     fn from(error: SetupError) -> Self {
         match error {
             SetupError::Forbidden => Self::Api(ApiError::Forbidden),
-            SetupError::PasskeysUnavailable => Self::PasskeysUnavailable,
             SetupError::OwnerNeedsPasskey => Self::OwnerNeedsPasskey,
             SetupError::MembersWithoutPasskey(count) => Self::MembersWithoutPasskey(count),
+            SetupError::OwnerNeedsProvider => Self::OwnerNeedsProvider,
+            SetupError::MembersWithoutProvider(count) => Self::MembersWithoutProvider(count),
             SetupError::Community(error) => Self::Api(lift(error)),
         }
     }
@@ -276,10 +277,13 @@ impl IntoResponse for SetupFailure {
     fn into_response(self) -> Response {
         match self {
             Self::Api(error) => error.into_response(),
-            Self::PasskeysUnavailable => conflict(json!({"error": "passkeys_unavailable"})),
             Self::OwnerNeedsPasskey => conflict(json!({"error": "owner_needs_passkey"})),
             Self::MembersWithoutPasskey(count) => {
                 conflict(json!({"error": "members_without_passkey", "count": count}))
+            }
+            Self::OwnerNeedsProvider => conflict(json!({"error": "owner_needs_provider"})),
+            Self::MembersWithoutProvider(count) => {
+                conflict(json!({"error": "members_without_provider", "count": count}))
             }
         }
     }

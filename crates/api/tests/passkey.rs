@@ -2045,7 +2045,7 @@ async fn passkeys_only_waits_for_the_owner_to_have_a_passkey_and_for_members_to_
         assert_eq!(body["error"], "members_without_passkey");
         assert_eq!(body["count"], 1);
         let setup = get_setup(&app, &owner_token).await;
-        assert_eq!(setup["current"]["sign_in_methods"], "any");
+        assert_eq!(setup["current"]["sign_in_methods"], "provider");
         assert_eq!(
             setup["current"]["provider_profile"], "full",
             "a refused request changed a choice"
@@ -2177,51 +2177,6 @@ async fn passkeys_only_turns_a_provider_away_and_the_page_stops_offering_it() {
         // A person with a passkey is unaffected.
         let (_, user_id) = signed_in(&app, &mut device, &owner_passkey).await;
         assert_eq!(user_id, owner.user_id);
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn the_choice_does_not_lock_everyone_out_when_the_server_is_started_without_passkeys() {
-    run(|db| async move {
-        let owner = first_owner(&db).await;
-        // Passkeys only was chosen while passkeys were on.
-        sqlx::query("UPDATE server_settings SET sign_in_methods = 'passkey'")
-            .execute(&db.owner)
-            .await
-            .expect("choice");
-        // The operator then starts the server with providers only, as a rollback does.
-        let provider = Provider::start().await;
-        let sign_in =
-            api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
-                .await
-                .expect("discover");
-        let app = api::router(db.runtime.clone(), Some(sign_in));
-        let invite_token = invite(&db, &owner).await;
-        let (status, body) = Call::new(Method::POST, "/v1/auth/start")
-            .json(json!({
-                "redirect_uri": REDIRECT,
-                "code_challenge": db::s256(VERIFIER),
-                "code_challenge_method": "S256",
-                "state": "client-state-0123456789abcdef",
-                "invite": invite_token,
-            }))
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let url = body["authorize_url"].as_str().expect("url");
-        assert!(url.starts_with(&provider.issuer), "{url}");
-        let (code, state) =
-            provider.authorize(url, oidc::Person::new("zed"), oidc::Tamper::default());
-        let (status, headers, _) = page(
-            &app,
-            &format!("/v1/auth/callback?code={code}&state={state}"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FOUND);
-        let pairs = redirect_pairs(&headers);
-        assert!(pairs.contains_key("code"), "{pairs:?}");
-        assert!(!pairs.contains_key("error"), "{pairs:?}");
     })
     .await;
 }

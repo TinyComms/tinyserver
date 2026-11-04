@@ -3,11 +3,11 @@
 //! Three choices, each enforced where the data is made or read, not only recorded:
 //!
 //! * [`ProviderProfile`]: what is kept from an identity provider when someone first signs in
-//!   with it (`auth::sign_in_in`).
+//!   with it (`api::auth`).
 //! * [`ActivityVisibility`]: who sees last-seen and how a member joined
 //!   (`community::member_select`), and whether last-seen is recorded at all (`app_seen`).
-//! * [`SignInMethods`]: whether a new sign-in through an identity provider is accepted
-//!   (`auth::sign_in_in`).
+//! * [`SignInMethods`]: which kind of sign-in is accepted from someone who is not yet a member
+//!   (`api::auth`).
 //!
 //! The defaults are what the server did before there was a setup, so an upgrade changes nothing
 //! until the owner chooses. Setup is owner-only; there is no permission bit for it.
@@ -95,7 +95,9 @@ impl ActivityVisibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SignInMethods {
-    /// Every method this deployment offers.
+    /// An identity provider. What the server did before passkeys.
+    Provider,
+    /// A provider or a passkey.
     Any,
     /// Passkeys only: a new sign-in through an identity provider is refused.
     Passkey,
@@ -104,6 +106,7 @@ pub enum SignInMethods {
 impl SignInMethods {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Provider => "provider",
             Self::Any => "any",
             Self::Passkey => "passkey",
         }
@@ -111,6 +114,7 @@ impl SignInMethods {
 
     pub fn parse(text: &str) -> Option<Self> {
         match text {
+            "provider" => Some(Self::Provider),
             "any" => Some(Self::Any),
             "passkey" => Some(Self::Passkey),
             _ => None,
@@ -131,7 +135,7 @@ impl Posture {
     pub const CONVENIENCE: Posture = Posture {
         provider_profile: ProviderProfile::Full,
         activity_visibility: ActivityVisibility::Everyone,
-        sign_in_methods: SignInMethods::Any,
+        sign_in_methods: SignInMethods::Provider,
     };
 
     /// The least the server can keep and still work.
@@ -203,10 +207,15 @@ pub struct SetupState {
     pub members: i32,
     /// Members who could not sign in under passkeys only until they add one.
     pub members_without_passkey: i32,
+    /// Members who could not sign in under a provider only until they add one.
+    pub members_without_provider: i32,
     /// Members with an email address on file, which 'erase emails' would remove.
     pub emails_stored: i32,
     /// Whether the owner has a passkey, which passkeys only needs before it can be chosen.
     pub owner_has_passkey: bool,
+    /// Whether the owner has a provider sign-in, which provider only needs before it can be
+    /// chosen again.
+    pub owner_has_provider: bool,
 }
 
 /// The owner's choices to apply. `None` leaves a choice as it is.
@@ -217,8 +226,8 @@ pub struct SetupChange {
     pub sign_in_methods: Option<SignInMethods>,
     /// Remove every member's stored email address. One way.
     pub erase_emails: bool,
-    /// Choose passkeys only although some members have no passkey yet: they cannot sign in
-    /// until the owner gives them a claim link.
+    /// Choose passkeys only (or a provider only) although some members have no such sign-in
+    /// yet: they cannot sign in until the owner gives them a claim link.
     pub allow_lockout: bool,
 }
 
@@ -247,15 +256,18 @@ pub enum SetupError {
     /// Not an owner.
     #[error("forbidden")]
     Forbidden,
-    /// Passkeys only, on a deployment with no passkey sign-in.
-    #[error("passkeys unavailable")]
-    PasskeysUnavailable,
     /// Passkeys only, while the owner has no passkey: the owner could not sign in again.
     #[error("owner needs a passkey")]
     OwnerNeedsPasskey,
     /// Passkeys only, while this many members have no passkey.
     #[error("{0} members have no passkey")]
     MembersWithoutPasskey(i32),
+    /// Provider only, while the owner has no provider sign-in.
+    #[error("owner needs a provider sign-in")]
+    OwnerNeedsProvider,
+    /// Provider only, while this many members have no provider sign-in.
+    #[error("{0} members have no provider sign-in")]
+    MembersWithoutProvider(i32),
     #[error(transparent)]
     Community(#[from] CommunityError),
 }
@@ -265,11 +277,11 @@ fn classify(error: sqlx::Error) -> SetupError {
         let message = db.message();
         match db.code().as_deref() {
             Some("42501") => return SetupError::Forbidden,
-            Some("22023") if message == "passkeys_unavailable" => {
-                return SetupError::PasskeysUnavailable
-            }
             Some("22023") if message == "owner_needs_passkey" => {
                 return SetupError::OwnerNeedsPasskey
+            }
+            Some("22023") if message == "owner_needs_provider" => {
+                return SetupError::OwnerNeedsProvider
             }
             Some("22023") => {
                 if let Some(count) = message
@@ -277,6 +289,12 @@ fn classify(error: sqlx::Error) -> SetupError {
                     .and_then(|count| count.parse().ok())
                 {
                     return SetupError::MembersWithoutPasskey(count);
+                }
+                if let Some(count) = message
+                    .strip_prefix("members_without_provider:")
+                    .and_then(|count| count.parse().ok())
+                {
+                    return SetupError::MembersWithoutProvider(count);
                 }
             }
             _ => {}
@@ -288,11 +306,12 @@ fn classify(error: sqlx::Error) -> SetupError {
 /// Owners only.
 pub async fn setup_state(pool: &PgPool, caller: &Caller) -> Result<SetupState, SetupError> {
     let mut tx = scope(pool, caller).await?;
-    let row: (Option<String>, String, String, String, i32, i32, i32, bool) =
+    let row: (Option<String>, String, String, String, i32, i32, i32, i32, bool, bool) =
         sqlx::query_as(&format!(
             "SELECT to_char(completed_at AT TIME ZONE 'UTC', '{STAMP}'),
                     provider_profile, activity_visibility, sign_in_methods,
-                    members, members_without_passkey, emails_stored, owner_has_passkey
+                    members, members_without_passkey, members_without_provider,
+                    emails_stored, owner_has_passkey, owner_has_provider
              FROM app_setup_state()"
         ))
         .fetch_one(&mut *tx)
@@ -305,33 +324,31 @@ pub async fn setup_state(pool: &PgPool, caller: &Caller) -> Result<SetupState, S
         posture,
         members: row.4,
         members_without_passkey: row.5,
-        emails_stored: row.6,
-        owner_has_passkey: row.7,
+        members_without_provider: row.6,
+        emails_stored: row.7,
+        owner_has_passkey: row.8,
+        owner_has_provider: row.9,
     })
 }
 
 /// Owners only. Applies the choices and marks setup done, in one transaction, audited as
 /// `setup.apply` with the choices and the counts, never a name or an address. Applying again
 /// later changes the choices the same way.
-///
-/// `passkeys_available` is whether this deployment offers passkey sign-in at all.
 pub async fn apply_setup(
     pool: &PgPool,
     caller: &Caller,
     change: &SetupChange,
-    passkeys_available: bool,
 ) -> Result<Applied, SetupError> {
     let mut tx = scope(pool, caller).await?;
     let (emails_erased, last_seen_cleared): (i32, i32) = sqlx::query_as(
         "SELECT emails_erased, last_seen_cleared
-         FROM app_setup_apply($1, $2, $3, $4, $5, $6)",
+         FROM app_setup_apply($1, $2, $3, $4, $5)",
     )
     .bind(change.provider_profile.map(ProviderProfile::as_str))
     .bind(change.activity_visibility.map(ActivityVisibility::as_str))
     .bind(change.sign_in_methods.map(SignInMethods::as_str))
     .bind(change.erase_emails)
     .bind(change.allow_lockout)
-    .bind(passkeys_available)
     .fetch_one(&mut *tx)
     .await
     .map_err(classify)?;
@@ -371,7 +388,10 @@ mod tests {
             Posture::CONVENIENCE.activity_visibility,
             ActivityVisibility::Everyone
         );
-        assert_eq!(Posture::CONVENIENCE.sign_in_methods, SignInMethods::Any);
+        assert_eq!(
+            Posture::CONVENIENCE.sign_in_methods,
+            SignInMethods::Provider
+        );
     }
 
     #[test]
@@ -399,9 +419,16 @@ mod tests {
         ] {
             assert_eq!(ActivityVisibility::parse(activity.as_str()), Some(activity));
         }
-        for methods in [SignInMethods::Any, SignInMethods::Passkey] {
+        for methods in [
+            SignInMethods::Provider,
+            SignInMethods::Any,
+            SignInMethods::Passkey,
+        ] {
             assert_eq!(SignInMethods::parse(methods.as_str()), Some(methods));
         }
+        assert_eq!(SignInMethods::Provider.as_str(), "provider");
+        assert_eq!(SignInMethods::Any.as_str(), "any");
+        assert_eq!(SignInMethods::Passkey.as_str(), "passkey");
         assert_eq!(ProviderProfile::parse("everything"), None);
         assert_eq!(ActivityVisibility::parse(""), None);
         assert_eq!(SignInMethods::parse("Passkey"), None);
