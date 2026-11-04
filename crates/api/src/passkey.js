@@ -61,7 +61,8 @@
     banned: 'This account is not allowed in.',
     flagged: 'This passkey was turned off because it looked copied. Use a recovery code.',
     slow_down: 'Too many tries. Wait a minute and try again.',
-    busy: 'The server is busy. Try again in a moment.'
+    busy: 'The server is busy. Try again in a moment.',
+    passkeys_off: 'This server now signs people in through its provider. Go back to Tiny and start again.'
   };
 
   function fail(error) {

@@ -150,10 +150,12 @@ async fn config(
     };
     Ok(Json(Config {
         methods: ["oidc"],
-        provider_name: if effective == db::SignInMethods::Passkey {
-            "Passkey"
-        } else {
+        // The name on the client's default button. Under `any` that button opens the passkey
+        // page, so it says so; only under `provider` does it name the provider.
+        provider_name: if effective == db::SignInMethods::Provider {
             sign_in.provider_name()
+        } else {
+            "Passkey"
         },
         providers: passkey
             .into_iter()

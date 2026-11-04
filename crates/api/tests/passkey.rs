@@ -1589,7 +1589,7 @@ async fn config_and_start_follow_the_stored_choice_beside_a_provider() {
         // provider: only the provider is listed, and a client asking for the passkey page is
         // told no, like for any id the server does not know.
         assert_eq!(provider_ids(&app).await, ["default"]);
-        assert_ne!(config_name(&app).await, "Passkey");
+        assert_eq!(config_name(&app).await, oidc::PROVIDER_NAME);
         let (status, body) = start_naming(&app, Some("passkey")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"], "bad_request");
@@ -1604,7 +1604,8 @@ async fn config_and_start_follow_the_stored_choice_beside_a_provider() {
         let (status, body) = put_setup(&app, &owner_token, json!({"sign_in_methods": "any"})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(provider_ids(&app).await, ["passkey", "default"]);
-        assert_ne!(config_name(&app).await, "Passkey");
+        // The default button opens the passkey page, so it is named for that.
+        assert_eq!(config_name(&app).await, "Passkey");
         // No name: the passkey page, with the default provider kept on the row.
         let (status, body) = start_naming(&app, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
