@@ -61,6 +61,12 @@ pub struct Passkeys {
     webauthn: Arc<Webauthn>,
 }
 
+impl std::fmt::Debug for Passkeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Passkeys").finish_non_exhaustive()
+    }
+}
+
 impl Passkeys {
     /// The relying party is the host of `public_url` unless `rp_id` names a domain above it. A
     /// passkey works only for the relying party it was made for, so changing either one later
@@ -268,10 +274,6 @@ fn failed(error: PasskeyError) -> Failure {
 fn logged(error: impl std::fmt::Display, what: &'static str) -> Failure {
     tracing::warn!(%error, "{what}");
     unavailable()
-}
-
-fn enabled(sign_in: &SignIn) -> Result<&Passkeys, Failure> {
-    sign_in.passkeys().ok_or_else(|| bad("invalid"))
 }
 
 /// 1 to `max` characters from the URL-safe base64 alphabet: what this server makes for a
@@ -485,7 +487,7 @@ async fn login_begin(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<StateBody>, JsonRejection>,
 ) -> Result<Json<Options>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     pending(&pool, &body.state).await?;
     let (challenge, state) = passkeys
@@ -522,7 +524,7 @@ async fn login_finish(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<LoginFinish>, JsonRejection>,
 ) -> Result<Json<Redirect>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let ceremony = spend(&pool, "login", &body.cid, Some(&body.state)).await?;
     let state: DiscoverableAuthentication = ceremony
@@ -589,7 +591,7 @@ async fn signup_begin(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<SignupBegin>, JsonRejection>,
 ) -> Result<Json<Options>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let pending = pending(&pool, &body.state).await?;
     let Some(invite_hash) = pending.invite_hash else {
@@ -637,7 +639,7 @@ async fn signup_finish(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<SignupFinish>, JsonRejection>,
 ) -> Result<Json<Recorded>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let ceremony = spend(&pool, "signup", &body.cid, Some(&body.state)).await?;
     let (Some(subject), Some(name)) = (ceremony.subject.clone(), ceremony.display_name.clone())
@@ -678,10 +680,8 @@ async fn signup_finish(
 /// The step after a passkey is made and its recovery codes are shown: tinyclient gets its code.
 async fn continue_sign_in(
     State(pool): State<PgPool>,
-    Extension(sign_in): Extension<SignIn>,
     body: Result<Json<ContinueBody>, JsonRejection>,
 ) -> Result<Json<Redirect>, Failure> {
-    enabled(&sign_in)?;
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let ceremony = spend(&pool, "continue", &body.cont, Some(&body.state)).await?;
     let subject = ceremony.subject.ok_or_else(|| bad("expired"))?;
@@ -695,7 +695,7 @@ async fn recover_begin(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<RecoverBegin>, JsonRejection>,
 ) -> Result<Json<Options>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     pending(&pool, &body.state).await?;
     let hash = db::recovery_hash(&body.code).ok_or_else(|| bad("invalid_code"))?;
@@ -753,7 +753,7 @@ async fn recover_finish(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<RecoverFinish>, JsonRejection>,
 ) -> Result<Json<Recovered>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let ceremony = spend(&pool, "recover", &body.cid, Some(&body.state)).await?;
     let hash = db::recovery_hash(&body.code).ok_or_else(|| bad("invalid_code"))?;
@@ -807,10 +807,8 @@ struct Who {
 
 async fn claim_peek(
     State(pool): State<PgPool>,
-    Extension(sign_in): Extension<SignIn>,
     body: Result<Json<TokenBody>, JsonRejection>,
 ) -> Result<Json<Who>, Failure> {
-    enabled(&sign_in)?;
     let Json(body) = body.map_err(|_| bad("invalid_link"))?;
     if !shaped(&body.token, 128) {
         return Err(bad("invalid_link"));
@@ -837,7 +835,7 @@ async fn claim_begin(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<TokenBody>, JsonRejection>,
 ) -> Result<Json<Options>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid_link"))?;
     if !shaped(&body.token, 128) {
         return Err(bad("invalid_link"));
@@ -894,7 +892,7 @@ async fn claim_finish(
     Extension(sign_in): Extension<SignIn>,
     body: Result<Json<ClaimFinish>, JsonRejection>,
 ) -> Result<Json<Claimed>, Failure> {
-    let passkeys = enabled(&sign_in)?;
+    let passkeys = sign_in.passkeys();
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let ceremony = spend(&pool, "claim", &body.cid, None).await?;
     if !shaped(&body.token, 128) || !ceremony.has_secret(&db::claim_hash(&body.token)) {

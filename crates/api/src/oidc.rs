@@ -109,6 +109,8 @@ pub struct SignInConfig {
     pub session_days: u32,
     /// The first is the default for `POST /v1/auth/start`.
     pub providers: Vec<ProviderConfig>,
+    /// The built-in passkey sign-in, which every deployment has.
+    pub passkeys: crate::passkey::Passkeys,
 }
 
 /// One provider.
@@ -227,8 +229,8 @@ struct Shared {
     session_days: u32,
     /// `TINYSERVER_PUBLIC_URL`, without a trailing slash.
     public_url: String,
-    /// The built-in passkey sign-in, when `TINYSERVER_AUTH` turns it on.
-    passkeys: Option<crate::passkey::Passkeys>,
+    /// The built-in passkey sign-in. Always on.
+    passkeys: crate::passkey::Passkeys,
 }
 
 pub(crate) struct Provider {
@@ -405,7 +407,7 @@ impl SignIn {
                 providers,
                 session_days: config.session_days,
                 public_url: public_url.as_str().trim_end_matches('/').to_string(),
-                passkeys: None,
+                passkeys: config.passkeys,
             }),
         })
     }
@@ -427,23 +429,19 @@ impl SignIn {
                 providers: Vec::new(),
                 session_days,
                 public_url: public_url.as_str().trim_end_matches('/').to_string(),
-                passkeys: Some(passkeys),
+                passkeys,
             }),
         })
     }
 
-    /// Adds passkey sign-in beside the providers already configured. Both work at once.
-    #[must_use]
-    pub fn with_passkeys(mut self, passkeys: crate::passkey::Passkeys) -> Self {
-        if let Some(shared) = Arc::get_mut(&mut self.inner) {
-            shared.passkeys = Some(passkeys);
-        }
-        self
+    /// The passkey provider.
+    pub(crate) fn passkeys(&self) -> &crate::passkey::Passkeys {
+        &self.inner.passkeys
     }
 
-    /// The passkey provider, when it is on.
-    pub(crate) fn passkeys(&self) -> Option<&crate::passkey::Passkeys> {
-        self.inner.passkeys.as_ref()
+    /// Whether any identity provider is configured. Without one, passkeys are the only way in.
+    pub(crate) fn has_providers(&self) -> bool {
+        !self.inner.providers.is_empty()
     }
 
     /// In configured order. The first is the default.
@@ -453,13 +451,11 @@ impl SignIn {
 
     /// The default provider's name.
     pub fn provider_name(&self) -> &str {
-        match (self.inner.providers.first(), &self.inner.passkeys) {
-            // Passkeys come first when they are on: the sign-in page they open offers the
-            // provider as the other way in.
-            (_, Some(_)) => "Passkey",
-            (Some(provider), None) => provider.name.as_str(),
-            (None, None) => "",
-        }
+        // A deployment with a provider keeps the provider's name; with none, it is passkeys.
+        self.inner
+            .providers
+            .first()
+            .map_or("Passkey", |provider| provider.name.as_str())
     }
 
     /// The provider with `id`, or the first when `id` is `None`.

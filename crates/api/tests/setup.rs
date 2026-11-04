@@ -7,8 +7,8 @@ use axum::http::{Method, StatusCode};
 use common::{first_owner, invite_hash, join, run, session, Call, TestDb, ISSUER, OWNER_EMAIL};
 use serde_json::{json, Value};
 
-fn app(db: &TestDb) -> axum::Router {
-    api::router(db.runtime.clone(), None)
+async fn app(db: &TestDb) -> axum::Router {
+    api::router(db.runtime.clone(), Some(common::sign_in_with(None).await))
 }
 
 async fn get_setup(app: &axum::Router, token: &str) -> (StatusCode, Value) {
@@ -70,7 +70,7 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
     run(|db| async move {
         let owner = first_owner(&db).await;
         let token = session(&db, &owner.user_id).await;
-        let app = app(&db);
+        let app = app(&db).await;
 
         let (status, setup) = get_setup(&app, &token).await;
         assert_eq!(status, StatusCode::OK, "{setup}");
@@ -86,10 +86,7 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
             })
         );
         // Passkeys are always on; no provider is configured in this app.
-        assert_eq!(
-            setup["deployment"],
-            json!({"passkeys": true, "sso": false})
-        );
+        assert_eq!(setup["deployment"], json!({"passkeys": true, "sso": false}));
         assert_eq!(setup["counts"]["members"], 1);
 
         let presets = setup["presets"].as_array().expect("presets");
@@ -152,7 +149,7 @@ async fn only_an_owner_may_see_or_change_the_choices() {
         let (_ada, ada_token) = join(&db, &owner, "ada@tinyserver.test", "member").await;
         // An admin holds every permission, and still is not an owner.
         let (_bea, bea_token) = join(&db, &owner, "bea@tinyserver.test", "admin").await;
-        let app = app(&db);
+        let app = app(&db).await;
 
         for token in [&ada_token, &bea_token] {
             let (status, body) = get_setup(&app, token).await;
@@ -191,7 +188,7 @@ async fn keeping_what_you_have_finishes_setup_and_changes_nothing() {
         let owner = first_owner(&db).await;
         let owner_token = session(&db, &owner.user_id).await;
         let (_ada, ada_token) = join(&db, &owner, "ada@tinyserver.test", "member").await;
-        let app = app(&db);
+        let app = app(&db).await;
 
         let (status, applied) = put_setup(&app, &owner_token, json!({})).await;
         assert_eq!(status, StatusCode::OK, "{applied}");
@@ -236,7 +233,7 @@ async fn a_choice_that_is_not_one_of_the_options_is_refused() {
     run(|db| async move {
         let owner = first_owner(&db).await;
         let token = session(&db, &owner.user_id).await;
-        let app = app(&db);
+        let app = app(&db).await;
         for body in [
             json!({"provider_profile": "everything"}),
             json!({"preset": "maximum"}),
@@ -257,7 +254,7 @@ async fn what_a_provider_may_leave_in_a_new_account_is_what_the_owner_chose() {
     run(|db| async move {
         let owner = first_owner(&db).await;
         let token = session(&db, &owner.user_id).await;
-        let app = app(&db);
+        let app = app(&db).await;
 
         // Full: the name and the email, and the start of the email when there is no name.
         let kept = join_with(
@@ -345,7 +342,7 @@ async fn erasing_emails_removes_every_members_address_and_says_how_many() {
         let token = session(&db, &owner.user_id).await;
         let (ada, _) = join(&db, &owner, "ada@tinyserver.test", "member").await;
         let (bea, _) = join(&db, &owner, "bea@tinyserver.test", "member").await;
-        let app = app(&db);
+        let app = app(&db).await;
 
         let (_, setup) = get_setup(&app, &token).await;
         assert_eq!(setup["counts"]["emails_stored"], 3);
@@ -414,7 +411,7 @@ async fn who_sees_when_a_member_was_last_online_is_the_owners_choice_and_nobody_
         let owner = first_owner(&db).await;
         let owner_token = session(&db, &owner.user_id).await;
         let (ada, ada_token) = join(&db, &owner, "ada@tinyserver.test", "member").await;
-        let app = app(&db);
+        let app = app(&db).await;
         let both = [owner.user_id.clone(), ada.user_id.clone()];
         db::touch_seen(&db.runtime, &both).await.expect("seen");
 
@@ -480,7 +477,7 @@ async fn applying_setup_is_audited_and_reaches_every_connected_client() {
     run(|db| async move {
         let owner = first_owner(&db).await;
         let token = session(&db, &owner.user_id).await;
-        let app = app(&db);
+        let app = app(&db).await;
         let (status, _) = put_setup(&app, &token, json!({"activity_visibility": "admins"})).await;
         assert_eq!(status, StatusCode::OK);
 

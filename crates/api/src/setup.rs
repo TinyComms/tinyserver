@@ -35,7 +35,7 @@ impl Deployment {
     pub(crate) fn of(sign_in: Option<&SignIn>) -> Self {
         Self {
             passkeys: true,
-            sso: sign_in.is_some_and(|sign_in| !sign_in.providers().is_empty()),
+            sso: sign_in.is_some_and(SignIn::has_providers),
         }
     }
 }

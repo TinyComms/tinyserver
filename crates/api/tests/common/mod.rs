@@ -9,6 +9,7 @@
 pub mod live;
 pub mod mls_client;
 pub mod oidc;
+pub mod passkey;
 pub mod pocket;
 pub mod sealed;
 
@@ -28,6 +29,20 @@ use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
 use tower::ServiceExt;
+
+/// The passkey relying party every suite uses.
+pub fn passkeys() -> api::Passkeys {
+    api::Passkeys::new(passkey::ORIGIN, "Test", None).expect("relying party")
+}
+
+/// Sign-in as a deployment builds it: with `provider` configured beside the passkeys, or with
+/// passkeys alone.
+pub async fn sign_in_with(provider: Option<&oidc::Provider>) -> api::SignIn {
+    match provider {
+        Some(provider) => provider.sign_in().await,
+        None => api::SignIn::passkey_only(passkey::ORIGIN, 30, passkeys()).expect("sign-in"),
+    }
+}
 
 pub const OWNER_EMAIL: &str = "owner@tinyserver.test";
 /// The issuer of identities made through `db` directly, without a provider.

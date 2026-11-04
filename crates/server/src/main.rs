@@ -455,44 +455,39 @@ async fn sign_in() -> anyhow::Result<api::SignIn> {
             .filter(|days| (1..=365).contains(days))
             .context("TINYSERVER_SESSION_MAX_DAYS is not a whole number from 1 to 365")?,
     };
-    let mode = AuthMode::from_env()?;
+    if env_var("TINYSERVER_AUTH").is_ok() {
+        tracing::warn!(
+            "TINYSERVER_AUTH is no longer read: passkeys are always on, and the owner chooses how members sign in from the client"
+        );
+    }
     let public_url = env_var("TINYSERVER_PUBLIC_URL")?;
-    let passkeys = if mode == AuthMode::Oidc {
-        None
-    } else {
-        // The relying party is the host of the public address: change the domain and every
-        // passkey stops working. See docs/auth-passkeys.md.
-        let name = env_var("TINYSERVER_PASSKEY_RP_NAME").unwrap_or_else(|_| "TinyComms".into());
-        // Unset: the host of the public address. Set only to a domain above it, and before
-        // anyone makes a passkey, since it cannot change afterwards.
-        let rp_id = env_var("TINYSERVER_PASSKEY_RP_ID").ok();
-        Some(
-            api::Passkeys::new(&public_url, &name, rp_id.as_deref())
-                .map_err(|error| anyhow::anyhow!("{error}"))?,
-        )
-    };
-    if let (AuthMode::Passkey, Some(passkeys)) = (mode, &passkeys) {
-        let sign_in = api::SignIn::passkey_only(&public_url, session_days, passkeys.clone())
+    // The relying party is the host of the public address: change the domain and every passkey
+    // stops working. See docs/auth-passkeys.md.
+    let name = env_var("TINYSERVER_PASSKEY_RP_NAME").unwrap_or_else(|_| "TinyComms".into());
+    // Unset: the host of the public address. Set only to a domain above it, and before anyone
+    // makes a passkey, since it cannot change afterwards.
+    let rp_id = env_var("TINYSERVER_PASSKEY_RP_ID").ok();
+    let passkeys = api::Passkeys::new(&public_url, &name, rp_id.as_deref())
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // Without a provider configured, passkeys are the only way in and nothing is contacted.
+    if !providers_configured() {
+        let sign_in = api::SignIn::passkey_only(&public_url, session_days, passkeys)
             .map_err(|error| anyhow::anyhow!("sign-in: {error}"))?;
-        tracing::info!(mode = "passkey", "sign-in ready");
+        tracing::info!("sign-in ready: passkeys only");
         return Ok(sign_in);
     }
     let config = api::SignInConfig {
         public_url,
         session_days,
         providers: providers_from_env()?,
+        passkeys,
     };
     let mut tries = 0;
     loop {
         match api::SignIn::discover(config.clone()).await {
             Ok(sign_in) => {
-                let sign_in = match passkeys.clone() {
-                    Some(passkeys) => sign_in.with_passkeys(passkeys),
-                    None => sign_in,
-                };
                 tracing::info!(
                     providers = config.providers.len(),
-                    passkeys = passkeys.is_some(),
                     default = %sign_in.provider_name(),
                     "sign-in providers ready"
                 );
@@ -508,31 +503,9 @@ async fn sign_in() -> anyhow::Result<api::SignIn> {
     }
 }
 
-/// `TINYSERVER_AUTH`: how people sign in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AuthMode {
-    /// Only the configured identity provider. What a server does when this is not set.
-    Oidc,
-    /// Only built-in passkeys. No provider is contacted or needed.
-    Passkey,
-    /// Both: the passkey page opens first and offers the provider as the other way in. For the
-    /// stretch while members move from a provider to passkeys.
-    Both,
-}
-
-impl AuthMode {
-    fn from_env() -> anyhow::Result<Self> {
-        match std::env::var("TINYSERVER_AUTH")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
-            None | Some("" | "oidc") => Ok(Self::Oidc),
-            Some("passkey") => Ok(Self::Passkey),
-            Some("both") => Ok(Self::Both),
-            Some(other) => bail!("TINYSERVER_AUTH is {other}; it is oidc, passkey or both"),
-        }
-    }
+/// Whether the environment names an identity provider at all.
+fn providers_configured() -> bool {
+    env_var("TINYSERVER_OIDC_ISSUER").is_ok() || env_var("TINYSERVER_OIDC_PROVIDERS").is_ok()
 }
 
 const DISCOVERY_TRIES: u32 = 12;

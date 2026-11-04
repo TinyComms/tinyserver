@@ -1,0 +1,142 @@
+//! A software passkey and the calls that put one on an account, shared by the suites that need
+//! a member with a passkey.
+
+use axum::http::{Method, StatusCode};
+use axum::Router;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use serde_json::{json, Value};
+use webauthn_authenticator_rs::prelude::{
+    CreationChallengeResponse, RequestChallengeResponse, Url, WebauthnAuthenticator,
+};
+use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+use webauthn_rs::prelude::Uuid;
+
+use super::{Call, TestDb};
+
+pub const ORIGIN: &str = "https://tiny.test";
+
+/// A person's authenticator and the browser origin it signs for.
+pub struct Device {
+    pub authenticator: SoftPasskey,
+    pub origin: Url,
+}
+
+impl Device {
+    pub fn new() -> Self {
+        Self::at(ORIGIN)
+    }
+
+    pub fn at(origin: &str) -> Self {
+        Self {
+            // `true` marks every ceremony as user-verified, as a phone's unlock would.
+            authenticator: SoftPasskey::new(true),
+            origin: Url::parse(origin).expect("origin"),
+        }
+    }
+
+    pub fn register(&mut self, options: &Value) -> Value {
+        // The server must ask for a discoverable credential: there is no username to sign in
+        // with otherwise. The software passkey cannot make one, so it is told it need not.
+        let selection = &options["publicKey"]["authenticatorSelection"];
+        assert_eq!(selection["residentKey"], "required", "{options}");
+        assert_eq!(selection["requireResidentKey"], true, "{options}");
+        assert_eq!(selection["userVerification"], "required", "{options}");
+        let mut options = options.clone();
+        options["publicKey"]["authenticatorSelection"]["residentKey"] = json!("discouraged");
+        options["publicKey"]["authenticatorSelection"]["requireResidentKey"] = json!(false);
+        let options: CreationChallengeResponse =
+            serde_json::from_value(options).expect("creation options");
+        let made = self
+            .authenticator
+            .do_registration(self.origin.clone(), options)
+            .expect("registered");
+        serde_json::to_value(made).expect("json")
+    }
+
+    /// Signs the server's challenge with the credential `credential_id`, and sends the user
+    /// handle `handle` as a resident-key authenticator would.
+    pub fn assert(&mut self, options: &Value, credential_id: &str, handle: &str) -> Value {
+        let mut options = options.clone();
+        options["publicKey"]["allowCredentials"] =
+            json!([{"type": "public-key", "id": credential_id}]);
+        let options: RequestChallengeResponse =
+            serde_json::from_value(options).expect("request options");
+        let asserted = self
+            .authenticator
+            .do_authentication(self.origin.clone(), options)
+            .expect("asserted");
+        let mut json = serde_json::to_value(asserted).expect("json");
+        let uuid = Uuid::parse_str(handle).expect("handle");
+        json["response"]["userHandle"] = Value::String(URL_SAFE_NO_PAD.encode(uuid.as_bytes()));
+        json
+    }
+}
+
+pub fn raw_id(credential: &Value) -> String {
+    credential["rawId"].as_str().expect("rawId").to_string()
+}
+
+pub struct Account {
+    pub token: String,
+    pub user_id: String,
+    pub credential_id: String,
+    pub subject: String,
+    pub codes: Vec<String>,
+}
+
+pub async fn subject_of(db: &TestDb, user_id: &str) -> String {
+    db::subject_of(&db.owner, user_id)
+        .await
+        .expect("subject")
+        .expect("has a passkey subject")
+}
+
+/// Puts a passkey on an existing account with a claim link, as an owner's roster would.
+pub async fn attach_passkey(
+    app: &Router,
+    db: &TestDb,
+    user_id: &str,
+    device: &mut Device,
+) -> Account {
+    let token = db::mint_claim(&db.owner, user_id, 14).await.expect("claim");
+    note(&token);
+    let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/claim/begin")
+        .json(json!({"token": token}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{begun}");
+    note(begun["cid"].as_str().expect("cid"));
+    let credential = device.register(&begun["options"]);
+    let (status, claimed) = Call::new(Method::POST, "/v1/auth/passkey/claim/finish")
+        .json(json!({"token": token, "cid": begun["cid"], "credential": credential}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{claimed}");
+    let codes: Vec<String> = claimed["codes"]
+        .as_array()
+        .expect("codes")
+        .iter()
+        .map(|code| code.as_str().expect("code").to_string())
+        .collect();
+    for code in &codes {
+        note(code);
+    }
+    Account {
+        token: String::new(),
+        user_id: user_id.to_string(),
+        credential_id: raw_id(&credential),
+        subject: subject_of(db, user_id).await,
+        codes,
+    }
+}
+
+/// Every secret the flows below make or are given, so a log test can look for each of them.
+pub static SECRETS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn note(secret: &str) {
+    SECRETS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push(secret.to_string());
+}

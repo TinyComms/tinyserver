@@ -315,6 +315,7 @@ pub fn config(providers: Vec<api::ProviderConfig>) -> api::SignInConfig {
         public_url: PUBLIC_URL.to_string(),
         session_days: 30,
         providers,
+        passkeys: super::passkeys(),
     }
 }
 

@@ -306,17 +306,27 @@ fn classify(error: sqlx::Error) -> SetupError {
 /// Owners only.
 pub async fn setup_state(pool: &PgPool, caller: &Caller) -> Result<SetupState, SetupError> {
     let mut tx = scope(pool, caller).await?;
-    let row: (Option<String>, String, String, String, i32, i32, i32, i32, bool, bool) =
-        sqlx::query_as(&format!(
-            "SELECT to_char(completed_at AT TIME ZONE 'UTC', '{STAMP}'),
+    let row: (
+        Option<String>,
+        String,
+        String,
+        String,
+        i32,
+        i32,
+        i32,
+        i32,
+        bool,
+        bool,
+    ) = sqlx::query_as(&format!(
+        "SELECT to_char(completed_at AT TIME ZONE 'UTC', '{STAMP}'),
                     provider_profile, activity_visibility, sign_in_methods,
                     members, members_without_passkey, members_without_provider,
                     emails_stored, owner_has_passkey, owner_has_provider
              FROM app_setup_state()"
-        ))
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(classify)?;
+    ))
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(classify)?;
     tx.commit().await.map_err(from_sql)?;
     let posture = posture_from(&row.1, &row.2, &row.3).map_err(CommunityError::Database)?;
     Ok(SetupState {

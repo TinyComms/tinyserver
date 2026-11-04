@@ -33,18 +33,16 @@ use url::Url;
 use crate::oidc::{Provider, SignIn};
 
 pub fn routes(sign_in: SignIn) -> Router<PgPool> {
-    let mut routes = Router::new()
+    Router::new()
         .route("/v1/auth/config", get(config))
         .route("/v1/auth/start", post(start))
         .route("/v1/auth/join", get(join).post(join_new))
         .route("/v1/auth/callback", get(callback))
         .route("/v1/auth/token", post(token))
-        .route("/v1/auth/backchannel-logout", post(backchannel_logout));
-    // Only when TINYSERVER_AUTH turns passkeys on: otherwise these paths do not exist.
-    if sign_in.passkeys().is_some() {
-        routes = routes.merge(crate::passkey::routes());
-    }
-    routes.layer(Extension(sign_in))
+        .route("/v1/auth/backchannel-logout", post(backchannel_logout))
+        // Passkeys are on in every deployment.
+        .merge(crate::passkey::routes())
+        .layer(Extension(sign_in))
 }
 
 #[derive(Serialize)]
@@ -135,7 +133,9 @@ impl IntoResponse for AuthApiError {
 async fn config(Extension(sign_in): Extension<SignIn>) -> Response {
     // `methods` stays `["oidc"]`: tinyclient runs the same browser flow for either, and an older
     // one must not meet a value it does not know.
-    let passkey = sign_in.passkeys().map(|_| ProviderEntry {
+    // Beside a provider the passkey entry waits for the owner to allow it; alone it is the
+    // only way in.
+    let passkey = (!sign_in.has_providers()).then_some(ProviderEntry {
         id: crate::passkey::PROVIDER_ID,
         name: "Passkey",
     });
@@ -165,14 +165,12 @@ async fn start(
     let invite = body.invite.as_deref().filter(|invite| !invite.is_empty());
     // The owner may have chosen passkeys only. Then the passkey page is the only way in, and
     // there is no provider beside it.
-    let passkey_only = passkey_only(&pool, &sign_in).await?;
-    // With passkeys on, sign-in opens the passkey page unless the client names a provider.
-    let passkey_page = sign_in.passkeys().is_some()
-        && (passkey_only
-            || body
-                .provider
-                .as_deref()
-                .is_none_or(|id| id == crate::passkey::PROVIDER_ID));
+    let passkey_only = passkey_only(&pool).await?;
+    // Sign-in opens the passkey page when there is no provider, or the owner chose passkeys only,
+    // or the client asks for it by name.
+    let passkey_page = passkey_only
+        || !sign_in.has_providers()
+        || body.provider.as_deref() == Some(crate::passkey::PROVIDER_ID);
     let provider = if passkey_only {
         None
     } else if passkey_page {
@@ -471,7 +469,7 @@ async fn callback(
         }
     };
     // Passkeys only: a provider has proved who this is, and the community does not take it.
-    match passkey_only(&pool, &sign_in).await {
+    match passkey_only(&pool).await {
         Ok(false) => {}
         Ok(true) => {
             tracing::info!(provider = %provider.id(), "sign-in refused: passkeys only");
@@ -531,13 +529,8 @@ async fn callback(
     }
 }
 
-/// Whether the owner chose passkeys only, and this deployment has passkeys to honour it. Without
-/// passkeys the choice cannot apply: refusing every provider then would lock everyone out, as it
-/// would after switching `TINYSERVER_AUTH` back.
-async fn passkey_only(pool: &PgPool, sign_in: &SignIn) -> Result<bool, AuthApiError> {
-    if sign_in.passkeys().is_none() {
-        return Ok(false);
-    }
+/// Whether the owner chose passkeys only. Every deployment has passkeys to honour it.
+async fn passkey_only(pool: &PgPool) -> Result<bool, AuthApiError> {
     db::posture(pool)
         .await
         .map(|posture| posture.sign_in_methods == db::SignInMethods::Passkey)

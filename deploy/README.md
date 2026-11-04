@@ -177,7 +177,7 @@ Nothing in tinyserver needs Cloudflare. It is a plain HTTP server on `BIND` (ins
 docker compose -f compose.yml -f compose.proxy.yml up -d
 ```
 
-(Add `-f compose.passkey.yml` between them if you use passkeys only.) Put `TUNNEL_TOKEN=unused` in `.env`: compose reads that variable while it loads the file even though cloudflared is not started.
+(Add `-f compose.passkey.yml` between them if you have retired Pocket ID.) Put `TUNNEL_TOKEN=unused` in `.env`: compose reads that variable while it loads the file even though cloudflared is not started.
 
 What your front end must do:
 
