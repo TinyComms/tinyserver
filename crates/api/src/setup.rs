@@ -21,6 +21,9 @@ use serde_json::{json, Value};
 use crate::community::{caller, lift, ApiError};
 use crate::oidc::SignIn;
 
+/// What the owner reads where a provider would be named and none is configured.
+pub(crate) const NO_PROVIDER_NAME: &str = "your sign-in provider";
+
 /// What this deployment offers, from how the server was started. Fixed for the life of the
 /// process.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -42,7 +45,7 @@ impl Deployment {
             provider_name: sign_in
                 .filter(|sign_in| sign_in.has_providers())
                 .map_or_else(
-                    || "your sign-in provider".to_string(),
+                    || NO_PROVIDER_NAME.to_string(),
                     |sign_in| sign_in.provider_name().to_string(),
                 ),
         }
@@ -152,7 +155,7 @@ fn choices(deployment: &Deployment) -> Value {
     ])
 }
 
-fn presets(_deployment: &Deployment) -> Value {
+fn presets() -> Value {
     json!([
         {
             "id": "convenience",
@@ -206,7 +209,7 @@ async fn show(
             "owner_has_provider": state.owner_has_provider,
         },
         "members": members,
-        "presets": presets(&deployment),
+        "presets": presets(),
         "choices": choices(&deployment),
         "always": always(),
     })))
@@ -289,31 +292,37 @@ async fn claim_links(
     body: Result<Json<ClaimLinksBody>, JsonRejection>,
 ) -> Result<Json<Value>, SetupFailure> {
     let caller = caller(&pool, &headers).await?;
+    // Owners only, before anything about the request is judged.
+    let members = db::setup_members(&pool, &caller).await?;
     let Json(body) = body.map_err(|_| SetupFailure::BadRequest)?;
     let days = body.days.unwrap_or(DEFAULT_DAYS);
     if body.user_ids.len() > MOST_LINKS || !(1..=90).contains(&days) {
         return Err(SetupFailure::BadRequest);
     }
-    // Check every id before minting any, so a refused request leaves nothing behind.
-    let members = db::setup_members(&pool, &caller).await?;
-    let mut named = Vec::with_capacity(body.user_ids.len());
+    // One link per member, in the order first named.
+    let mut ids: Vec<String> = Vec::with_capacity(body.user_ids.len());
     for id in &body.user_ids {
         let id = id.to_lowercase();
-        let member = members
-            .iter()
-            .find(|member| member.user_id == id)
-            .ok_or(SetupFailure::BadRequest)?;
-        named.push(member);
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
     }
-    let mut links = Vec::with_capacity(named.len());
-    for member in named {
-        let token = db::claim_link_for(&pool, &caller, &member.user_id, days).await?;
-        links.push(json!({
-            "user_id": member.user_id,
-            "display_name": member.display_name,
-            "url": crate::passkey::claim_url(&public_url, &token),
-        }));
-    }
+    // Minted in one transaction: any id that is not a current member refuses the lot.
+    let made = db::claim_links_for(&pool, &caller, &ids, days).await?;
+    let links: Vec<Value> = made
+        .into_iter()
+        .map(|(user_id, token)| {
+            let name = members
+                .iter()
+                .find(|member| member.user_id == user_id)
+                .map(|member| member.display_name.as_str());
+            json!({
+                "user_id": user_id,
+                "display_name": name,
+                "url": crate::passkey::claim_url(&public_url, &token),
+            })
+        })
+        .collect();
     tracing::info!(user_id = %caller.user_id, links = links.len(), days, "claim links made");
     Ok(Json(json!({ "links": links })))
 }
@@ -422,12 +431,7 @@ mod tests {
 
     #[test]
     fn a_preset_in_the_outline_is_the_posture_it_applies() {
-        let deployment = Deployment {
-            passkeys: true,
-            sso: false,
-            provider_name: "your sign-in provider".to_string(),
-        };
-        for preset in presets(&deployment).as_array().expect("presets") {
+        for preset in presets().as_array().expect("presets") {
             let posture: Posture = match preset["id"].as_str().expect("id") {
                 "convenience" => Preset::Convenience.posture(),
                 "privacy" => Preset::Privacy.posture(),
@@ -438,13 +442,8 @@ mod tests {
     }
 
     #[test]
-    fn both_presets_are_offered_whatever_the_deployment() {
-        let deployment = Deployment {
-            passkeys: true,
-            sso: false,
-            provider_name: "your sign-in provider".to_string(),
-        };
-        for preset in presets(&deployment).as_array().expect("presets") {
+    fn both_presets_are_always_offered() {
+        for preset in presets().as_array().expect("presets") {
             assert_eq!(preset["available"], true);
             assert!(preset.get("unavailable").is_none());
         }

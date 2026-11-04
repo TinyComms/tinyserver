@@ -101,7 +101,7 @@ pub use session::{
     close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,
 };
 pub use setup::{
-    apply_setup, claim_link_for, posture, setup_members, setup_state, ActivityVisibility, Applied,
+    apply_setup, claim_links_for, posture, setup_members, setup_state, ActivityVisibility, Applied,
     Posture, Preset, ProviderProfile, SetupChange, SetupError, SetupMember, SetupState,
     SignInMethods,
 };

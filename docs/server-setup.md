@@ -152,7 +152,7 @@ Owners only (`403 forbidden` for anyone else, `401` without a session).
   "members": [{"user_id": "...", "display_name": "Owner", "passkey": false, "provider": true}],
   "presets": [
     {"id": "convenience", "title": "...", "summary": "...", "choices": {...}, "available": true},
-    {"id": "privacy", "title": "...", "summary": "...", "choices": {...}, "available": true, "unavailable": null}
+    {"id": "privacy", "title": "...", "summary": "...", "choices": {...}, "available": true}
   ],
   "choices": [
     {"id": "provider_profile", "title": "...", "question": "...", "relevant": false,
@@ -164,7 +164,9 @@ Owners only (`403 forbidden` for anyone else, `401` without a session).
 
 `needed` is true until `completed_at` is set. `deployment` is what the server was started with.
 `counts` is what a choice would touch, so the page can say "3 members have no passkey yet" before
-the owner chooses. `members` is every member who is not banned, owner included, by name, with which sign-ins each has, so the page can draw a checklist. An option's `needs` lists what it depends on (`owner_has_provider`, `owner_has_passkey`).
+the owner chooses. `members` is every member who is not banned, owner included, by name, with
+which sign-ins each has, so the page can draw a checklist. An option's `needs` lists what it
+depends on (`owner_has_provider`, `owner_has_passkey`).
 `relevant: false` means the choice has nothing to act on in this deployment; show it dimmed.
 
 ### `PUT /v1/setup`
@@ -204,12 +206,13 @@ about to leave without a sign-in they can use.
 {"user_ids": ["..."], "days": 14}
 ```
 
-`days` is optional (1 to 90, default 14); at most 200 ids. The reply is
-`{"links": [{"user_id": "...", "display_name": "Bo", "url": "https://.../v1/auth/passkey/claim#<token>"}]}`.
+`days` is optional (1 to 90, default 14); at most 200 ids, and an id named twice gets one link.
+The reply is `{"links": [{"user_id": "...", "display_name": "Bo", "url": "..."}]}`, where `url` is
+`https://<server>/v1/auth/passkey/claim#<token>`.
 The token is in the fragment and the server keeps only its hash, so the links are shown once and
 never listed. A new link for a member replaces the one before. An id that is not a current member
 (unknown, deleted or banned), a bad `days` or too many ids is `400 bad_request` for the whole
-request, and nothing is made. Each link is audited `passkey.claim_link` with the owner as actor.
+request, and nothing is made or replaced (it is all one transaction). Each link is audited `passkey.claim_link` with the owner as actor.
 
 Applying is audited `setup.apply` (the choices, the two counts, `allow_lockout`; never a name or an
 address) and emits `server.updated`, so every connected client learns the new choices. The same

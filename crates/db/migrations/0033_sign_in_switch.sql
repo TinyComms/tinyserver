@@ -195,7 +195,7 @@ BEGIN
                     WHERE i.user_id = u.id AND i.issuer <> 'tinyserver:passkey')
     FROM memberships m
     JOIN users u ON u.id = m.user_id
-    WHERE NOT app_banned(m.user_id)
+    WHERE u.deleted_at IS NULL AND NOT app_banned(m.user_id)
     ORDER BY u.display_name, u.id;
 END;
 $$;

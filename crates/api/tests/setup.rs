@@ -750,6 +750,27 @@ async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
             .expect("count");
         assert_eq!(before, after, "nothing minted for a refused request");
 
+        // The same id twice is one link, and it works.
+        let (status, twice) = links(json!([bo, bo]), None, token.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{twice}");
+        assert_eq!(twice["links"].as_array().map(Vec::len), Some(1), "{twice}");
+        let twice = token_of(&twice);
+        assert_eq!(peek(twice.clone()).await.0, StatusCode::OK);
+
+        // A failure part-way replaces nothing: Bo comes first, Cy (banned) refuses the lot.
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_claims")
+            .fetch_one(&db.owner)
+            .await
+            .expect("count");
+        let (status, body) = links(json!([bo, cy]), None, token.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(peek(twice).await.0, StatusCode::OK, "Bo's link survives");
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_claims")
+            .fetch_one(&db.owner)
+            .await
+            .expect("count");
+        assert_eq!(before, after);
+
         let (status, _) = links(json!([bo]), Some(91), token.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = links(json!([bo]), Some(0), token.clone()).await;
@@ -759,6 +780,8 @@ async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
         let bo_token = session(&db, &bo).await;
         let (status, _) = links(json!([bo]), None, bo_token.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = links(json!([bo]), Some(91), bo_token.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "ownership is judged first");
         let (status, _) = get_setup(&app, &bo_token).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     })

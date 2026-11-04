@@ -379,26 +379,32 @@ pub async fn setup_members(pool: &PgPool, caller: &Caller) -> Result<Vec<SetupMe
         .collect())
 }
 
-/// Owners only. A claim link for a member, good for `days` (1 to 90), audited with the owner as
-/// the actor. Returns the token, which is shown once and kept only as a hash. An older link for
-/// the same member stops working. `NoSuchMember` for anyone banned, deleted or not a member.
-pub async fn claim_link_for(
+/// Owners only. A claim link for each member named, good for `days` (1 to 90), audited with the
+/// owner as the actor. Returns `(user_id, token)` in the order given. A token is shown once and
+/// kept only as a hash. An older link for the same member stops working. All in one
+/// transaction: `NoSuchMember` for anyone banned, deleted or not a member refuses the lot and
+/// replaces nothing.
+pub async fn claim_links_for(
     pool: &PgPool,
     caller: &Caller,
-    user_id: &str,
+    user_ids: &[String],
     days: i32,
-) -> Result<String, SetupError> {
-    let token = new_token();
+) -> Result<Vec<(String, String)>, SetupError> {
     let mut tx = scope(pool, caller).await?;
-    sqlx::query("SELECT app_setup_claim_link($1, $2::uuid, $3)")
-        .bind(token_digest(&token).as_slice())
-        .bind(user_id)
-        .bind(days)
-        .execute(&mut *tx)
-        .await
-        .map_err(classify)?;
+    let mut made = Vec::with_capacity(user_ids.len());
+    for user_id in user_ids {
+        let token = new_token();
+        sqlx::query("SELECT app_setup_claim_link($1, $2::uuid, $3)")
+            .bind(token_digest(&token).as_slice())
+            .bind(user_id)
+            .bind(days)
+            .execute(&mut *tx)
+            .await
+            .map_err(classify)?;
+        made.push((user_id.clone(), token));
+    }
     tx.commit().await.map_err(from_sql)?;
-    Ok(token)
+    Ok(made)
 }
 
 /// Owners only. Applies the choices and marks setup done, in one transaction, audited as
