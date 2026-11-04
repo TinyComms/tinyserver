@@ -1473,7 +1473,6 @@ async fn the_passkey_routes_are_always_there_and_provider_only_sends_start_to_th
 }
 
 #[tokio::test]
-#[ignore = "Task 4 makes start and config follow the stored choice"]
 async fn any_opens_the_passkey_page_and_still_offers_the_provider() {
     run(|db| async move {
         let owner = first_owner(&db).await;
@@ -1525,6 +1524,191 @@ async fn any_opens_the_passkey_page_and_still_offers_the_provider() {
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::OK);
+    })
+    .await;
+}
+
+/// `POST /v1/auth/start` as tinyclient sends it, naming `provider` when given.
+async fn start_naming(app: &Router, provider: Option<&str>) -> (StatusCode, Value) {
+    let mut body = json!({
+        "redirect_uri": REDIRECT,
+        "code_challenge": db::s256(VERIFIER),
+        "code_challenge_method": "S256",
+        "state": "client-state-0123456789abcdef",
+    });
+    if let Some(provider) = provider {
+        body["provider"] = json!(provider);
+    }
+    Call::new(Method::POST, "/v1/auth/start")
+        .json(body)
+        .send(app)
+        .await
+}
+
+async fn provider_ids(app: &Router) -> Vec<String> {
+    let (status, config) = Call::new(Method::GET, "/v1/auth/config").send(app).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["methods"], json!(["oidc"]));
+    config["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("id").to_string())
+        .collect()
+}
+
+async fn provider_app(db: &TestDb, provider: &Provider) -> Router {
+    let sign_in = api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
+        .await
+        .expect("discover");
+    api::router(db.runtime.clone(), Some(sign_in))
+}
+
+#[tokio::test]
+async fn config_and_start_follow_the_stored_choice_beside_a_provider() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let provider = Provider::start().await;
+        let app = provider_app(&db, &provider).await;
+        let mut device = Device::new();
+        attach_passkey(&app, &db, &owner.user_id, &mut device).await;
+
+        // provider: only the provider is listed, and a client asking for the passkey page is
+        // told no, like for any id the server does not know.
+        assert_eq!(provider_ids(&app).await, ["default"]);
+        let (status, body) = start_naming(&app, Some("passkey")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "bad_request");
+        let (status, body) = start_naming(&app, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .starts_with(&provider.issuer));
+
+        // any: both, the passkey first. A name the server does not know is still refused.
+        let (status, body) = put_setup(&app, &owner_token, json!({"sign_in_methods": "any"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(provider_ids(&app).await, ["passkey", "default"]);
+        let (status, body) = start_naming(&app, Some("passkey")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .contains("/v1/auth/passkey"));
+        let (status, body) = start_naming(&app, Some("nope")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // passkey: only the passkey, and a named provider is ignored.
+        let (status, body) =
+            put_setup(&app, &owner_token, json!({"sign_in_methods": "passkey"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(provider_ids(&app).await, ["passkey"]);
+        let (status, body) = start_naming(&app, Some("default")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let url = body["authorize_url"].as_str().expect("url");
+        assert!(url.contains("/v1/auth/passkey"), "{url}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_no_provider_any_name_in_start_opens_the_passkey_page() {
+    run(|db| async move {
+        let app = passkey_app(&db);
+        for named in [Some("default"), Some("nope"), Some("passkey")] {
+            let (status, body) = start_naming(&app, named).await;
+            assert_eq!(status, StatusCode::OK, "{named:?}: {body}");
+            let url = body["authorize_url"].as_str().expect("url");
+            assert!(url.contains("/v1/auth/passkey"), "{url}");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn switching_to_the_provider_only_turns_a_passkey_ceremony_away_and_keeps_the_claim_and_recovery_pages(
+) {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let provider = Provider::start().await;
+        let app = provider_app(&db, &provider).await;
+        let (status, body) = put_setup(&app, &owner_token, json!({"sign_in_methods": "any"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // A member with a passkey and recovery codes, and a claim link for another.
+        let mut device = Device::new();
+        let invite_token = invite(&db, &owner).await;
+        let account = sign_up(&app, &db, &mut device, &invite_token, "Ada").await;
+        let other = oidc_member(&db, &owner, "bo@example.org").await;
+        let claim = db::mint_claim(&db.owner, &other.user_id, 14)
+            .await
+            .expect("claim");
+        let (state, _) = start(&app, None).await;
+        let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/login/begin")
+            .json(json!({"state": state}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{begun}");
+        note(begun["cid"].as_str().expect("cid"));
+        let credential = device.assert(&begun["options"], &account.credential_id, &account.subject);
+
+        // Ada has no provider identity, so the owner says the switch may leave her out.
+        let (status, body) = put_setup(
+            &app,
+            &owner_token,
+            json!({"sign_in_methods": "provider", "allow_lockout": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let codes_before = count(&db, "SELECT count(*) FROM auth_codes").await;
+        let ceremonies_before = count(&db, "SELECT count(*) FROM passkey_ceremonies").await;
+
+        let (status, body) = Call::new(Method::POST, "/v1/auth/passkey/login/finish")
+            .json(json!({"state": state, "cid": begun["cid"], "credential": credential}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body, json!({"error": "passkeys_off"}));
+        for (path, body) in [
+            ("login/begin", json!({"state": state})),
+            ("signup/begin", json!({"state": state, "name": "Cy"})),
+            (
+                "signup/finish",
+                json!({"state": state, "cid": "x", "credential": {}}),
+            ),
+        ] {
+            let (status, got) = Call::new(Method::POST, &format!("/v1/auth/passkey/{path}"))
+                .json(body)
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {got}");
+            assert_eq!(got, json!({"error": "passkeys_off"}), "{path}");
+        }
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM auth_codes").await,
+            codes_before,
+            "no session was made"
+        );
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM passkey_ceremonies").await,
+            ceremonies_before,
+            "a refused ceremony wrote a row"
+        );
+
+        // Claim and recovery still work.
+        let (status, who) = Call::new(Method::POST, "/v1/auth/passkey/claim/peek")
+            .json(json!({"token": claim}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{who}");
+        let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/recover/begin")
+            .json(json!({"state": state, "code": account.codes[0]}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{begun}");
     })
     .await;
 }

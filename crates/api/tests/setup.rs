@@ -519,9 +519,12 @@ async fn going_back_to_a_provider_waits_for_the_owner_to_have_one() {
             .await
             .expect("owner invite")
             .expect("no owner yet");
+        // The stored choice is `provider`, which turns passkey sign-up away, so set `any` first.
+        sqlx::query("UPDATE server_settings SET sign_in_methods = 'any'")
+            .execute(&db.owner)
+            .await
+            .expect("any");
         let owner = sign_up(&app, &db, &mut Device::new(), &bootstrap.token, "Owner").await;
-        let (status, put) = put_setup(&app, &owner.token, json!({"sign_in_methods": "any"})).await;
-        assert_eq!(status, StatusCode::OK, "{put}");
 
         let (status, put) =
             put_setup(&app, &owner.token, json!({"sign_in_methods": "provider"})).await;

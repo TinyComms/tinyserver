@@ -40,7 +40,7 @@ use webauthn_rs::prelude::{
     RegisterPublicKeyCredential, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
 };
 
-use crate::auth::{client_url, escape, expired, server_trouble, Outcome, STYLE};
+use crate::auth::{client_url, effective, escape, expired, server_trouble, Outcome, STYLE};
 use crate::community::{caller, lift, ApiError};
 use crate::oidc::{ConfigError, SignIn};
 
@@ -488,6 +488,14 @@ async fn login_begin(
     body: Result<Json<StateBody>, JsonRejection>,
 ) -> Result<Json<Options>, Failure> {
     let passkeys = sign_in.passkeys();
+    // Providers only: the owner has switched the ceremonies off.
+    if effective(&pool, &sign_in)
+        .await
+        .map_err(|_| unavailable())?
+        == db::SignInMethods::Provider
+    {
+        return Err(bad("passkeys_off"));
+    }
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     pending(&pool, &body.state).await?;
     let (challenge, state) = passkeys
@@ -525,6 +533,14 @@ async fn login_finish(
     body: Result<Json<LoginFinish>, JsonRejection>,
 ) -> Result<Json<Redirect>, Failure> {
     let passkeys = sign_in.passkeys();
+    // Providers only: the owner has switched the ceremonies off.
+    if effective(&pool, &sign_in)
+        .await
+        .map_err(|_| unavailable())?
+        == db::SignInMethods::Provider
+    {
+        return Err(bad("passkeys_off"));
+    }
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let ceremony = spend(&pool, "login", &body.cid, Some(&body.state)).await?;
     let state: DiscoverableAuthentication = ceremony
@@ -592,6 +608,14 @@ async fn signup_begin(
     body: Result<Json<SignupBegin>, JsonRejection>,
 ) -> Result<Json<Options>, Failure> {
     let passkeys = sign_in.passkeys();
+    // Providers only: the owner has switched the ceremonies off.
+    if effective(&pool, &sign_in)
+        .await
+        .map_err(|_| unavailable())?
+        == db::SignInMethods::Provider
+    {
+        return Err(bad("passkeys_off"));
+    }
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let pending = pending(&pool, &body.state).await?;
     let Some(invite_hash) = pending.invite_hash else {
@@ -640,6 +664,14 @@ async fn signup_finish(
     body: Result<Json<SignupFinish>, JsonRejection>,
 ) -> Result<Json<Recorded>, Failure> {
     let passkeys = sign_in.passkeys();
+    // Providers only: the owner has switched the ceremonies off.
+    if effective(&pool, &sign_in)
+        .await
+        .map_err(|_| unavailable())?
+        == db::SignInMethods::Provider
+    {
+        return Err(bad("passkeys_off"));
+    }
     let Json(body) = body.map_err(|_| bad("invalid"))?;
     let ceremony = spend(&pool, "signup", &body.cid, Some(&body.state)).await?;
     let (Some(subject), Some(name)) = (ceremony.subject.clone(), ceremony.display_name.clone())

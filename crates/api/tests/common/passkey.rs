@@ -156,8 +156,8 @@ pub async fn start(app: &Router, invite: Option<&str>) -> (String, String) {
     start_as(app, invite, None).await
 }
 
-/// [`start`] naming the sign-in method: a deployment with a provider goes to it unless the
-/// body says `"provider": "passkey"`.
+/// [`start`] naming the sign-in method. Where it goes depends on what the owner chose: with
+/// `provider` stored, `"provider": "passkey"` is refused; with `any`, it opens the passkey page.
 pub async fn start_as(
     app: &Router,
     invite: Option<&str>,
