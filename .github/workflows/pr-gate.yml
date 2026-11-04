@@ -33,4 +33,10 @@ jobs:
       - name: Check
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/pr-gate.py check
+        run: |
+          # The pull request that adds the gate has no gate on its base to be judged by.
+          if [ ! -f .github/scripts/pr-gate.py ]; then
+            echo "::notice title=pr-gate::the base has no pr-gate yet, so this pull request introduces it"
+            exit 0
+          fi
+          python3 .github/scripts/pr-gate.py check
