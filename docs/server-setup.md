@@ -68,6 +68,11 @@ affected by this choice.
 | `any` | a passkey or the provider; the sign-in page offers both |
 | `passkey` | a sign-in through a provider is refused, and the passkey page stops offering one |
 
+The choice takes effect at once. Passkeys are always on in the server; this says which sign-ins it
+accepts from people who are not yet members. On a deployment with no provider configured the
+stored value is irrelevant: sign-in is always by passkey, the choice is marked `"relevant": false`,
+and the `provider` guards below do not apply (the value is stored as sent).
+
 `passkey` closes the provider door for **new sign-ins**, and `provider` closes the passkey door
 the same way. Sessions already open carry on until they expire or the person signs out. A
 provider that has just vouched for someone, part-way through signing in when the owner chose, is
@@ -77,11 +82,13 @@ Moving to `passkey` or `provider` is refused, with a reason the owner can act on
 
 - **The owner has that sign-in themself**: `409 owner_needs_passkey` or `409 owner_needs_provider`.
   Without one the owner would be locked out at their next sign-in. The owner adds a passkey with
-  a claim link, as any member does.
-- **Every member (banned ones aside) has it, or the owner says they can wait**:
+  a claim link, as any member does. The `provider` guard applies only when a provider is
+  configured.
+- **Every other member (banned ones aside) has it, or the owner says they can wait**:
   `409 members_without_passkey` or `409 members_without_provider`, each with `count`. People
   without it cannot sign in until the owner gives them a claim link (`docs/auth-passkeys.md`).
-  `allow_lockout: true` accepts that.
+  `allow_lockout: true` accepts that. The owner is not one of these members: their own state is
+  the check above. The `provider` guard applies only when a provider is configured.
 
 ## 3. The two presets
 
@@ -147,9 +154,9 @@ Owners only (`403 forbidden` for anyone else, `401` without a session).
   "completed_at": null,
   "current": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "provider"},
   "deployment": {"passkeys": true, "sso": false},
-  "counts": {"members": 1, "members_without_passkey": 1, "members_without_provider": 0,
-             "emails_stored": 1, "owner_has_passkey": false, "owner_has_provider": true},
-  "members": [{"user_id": "...", "display_name": "Owner", "passkey": false, "provider": true}],
+  "counts": {"members": 1, "members_without_passkey": 1, "members_without_provider": 1,
+             "emails_stored": 2, "owner_has_passkey": false, "owner_has_provider": true},
+  "members": [{"user_id": "...", "display_name": "Bo", "passkey": false, "provider": false}],
   "presets": [
     {"id": "convenience", "title": "...", "summary": "...", "choices": {...}, "available": true},
     {"id": "privacy", "title": "...", "summary": "...", "choices": {...}, "available": true}
@@ -164,9 +171,13 @@ Owners only (`403 forbidden` for anyone else, `401` without a session).
 
 `needed` is true until `completed_at` is set. `deployment` is what the server was started with.
 `counts` is what a choice would touch, so the page can say "3 members have no passkey yet" before
-the owner chooses. `members` is every member who is not banned, owner included, by name, with
-which sign-ins each has, so the page can draw a checklist. An option's `needs` lists what it
-depends on (`owner_has_provider`, `owner_has_passkey`).
+the owner chooses. The owner is not a "member" in these numbers; their own state is
+`owner_has_passkey` and `owner_has_provider`. `members` is the number of non-banned memberships
+other than the caller's, and `members_without_passkey` and `members_without_provider` are counted
+over those same people. `emails_stored` counts every member who has an address on file, the owner
+included. The `members` array lists those same people, by name, with which sign-ins each has, so
+the page can draw a checklist (an empty array on a server with only its owner). An option's
+`needs` lists what it depends on (`owner_has_provider`, `owner_has_passkey`).
 `relevant: false` means the choice has nothing to act on in this deployment; show it dimmed.
 
 ### `PUT /v1/setup`
@@ -200,7 +211,8 @@ To give the owner a passkey (`owner_needs_passkey`), a client calls `POST /v1/me
 ### `POST /v1/setup/claim-links`
 
 Owners only. Makes a passkey claim link for each member named, to hand to people the owner is
-about to leave without a sign-in they can use.
+about to leave without a sign-in they can use. The owner may name themself (a client offers "Add a
+passkey for me"), though the owner is not in `members`.
 
 ```json
 {"user_ids": ["..."], "days": 14}
@@ -212,7 +224,8 @@ The reply is `{"links": [{"user_id": "...", "display_name": "Bo", "url": "..."}]
 The token is in the fragment and the server keeps only its hash, so the links are shown once and
 never listed. A new link for a member replaces the one before. An id that is not a current member
 (unknown, deleted or banned), a bad `days` or too many ids is `400 bad_request` for the whole
-request, and nothing is made or replaced (it is all one transaction). Each link is audited `passkey.claim_link` with the owner as actor.
+request, and nothing is made or replaced (it is all one transaction). Each link is audited
+`passkey.claim_link` with the owner as actor.
 
 Applying is audited `setup.apply` (the choices, the two counts, `allow_lockout`; never a name or an
 address) and emits `server.updated`, so every connected client learns the new choices. The same
@@ -226,15 +239,17 @@ everything else that writes.
 `crates/api/tests/setup.rs` and, where passkeys are involved, `crates/api/tests/passkey.rs`:
 
 - a new server says setup is needed, offers every option (three for sign-in: `provider`, `any`,
-  `passkey`) with a sentence of effect, lists the members and both presets as available, and lists
+  `passkey`) with a sentence of effect, counts and lists the members other than the owner (none,
+  on a new server) and says what the owner has, offers both presets as available, and lists
   `first_run_setup` in its capabilities;
 - only an owner may read or change the choices (a member and an admin with every permission are
   refused; no session is `401`), and a refused attempt writes nothing and audits nothing;
 - `{}` finishes setup and changes no choice; the first completion time stays the first;
 - an unknown choice, preset or field is refused and does not finish setup;
-- the owner sees who is ready (banned members left out) and makes claim links: the link opens for
-  that member, a second one replaces the first, a banned id or a bad `days` is `400` and a member
-  is `403`, and the audit row names the owner;
+- the owner sees who is ready (banned members and the owner left out of the list and the counts)
+  and makes claim links: the link opens for that member, a second one replaces the first, the owner
+  may make one for themself, a banned id or a bad `days` is `400` and a member is `403`, and the
+  audit row names the owner;
 - what a provider may leave: full, name only (and never the start of an email as a name), nothing,
   and none of it reaches existing accounts or a returning sign-in; a name typed for a passkey is
   untouched;
@@ -248,7 +263,11 @@ everything else that writes.
 - passkeys only turns a provider away at the callback without spending the invite or making an
   account, the passkey page stops offering the provider, and `start` opens the passkey page even
   when the provider is named;
-- the choice does not lock anyone out when the server is started without passkeys;
+- going back to `provider`: refused while the owner has no provider sign-in, refused with a count
+  of the other members who have none (banned ones aside), accepted with `allow_lockout`;
+- on a deployment with no provider configured, the owner with no provider identity applies a
+  preset that stores `provider`: it is accepted, `GET /v1/server` says `provider`, and
+  `POST /v1/auth/start` still opens the passkey page;
 - setup is audited and emits `server.updated`.
 
 Not tested: a client. tinyclient does not yet show these choices (see the client section of the
