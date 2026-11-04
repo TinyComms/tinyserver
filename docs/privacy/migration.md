@@ -6,10 +6,10 @@ What happens to existing plaintext, to old and new clients and servers, to the s
 
 | Statement | Source |
 |---|---|
-| Existing conversations stay plaintext. They are **never converted in place** | `e2ee-text.md` section 9 |
-| The client labels a plaintext conversation as such for all time: "Not end-to-end encrypted: the server can read this conversation". Nothing silently reclassifies old plaintext as protected | section 7 |
-| There is no automatic converter: converting would copy plaintext into ciphertext made by the server, which would give the server the keys | section 9 |
-| How a community moves: create encrypted channels, tell people, and let an owner delete the plaintext ones. Deleting a channel hard-deletes its messages; the outbox scrub (`0014`) covers edits | section 9 |
+| A member who can speak turns a plaintext conversation on once with `POST /v1/conversations/{id}/e2ee`. Messages and files already stored stay plaintext. There is no downgrade | `e2ee-text.md` section 9 |
+| The client labels that conversation "End-to-end encrypted" and says messages and files from before the upgrade can still be read by the server. It does not call those older rows protected | section 9; tinyclient `Encryption::EndToEndAfterPlain` |
+| There is no converter that copies old plaintext into ciphertext. That would give the server the keys. The upgrade only refuses new plaintext | section 9 |
+| Deleting a channel still hard-deletes its messages; the outbox scrub (`0014`) covers edits. An upgrade does not delete the old rows | section 9 |
 | The old plaintext survives in: Postgres WAL and dead rows until cleared, every backup taken before the delete, every client's local cache (`chat.sqlite` is not encrypted at rest), other members' devices | [`retention-and-deletion.md`](retention-and-deletion.md) |
 | Attachments of plaintext conversations stay plaintext files in the upload volume, with plaintext names and types in `attachments` | [`metadata.md`](metadata.md) |
 

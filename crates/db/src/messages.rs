@@ -106,6 +106,9 @@ pub enum MessageError {
     /// A community root key is set, and a different one was given without saying to replace it.
     #[error("root exists")]
     RootExists,
+    /// This pair already has an encrypted direct, so the plaintext one stays plaintext.
+    #[error("e2ee twin")]
+    E2eeTwin,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -254,6 +257,24 @@ pub async fn open_direct(
             .map_err(message_sql)?;
     tx.commit().await.map_err(message_sql)?;
     Ok(row)
+}
+
+/// Turns a plaintext conversation into an encrypted one. Messages already stored stay plaintext.
+/// Already encrypted answers the conversation again.
+pub async fn upgrade_conversation(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+) -> Result<Value, MessageError> {
+    if !is_uuid(conversation) {
+        return Err(MessageError::Invalid);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(&mut tx, "SELECT app_e2ee_upgrade($1::uuid)", |query| {
+        query.bind(conversation)
+    })
+    .await?;
+    commit(tx, value).await
 }
 
 pub async fn list_messages(
@@ -665,6 +686,7 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E16" => MessageError::GroupTooLarge,
         "P0E17" => MessageError::IdTaken,
         "P0E18" => MessageError::RootExists,
+        "P0E19" => MessageError::E2eeTwin,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
@@ -675,7 +697,8 @@ fn channel_patch(value: &Value) -> Result<Value, MessageError> {
     let Some(obj) = value.as_object() else {
         return Err(MessageError::Invalid);
     };
-    // Whether a channel is encrypted is fixed when it is made, never changed.
+    // Encryption is not a channel patch. Turning it on is POST /v1/conversations/{id}/e2ee,
+    // and there is no way to turn it off.
     if obj.contains_key("e2ee") {
         return Err(MessageError::Invalid);
     }
