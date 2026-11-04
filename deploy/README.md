@@ -177,7 +177,7 @@ Nothing in tinyserver needs Cloudflare. It is a plain HTTP server on `BIND` (ins
 docker compose -f compose.yml -f compose.proxy.yml up -d
 ```
 
-(Add `-f compose.passkey.yml` between them if you use passkeys only.) Put `TUNNEL_TOKEN=unused` in `.env`: compose reads that variable while it loads the file even though cloudflared is not started.
+(Add `-f compose.passkey.yml` between them once you have chosen *Passkeys only* in the client and want Pocket ID stopped, step 9 of the runbook in [`docs/auth-passkeys.md`](../docs/auth-passkeys.md). `compose.yml` alone needs no sign-in setting: passkeys are always on, and the owner chooses in the client.) Put `TUNNEL_TOKEN=unused` in `.env`: compose reads that variable while it loads the file even though cloudflared is not started.
 
 What your front end must do:
 
@@ -236,6 +236,14 @@ TINYSERVER_IMAGE=ghcr.io/tinycomms/tinyserver:<sha>   docker compose -f compose.
 ```
 
 `TINYSERVER_IMAGE` can live in the environment file instead. The binary carries its migrations, so nothing from the source tree has to be copied for it; the checkout is still where compose.yml, the Pocket ID setup and the Postgres init script come from. A tenant adds the file with `TENANT_COMPOSE_FILES`. If the package is private, `docker login ghcr.io` on the host first with a token that can read packages.
+
+### Upgrading to the release with the sign-in switch
+
+This release always serves passkeys and drops `TINYSERVER_AUTH`; the owner chooses how members sign in from the client (Server Settings › Privacy). Before you upgrade:
+
+- **A bare-IP public URL must become a hostname.** Passkeys are bound to the host of `TINYSERVER_PUBLIC_URL`, and an IP address cannot hold them, so a server whose public URL is something like `http://192.168.1.20:8080` no longer starts. Give it a hostname (your domain, or `http://localhost:8080` for a server only you use) before this release.
+- **If you ran `TINYSERVER_AUTH=both` or `passkey` with Pocket ID still configured,** the upgrade stores *Through Pocket ID only* (the database cannot see the old variable), which turns passkey sign-in off for members whose only sign-in is a passkey. The server logs a warning at start. Straight after the upgrade, choose *Passkeys, or through Pocket ID* (or *Passkeys only*) in Server Settings › Privacy. Open sessions and claim links keep working meanwhile. `oidc` or unset changes nothing.
+- **Adding a provider later to a passkey-only server** applies the stored choice at once, *Through Pocket ID only* unless you changed it, so choose first; the server warns at start when that choice would leave members without a way in. See [`docs/auth-passkeys.md`](../docs/auth-passkeys.md) section 2.
 
 ### Upgrading to the release with `tinyserver-init`
 

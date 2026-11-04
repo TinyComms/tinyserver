@@ -33,18 +33,16 @@ use url::Url;
 use crate::oidc::{Provider, SignIn};
 
 pub fn routes(sign_in: SignIn) -> Router<PgPool> {
-    let mut routes = Router::new()
+    Router::new()
         .route("/v1/auth/config", get(config))
         .route("/v1/auth/start", post(start))
         .route("/v1/auth/join", get(join).post(join_new))
         .route("/v1/auth/callback", get(callback))
         .route("/v1/auth/token", post(token))
-        .route("/v1/auth/backchannel-logout", post(backchannel_logout));
-    // Only when TINYSERVER_AUTH turns passkeys on: otherwise these paths do not exist.
-    if sign_in.passkeys().is_some() {
-        routes = routes.merge(crate::passkey::routes());
-    }
-    routes.layer(Extension(sign_in))
+        .route("/v1/auth/backchannel-logout", post(backchannel_logout))
+        // Passkeys are on in every deployment.
+        .merge(crate::passkey::routes())
+        .layer(Extension(sign_in))
 }
 
 #[derive(Serialize)]
@@ -112,7 +110,7 @@ struct ErrorBody {
     error: &'static str,
 }
 
-enum AuthApiError {
+pub(crate) enum AuthApiError {
     BadRequest,
     InvalidGrant,
     /// Back-channel logout, OpenID Connect Back-Channel Logout 1.0 section 2.8.
@@ -132,25 +130,42 @@ impl IntoResponse for AuthApiError {
     }
 }
 
-async fn config(Extension(sign_in): Extension<SignIn>) -> Response {
+async fn config(
+    State(pool): State<PgPool>,
+    Extension(sign_in): Extension<SignIn>,
+) -> Result<Response, AuthApiError> {
     // `methods` stays `["oidc"]`: tinyclient runs the same browser flow for either, and an older
     // one must not meet a value it does not know.
-    let passkey = sign_in.passkeys().map(|_| ProviderEntry {
+    // The passkey entry is listed unless the owner chose providers only, and the providers
+    // unless the owner chose passkeys only.
+    let effective = effective(&pool, &sign_in).await?;
+    let passkey = (effective != db::SignInMethods::Provider).then_some(ProviderEntry {
         id: crate::passkey::PROVIDER_ID,
         name: "Passkey",
     });
-    Json(Config {
+    let providers = if effective == db::SignInMethods::Passkey {
+        &[]
+    } else {
+        sign_in.providers()
+    };
+    Ok(Json(Config {
         methods: ["oidc"],
-        provider_name: sign_in.provider_name(),
+        // The name on the client's default button. Under `any` that button opens the passkey
+        // page, so it says so; only under `provider` does it name the provider.
+        provider_name: if effective == db::SignInMethods::Provider {
+            sign_in.provider_name()
+        } else {
+            "Passkey"
+        },
         providers: passkey
             .into_iter()
-            .chain(sign_in.providers().iter().map(|provider| ProviderEntry {
+            .chain(providers.iter().map(|provider| ProviderEntry {
                 id: provider.id(),
                 name: provider.name(),
             }))
             .collect(),
     })
-    .into_response()
+    .into_response())
 }
 
 async fn start(
@@ -163,27 +178,26 @@ async fn start(
         AuthApiError::BadRequest
     })?;
     let invite = body.invite.as_deref().filter(|invite| !invite.is_empty());
-    // The owner may have chosen passkeys only. Then the passkey page is the only way in, and
-    // there is no provider beside it.
-    let passkey_only = passkey_only(&pool, &sign_in).await?;
-    // With passkeys on, sign-in opens the passkey page unless the client names a provider.
-    let passkey_page = sign_in.passkeys().is_some()
-        && (passkey_only
-            || body
-                .provider
-                .as_deref()
-                .is_none_or(|id| id == crate::passkey::PROVIDER_ID));
-    let provider = if passkey_only {
-        None
-    } else if passkey_page {
-        // The provider that stays the way in beside it, if one is configured.
-        sign_in.provider(None)
-    } else {
-        let Some(provider) = sign_in.provider(body.provider.as_deref()) else {
-            auth_refused("/v1/auth/start", "provider_missing");
-            return Err(AuthApiError::BadRequest);
-        };
-        Some(provider)
+    // What the owner chose decides where sign-in goes. With no provider configured it is always
+    // the passkey page.
+    let effective = effective(&pool, &sign_in).await?;
+    let asked_for_passkey = body.provider.as_deref() == Some(crate::passkey::PROVIDER_ID);
+    let (passkey_page, provider) = match effective {
+        // The page is the only way in; a provider the client names is ignored.
+        db::SignInMethods::Passkey => (true, None),
+        // The page first, with the default provider kept for its "instead" link, unless the
+        // client names a provider to go straight to.
+        db::SignInMethods::Any if body.provider.is_none() || asked_for_passkey => {
+            (true, sign_in.provider(None))
+        }
+        // Providers only (or `any` with a named provider). "passkey" is just an unknown id here.
+        db::SignInMethods::Any | db::SignInMethods::Provider => {
+            let Some(provider) = sign_in.provider(body.provider.as_deref()) else {
+                auth_refused("/v1/auth/start", "provider_missing");
+                return Err(AuthApiError::BadRequest);
+            };
+            (false, Some(provider))
+        }
     };
     let reason = if !loopback_redirect(&body.redirect_uri) {
         "bad_redirect"
@@ -471,12 +485,12 @@ async fn callback(
         }
     };
     // Passkeys only: a provider has proved who this is, and the community does not take it.
-    match passkey_only(&pool, &sign_in).await {
-        Ok(false) => {}
-        Ok(true) => {
+    match effective(&pool, &sign_in).await {
+        Ok(db::SignInMethods::Passkey) => {
             tracing::info!(provider = %provider.id(), "sign-in refused: passkeys only");
             return back(Outcome::Error("passkey_only"));
         }
+        Ok(_) => {}
         Err(_) => return back(Outcome::Error("failed")),
     }
     let signed_in = match db::sign_in(
@@ -531,16 +545,18 @@ async fn callback(
     }
 }
 
-/// Whether the owner chose passkeys only, and this deployment has passkeys to honour it. Without
-/// passkeys the choice cannot apply: refusing every provider then would lock everyone out, as it
-/// would after switching `TINYSERVER_AUTH` back.
-async fn passkey_only(pool: &PgPool, sign_in: &SignIn) -> Result<bool, AuthApiError> {
-    if sign_in.passkeys().is_none() {
-        return Ok(false);
+/// How members sign in right now: what the owner chose, except that a deployment with no
+/// provider can only use passkeys.
+pub(crate) async fn effective(
+    pool: &PgPool,
+    sign_in: &SignIn,
+) -> Result<db::SignInMethods, AuthApiError> {
+    if !sign_in.has_providers() {
+        return Ok(db::SignInMethods::Passkey);
     }
     db::posture(pool)
         .await
-        .map(|posture| posture.sign_in_methods == db::SignInMethods::Passkey)
+        .map(|posture| posture.sign_in_methods)
         .map_err(|error| {
             tracing::warn!(%error, "sign-in choices not read");
             AuthApiError::Unavailable

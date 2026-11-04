@@ -57,6 +57,11 @@ pub fn app(pool: PgPool, live: Live, sign_in: Option<SignIn>) -> Router {
 fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
     let operator = Operator::new(pool.clone());
     let deployment = setup::Deployment::of(sign_in.as_ref());
+    // Empty only with no `sign_in`, which production never passes; the setup routes are for
+    // servers that have one, and tests that do not mint claim links.
+    let public_url = sign_in
+        .as_ref()
+        .map_or_else(String::new, |sign_in| sign_in.public_url().to_string());
     let mut routes = Router::new()
         .merge(health::routes(live.clone()))
         .merge(operator::routes())
@@ -64,7 +69,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(account::routes())
         .merge(community::routes())
         .merge(admin::routes())
-        .merge(setup::routes(deployment))
+        .merge(setup::routes(deployment, public_url))
         .merge(bot::routes())
         .merge(messages::routes())
         .merge(reports::routes())

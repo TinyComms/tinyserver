@@ -6,7 +6,7 @@
 # What it does:
 #   * tinyserver signs people in with its own passkeys and contacts no identity provider.
 #   * Pocket ID, its data job, and its three secrets are not started or mounted. Its volume is
-#     left alone, so going back is `docker compose -f compose.yml up -d` with TINYSERVER_AUTH=both.
+#     left alone.
 #   * The auth hostname is no longer needed. Remove its public hostname from the tunnel in
 #     Cloudflare when you are sure you will not go back.
 #
@@ -28,7 +28,6 @@ services:
         condition: service_healthy
     secrets: !override []
     environment: !override
-      TINYSERVER_AUTH: passkey
       DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
       BIND: 0.0.0.0:8080
       TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}

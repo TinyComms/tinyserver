@@ -12,93 +12,23 @@ mod common;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use common::oidc::{self, Provider};
-use common::{first_owner, join, run, session, Call, TestDb};
+use common::passkey::{
+    attach_passkey, invite, note, raw_id, redeem, sign_up, start, subject_of, Account, Device,
+    ORIGIN, REDIRECT, SECRETS, VERIFIER,
+};
+use common::{first_owner, join, passkeys, run, session, Call, TestDb};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
-use webauthn_authenticator_rs::prelude::{
-    CreationChallengeResponse, RequestChallengeResponse, Url, WebauthnAuthenticator,
-};
-use webauthn_authenticator_rs::softpasskey::SoftPasskey;
-use webauthn_rs::prelude::Uuid;
-
-const ORIGIN: &str = "https://tiny.test";
-const REDIRECT: &str = "http://127.0.0.1:53121/callback";
-const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0123456789";
-
-fn passkeys() -> api::Passkeys {
-    api::Passkeys::new(ORIGIN, "Test", None).expect("relying party")
-}
+use webauthn_authenticator_rs::prelude::Url;
 
 /// Passkeys only: no identity provider anywhere.
 fn passkey_app(db: &TestDb) -> Router {
     let sign_in = api::SignIn::passkey_only(ORIGIN, 30, passkeys()).expect("sign-in");
     api::router(db.runtime.clone(), Some(sign_in))
-}
-
-/// A person's authenticator and the browser origin it signs for.
-struct Device {
-    authenticator: SoftPasskey,
-    origin: Url,
-}
-
-impl Device {
-    fn new() -> Self {
-        Self::at(ORIGIN)
-    }
-
-    fn at(origin: &str) -> Self {
-        Self {
-            // `true` marks every ceremony as user-verified, as a phone's unlock would.
-            authenticator: SoftPasskey::new(true),
-            origin: Url::parse(origin).expect("origin"),
-        }
-    }
-
-    fn register(&mut self, options: &Value) -> Value {
-        // The server must ask for a discoverable credential: there is no username to sign in
-        // with otherwise. The software passkey cannot make one, so it is told it need not.
-        let selection = &options["publicKey"]["authenticatorSelection"];
-        assert_eq!(selection["residentKey"], "required", "{options}");
-        assert_eq!(selection["requireResidentKey"], true, "{options}");
-        assert_eq!(selection["userVerification"], "required", "{options}");
-        let mut options = options.clone();
-        options["publicKey"]["authenticatorSelection"]["residentKey"] = json!("discouraged");
-        options["publicKey"]["authenticatorSelection"]["requireResidentKey"] = json!(false);
-        let options: CreationChallengeResponse =
-            serde_json::from_value(options).expect("creation options");
-        let made = self
-            .authenticator
-            .do_registration(self.origin.clone(), options)
-            .expect("registered");
-        serde_json::to_value(made).expect("json")
-    }
-
-    /// Signs the server's challenge with the credential `credential_id`, and sends the user
-    /// handle `handle` as a resident-key authenticator would.
-    fn assert(&mut self, options: &Value, credential_id: &str, handle: &str) -> Value {
-        let mut options = options.clone();
-        options["publicKey"]["allowCredentials"] =
-            json!([{"type": "public-key", "id": credential_id}]);
-        let options: RequestChallengeResponse =
-            serde_json::from_value(options).expect("request options");
-        let asserted = self
-            .authenticator
-            .do_authentication(self.origin.clone(), options)
-            .expect("asserted");
-        let mut json = serde_json::to_value(asserted).expect("json");
-        let uuid = Uuid::parse_str(handle).expect("handle");
-        json["response"]["userHandle"] = Value::String(URL_SAFE_NO_PAD.encode(uuid.as_bytes()));
-        json
-    }
-}
-
-fn raw_id(credential: &Value) -> String {
-    credential["rawId"].as_str().expect("rawId").to_string()
 }
 
 /// A page, not JSON.
@@ -126,129 +56,6 @@ async fn page(app: &Router, path: &str) -> (StatusCode, HeaderMap, String) {
         headers,
         String::from_utf8_lossy(&bytes).into_owned(),
     )
-}
-
-async fn invite(db: &TestDb, owner: &db::Caller) -> String {
-    match db::create_invite(&db.runtime, owner, "member", None).await {
-        Ok(db::Wrote::Fresh(issued)) => issued.token,
-        _ => panic!("invite"),
-    }
-}
-
-/// `POST /v1/auth/start`: the pending sign-in's state and the page it sends the browser to.
-async fn start(app: &Router, invite: Option<&str>) -> (String, String) {
-    let mut body = json!({
-        "redirect_uri": REDIRECT,
-        "code_challenge": db::s256(VERIFIER),
-        "code_challenge_method": "S256",
-        "state": "client-state-0123456789abcdef",
-    });
-    if let Some(invite) = invite {
-        body["invite"] = json!(invite);
-    }
-    let (status, body) = Call::new(Method::POST, "/v1/auth/start")
-        .json(body)
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let url = Url::parse(body["authorize_url"].as_str().expect("url")).expect("url");
-    let state = url
-        .query_pairs()
-        .find(|(name, _)| name == "state")
-        .map(|(_, value)| value.into_owned())
-        .expect("state");
-    note(&state);
-    (state, url.path().to_string())
-}
-
-/// What the browser is redirected to, and trades for a session.
-async fn redeem(app: &Router, redirect: &str) -> (String, String) {
-    let url = Url::parse(redirect).expect("redirect");
-    assert_eq!(url.path(), "/callback");
-    let get = |name: &str| {
-        url.query_pairs()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.into_owned())
-    };
-    assert_eq!(
-        get("state").as_deref(),
-        Some("client-state-0123456789abcdef")
-    );
-    let code = get("code").unwrap_or_else(|| panic!("no code in {redirect}"));
-    note(&code);
-    let (status, body) = Call::new(Method::POST, "/v1/auth/token")
-        .json(json!({"code": code, "code_verifier": VERIFIER}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    note(body["token"].as_str().expect("token"));
-    (
-        body["token"].as_str().expect("token").to_string(),
-        body["user_id"].as_str().expect("user").to_string(),
-    )
-}
-
-struct Account {
-    token: String,
-    user_id: String,
-    credential_id: String,
-    subject: String,
-    codes: Vec<String>,
-}
-
-async fn subject_of(db: &TestDb, user_id: &str) -> String {
-    db::subject_of(&db.owner, user_id)
-        .await
-        .expect("subject")
-        .expect("has a passkey subject")
-}
-
-/// Sign-up with an invite, all the way to a session.
-async fn sign_up(
-    app: &Router,
-    db: &TestDb,
-    device: &mut Device,
-    invite: &str,
-    name: &str,
-) -> Account {
-    let (state, path) = start(app, Some(invite)).await;
-    assert_eq!(path, "/v1/auth/passkey");
-    let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/signup/begin")
-        .json(json!({"state": state, "display_name": name}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{begun}");
-    let credential = device.register(&begun["options"]);
-    let (status, finished) = Call::new(Method::POST, "/v1/auth/passkey/signup/finish")
-        .json(json!({"state": state, "cid": begun["cid"], "credential": credential}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{finished}");
-    let codes: Vec<String> = finished["codes"]
-        .as_array()
-        .expect("codes")
-        .iter()
-        .map(|code| code.as_str().expect("code").to_string())
-        .collect();
-    for code in &codes {
-        note(code);
-    }
-    note(begun["cid"].as_str().expect("cid"));
-    note(finished["cont"].as_str().expect("cont"));
-    let (status, sent) = Call::new(Method::POST, "/v1/auth/passkey/continue")
-        .json(json!({"state": state, "cont": finished["cont"]}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{sent}");
-    let (token, user_id) = redeem(app, sent["redirect"].as_str().expect("redirect")).await;
-    let subject = subject_of(db, &user_id).await;
-    Account {
-        token,
-        user_id,
-        credential_id: raw_id(&credential),
-        subject,
-        codes,
-    }
 }
 
 /// Sign-in with a passkey, no username: the redirect tinyclient gets, or the failure.
@@ -302,6 +109,7 @@ fn sha(text: &str) -> Vec<u8> {
 #[tokio::test]
 async fn config_offers_the_passkey_and_start_opens_its_page() {
     run(|db| async move {
+        // The stored choice is the default, `provider`; with no provider, passkeys it is.
         let app = passkey_app(&db);
         let (status, body) = Call::new(Method::GET, "/v1/auth/config").send(&app).await;
         assert_eq!(status, StatusCode::OK);
@@ -1611,51 +1419,72 @@ async fn the_pages_say_what_may_run_and_carry_no_secret() {
 }
 
 #[tokio::test]
-async fn without_passkeys_turned_on_there_are_no_passkey_routes() {
+async fn the_passkey_routes_are_always_there_and_provider_only_sends_start_to_the_provider() {
     run(|db| async move {
+        let owner = first_owner(&db).await;
         let provider = Provider::start().await;
-        let sign_in =
-            api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
-                .await
-                .expect("discover");
-        let app = api::router(db.runtime.clone(), Some(sign_in));
-        let (status, config) = Call::new(Method::GET, "/v1/auth/config").send(&app).await;
-        assert_eq!(status, StatusCode::OK);
+        let app = api::router(
+            db.runtime.clone(),
+            Some(common::sign_in_with(Some(&provider)).await),
+        );
+        // The passkey routes answer: a bad token is a refusal, not a missing route.
+        for path in [
+            "/v1/auth/passkey/claim/peek",
+            "/v1/auth/passkey/claim/begin",
+        ] {
+            let (status, body) = Call::new(Method::POST, path)
+                .json(json!({"token": "x"}))
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            assert_eq!(body["error"], "invalid_link", "{path}");
+        }
+        let (status, _, _) = page(&app, "/v1/auth/passkey?state=x").await;
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+            "{status}"
+        );
+        // A claim link works whatever the owner chose: here, the default `provider`.
+        let mut device = Device::new();
+        attach_passkey(&app, &db, &owner.user_id, &mut device).await;
+
+        // With a provider and the default stored choice, the provider is the way in.
+        let (_, config) = Call::new(Method::GET, "/v1/auth/config").send(&app).await;
         assert_eq!(
             config["providers"]
                 .as_array()
                 .map(|list| list.iter().map(|p| p["id"].clone()).collect::<Vec<_>>()),
             Some(vec![json!("default")])
         );
-        for path in [
-            "/v1/auth/passkey/login/begin",
-            "/v1/auth/passkey/signup/begin",
-            "/v1/auth/passkey/claim/peek",
-            "/v1/me/passkeys/link",
-        ] {
-            let (status, _) = Call::new(Method::POST, path)
-                .json(json!({}))
-                .send(&app)
-                .await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
-        }
-        let (status, _, _) = page(&app, "/v1/auth/passkey?state=x").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = Call::new(Method::POST, "/v1/auth/start")
+            .json(json!({
+                "redirect_uri": REDIRECT,
+                "code_challenge": db::s256(VERIFIER),
+                "code_challenge_method": "S256",
+                "state": "client-state-0123456789abcdef",
+            }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let url = body["authorize_url"].as_str().expect("url");
+        assert!(url.starts_with(&provider.issuer), "{url}");
     })
     .await;
 }
 
 #[tokio::test]
-async fn both_modes_open_the_passkey_page_and_still_offer_the_provider() {
+async fn any_opens_the_passkey_page_and_still_offers_the_provider() {
     run(|db| async move {
         let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
         let provider = Provider::start().await;
         let sign_in =
             api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
                 .await
-                .expect("discover")
-                .with_passkeys(passkeys());
+                .expect("discover");
         let app = api::router(db.runtime.clone(), Some(sign_in));
+        let (status, body) = put_setup(&app, &owner_token, json!({"sign_in_methods": "any"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         let (_, config) = Call::new(Method::GET, "/v1/auth/config").send(&app).await;
         assert_eq!(config["providers"][0]["id"], "passkey");
         assert_eq!(config["providers"][1]["id"], "default");
@@ -1695,6 +1524,223 @@ async fn both_modes_open_the_passkey_page_and_still_offer_the_provider() {
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::OK);
+    })
+    .await;
+}
+
+/// `POST /v1/auth/start` as tinyclient sends it, naming `provider` when given.
+async fn start_naming(app: &Router, provider: Option<&str>) -> (StatusCode, Value) {
+    let mut body = json!({
+        "redirect_uri": REDIRECT,
+        "code_challenge": db::s256(VERIFIER),
+        "code_challenge_method": "S256",
+        "state": "client-state-0123456789abcdef",
+    });
+    if let Some(provider) = provider {
+        body["provider"] = json!(provider);
+    }
+    Call::new(Method::POST, "/v1/auth/start")
+        .json(body)
+        .send(app)
+        .await
+}
+
+async fn provider_ids(app: &Router) -> Vec<String> {
+    let (status, config) = Call::new(Method::GET, "/v1/auth/config").send(app).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["methods"], json!(["oidc"]));
+    config["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("id").to_string())
+        .collect()
+}
+
+async fn config_name(app: &Router) -> String {
+    let (_, config) = Call::new(Method::GET, "/v1/auth/config").send(app).await;
+    config["provider_name"].as_str().expect("name").to_string()
+}
+
+async fn newest_pending_provider(db: &TestDb) -> String {
+    sqlx::query_scalar("SELECT provider FROM auth_pending ORDER BY created_at DESC LIMIT 1")
+        .fetch_one(&db.owner)
+        .await
+        .expect("pending row")
+}
+
+async fn provider_app(db: &TestDb, provider: &Provider) -> Router {
+    let sign_in = api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
+        .await
+        .expect("discover");
+    api::router(db.runtime.clone(), Some(sign_in))
+}
+
+#[tokio::test]
+async fn config_and_start_follow_the_stored_choice_beside_a_provider() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let provider = Provider::start().await;
+        let app = provider_app(&db, &provider).await;
+        let mut device = Device::new();
+        attach_passkey(&app, &db, &owner.user_id, &mut device).await;
+
+        // provider: only the provider is listed, and a client asking for the passkey page is
+        // told no, like for any id the server does not know.
+        assert_eq!(provider_ids(&app).await, ["default"]);
+        assert_eq!(config_name(&app).await, oidc::PROVIDER_NAME);
+        let (status, body) = start_naming(&app, Some("passkey")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "bad_request");
+        let (status, body) = start_naming(&app, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .starts_with(&provider.issuer));
+
+        // any: both, the passkey first. A name the server does not know is still refused.
+        let (status, body) = put_setup(&app, &owner_token, json!({"sign_in_methods": "any"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(provider_ids(&app).await, ["passkey", "default"]);
+        // The default button opens the passkey page, so it is named for that.
+        assert_eq!(config_name(&app).await, "Passkey");
+        // No name: the passkey page, with the default provider kept on the row.
+        let (status, body) = start_naming(&app, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .contains("/v1/auth/passkey"));
+        assert_eq!(newest_pending_provider(&db).await, "default");
+        // A real provider id goes straight to the issuer.
+        let (status, body) = start_naming(&app, Some("default")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .starts_with(&provider.issuer));
+        let (status, body) = start_naming(&app, Some("passkey")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .contains("/v1/auth/passkey"));
+        let (status, body) = start_naming(&app, Some("nope")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // passkey: only the passkey, and a named provider is ignored.
+        let (status, body) =
+            put_setup(&app, &owner_token, json!({"sign_in_methods": "passkey"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(provider_ids(&app).await, ["passkey"]);
+        assert_eq!(config_name(&app).await, "Passkey");
+        let (status, body) = start_naming(&app, Some("default")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let url = body["authorize_url"].as_str().expect("url");
+        assert!(url.contains("/v1/auth/passkey"), "{url}");
+        assert_eq!(newest_pending_provider(&db).await, "passkey");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_no_provider_any_name_in_start_opens_the_passkey_page() {
+    run(|db| async move {
+        let app = passkey_app(&db);
+        for named in [Some("default"), Some("nope"), Some("passkey")] {
+            let (status, body) = start_naming(&app, named).await;
+            assert_eq!(status, StatusCode::OK, "{named:?}: {body}");
+            let url = body["authorize_url"].as_str().expect("url");
+            assert!(url.contains("/v1/auth/passkey"), "{url}");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn switching_to_the_provider_only_turns_a_passkey_ceremony_away_and_keeps_the_claim_and_recovery_pages(
+) {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let provider = Provider::start().await;
+        let app = provider_app(&db, &provider).await;
+        let (status, body) = put_setup(&app, &owner_token, json!({"sign_in_methods": "any"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // A member with a passkey and recovery codes, and a claim link for another.
+        let mut device = Device::new();
+        let invite_token = invite(&db, &owner).await;
+        let account = sign_up(&app, &db, &mut device, &invite_token, "Ada").await;
+        let other = oidc_member(&db, &owner, "bo@example.org").await;
+        let claim = db::mint_claim(&db.owner, &other.user_id, 14)
+            .await
+            .expect("claim");
+        let (state, _) = start(&app, None).await;
+        let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/login/begin")
+            .json(json!({"state": state}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{begun}");
+        note(begun["cid"].as_str().expect("cid"));
+        let credential = device.assert(&begun["options"], &account.credential_id, &account.subject);
+
+        // Ada has no provider identity, so the owner says the switch may leave her out.
+        let (status, body) = put_setup(
+            &app,
+            &owner_token,
+            json!({"sign_in_methods": "provider", "allow_lockout": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let codes_before = count(&db, "SELECT count(*) FROM auth_codes").await;
+        let ceremonies_before = count(&db, "SELECT count(*) FROM passkey_ceremonies").await;
+
+        let (status, body) = Call::new(Method::POST, "/v1/auth/passkey/login/finish")
+            .json(json!({"state": state, "cid": begun["cid"], "credential": credential}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body, json!({"error": "passkeys_off"}));
+        for (path, body) in [
+            ("login/begin", json!({"state": state})),
+            ("signup/begin", json!({"state": state, "name": "Cy"})),
+            (
+                "signup/finish",
+                json!({"state": state, "cid": "x", "credential": {}}),
+            ),
+        ] {
+            let (status, got) = Call::new(Method::POST, &format!("/v1/auth/passkey/{path}"))
+                .json(body)
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {got}");
+            assert_eq!(got, json!({"error": "passkeys_off"}), "{path}");
+        }
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM auth_codes").await,
+            codes_before,
+            "no session was made"
+        );
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM passkey_ceremonies").await,
+            ceremonies_before,
+            "a refused ceremony wrote a row"
+        );
+
+        // Claim and recovery still work.
+        let (status, who) = Call::new(Method::POST, "/v1/auth/passkey/claim/peek")
+            .json(json!({"token": claim}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{who}");
+        let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/recover/begin")
+            .json(json!({"state": state, "code": account.codes[0]}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{begun}");
     })
     .await;
 }
@@ -1788,16 +1834,6 @@ async fn spend_code(
         credential,
     };
     db::recover(&db.runtime, &recovery).await.map(|_| ())
-}
-
-/// Every secret the flows below make or are given, so a log test can look for each of them.
-static SECRETS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-fn note(secret: &str) {
-    SECRETS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .push(secret.to_string());
 }
 
 /// What the subscriber wrote.
@@ -1948,40 +1984,6 @@ async fn no_secret_a_flow_makes_reaches_the_logs() {
 
 // First-run setup, where it meets passkeys.
 
-/// Puts a passkey on an existing account with a claim link, as an owner's roster would.
-async fn attach_passkey(app: &Router, db: &TestDb, user_id: &str, device: &mut Device) -> Account {
-    let token = db::mint_claim(&db.owner, user_id, 14).await.expect("claim");
-    note(&token);
-    let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/claim/begin")
-        .json(json!({"token": token}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{begun}");
-    note(begun["cid"].as_str().expect("cid"));
-    let credential = device.register(&begun["options"]);
-    let (status, claimed) = Call::new(Method::POST, "/v1/auth/passkey/claim/finish")
-        .json(json!({"token": token, "cid": begun["cid"], "credential": credential}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{claimed}");
-    let codes: Vec<String> = claimed["codes"]
-        .as_array()
-        .expect("codes")
-        .iter()
-        .map(|code| code.as_str().expect("code").to_string())
-        .collect();
-    for code in &codes {
-        note(code);
-    }
-    Account {
-        token: String::new(),
-        user_id: user_id.to_string(),
-        credential_id: raw_id(&credential),
-        subject: subject_of(db, user_id).await,
-        codes,
-    }
-}
-
 async fn put_setup(app: &Router, token: &str, body: Value) -> (StatusCode, Value) {
     Call::new(Method::PUT, "/v1/setup")
         .token(token)
@@ -2024,7 +2026,7 @@ async fn passkeys_only_waits_for_the_owner_to_have_a_passkey_and_for_members_to_
         let setup = get_setup(&app, &owner_token).await;
         assert_eq!(setup["deployment"], json!({"passkeys": true, "sso": false}));
         assert_eq!(setup["counts"]["owner_has_passkey"], false);
-        assert_eq!(setup["counts"]["members_without_passkey"], 2);
+        assert_eq!(setup["counts"]["members_without_passkey"], 1);
         assert_eq!(setup["presets"][1]["available"], true);
 
         // The owner has no passkey: choosing passkeys only would lock the owner out.
@@ -2045,7 +2047,7 @@ async fn passkeys_only_waits_for_the_owner_to_have_a_passkey_and_for_members_to_
         assert_eq!(body["error"], "members_without_passkey");
         assert_eq!(body["count"], 1);
         let setup = get_setup(&app, &owner_token).await;
-        assert_eq!(setup["current"]["sign_in_methods"], "any");
+        assert_eq!(setup["current"]["sign_in_methods"], "provider");
         assert_eq!(
             setup["current"]["provider_profile"], "full",
             "a refused request changed a choice"
@@ -2090,8 +2092,7 @@ async fn passkeys_only_turns_a_provider_away_and_the_page_stops_offering_it() {
         let sign_in =
             api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
                 .await
-                .expect("discover")
-                .with_passkeys(passkeys());
+                .expect("discover");
         let app = api::router(db.runtime.clone(), Some(sign_in));
         let mut device = Device::new();
         let owner_passkey = attach_passkey(&app, &db, &owner.user_id, &mut device).await;
@@ -2177,51 +2178,6 @@ async fn passkeys_only_turns_a_provider_away_and_the_page_stops_offering_it() {
         // A person with a passkey is unaffected.
         let (_, user_id) = signed_in(&app, &mut device, &owner_passkey).await;
         assert_eq!(user_id, owner.user_id);
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn the_choice_does_not_lock_everyone_out_when_the_server_is_started_without_passkeys() {
-    run(|db| async move {
-        let owner = first_owner(&db).await;
-        // Passkeys only was chosen while passkeys were on.
-        sqlx::query("UPDATE server_settings SET sign_in_methods = 'passkey'")
-            .execute(&db.owner)
-            .await
-            .expect("choice");
-        // The operator then starts the server with providers only, as a rollback does.
-        let provider = Provider::start().await;
-        let sign_in =
-            api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
-                .await
-                .expect("discover");
-        let app = api::router(db.runtime.clone(), Some(sign_in));
-        let invite_token = invite(&db, &owner).await;
-        let (status, body) = Call::new(Method::POST, "/v1/auth/start")
-            .json(json!({
-                "redirect_uri": REDIRECT,
-                "code_challenge": db::s256(VERIFIER),
-                "code_challenge_method": "S256",
-                "state": "client-state-0123456789abcdef",
-                "invite": invite_token,
-            }))
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let url = body["authorize_url"].as_str().expect("url");
-        assert!(url.starts_with(&provider.issuer), "{url}");
-        let (code, state) =
-            provider.authorize(url, oidc::Person::new("zed"), oidc::Tamper::default());
-        let (status, headers, _) = page(
-            &app,
-            &format!("/v1/auth/callback?code={code}&state={state}"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FOUND);
-        let pairs = redirect_pairs(&headers);
-        assert!(pairs.contains_key("code"), "{pairs:?}");
-        assert!(!pairs.contains_key("error"), "{pairs:?}");
     })
     .await;
 }

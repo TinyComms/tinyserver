@@ -12,28 +12,32 @@ tinyserver treats a passkey as one more source of a person's identity, next to O
 
 The library that does the WebAuthn work is `webauthn-rs` (0.6.2, pinned, RustCrypto underneath, no OpenSSL). tinyserver does not implement WebAuthn or any cryptography.
 
-## 2. Modes
+## 2. How people sign in
 
-`TINYSERVER_AUTH` decides how people sign in.
+Passkeys are always on. The server always serves the passkey page, the claim pages and the ceremonies, whatever else is configured; there is no environment variable for it. (`TINYSERVER_AUTH` is gone. A server started with it still set logs one warning and ignores it.) The one fact about the deployment is whether an identity provider is configured (`TINYSERVER_OIDC_ISSUER` or `TINYSERVER_OIDC_PROVIDERS`).
 
-| Value | What happens |
-|---|---|
-| `oidc` (default, and what an unset value means) | Exactly as before. No passkey route exists. |
-| `both` | `POST /v1/auth/start` returns the passkey page. It offers "Sign in with Pocket ID instead", so members who have not moved yet still get in. A client that names the provider (`"provider": "default"`) goes straight to it, as before. |
-| `passkey` | Passkeys only. No identity provider is contacted or needed. |
+What the community *accepts* is the owner's choice, made in the client at Server Settings › Privacy (the API is in [`server-setup.md`](server-setup.md)). It takes effect at once, with no restart and no shell:
 
-`TINYSERVER_AUTH` is what this deployment *can* do. What the community *accepts* is the owner's choice at [first-run setup](server-setup.md): "passkeys only" there turns a provider sign-in away (and the passkey page stops offering one) while the deployment still runs providers. With `TINYSERVER_AUTH=oidc` there are no passkeys to honour it, so it is ignored and providers work.
+| Owner's choice (`sign_in_methods`) | `POST /v1/auth/start` returns | Who can get in |
+|---|---|---|
+| *Through Pocket ID only* (`provider`, the default) | the provider's authorize URL | provider accounts |
+| *Passkeys, or through Pocket ID* (`any`) | the passkey page, with "Sign in with Pocket ID instead" | both |
+| *Passkeys only* (`passkey`) | the passkey page, no provider link | passkeys |
 
-tinyclient needs no change to sign in. It never picks a provider: it calls `/v1/auth/start`, opens the `authorize_url` it gets in the system browser, and listens on `127.0.0.1` for the one-time code, which the passkey page sends exactly as the OIDC callback does. (`GET /v1/auth/config` lists `passkey` as a provider and still says `"methods": ["oidc"]`, so an older client does not meet a value it does not know.)
+A client that names the provider (`"provider": "default"`) goes straight to it under the first two rows, as before; under *Passkeys only* the name is ignored and the passkey page opens (only under *Through Pocket ID only* is `"provider": "passkey"` refused, with a 400). A deployment with no provider configured is always passkeys: the stored value is irrelevant there until a provider is configured, the effect is always the last row, and the owner's guards about provider sign-ins do not fire. Once a provider is configured the stored value applies at once, and it starts at *Through Pocket ID only*, which locks out every member whose only sign-in is a passkey. So choose *Passkeys, or through Pocket ID* (or *Passkeys only*) before adding a provider; a server that starts with a provider, that stored choice and members without a provider sign-in logs a warning saying so, and changes nothing.
+
+**Upgrading from `TINYSERVER_AUTH`.** The variable is no longer read, and the database cannot see what it said: migration 0033 stores *Through Pocket ID only* for every server that has a provider configured. A server that ran `TINYSERVER_AUTH=both` (or `passkey` with the OIDC variables still set) therefore starts with passkey sign-in off for members whose only sign-in is a passkey, and logs a warning at start saying so. Choose *Passkeys, or through Pocket ID* (or *Passkeys only*) in Server Settings › Privacy straight after the upgrade. Open sessions and claim links keep working meanwhile. A server that ran `oidc`, or left it unset, changes nothing.
+
+tinyclient needs no change to sign in. It never picks a provider: it calls `/v1/auth/start`, opens the `authorize_url` it gets in the system browser, and listens on `127.0.0.1` for the one-time code, which the passkey page sends exactly as the OIDC callback does. (`GET /v1/auth/config` lists `passkey` as a provider unless the choice is *Through Pocket ID only*, names the default button `Passkey` unless it is, and still says `"methods": ["oidc"]`, so an older client does not meet a value it does not know.)
 
 Other settings:
 
 | Variable | Meaning |
 |---|---|
-| `TINYSERVER_PUBLIC_URL` | Required in every mode. The passkey page and the claim links are served from it. |
+| `TINYSERVER_PUBLIC_URL` | Always required. The passkey page and the claim links are served from it. |
 | `TINYSERVER_PASSKEY_RP_NAME` | The name a browser shows when it asks for a passkey. Default `TinyComms`. |
 | `TINYSERVER_PASSKEY_RP_ID` | The relying party id. Unset means the host of `TINYSERVER_PUBLIC_URL`. See section 6. |
-| `TINYSERVER_SESSION_MAX_DAYS` | How long a session lasts. Existing sessions are not touched by switching modes. |
+| `TINYSERVER_SESSION_MAX_DAYS` | How long a session lasts. Existing sessions are not touched by changing the sign-in choice. |
 
 ## 3. What is stored, and what is not
 
@@ -99,16 +103,18 @@ Keep a plain rule in mind: **a member's account does not change.** They keep the
 
 The steps are for the compose deployment in `deploy/` (as run on the Cloudzy host). `HOST` stands for that machine; every `docker compose` command runs in the directory that holds `compose.yml` and `.env`. Nothing here touches a host by itself: you run each step and check it.
 
-Until step 7 the move can be undone by setting `TINYSERVER_AUTH=oidc` again.
+Until step 9 the move can be undone with one choice in the client (see "Going back").
 
 ### Before you start
 
 - Tell members what is coming, and what a recovery code is.
-- Check `docker compose version` is 2.24.4 or later (step 7 needs `!override`).
+- Check `docker compose version` is 2.24.4 or later (step 9 needs `!override`).
 - Decide the relying party (section 6) now, in `.env`, if you want one other than the exact host.
 - Pick a date. A member's current session keeps working after the move, for up to `TINYSERVER_SESSION_MAX_DAYS` (30 by default). When it ends they sign in with a passkey, so they need their link before then.
 
 ### Steps
+
+The owner drives the move from the client. A shell is needed for the backup, the update and the optional last step; steps 5 and 6 give optional shell alternatives.
 
 1. **Back up, and check the backup.** On HOST:
 
@@ -121,11 +127,17 @@ Until step 7 the move can be undone by setting `TINYSERVER_AUTH=oidc` again.
 
    Copy both files off the machine, to somewhere only you can read. (The volume name is `<project>_tinyserver_uploads`; `docker volume ls` shows it.)
 
-2. **Update, staying on Pocket ID.** Pull and rebuild the release that has passkeys and run `docker compose up -d`. Leave `TINYSERVER_AUTH` unset. The migrations (0030 passkeys, 0031 setup) are applied by `tinyserver-init`. Nothing about sign-in changes, and the owner is not yet asked to choose anything: `GET /v1/setup` says `needed` and the defaults are what the server did before. Check that a member can still sign in.
+2. **Update, staying on Pocket ID.** Pull and rebuild the release that has the sign-in switch and run `docker compose up -d`. The migrations (0030 passkeys, 0031 setup, 0033 sign-in switch) are applied by `tinyserver-init`. Nothing about sign-in changes: the choice starts at *Through Pocket ID only*, which is what the server did before, and `GET /v1/setup` says `needed`. Check that a member can still sign in.
 
-3. **Try passkeys yourself.** Set `TINYSERVER_AUTH=both` in `.env` and run `docker compose up -d tinyserver`. Open tinyclient and start a sign-in: the browser now shows the passkey page with "Sign in with Pocket ID instead". Use a claim link for your own account (step 5), sign in with the passkey, and try it in every browser your members use, on both a phone and a computer. This is the check that has not been done for you.
+3. **Add your own passkey.** In the client, Server Settings › Sign-in › Add a passkey. This uses a claim page, which works while the choice is still *Through Pocket ID only*; signing in with a passkey does not yet.
 
-4. **Export the roster, before Pocket ID is gone.** Make a directory only the server's user can write, and run the CLI as the owner role through the init service (it holds the owner database password; the serving container does not):
+4. **Choose *Passkeys, or through Pocket ID*, then try your passkey.** Server Settings › Privacy. The passkey page now opens at sign-in, with "Sign in with Pocket ID instead", so members who have not moved still get in. The choice takes effect at once. Nothing is refused here. Now sign in with your passkey in every browser your members use, on both a phone and a computer, before you send anyone a link. This is the check that has not been done for you.
+
+5. **Send passkey links.** From the same page, pick the members and make their links; the client shows each once, with Copy per row and Copy all. A new link for a person replaces their old one. Each link works once, for that member only, and expires (14 days by default, 1 to 90). The server keeps only a hash.
+
+   Send each person only their own link, by a way you trust (Signal, email, in person). The link carries its token after a `#`, which a browser never sends anywhere, so it is not in any server or proxy log. Anyone who holds an unused link can set up a passkey on that account, so treat a link like a password reset.
+
+   From a shell, `auth claim-links` still makes links from a roster export. It suits making them for everyone at once, or running without the client. First export the roster:
 
    ```
    install -d -m 700 -o 10001 -g 10001 ./auth-out
@@ -133,52 +145,48 @@ Until step 7 the move can be undone by setting `TINYSERVER_AUTH=oidc` again.
      --entrypoint tinyserver tinyserver-init auth export-members --out /out/members.tsv
    ```
 
-   `members.tsv` lists each member: id, name, the email Pocket ID gave (if any), role, joined, last seen, how many passkeys, whether they are banned, what signs them in, and the provider's own name for them (`identities`, as `issuer subject`). It exists so that, after Pocket ID is gone, you still know who is who, and so a retired identity can be put back.
+   `members.tsv` lists each member: id, name, the email Pocket ID gave (if any), role, joined, last seen, how many passkeys, banned or not, what signs them in, and the provider's own name for them (`identities`, as `issuer subject`). Keep it: after Pocket ID is gone it is how you know who is who, and how a retired identity is put back.
 
-5. **Make claim links.**
+   Then make the links:
 
    ```
    docker compose run --rm --no-deps -v "$PWD/auth-out:/out" \
      --entrypoint tinyserver tinyserver-init auth claim-links --all-unclaimed --days 14 --out /out/claims.tsv
    ```
 
-   For one person: `--user <id>` instead of `--all-unclaimed`. A new link for a person replaces their old one. Each link works once, for that member only, and expires. **The tokens are in the file only**: the log gets a count. The files are mode 0600 and are never overwritten.
-
-   Send each person only their own link, by a way you trust (Signal, email, in person). The link carries its token after a `#`, which a browser never sends anywhere, so it is not in any server or proxy log. Anyone who holds an unused link can set up a passkey on that account, so treat a link like a password reset.
-
-   Then move the files off HOST and delete them there:
+   The tokens are in `claims.tsv` only; the log gets a count. Both files are mode 0600 and never overwritten. For one person use `--user <id>` instead of `--all-unclaimed`. Then move the files off HOST and delete them there:
 
    ```
    sudo chown "$USER" auth-out/*.tsv && mv auth-out/*.tsv /secure/place/ && rmdir auth-out
    ```
 
-6. **Watch progress.** `docker compose run --rm --no-deps --entrypoint tinyserver tinyserver-init auth status` says how many members have a passkey and lists who does not. Re-issue links as needed (step 5). The owner sees the same count as `members_without_passkey` in `GET /v1/setup`.
+6. **Watch the counts.** The same page shows, for the members other than you (banned ones left out), how many have a passkey and how many do not, and who. `docker compose run --rm --no-deps --entrypoint tinyserver tinyserver-init auth status` gives the same counts from a shell, except that it counts you too, so its numbers can be one higher than the client's. Re-issue links as needed (step 5).
 
-7. **Cut over, when you are ready.** Take a fresh backup (step 1). Optionally remove the Pocket ID identities of members who have a passkey and a recovery code, so a compromised Pocket ID can no longer sign them in:
+7. **Choose *Passkeys only*.** Server Settings › Privacy. It is refused unless you have a passkey yourself (step 3). If some members have not claimed one yet, the page says how many and offers "Switch anyway": they stay members, keep any session they have until it ends, and cannot sign in again until you give them a link. Take a fresh backup first (step 1). The privacy preset makes this choice together with the others.
+
+8. **Check.** Sign in with a passkey. Make an invite and sign up a test account with it. Check the counts, or `auth status`.
+
+9. **Optional, in a shell: retire Pocket ID.** Remove the Pocket ID identities of members who have a passkey and a recovery code, so a compromised Pocket ID can no longer sign them in:
 
    ```
    docker compose run --rm --no-deps --entrypoint tinyserver tinyserver-init auth retire-oidc-identities          # says what it would do
    docker compose run --rm --no-deps --entrypoint tinyserver tinyserver-init auth retire-oidc-identities --apply
    ```
 
-   Members who have no passkey keep their identity and can still sign in through Pocket ID until you remove it. Then switch to passkeys only and stop Pocket ID:
+   Members who have no passkey keep their identity and can still sign in through Pocket ID until you remove it. Then stop Pocket ID with the overlay:
 
    ```
    docker compose -f compose.yml -f compose.passkey.yml up -d
    ```
 
-   Keep `AUTH_PUBLIC_URL` in `.env`: compose reads it before the override applies, and it is unused in this mode. Pocket ID's volume is left in place. After you are sure you will not go back, remove the auth hostname from the tunnel in Cloudflare.
+   With no provider configured the server is passkeys only whatever was stored, so do step 7 first. Keep `AUTH_PUBLIC_URL` in `.env`: compose reads it before the override applies, and it is unused here. Pocket ID's volume is left in place. After you are sure you will not go back, remove the auth hostname from the tunnel in Cloudflare.
 
-   Then the owner makes the community's own choices in the app ([`server-setup.md`](server-setup.md)): what to keep, who sees last-online, and, if Pocket ID is still running in `both`, whether to accept passkeys only. The privacy preset can be chosen here, once the owner has a passkey; it asks for `allow_lockout` if any member has not claimed one yet.
-
-8. **Check.** Sign in with a passkey. Make an invite and sign up a test account with it. Check `auth status`.
-
-9. **Members who have not claimed.** They stay members but cannot sign in once their session ends and Pocket ID is gone. Mint each a link (step 5, `--user`). Since there is no provider to confirm who is asking, give a link only to someone you know is that member.
+   Members who have not claimed a passkey cannot sign in once their session ends and Pocket ID is gone. Make each a link (step 5). Since there is no provider to confirm who is asking, give a link only to someone you know is that member.
 
 ### Going back
 
-- Before step 7: `TINYSERVER_AUTH=oidc` in `.env`, `docker compose up -d tinyserver`. Passkeys already made stay stored and are unused. If the owner had chosen "passkeys only" in setup, that choice is kept but not applied without passkeys, so no one is locked out.
-- After step 7, with Pocket ID's volume intact: `TINYSERVER_AUTH=both docker compose -f compose.yml up -d`. Members whose Pocket ID identity was retired need it back. The `identities` column of `members.tsv` (and the `retire-oidc-identities` listing) has each one's subject: `tinyserver relink-identity --user-id <id> --issuer <issuer> --subject <subject>` per member.
+- Before step 9: in the client, choose *Through Pocket ID only*. It takes effect at once. It is refused unless you have a Pocket ID sign-in yourself, and, for members who have none, offers "Switch anyway". Passkeys already made stay stored and are unused.
+- After step 9, with Pocket ID's volume intact: `docker compose -f compose.yml up -d` brings Pocket ID back, then choose *Through Pocket ID only* (or *Passkeys, or through Pocket ID*) in the client. Members whose Pocket ID identity was retired need it back. The `identities` column of `members.tsv` (and the `retire-oidc-identities` listing) has each one's subject: `tinyserver relink-identity --user-id <id> --issuer <issuer> --subject <subject>` per member. That includes you: *Through Pocket ID only* is refused while you have no Pocket ID sign-in, so relink your own identity first, or choose *Passkeys, or through Pocket ID*, which needs none.
 - Last resort: restore the dump from step 1. Everything after it, including passkeys made since, is lost.
 
 ### What the move does not do
@@ -206,12 +214,12 @@ Tested (`crates/api/tests/passkey.rs`, `crates/db/src/passkey.rs`, `crates/api/s
 - claim links: hash-only storage, single use, expiry, wrong or mismatched token, replacement by a newer link, a banned member getting none, a ban holding after the Pocket ID identity is retired, the account (id, name, email, creation time) unchanged and both identities kept
 - retiring identities: dry run changes nothing; members without a passkey are skipped; it is audited; the roster is right
 - a second device through a self-made link; account deletion removing everything; the tables holding no address, agent, email or phone, closed to the runtime role with row-level security forced; the migration's functions closed to the world
-- the pages' policy names exactly their script; `oidc` mode has no passkey routes; `both` offers the provider and still honours a named provider; rate limits
+- the pages' policy names exactly their script; the passkey routes are mounted whether or not a provider is configured; each of the three choices opens the page it should (`provider` the provider's address, `any` the passkey page with the provider kept on the row, `passkey` the passkey page whatever provider the request names); rate limits. (An old `TINYSERVER_AUTH` being ignored with a warning is a few lines in `main.rs` and is not covered by a test.)
 - compose: `docker compose config` accepts the default file (Pocket ID is still a service) and the passkey variant (no Pocket ID service, secret or OIDC variable; the owner database password only in `tinyserver-init`). These were validated, not started: no stack was brought up
-- the owner's first-run setup where it meets passkeys: passkeys only refused until the owner has a passkey and members are counted or knowingly left out, a provider turned away without spending its invite, the passkey page no longer offering one, and the choice not applied when the server runs without passkeys (see [`server-setup.md`](server-setup.md) section 7)
+- the owner's setup where it meets sign-in (`crates/api/tests/setup.rs`, `passkey.rs`, and [`server-setup.md`](server-setup.md) section 7): every switch refused until the owner has the sign-in it moves to and the other members have it or the owner accepts the lockout; the owner left out of the member counts and the member list; a provider turned away without spending its invite; and, with no provider configured, the stored choice recorded without the provider guards firing while sign-in still opens the passkey page
 - the operator commands, as the real binary against a scratch database seeded like a Pocket ID community: `auth status`, `export-members`, `claim-links` (links only in the file, none in output, log or database; a banned member refused; an existing file never overwritten; bad arguments refused) and `retire-oidc-identities` (nothing to do while nobody has a passkey)
 - logs: a trace-level capture of a sign-up, sign-in, recovery and claim finds none of the secrets they made; the server's log policy is checked to hold the WebAuthn crates at warn
-- the existing sign-in suites (auth, http, limit, account, privacy, rules, server, signup_logs) and all unit tests still pass, so the default `oidc` mode is unchanged
+- the existing sign-in suites (auth, http, limit, account, privacy, rules, server, signup_logs) and all unit tests still pass
 
 Not covered, and what that means:
 
