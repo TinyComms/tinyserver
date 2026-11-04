@@ -2025,7 +2025,7 @@ async fn passkeys_only_waits_for_the_owner_to_have_a_passkey_and_for_members_to_
         let setup = get_setup(&app, &owner_token).await;
         assert_eq!(setup["deployment"], json!({"passkeys": true, "sso": false}));
         assert_eq!(setup["counts"]["owner_has_passkey"], false);
-        assert_eq!(setup["counts"]["members_without_passkey"], 2);
+        assert_eq!(setup["counts"]["members_without_passkey"], 1);
         assert_eq!(setup["presets"][1]["available"], true);
 
         // The owner has no passkey: choosing passkeys only would lock the owner out.

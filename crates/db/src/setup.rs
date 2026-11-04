@@ -414,17 +414,19 @@ pub async fn apply_setup(
     pool: &PgPool,
     caller: &Caller,
     change: &SetupChange,
+    providers: bool,
 ) -> Result<Applied, SetupError> {
     let mut tx = scope(pool, caller).await?;
     let (emails_erased, last_seen_cleared): (i32, i32) = sqlx::query_as(
         "SELECT emails_erased, last_seen_cleared
-         FROM app_setup_apply($1, $2, $3, $4, $5)",
+         FROM app_setup_apply($1, $2, $3, $4, $5, $6)",
     )
     .bind(change.provider_profile.map(ProviderProfile::as_str))
     .bind(change.activity_visibility.map(ActivityVisibility::as_str))
     .bind(change.sign_in_methods.map(SignInMethods::as_str))
     .bind(change.erase_emails)
     .bind(change.allow_lockout)
+    .bind(providers)
     .fetch_one(&mut *tx)
     .await
     .map_err(classify)?;

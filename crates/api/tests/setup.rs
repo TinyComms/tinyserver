@@ -89,7 +89,7 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
         );
         // Passkeys are always on; no provider is configured in this app.
         assert_eq!(setup["deployment"], json!({"passkeys": true, "sso": false}));
-        assert_eq!(setup["counts"]["members"], 1);
+        assert_eq!(setup["counts"]["members"], 0, "the owner is not counted");
 
         let presets = setup["presets"].as_array().expect("presets");
         let ids: Vec<&str> = presets
@@ -129,10 +129,9 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
         );
         assert_eq!(methods["options"][2]["needs"], json!(["owner_has_passkey"]));
         let members = setup["members"].as_array().expect("members");
-        assert_eq!(members.len(), 1);
-        assert_eq!(members[0]["user_id"], owner.user_id);
-        assert_eq!(members[0]["passkey"], false);
-        assert_eq!(members[0]["provider"], true);
+        assert!(members.is_empty(), "the owner is not listed: {members:?}");
+        assert_eq!(setup["counts"]["owner_has_provider"], true);
+        assert_eq!(setup["counts"]["owner_has_passkey"], false);
         for choice in choices {
             assert!(choice["question"]
                 .as_str()
@@ -670,9 +669,17 @@ async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
             .iter()
             .map(|m| m["user_id"].as_str().expect("id"))
             .collect();
-        assert!(listed.contains(&owner.user_id.as_str()) && listed.contains(&bo.as_str()));
+        assert!(listed.contains(&bo.as_str()), "{listed:?}");
+        assert!(
+            !listed.contains(&owner.user_id.as_str()),
+            "the owner is not one of the members: {listed:?}"
+        );
         assert!(!listed.contains(&cy.as_str()), "{listed:?}");
-        assert_eq!(setup["counts"]["members_without_passkey"], 2);
+        assert_eq!(setup["counts"]["members_without_passkey"], 1);
+        assert_eq!(
+            setup["counts"]["members"], 1,
+            "Bo; Cy is banned, the owner is not counted"
+        );
         assert_eq!(setup["counts"]["members_without_provider"], 0);
         assert_eq!(setup["counts"]["owner_has_provider"], true);
 
@@ -742,7 +749,7 @@ async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
             .fetch_one(&db.owner)
             .await
             .expect("count");
-        let (status, _) = links(json!([owner.user_id, cy]), None, token.clone()).await;
+        let (status, _) = links(json!([bo, cy]), None, token.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let after: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_claims")
             .fetch_one(&db.owner)
@@ -776,6 +783,11 @@ async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
         let (status, _) = links(json!([bo]), Some(0), token.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
+        // The owner may mint a link for themself ("Add a passkey for me").
+        let (status, own) = links(json!([owner.user_id]), None, token.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{own}");
+        assert_eq!(own["links"][0]["user_id"], owner.user_id);
+
         // A member may not.
         let bo_token = session(&db, &bo).await;
         let (status, _) = links(json!([bo]), None, bo_token.clone()).await;
@@ -784,6 +796,43 @@ async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
         assert_eq!(status, StatusCode::FORBIDDEN, "ownership is judged first");
         let (status, _) = get_setup(&app, &bo_token).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn without_a_provider_the_provider_choice_needs_no_provider_sign_in() {
+    run(|db| async move {
+        // A passkey-only deployment: the owner has no provider identity, and none exists to
+        // have. The stored value is recorded, and the server still behaves as passkeys.
+        let app = app(&db).await;
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let (status, put) = put_setup(&app, &token, json!({"preset": "convenience"})).await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let (status, server) = Call::new(Method::GET, "/v1/server")
+            .token(&token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(server["sign_in_methods"], "provider", "{server}");
+        let (status, body) = Call::new(Method::POST, "/v1/auth/start")
+            .json(json!({
+                "redirect_uri": common::passkey::REDIRECT,
+                "code_challenge": db::s256("v".repeat(43).as_str()),
+                "code_challenge_method": "S256",
+                "state": "client-state-0123456789abcdef",
+            }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["authorize_url"]
+                .as_str()
+                .expect("url")
+                .contains("/v1/auth/passkey"),
+            "{body}"
+        );
     })
     .await;
 }

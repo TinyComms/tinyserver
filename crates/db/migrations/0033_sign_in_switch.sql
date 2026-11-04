@@ -34,7 +34,10 @@ UPDATE server_settings SET sign_in_methods = 'provider' WHERE sign_in_methods = 
 -- sign-in (`members_without_provider`) and whether the owner has one (`owner_has_provider`).
 -- A passkey's own identity has the issuer 'tinyserver:passkey' and does not count as a
 -- provider. Both `members_without_*` counts leave out banned members, who cannot sign in
--- anyway; that also changes `members_without_passkey` from 0031.
+-- anyway; that also changes `members_without_passkey` from 0031. The owner asking is not a
+-- "member" in these numbers: `members` is the non-banned memberships other than the caller, and
+-- both counts are taken over those same people. The owner's own state is `owner_has_passkey` and
+-- `owner_has_provider`.
 -- The result columns differ from 0031, so the old function goes first.
 DROP FUNCTION app_setup_state();
 CREATE FUNCTION app_setup_state()
@@ -61,12 +64,13 @@ BEGIN
     END IF;
     RETURN QUERY
     SELECT s.setup_completed_at, s.provider_profile, s.activity_visibility, s.sign_in_methods,
-           (SELECT count(*)::integer FROM memberships),
            (SELECT count(*)::integer FROM memberships m
-             WHERE NOT app_banned(m.user_id)
+             WHERE m.user_id <> app_uid() AND NOT app_banned(m.user_id)),
+           (SELECT count(*)::integer FROM memberships m
+             WHERE m.user_id <> app_uid() AND NOT app_banned(m.user_id)
                AND NOT EXISTS (SELECT 1 FROM passkey_credentials c WHERE c.user_id = m.user_id)),
            (SELECT count(*)::integer FROM memberships m
-             WHERE NOT app_banned(m.user_id)
+             WHERE m.user_id <> app_uid() AND NOT app_banned(m.user_id)
                AND NOT EXISTS (SELECT 1 FROM user_identities i
                                 WHERE i.user_id = m.user_id AND i.issuer <> 'tinyserver:passkey')),
            (SELECT count(*)::integer FROM users u
@@ -87,9 +91,11 @@ $$;
 --                                    owner out at the next sign-in.
 --   'members_without_passkey:<n>'    to 'passkey' while n members have none, unless p_allow_lockout.
 --   'owner_needs_provider'           to 'provider' while the owner has no provider sign-in.
+--                                    Both provider refusals apply only when p_providers says a
+--                                    provider is configured; without one the value is irrelevant.
 --   'members_without_provider:<n>'   to 'provider' while n members have none, unless p_allow_lockout.
 --
--- Banned members are not counted. Each argument is the new value, or null to leave a choice as
+-- Banned members and the owner themself are not counted. Each argument is the new value, or null to leave a choice as
 -- it is. Erasing emails and clearing last-seen are one-way, and only happen when asked for
 -- (emails) or when the choice itself says so ('nobody').
 DROP FUNCTION app_setup_apply(text, text, text, boolean, boolean, boolean);
@@ -98,7 +104,8 @@ CREATE FUNCTION app_setup_apply(
     p_activity_visibility text,
     p_sign_in_methods text,
     p_erase_emails boolean,
-    p_allow_lockout boolean
+    p_allow_lockout boolean,
+    p_providers boolean
 )
 RETURNS TABLE (emails_erased integer, last_seen_cleared integer)
 LANGUAGE plpgsql
@@ -130,27 +137,29 @@ BEGIN
         END IF;
         SELECT count(*)::integer INTO v_lacking
         FROM memberships m
-        WHERE NOT app_banned(m.user_id)
+        WHERE m.user_id <> v_user AND NOT app_banned(m.user_id)
           AND NOT EXISTS (SELECT 1 FROM passkey_credentials c WHERE c.user_id = m.user_id);
         IF v_lacking > 0 AND NOT p_allow_lockout THEN
             RAISE EXCEPTION 'members_without_passkey:%', v_lacking USING ERRCODE = '22023';
         END IF;
     END IF;
 
-    IF v_sign_in = 'provider'
-       AND p_sign_in_methods IS NOT NULL
-       AND (SELECT sign_in_methods FROM server_settings) <> 'provider' THEN
-        IF NOT EXISTS (SELECT 1 FROM user_identities i
-                        WHERE i.user_id = v_user AND i.issuer <> 'tinyserver:passkey') THEN
-            RAISE EXCEPTION 'owner_needs_provider' USING ERRCODE = '22023';
-        END IF;
-        SELECT count(*)::integer INTO v_lacking
-        FROM memberships m
-        WHERE NOT app_banned(m.user_id)
-          AND NOT EXISTS (SELECT 1 FROM user_identities i
-                           WHERE i.user_id = m.user_id AND i.issuer <> 'tinyserver:passkey');
-        IF v_lacking > 0 AND NOT p_allow_lockout THEN
-            RAISE EXCEPTION 'members_without_provider:%', v_lacking USING ERRCODE = '22023';
+    IF p_providers THEN
+        IF v_sign_in = 'provider'
+           AND p_sign_in_methods IS NOT NULL
+           AND (SELECT sign_in_methods FROM server_settings) <> 'provider' THEN
+            IF NOT EXISTS (SELECT 1 FROM user_identities i
+                            WHERE i.user_id = v_user AND i.issuer <> 'tinyserver:passkey') THEN
+                RAISE EXCEPTION 'owner_needs_provider' USING ERRCODE = '22023';
+            END IF;
+            SELECT count(*)::integer INTO v_lacking
+            FROM memberships m
+            WHERE m.user_id <> v_user AND NOT app_banned(m.user_id)
+              AND NOT EXISTS (SELECT 1 FROM user_identities i
+                               WHERE i.user_id = m.user_id AND i.issuer <> 'tinyserver:passkey');
+            IF v_lacking > 0 AND NOT p_allow_lockout THEN
+                RAISE EXCEPTION 'members_without_provider:%', v_lacking USING ERRCODE = '22023';
+            END IF;
         END IF;
     END IF;
 
@@ -176,7 +185,8 @@ END;
 $$;
 
 -- Who the owner can hand a passkey link to, and whether each is ready for either kind of
--- sign-in. Banned members are left out: they cannot sign in anyway. The owner is included.
+-- sign-in. Banned members are left out: they cannot sign in anyway. So is the caller; the owner's
+-- own state is in app_setup_state().
 CREATE FUNCTION app_setup_members()
 RETURNS TABLE (user_id uuid, display_name text, passkey boolean, provider boolean)
 LANGUAGE plpgsql
@@ -195,7 +205,7 @@ BEGIN
                     WHERE i.user_id = u.id AND i.issuer <> 'tinyserver:passkey')
     FROM memberships m
     JOIN users u ON u.id = m.user_id
-    WHERE u.deleted_at IS NULL AND NOT app_banned(m.user_id)
+    WHERE u.deleted_at IS NULL AND NOT app_banned(m.user_id) AND m.user_id <> app_uid()
     ORDER BY u.display_name, u.id;
 END;
 $$;
@@ -236,7 +246,7 @@ DECLARE
 BEGIN
     FOREACH v_function IN ARRAY ARRAY[
         'app_setup_state()',
-        'app_setup_apply(text, text, text, boolean, boolean)',
+        'app_setup_apply(text, text, text, boolean, boolean, boolean)',
         'app_setup_members()',
         'app_setup_claim_link(bytea, uuid, integer)'
     ] LOOP

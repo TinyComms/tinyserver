@@ -251,11 +251,12 @@ impl ApplyBody {
 async fn apply(
     State(pool): State<PgPool>,
     headers: HeaderMap,
+    Extension(deployment): Extension<Deployment>,
     body: Result<Json<ApplyBody>, JsonRejection>,
 ) -> Result<Json<db::Applied>, SetupFailure> {
     let caller = caller(&pool, &headers).await?;
     let Json(body) = body.map_err(|_| SetupFailure::Api(ApiError::Invalid))?;
-    let applied = db::apply_setup(&pool, &caller, &body.change()).await?;
+    let applied = db::apply_setup(&pool, &caller, &body.change(), deployment.sso).await?;
     tracing::info!(
         user_id = %caller.user_id,
         provider_profile = applied.settings.provider_profile.as_str(),
