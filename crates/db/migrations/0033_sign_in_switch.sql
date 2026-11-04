@@ -214,14 +214,17 @@ END;
 $$;
 
 -- A claim link the owner makes for a member, so they can add a passkey. It replaces any link
--- that member had. The audit row names the owner as the actor.
+-- that member had. The audit row names the owner as the actor. Returns the member's display
+-- name, so the owner's own link (the owner is not in app_setup_members()) is named too.
 --   42501  not an owner.   22023  days outside 1..90.   P0002  not a current member.
 CREATE FUNCTION app_setup_claim_link(p_hash bytea, p_user uuid, p_days integer)
-RETURNS void
+RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
 AS $$
+DECLARE
+    v_name text;
 BEGIN
     IF NOT app_owner_of(app_uid()) THEN
         RAISE EXCEPTION 'forbidden' USING ERRCODE = '42501';
@@ -229,10 +232,10 @@ BEGIN
     IF p_days NOT BETWEEN 1 AND 90 THEN
         RAISE EXCEPTION 'bad lifetime' USING ERRCODE = '22023';
     END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM memberships m JOIN users u ON u.id = m.user_id
-         WHERE m.user_id = p_user AND u.deleted_at IS NULL AND NOT app_banned(m.user_id)
-    ) THEN
+    SELECT u.display_name INTO v_name
+    FROM memberships m JOIN users u ON u.id = m.user_id
+    WHERE m.user_id = p_user AND u.deleted_at IS NULL AND NOT app_banned(m.user_id);
+    IF NOT FOUND THEN
         RAISE EXCEPTION 'not a member' USING ERRCODE = 'P0002';
     END IF;
     DELETE FROM passkey_claims WHERE user_id = p_user;
@@ -240,7 +243,27 @@ BEGIN
     VALUES (p_hash, p_user, now() + make_interval(days => p_days));
     INSERT INTO audit_log (actor_id, action, subject, detail, subject_user_id)
     VALUES (app_uid(), 'passkey.claim_link', 'user', jsonb_build_object('days', p_days), p_user);
+    RETURN v_name;
 END;
+$$;
+
+-- What the server checks once at start, before anyone is signed in: the stored sign-in choice
+-- and how many people (the owner included, banned members not) have no identity-provider
+-- sign-in. Only counts leave; the server logs a warning when a provider is configured, the
+-- choice is 'provider', and that count is not zero.
+CREATE FUNCTION app_sign_in_standing()
+RETURNS TABLE (sign_in_methods text, members_without_provider integer)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT s.sign_in_methods,
+           (SELECT count(*)::integer FROM memberships m JOIN users u ON u.id = m.user_id
+             WHERE u.deleted_at IS NULL AND NOT app_banned(m.user_id)
+               AND NOT EXISTS (SELECT 1 FROM user_identities i
+                                WHERE i.user_id = m.user_id AND i.issuer <> 'tinyserver:passkey'))
+    FROM server_settings s;
 $$;
 
 DO $$
@@ -251,7 +274,8 @@ BEGIN
         'app_setup_state()',
         'app_setup_apply(text, text, text, boolean, boolean, boolean)',
         'app_setup_members()',
-        'app_setup_claim_link(bytea, uuid, integer)'
+        'app_setup_claim_link(bytea, uuid, integer)',
+        'app_sign_in_standing()'
     ] LOOP
         EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', v_function);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO app_runtime', v_function);

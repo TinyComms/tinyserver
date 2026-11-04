@@ -358,7 +358,8 @@ pub struct SetupMember {
     pub provider: bool,
 }
 
-/// Owners only. Every member who is not banned, the owner included, by name.
+/// Owners only. Every member other than the caller who is not banned, by name. The owner's own
+/// state is in [`setup_state`].
 pub async fn setup_members(pool: &PgPool, caller: &Caller) -> Result<Vec<SetupMember>, SetupError> {
     let mut tx = scope(pool, caller).await?;
     let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
@@ -380,8 +381,8 @@ pub async fn setup_members(pool: &PgPool, caller: &Caller) -> Result<Vec<SetupMe
 }
 
 /// Owners only. A claim link for each member named, good for `days` (1 to 90), audited with the
-/// owner as the actor. Returns `(user_id, token)` in the order given. A token is shown once and
-/// kept only as a hash. An older link for the same member stops working. All in one
+/// owner as the actor. Returns `(user_id, display_name, token)` in the order given, the owner's
+/// own link named like anyone else's. A token is shown once and kept only as a hash. An older link for the same member stops working. All in one
 /// transaction: `NoSuchMember` for anyone banned, deleted or not a member refuses the lot and
 /// replaces nothing.
 pub async fn claim_links_for(
@@ -389,22 +390,44 @@ pub async fn claim_links_for(
     caller: &Caller,
     user_ids: &[String],
     days: i32,
-) -> Result<Vec<(String, String)>, SetupError> {
+) -> Result<Vec<(String, String, String)>, SetupError> {
     let mut tx = scope(pool, caller).await?;
     let mut made = Vec::with_capacity(user_ids.len());
     for user_id in user_ids {
         let token = new_token();
-        sqlx::query("SELECT app_setup_claim_link($1, $2::uuid, $3)")
+        let name: String = sqlx::query_scalar("SELECT app_setup_claim_link($1, $2::uuid, $3)")
             .bind(token_digest(&token).as_slice())
             .bind(user_id)
             .bind(days)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(classify)?;
-        made.push((user_id.clone(), token));
+        made.push((user_id.clone(), name, token));
     }
     tx.commit().await.map_err(from_sql)?;
     Ok(made)
+}
+
+/// What the server reads once at start: the stored sign-in choice, and how many people who can
+/// sign in (the owner included, banned members not) have no identity-provider sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignInStanding {
+    pub sign_in_methods: SignInMethods,
+    pub members_without_provider: i32,
+}
+
+/// No caller: only the choice and a count leave, for the start-up warning.
+pub async fn sign_in_standing(pool: &PgPool) -> Result<SignInStanding, DbError> {
+    let row: (String, i32) = sqlx::query_as(
+        "SELECT sign_in_methods, members_without_provider FROM app_sign_in_standing()",
+    )
+    .fetch_one(pool)
+    .await?;
+    let corrupt = || DbError::Sql(sqlx::Error::Protocol("unknown posture value".into()));
+    Ok(SignInStanding {
+        sign_in_methods: SignInMethods::parse(&row.0).ok_or_else(corrupt)?,
+        members_without_provider: row.1,
+    })
 }
 
 /// Owners only. Applies the choices and marks setup done, in one transaction, audited as

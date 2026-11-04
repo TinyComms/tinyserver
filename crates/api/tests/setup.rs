@@ -787,6 +787,20 @@ async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
         let (status, own) = links(json!([owner.user_id]), None, token.clone()).await;
         assert_eq!(status, StatusCode::OK, "{own}");
         assert_eq!(own["links"][0]["user_id"], owner.user_id);
+        // Named like anyone else's: tinyclient refuses a link without a name.
+        let (_, owner_name) = account(&db, &owner.user_id).await;
+        assert_eq!(own["links"][0]["display_name"], owner_name, "{own}");
+
+        // Bo and the owner in one request: every link is named.
+        let (status, both) = links(json!([bo, owner.user_id]), None, token.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{both}");
+        let names: Vec<&str> = both["links"]
+            .as_array()
+            .expect("links")
+            .iter()
+            .map(|link| link["display_name"].as_str().expect("a name, never null"))
+            .collect();
+        assert_eq!(names, vec!["Bo", owner_name.as_str()]);
 
         // A member may not.
         let bo_token = session(&db, &bo).await;

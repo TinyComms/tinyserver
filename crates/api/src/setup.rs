@@ -294,7 +294,7 @@ async fn claim_links(
 ) -> Result<Json<Value>, SetupFailure> {
     let caller = caller(&pool, &headers).await?;
     // Owners only, before anything about the request is judged.
-    let members = db::setup_members(&pool, &caller).await?;
+    db::setup_members(&pool, &caller).await?;
     let Json(body) = body.map_err(|_| SetupFailure::BadRequest)?;
     let days = body.days.unwrap_or(DEFAULT_DAYS);
     if body.user_ids.len() > MOST_LINKS || !(1..=90).contains(&days) {
@@ -312,11 +312,7 @@ async fn claim_links(
     let made = db::claim_links_for(&pool, &caller, &ids, days).await?;
     let links: Vec<Value> = made
         .into_iter()
-        .map(|(user_id, token)| {
-            let name = members
-                .iter()
-                .find(|member| member.user_id == user_id)
-                .map(|member| member.display_name.as_str());
+        .map(|(user_id, name, token)| {
             json!({
                 "user_id": user_id,
                 "display_name": name,

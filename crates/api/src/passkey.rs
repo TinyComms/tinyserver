@@ -1508,4 +1508,12 @@ mod tests {
             assert!(Passkeys::new(url, "T", Some(bad)).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn a_local_server_uses_localhost_because_an_ip_address_cannot_be_a_relying_party() {
+        use super::Passkeys;
+        assert!(Passkeys::new("http://localhost:8080", "T", None).is_ok());
+        assert!(Passkeys::new("http://127.0.0.1:8080", "T", None).is_err());
+        assert!(Passkeys::new("http://[::1]:8080", "T", None).is_err());
+    }
 }

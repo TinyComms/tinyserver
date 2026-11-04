@@ -414,6 +414,7 @@ async fn serve() -> anyhow::Result<()> {
         ..defaults
     };
     let sign_in = sign_in().await?;
+    sign_in_warnings(&pool, &sign_in).await;
     let media = media_config(limits.call_room_max)?;
     let live = match media {
         Some(config) => {
@@ -455,11 +456,6 @@ async fn sign_in() -> anyhow::Result<api::SignIn> {
             .filter(|days| (1..=365).contains(days))
             .context("TINYSERVER_SESSION_MAX_DAYS is not a whole number from 1 to 365")?,
     };
-    if env_var("TINYSERVER_AUTH").is_ok() {
-        tracing::warn!(
-            "TINYSERVER_AUTH is no longer read: passkeys are always on, and the owner chooses how members sign in from the client"
-        );
-    }
     let public_url = env_var("TINYSERVER_PUBLIC_URL")?;
     // The relying party is the host of the public address: change the domain and every passkey
     // stops working. See docs/auth-passkeys.md.
@@ -468,7 +464,7 @@ async fn sign_in() -> anyhow::Result<api::SignIn> {
     // makes a passkey, since it cannot change afterwards.
     let rp_id = env_var("TINYSERVER_PASSKEY_RP_ID").ok();
     let passkeys = api::Passkeys::new(&public_url, &name, rp_id.as_deref())
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        .map_err(|error| passkeys_refused(&public_url, &error.to_string()))?;
     // Without a provider configured, passkeys are the only way in and nothing is contacted.
     if !providers_configured() {
         let sign_in = api::SignIn::passkey_only(&public_url, session_days, passkeys)
@@ -500,6 +496,71 @@ async fn sign_in() -> anyhow::Result<api::SignIn> {
             }
             Err(error) => bail!("sign-in: {error}"),
         }
+    }
+}
+
+/// Why passkeys cannot start, said so the operator can fix it. An IP address is the usual cause:
+/// webauthn binds passkeys to a hostname and refuses an address.
+fn passkeys_refused(public_url: &str, error: &str) -> anyhow::Error {
+    let ip = url::Url::parse(public_url)
+        .ok()
+        .and_then(|url| url.host().map(|host| !matches!(host, url::Host::Domain(_))))
+        .unwrap_or(false);
+    let error = anyhow::anyhow!("{error}");
+    if ip {
+        error.context(
+            "TINYSERVER_PUBLIC_URL must use a hostname, not an IP address, because passkeys are \
+             bound to it: use http://localhost:8080 for a local server, or your domain",
+        )
+    } else {
+        error.context("passkeys cannot use TINYSERVER_PUBLIC_URL")
+    }
+}
+
+/// Warnings at start for an owner whose stored sign-in choice would turn people away. Nothing is
+/// changed: the choice is the owner's, made in the client. A choice that cannot be read is only
+/// logged, since every sign-in reads it again.
+async fn sign_in_warnings(pool: &PgPool, sign_in: &api::SignIn) {
+    let old_auth = env_var("TINYSERVER_AUTH").ok();
+    if !providers_configured() {
+        if old_auth.is_some() {
+            tracing::warn!(
+                "TINYSERVER_AUTH is no longer read: with no provider configured, passkeys are the only way in"
+            );
+        }
+        return;
+    }
+    let standing = match db::sign_in_standing(pool).await {
+        Ok(standing) => standing,
+        Err(error) => {
+            tracing::warn!(%error, "sign-in choice not read at start");
+            return;
+        }
+    };
+    let provider_only = standing.sign_in_methods == db::SignInMethods::Provider;
+    let provider = sign_in.provider_name();
+    let ran_passkeys = matches!(old_auth.as_deref().map(str::trim), Some("both" | "passkey"));
+    if ran_passkeys && provider_only {
+        tracing::warn!(
+            members_without_provider = standing.members_without_provider,
+            "TINYSERVER_AUTH is no longer read, and you ran passkeys before: choose 'Passkeys, or \
+             through {provider}' (or 'Passkeys only') in Server Settings › Privacy so passkey \
+             members can keep signing in; open sessions and claim links keep working meanwhile"
+        );
+        return;
+    }
+    if old_auth.is_some() {
+        tracing::warn!(
+            "TINYSERVER_AUTH is no longer read: passkeys are always on, and the owner chooses how members sign in from the client"
+        );
+    }
+    if provider_only && standing.members_without_provider > 0 {
+        tracing::warn!(
+            members_without_provider = standing.members_without_provider,
+            "sign-in is through {provider} only, and some members have no {provider} sign-in, so \
+             they cannot sign in: choose 'Passkeys, or through {provider}' (or 'Passkeys only') in \
+             Server Settings › Privacy"
+        );
     }
 }
 
@@ -808,7 +869,26 @@ fn env_var(name: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_code, join_url};
+    use super::{join_code, join_url, passkeys_refused};
+
+    #[test]
+    fn an_ip_public_url_is_refused_with_what_to_use_instead() {
+        for url in ["http://127.0.0.1:8080", "http://[::1]:8080"] {
+            let message = format!("{:#}", passkeys_refused(url, "invalid rp id"));
+            assert!(message.contains("must use a hostname"), "{message}");
+            assert!(message.contains("http://localhost:8080"), "{message}");
+            assert!(
+                message.contains("invalid rp id"),
+                "the original error is kept: {message}"
+            );
+        }
+        let message = format!(
+            "{:#}",
+            passkeys_refused("https://chat.example.org", "other")
+        );
+        assert!(!message.contains("must use a hostname"), "{message}");
+        assert!(message.contains("other"), "{message}");
+    }
 
     #[test]
     fn owner_link_contains_the_compatible_invite_code() {
