@@ -175,8 +175,9 @@ the owner chooses. The owner is not a "member" in these numbers; their own state
 `owner_has_passkey` and `owner_has_provider`. `members` is the number of non-banned memberships
 other than the caller's, and `members_without_passkey` and `members_without_provider` are counted
 over those same people. `emails_stored` counts every member who has an address on file, the owner
-included (in the example, the owner and Bo). The `members` array lists those same people, by name, with which sign-ins each has, so
-the page can draw a checklist (an empty array on a server with only its owner). An option's
+included (in the example, the owner and Bo). The `members` array lists those same people, by
+name, with which sign-ins each has, so the page can draw a checklist (an empty array on a server
+with only its owner). An option's
 `needs` lists what it depends on (`owner_has_provider`, `owner_has_passkey`).
 `relevant: false` means the choice has nothing to act on in this deployment; show it dimmed.
 
@@ -270,5 +271,5 @@ everything else that writes.
   `POST /v1/auth/start` still opens the passkey page;
 - setup is audited and emits `server.updated`.
 
-Not tested: a client. tinyclient does not yet show these choices (see the client section of the
-pull request), so today an owner reaches setup through the API.
+Not tested here: a client. tinyclient's Server Settings drive these endpoints, and its own tests
+cover that side.

@@ -46,7 +46,8 @@ wrong window. Moving to passkeys is a nine-step shell runbook, and going back is
 
    - `counts.owner_has_passkey`, `counts.owner_has_provider`
    - `counts.members_without_passkey`, `counts.members_without_provider`
-   - `members: [{user_id, display_name, passkey: bool, provider: bool}]`, every member
+   - `members: [{user_id, display_name, passkey: bool, provider: bool}]`, every member other
+     than you and banned members
 
 4. **The owner hands out claim links from the client.** `POST /v1/setup/claim-links`, owner-only,
    `{"user_ids": [...], "days": 14}` → `{"links": [{"user_id", "display_name", "url"}]}`. One link
@@ -91,8 +92,8 @@ wrong window. Moving to passkeys is a nine-step shell runbook, and going back is
 
 ## Deployment
 
-- `deploy/compose.yml` drops `TINYSERVER_AUTH`. `compose.passkey.yml` becomes only the overlay that
-  retires Pocket ID (profiles, secrets, depends_on), with no auth environment.
+- `deploy/compose.yml` drops `TINYSERVER_AUTH`. `compose.passkey.yml` keeps its `!override`
+  environment, which drops the OIDC variables, and loses only `TINYSERVER_AUTH`.
 - `docs/auth-passkeys.md` §2 Modes is replaced by the table above; §8's runbook becomes: back up,
   update, add your own passkey from Server Settings › Sign-in, switch to *Passkeys, or through
   Pocket ID*, send links from Server Settings › Privacy, watch the counts there, switch to

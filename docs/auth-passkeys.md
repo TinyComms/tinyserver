@@ -24,9 +24,11 @@ What the community *accepts* is the owner's choice, made in the client at Server
 | *Passkeys, or through Pocket ID* (`any`) | the passkey page, with "Sign in with Pocket ID instead" | both |
 | *Passkeys only* (`passkey`) | the passkey page, no provider link | passkeys |
 
-A client that names the provider (`"provider": "default"`) goes straight to it under the first two rows, as before; under *Passkeys only* the name is ignored and the passkey page opens (only under *Through Pocket ID only* is `"provider": "passkey"` refused, with a 400). A deployment with no provider configured is always passkeys: the stored value is irrelevant there, the effect is always the last row, and the owner's guards about provider sign-ins do not fire.
+A client that names the provider (`"provider": "default"`) goes straight to it under the first two rows, as before; under *Passkeys only* the name is ignored and the passkey page opens (only under *Through Pocket ID only* is `"provider": "passkey"` refused, with a 400). A deployment with no provider configured is always passkeys: the stored value is irrelevant there until a provider is configured, the effect is always the last row, and the owner's guards about provider sign-ins do not fire. Once a provider is configured the stored value applies at once, and it starts at *Through Pocket ID only*, which locks out every member whose only sign-in is a passkey. So choose *Passkeys, or through Pocket ID* (or *Passkeys only*) before adding a provider; a server that starts with a provider, that stored choice and members without a provider sign-in logs a warning saying so, and changes nothing.
 
-tinyclient needs no change to sign in. It never picks a provider: it calls `/v1/auth/start`, opens the `authorize_url` it gets in the system browser, and listens on `127.0.0.1` for the one-time code, which the passkey page sends exactly as the OIDC callback does. (`GET /v1/auth/config` lists `passkey` as a provider and still says `"methods": ["oidc"]`, so an older client does not meet a value it does not know.)
+**Upgrading from `TINYSERVER_AUTH`.** The variable is no longer read, and the database cannot see what it said: migration 0033 stores *Through Pocket ID only* for every server that has a provider configured. A server that ran `TINYSERVER_AUTH=both` (or `passkey` with the OIDC variables still set) therefore starts with passkey sign-in off for members whose only sign-in is a passkey, and logs a warning at start saying so. Choose *Passkeys, or through Pocket ID* (or *Passkeys only*) in Server Settings › Privacy straight after the upgrade. Open sessions and claim links keep working meanwhile. A server that ran `oidc`, or left it unset, changes nothing.
+
+tinyclient needs no change to sign in. It never picks a provider: it calls `/v1/auth/start`, opens the `authorize_url` it gets in the system browser, and listens on `127.0.0.1` for the one-time code, which the passkey page sends exactly as the OIDC callback does. (`GET /v1/auth/config` lists `passkey` as a provider unless the choice is *Through Pocket ID only*, names the default button `Passkey` unless it is, and still says `"methods": ["oidc"]`, so an older client does not meet a value it does not know.)
 
 Other settings:
 
@@ -127,9 +129,9 @@ The owner drives the move from the client. A shell is needed for the backup, the
 
 2. **Update, staying on Pocket ID.** Pull and rebuild the release that has the sign-in switch and run `docker compose up -d`. The migrations (0030 passkeys, 0031 setup, 0033 sign-in switch) are applied by `tinyserver-init`. Nothing about sign-in changes: the choice starts at *Through Pocket ID only*, which is what the server did before, and `GET /v1/setup` says `needed`. Check that a member can still sign in.
 
-3. **Add your own passkey.** In the client, Server Settings › Sign-in › Add a passkey. Sign in with it in every browser your members use, on both a phone and a computer. This is the check that has not been done for you.
+3. **Add your own passkey.** In the client, Server Settings › Sign-in › Add a passkey. This uses a claim page, which works while the choice is still *Through Pocket ID only*; signing in with a passkey does not yet.
 
-4. **Choose *Passkeys, or through Pocket ID*.** Server Settings › Privacy. The passkey page now opens at sign-in, with "Sign in with Pocket ID instead", so members who have not moved still get in. The choice takes effect at once. Nothing is refused here.
+4. **Choose *Passkeys, or through Pocket ID*, then try your passkey.** Server Settings › Privacy. The passkey page now opens at sign-in, with "Sign in with Pocket ID instead", so members who have not moved still get in. The choice takes effect at once. Nothing is refused here. Now sign in with your passkey in every browser your members use, on both a phone and a computer, before you send anyone a link. This is the check that has not been done for you.
 
 5. **Send passkey links.** From the same page, pick the members and make their links; the client shows each once, with Copy per row and Copy all. A new link for a person replaces their old one. Each link works once, for that member only, and expires (14 days by default, 1 to 90). The server keeps only a hash.
 
@@ -158,7 +160,7 @@ The owner drives the move from the client. A shell is needed for the backup, the
    sudo chown "$USER" auth-out/*.tsv && mv auth-out/*.tsv /secure/place/ && rmdir auth-out
    ```
 
-6. **Watch the counts.** The same page shows, for the members other than you (banned ones left out), how many have a passkey and how many do not, and who. `docker compose run --rm --no-deps --entrypoint tinyserver tinyserver-init auth status` says the same from a shell. Re-issue links as needed (step 5).
+6. **Watch the counts.** The same page shows, for the members other than you (banned ones left out), how many have a passkey and how many do not, and who. `docker compose run --rm --no-deps --entrypoint tinyserver tinyserver-init auth status` gives the same counts from a shell, except that it counts you too, so its numbers can be one higher than the client's. Re-issue links as needed (step 5).
 
 7. **Choose *Passkeys only*.** Server Settings › Privacy. It is refused unless you have a passkey yourself (step 3). If some members have not claimed one yet, the page says how many and offers "Switch anyway": they stay members, keep any session they have until it ends, and cannot sign in again until you give them a link. Take a fresh backup first (step 1). The privacy preset makes this choice together with the others.
 
@@ -184,7 +186,7 @@ The owner drives the move from the client. A shell is needed for the backup, the
 ### Going back
 
 - Before step 9: in the client, choose *Through Pocket ID only*. It takes effect at once. It is refused unless you have a Pocket ID sign-in yourself, and, for members who have none, offers "Switch anyway". Passkeys already made stay stored and are unused.
-- After step 9, with Pocket ID's volume intact: `docker compose -f compose.yml up -d` brings Pocket ID back, then choose *Through Pocket ID only* (or *Passkeys, or through Pocket ID*) in the client. Members whose Pocket ID identity was retired need it back. The `identities` column of `members.tsv` (and the `retire-oidc-identities` listing) has each one's subject: `tinyserver relink-identity --user-id <id> --issuer <issuer> --subject <subject>` per member.
+- After step 9, with Pocket ID's volume intact: `docker compose -f compose.yml up -d` brings Pocket ID back, then choose *Through Pocket ID only* (or *Passkeys, or through Pocket ID*) in the client. Members whose Pocket ID identity was retired need it back. The `identities` column of `members.tsv` (and the `retire-oidc-identities` listing) has each one's subject: `tinyserver relink-identity --user-id <id> --issuer <issuer> --subject <subject>` per member. That includes you: *Through Pocket ID only* is refused while you have no Pocket ID sign-in, so relink your own identity first, or choose *Passkeys, or through Pocket ID*, which needs none.
 - Last resort: restore the dump from step 1. Everything after it, including passkeys made since, is lost.
 
 ### What the move does not do
