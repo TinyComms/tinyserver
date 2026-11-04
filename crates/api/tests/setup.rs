@@ -506,13 +506,6 @@ async fn applying_setup_is_audited_and_reaches_every_connected_client() {
     .await;
 }
 
-async fn passkey_invite(db: &TestDb, owner: &db::Caller) -> String {
-    match db::create_invite(&db.runtime, owner, "member", None).await {
-        Ok(db::Wrote::Fresh(issued)) => issued.token,
-        _ => panic!("invite"),
-    }
-}
-
 #[tokio::test]
 async fn going_back_to_a_provider_waits_for_the_owner_to_have_one() {
     run(|db| async move {
@@ -534,6 +527,15 @@ async fn going_back_to_a_provider_waits_for_the_owner_to_have_one() {
             put_setup(&app, &owner.token, json!({"sign_in_methods": "provider"})).await;
         assert_eq!(status, StatusCode::CONFLICT, "{put}");
         assert_eq!(put, json!({"error": "owner_needs_provider"}));
+        let (status, server) = Call::new(Method::GET, "/v1/server")
+            .token(&owner.token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(
+            server["sign_in_methods"], "any",
+            "a refusal changes nothing"
+        );
     })
     .await;
 }
@@ -556,7 +558,7 @@ async fn going_back_to_a_provider_waits_for_the_members_to_have_one() {
             &app,
             &db,
             &mut Device::new(),
-            &passkey_invite(&db, &owner).await,
+            &common::passkey::invite(&db, &owner).await,
             "Bo",
         )
         .await;
@@ -564,7 +566,7 @@ async fn going_back_to_a_provider_waits_for_the_members_to_have_one() {
             &app,
             &db,
             &mut Device::new(),
-            &passkey_invite(&db, &owner).await,
+            &common::passkey::invite(&db, &owner).await,
             "Cy",
         )
         .await;
@@ -581,6 +583,15 @@ async fn going_back_to_a_provider_waits_for_the_members_to_have_one() {
         assert_eq!(
             put,
             json!({"error": "members_without_provider", "count": 1})
+        );
+        let (status, server) = Call::new(Method::GET, "/v1/server")
+            .token(&token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(
+            server["sign_in_methods"], "any",
+            "a refusal changes nothing"
         );
 
         let (status, put) = put_setup(

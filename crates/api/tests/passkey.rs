@@ -14,16 +14,16 @@ use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
 use base64::Engine;
 use common::oidc::{self, Provider};
-use common::passkey::{attach_passkey, note, raw_id, subject_of, Account, Device, ORIGIN, SECRETS};
+use common::passkey::{
+    attach_passkey, invite, note, raw_id, redeem, sign_up, start, subject_of, Account, Device,
+    ORIGIN, REDIRECT, SECRETS, VERIFIER,
+};
 use common::{first_owner, join, passkeys, run, session, Call, TestDb};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use webauthn_authenticator_rs::prelude::Url;
-
-const REDIRECT: &str = "http://127.0.0.1:53121/callback";
-const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0123456789";
 
 /// Passkeys only: no identity provider anywhere.
 fn passkey_app(db: &TestDb) -> Router {
@@ -56,114 +56,6 @@ async fn page(app: &Router, path: &str) -> (StatusCode, HeaderMap, String) {
         headers,
         String::from_utf8_lossy(&bytes).into_owned(),
     )
-}
-
-async fn invite(db: &TestDb, owner: &db::Caller) -> String {
-    match db::create_invite(&db.runtime, owner, "member", None).await {
-        Ok(db::Wrote::Fresh(issued)) => issued.token,
-        _ => panic!("invite"),
-    }
-}
-
-/// `POST /v1/auth/start`: the pending sign-in's state and the page it sends the browser to.
-async fn start(app: &Router, invite: Option<&str>) -> (String, String) {
-    let mut body = json!({
-        "redirect_uri": REDIRECT,
-        "code_challenge": db::s256(VERIFIER),
-        "code_challenge_method": "S256",
-        "state": "client-state-0123456789abcdef",
-    });
-    if let Some(invite) = invite {
-        body["invite"] = json!(invite);
-    }
-    let (status, body) = Call::new(Method::POST, "/v1/auth/start")
-        .json(body)
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let url = Url::parse(body["authorize_url"].as_str().expect("url")).expect("url");
-    let state = url
-        .query_pairs()
-        .find(|(name, _)| name == "state")
-        .map(|(_, value)| value.into_owned())
-        .expect("state");
-    note(&state);
-    (state, url.path().to_string())
-}
-
-/// What the browser is redirected to, and trades for a session.
-async fn redeem(app: &Router, redirect: &str) -> (String, String) {
-    let url = Url::parse(redirect).expect("redirect");
-    assert_eq!(url.path(), "/callback");
-    let get = |name: &str| {
-        url.query_pairs()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.into_owned())
-    };
-    assert_eq!(
-        get("state").as_deref(),
-        Some("client-state-0123456789abcdef")
-    );
-    let code = get("code").unwrap_or_else(|| panic!("no code in {redirect}"));
-    note(&code);
-    let (status, body) = Call::new(Method::POST, "/v1/auth/token")
-        .json(json!({"code": code, "code_verifier": VERIFIER}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    note(body["token"].as_str().expect("token"));
-    (
-        body["token"].as_str().expect("token").to_string(),
-        body["user_id"].as_str().expect("user").to_string(),
-    )
-}
-
-/// Sign-up with an invite, all the way to a session.
-async fn sign_up(
-    app: &Router,
-    db: &TestDb,
-    device: &mut Device,
-    invite: &str,
-    name: &str,
-) -> Account {
-    let (state, path) = start(app, Some(invite)).await;
-    assert_eq!(path, "/v1/auth/passkey");
-    let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/signup/begin")
-        .json(json!({"state": state, "display_name": name}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{begun}");
-    let credential = device.register(&begun["options"]);
-    let (status, finished) = Call::new(Method::POST, "/v1/auth/passkey/signup/finish")
-        .json(json!({"state": state, "cid": begun["cid"], "credential": credential}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{finished}");
-    let codes: Vec<String> = finished["codes"]
-        .as_array()
-        .expect("codes")
-        .iter()
-        .map(|code| code.as_str().expect("code").to_string())
-        .collect();
-    for code in &codes {
-        note(code);
-    }
-    note(begun["cid"].as_str().expect("cid"));
-    note(finished["cont"].as_str().expect("cont"));
-    let (status, sent) = Call::new(Method::POST, "/v1/auth/passkey/continue")
-        .json(json!({"state": state, "cont": finished["cont"]}))
-        .send(app)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{sent}");
-    let (token, user_id) = redeem(app, sent["redirect"].as_str().expect("redirect")).await;
-    let subject = subject_of(db, &user_id).await;
-    Account {
-        token,
-        user_id,
-        credential_id: raw_id(&credential),
-        subject,
-        codes,
-    }
 }
 
 /// Sign-in with a passkey, no username: the redirect tinyclient gets, or the failure.
