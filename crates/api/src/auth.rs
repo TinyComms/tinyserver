@@ -150,7 +150,11 @@ async fn config(
     };
     Ok(Json(Config {
         methods: ["oidc"],
-        provider_name: sign_in.provider_name(),
+        provider_name: if effective == db::SignInMethods::Passkey {
+            "Passkey"
+        } else {
+            sign_in.provider_name()
+        },
         providers: passkey
             .into_iter()
             .chain(providers.iter().map(|provider| ProviderEntry {

@@ -1557,6 +1557,18 @@ async fn provider_ids(app: &Router) -> Vec<String> {
         .collect()
 }
 
+async fn config_name(app: &Router) -> String {
+    let (_, config) = Call::new(Method::GET, "/v1/auth/config").send(app).await;
+    config["provider_name"].as_str().expect("name").to_string()
+}
+
+async fn newest_pending_provider(db: &TestDb) -> String {
+    sqlx::query_scalar("SELECT provider FROM auth_pending ORDER BY created_at DESC LIMIT 1")
+        .fetch_one(&db.owner)
+        .await
+        .expect("pending row")
+}
+
 async fn provider_app(db: &TestDb, provider: &Provider) -> Router {
     let sign_in = api::SignIn::discover(oidc::config(vec![provider.provider_config("default")]))
         .await
@@ -1577,6 +1589,7 @@ async fn config_and_start_follow_the_stored_choice_beside_a_provider() {
         // provider: only the provider is listed, and a client asking for the passkey page is
         // told no, like for any id the server does not know.
         assert_eq!(provider_ids(&app).await, ["default"]);
+        assert_ne!(config_name(&app).await, "Passkey");
         let (status, body) = start_naming(&app, Some("passkey")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"], "bad_request");
@@ -1591,6 +1604,22 @@ async fn config_and_start_follow_the_stored_choice_beside_a_provider() {
         let (status, body) = put_setup(&app, &owner_token, json!({"sign_in_methods": "any"})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(provider_ids(&app).await, ["passkey", "default"]);
+        assert_ne!(config_name(&app).await, "Passkey");
+        // No name: the passkey page, with the default provider kept on the row.
+        let (status, body) = start_naming(&app, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .contains("/v1/auth/passkey"));
+        assert_eq!(newest_pending_provider(&db).await, "default");
+        // A real provider id goes straight to the issuer.
+        let (status, body) = start_naming(&app, Some("default")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["authorize_url"]
+            .as_str()
+            .expect("url")
+            .starts_with(&provider.issuer));
         let (status, body) = start_naming(&app, Some("passkey")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["authorize_url"]
@@ -1605,10 +1634,12 @@ async fn config_and_start_follow_the_stored_choice_beside_a_provider() {
             put_setup(&app, &owner_token, json!({"sign_in_methods": "passkey"})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(provider_ids(&app).await, ["passkey"]);
+        assert_eq!(config_name(&app).await, "Passkey");
         let (status, body) = start_naming(&app, Some("default")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let url = body["authorize_url"].as_str().expect("url");
         assert!(url.contains("/v1/auth/passkey"), "{url}");
+        assert_eq!(newest_pending_provider(&db).await, "passkey");
     })
     .await;
 }
