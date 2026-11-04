@@ -146,6 +146,30 @@ case "$ci" in
     *) block "CI: $(git rev-parse --short "$head") is $ci" ;;
 esac
 
+# The lab's recorded run of the release suite on this exact SHA (e2e/README.md, docs/quality-gate.md):
+# the last released tinyclient on each platform, driven against this build, with a recording of
+# each. e2e/gate.json says whether a missing one blocks yet: "report" until every platform's lab
+# is in, then "enforce".
+gatefile=$root/e2e/gate.json
+if [ -f "$gatefile" ]; then
+    e2e_context=$(sed -n 's/.*"release_context": *"\([^"]*\)".*/\1/p' "$gatefile")
+    e2e_mode=$(sed -n 's/.*"release_proof": *"\([^"]*\)".*/\1/p' "$gatefile")
+    e2e=$(gh api "repos/$repo/commits/$head/statuses?per_page=100" \
+        --jq "[.[] | select(.context == \"$e2e_context\")][0] | \"\\(.state) \\(.target_url)\"" 2>/dev/null) || e2e=
+    case "$e2e" in
+        "success "*) ok "e2e: the lab recorded the release suite green on $(git rev-parse --short "$head"): ${e2e#success }" ;;
+        ""|"null null") e2e_now="no $e2e_context status" ;;
+        *) e2e_now="$e2e_context is ${e2e%% *}" ;;
+    esac
+    if [ -n "${e2e_now:-}" ]; then
+        if [ "$e2e_mode" = enforce ]; then
+            block "e2e: $e2e_now on $(git rev-parse --short "$head"); the lab has not recorded the release suite green"
+        else
+            echo "  note   e2e: $e2e_now on $(git rev-parse --short "$head") (release_proof is $e2e_mode, so this does not block yet)"
+        fi
+    fi
+fi
+
 if [ -z "$host" ] || [ -z "$dir" ]; then
     block "host: Community host or Community dir is blank in AGENTS.md; stop and ask Justin once"
 elif ! printf '%s\n' "$dir" | grep -Eq '^/[A-Za-z0-9._/-]+$'; then

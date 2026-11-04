@@ -12,6 +12,17 @@ An agent doing feature work does not tag or deploy. It may tell Justin that merg
 
 Nothing deploys with no agent in the thread: no scheduler, no GitHub Action, no cron. CI (`ci.yml`) only tests. Merged does not mean live.
 
+### The quality gate
+
+The gate is written in tinyclient (`docs/quality-gate.md`); `docs/quality-gate.md` here says where the server differs. For a feature agent:
+
+- Open the pull request from `.github/pull_request_template.md`, with one type checked.
+- A `feature` or `fix` brings an `e2e/scenarios/<id>` in the same pull request. A released client drives it against this branch, and it fails on `main` without the change.
+- Do not paste your own screenshots as proof. The lab records each client and posts `e2e-proof`.
+- A migration says so in the pull request, with its rollback.
+
+The deploy check prints an `e2e:` line. When `e2e/gate.json` has `"release_proof": "enforce"`, a missing one is a `BLOCK`.
+
 ### Not on the daily train
 
 tinyserver has no release train and no tags. `Cargo.toml` staying at `0.1.0` is fine. Do not invent server tags.
