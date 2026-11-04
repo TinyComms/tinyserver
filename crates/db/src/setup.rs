@@ -21,6 +21,7 @@ use crate::community::{audit, from_sql, scope, STAMP};
 use crate::error::DbError;
 use crate::outbox::emit;
 use crate::server::{settings_in, ServerSettings};
+use crate::session::{new_token, token_digest};
 use crate::{Caller, CommunityError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +269,9 @@ pub enum SetupError {
     /// Provider only, while this many members have no provider sign-in.
     #[error("{0} members have no provider sign-in")]
     MembersWithoutProvider(i32),
+    /// A claim link for someone who is not a current member (unknown, deleted or banned).
+    #[error("no such member")]
+    NoSuchMember,
     #[error(transparent)]
     Community(#[from] CommunityError),
 }
@@ -277,6 +281,8 @@ fn classify(error: sqlx::Error) -> SetupError {
         let message = db.message();
         match db.code().as_deref() {
             Some("42501") => return SetupError::Forbidden,
+            // P0002: not a current member. 22P02: not even a uuid.
+            Some("P0002" | "22P02") => return SetupError::NoSuchMember,
             Some("22023") if message == "owner_needs_passkey" => {
                 return SetupError::OwnerNeedsPasskey
             }
@@ -339,6 +345,60 @@ pub async fn setup_state(pool: &PgPool, caller: &Caller) -> Result<SetupState, S
         owner_has_passkey: row.8,
         owner_has_provider: row.9,
     })
+}
+
+/// A member as the owner's checklist shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetupMember {
+    pub user_id: String,
+    pub display_name: String,
+    /// Has a passkey.
+    pub passkey: bool,
+    /// Has a sign-in through an identity provider.
+    pub provider: bool,
+}
+
+/// Owners only. Every member who is not banned, the owner included, by name.
+pub async fn setup_members(pool: &PgPool, caller: &Caller) -> Result<Vec<SetupMember>, SetupError> {
+    let mut tx = scope(pool, caller).await?;
+    let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
+        "SELECT user_id::text, display_name, passkey, provider FROM app_setup_members()",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(classify)?;
+    tx.commit().await.map_err(from_sql)?;
+    Ok(rows
+        .into_iter()
+        .map(|(user_id, display_name, passkey, provider)| SetupMember {
+            user_id,
+            display_name,
+            passkey,
+            provider,
+        })
+        .collect())
+}
+
+/// Owners only. A claim link for a member, good for `days` (1 to 90), audited with the owner as
+/// the actor. Returns the token, which is shown once and kept only as a hash. An older link for
+/// the same member stops working. `NoSuchMember` for anyone banned, deleted or not a member.
+pub async fn claim_link_for(
+    pool: &PgPool,
+    caller: &Caller,
+    user_id: &str,
+    days: i32,
+) -> Result<String, SetupError> {
+    let token = new_token();
+    let mut tx = scope(pool, caller).await?;
+    sqlx::query("SELECT app_setup_claim_link($1, $2::uuid, $3)")
+        .bind(token_digest(&token).as_slice())
+        .bind(user_id)
+        .bind(days)
+        .execute(&mut *tx)
+        .await
+        .map_err(classify)?;
+    tx.commit().await.map_err(from_sql)?;
+    Ok(token)
 }
 
 /// Owners only. Applies the choices and marks setup done, in one transaction, audited as

@@ -175,13 +175,70 @@ BEGIN
 END;
 $$;
 
+-- Who the owner can hand a passkey link to, and whether each is ready for either kind of
+-- sign-in. Banned members are left out: they cannot sign in anyway. The owner is included.
+CREATE FUNCTION app_setup_members()
+RETURNS TABLE (user_id uuid, display_name text, passkey boolean, provider boolean)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF NOT app_owner_of(app_uid()) THEN
+        RAISE EXCEPTION 'forbidden' USING ERRCODE = '42501';
+    END IF;
+    RETURN QUERY
+    SELECT u.id, u.display_name,
+           EXISTS (SELECT 1 FROM passkey_credentials c WHERE c.user_id = u.id),
+           EXISTS (SELECT 1 FROM user_identities i
+                    WHERE i.user_id = u.id AND i.issuer <> 'tinyserver:passkey')
+    FROM memberships m
+    JOIN users u ON u.id = m.user_id
+    WHERE NOT app_banned(m.user_id)
+    ORDER BY u.display_name, u.id;
+END;
+$$;
+
+-- A claim link the owner makes for a member, so they can add a passkey. It replaces any link
+-- that member had. The audit row names the owner as the actor.
+--   42501  not an owner.   22023  days outside 1..90.   P0002  not a current member.
+CREATE FUNCTION app_setup_claim_link(p_hash bytea, p_user uuid, p_days integer)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF NOT app_owner_of(app_uid()) THEN
+        RAISE EXCEPTION 'forbidden' USING ERRCODE = '42501';
+    END IF;
+    IF p_days NOT BETWEEN 1 AND 90 THEN
+        RAISE EXCEPTION 'bad lifetime' USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM memberships m JOIN users u ON u.id = m.user_id
+         WHERE m.user_id = p_user AND u.deleted_at IS NULL AND NOT app_banned(m.user_id)
+    ) THEN
+        RAISE EXCEPTION 'not a member' USING ERRCODE = 'P0002';
+    END IF;
+    DELETE FROM passkey_claims WHERE user_id = p_user;
+    INSERT INTO passkey_claims (token_hash, user_id, expires_at)
+    VALUES (p_hash, p_user, now() + make_interval(days => p_days));
+    INSERT INTO audit_log (actor_id, action, subject, detail, subject_user_id)
+    VALUES (app_uid(), 'passkey.claim_link', 'user', jsonb_build_object('days', p_days), p_user);
+END;
+$$;
+
 DO $$
 DECLARE
     v_function text;
 BEGIN
     FOREACH v_function IN ARRAY ARRAY[
         'app_setup_state()',
-        'app_setup_apply(text, text, text, boolean, boolean)'
+        'app_setup_apply(text, text, text, boolean, boolean)',
+        'app_setup_members()',
+        'app_setup_claim_link(bytea, uuid, integer)'
     ] LOOP
         EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', v_function);
         EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO app_runtime', v_function);

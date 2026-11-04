@@ -100,6 +100,8 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
         assert_eq!(presets[0]["available"], true);
         assert_eq!(presets[1]["available"], true);
         assert!(presets[1]["unavailable"].is_null());
+        assert_eq!(presets[0]["choices"]["sign_in_methods"], "provider");
+        assert_eq!(presets[1]["choices"]["sign_in_methods"], "passkey");
 
         let choices = setup["choices"].as_array().expect("choices");
         let ids: Vec<&str> = choices
@@ -110,6 +112,27 @@ async fn a_server_that_has_not_been_set_up_says_so_and_offers_what_it_would_do()
             ids,
             ["provider_profile", "activity_visibility", "sign_in_methods"]
         );
+        let methods = &choices[2];
+        let options: Vec<&str> = methods["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .map(|o| o["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(options, ["provider", "any", "passkey"]);
+        assert_eq!(
+            methods["options"][0]["needs"],
+            json!(["owner_has_provider"])
+        );
+        assert!(
+            methods["options"][1]["needs"].is_null() || methods["options"][1]["needs"] == json!([])
+        );
+        assert_eq!(methods["options"][2]["needs"], json!(["owner_has_passkey"]));
+        let members = setup["members"].as_array().expect("members");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["user_id"], owner.user_id);
+        assert_eq!(members[0]["passkey"], false);
+        assert_eq!(members[0]["provider"], true);
         for choice in choices {
             assert!(choice["question"]
                 .as_str()
@@ -616,6 +639,128 @@ async fn going_back_to_a_provider_waits_for_the_members_to_have_one() {
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::OK, "{me}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_owner_can_see_who_is_ready_and_hand_out_passkey_links() {
+    run(|db| async move {
+        let provider = Provider::start().await;
+        let app = api::router(
+            db.runtime.clone(),
+            Some(common::sign_in_with(Some(&provider)).await),
+        );
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let bo = join_with(&db, &owner, "bo", None, Some("Bo")).await;
+        let cy = join_with(&db, &owner, "cy", None, Some("Cy")).await;
+        let (status, banned) = Call::new(Method::POST, "/v1/bans")
+            .token(&token)
+            .json(json!({"user_id": cy}))
+            .send(&app)
+            .await;
+        assert!(status.is_success(), "{status} {banned}");
+
+        let (status, setup) = get_setup(&app, &token).await;
+        assert_eq!(status, StatusCode::OK, "{setup}");
+        let listed: Vec<&str> = setup["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .map(|m| m["user_id"].as_str().expect("id"))
+            .collect();
+        assert!(listed.contains(&owner.user_id.as_str()) && listed.contains(&bo.as_str()));
+        assert!(!listed.contains(&cy.as_str()), "{listed:?}");
+        assert_eq!(setup["counts"]["members_without_passkey"], 2);
+        assert_eq!(setup["counts"]["members_without_provider"], 0);
+        assert_eq!(setup["counts"]["owner_has_provider"], true);
+
+        let links = |ids: Value, days: Option<i32>, token: String| {
+            let app = app.clone();
+            async move {
+                let mut body = json!({"user_ids": ids});
+                if let Some(days) = days {
+                    body["days"] = json!(days);
+                }
+                Call::new(Method::POST, "/v1/setup/claim-links")
+                    .token(&token)
+                    .json(body)
+                    .send(&app)
+                    .await
+            }
+        };
+        let token_of = |reply: &Value| {
+            let url = reply["links"][0]["url"].as_str().expect("url").to_string();
+            let prefix = "https://chat.tinyserver.test/v1/auth/passkey/claim#";
+            assert!(url.starts_with(prefix), "{url}");
+            url[prefix.len()..].to_string()
+        };
+        let peek = |claim: String| {
+            let app = app.clone();
+            async move {
+                Call::new(Method::POST, "/v1/auth/passkey/claim/peek")
+                    .json(json!({"token": claim}))
+                    .send(&app)
+                    .await
+            }
+        };
+
+        let (status, first) = links(json!([bo]), None, token.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["links"].as_array().map(Vec::len), Some(1));
+        assert_eq!(first["links"][0]["user_id"], bo);
+        assert_eq!(first["links"][0]["display_name"], "Bo");
+        let first = token_of(&first);
+        let (status, who) = peek(first.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{who}");
+        assert_eq!(who["name"], "Bo");
+
+        let actor: Option<String> = sqlx::query_scalar(
+            "SELECT actor_id::text FROM audit_log WHERE action = 'passkey.claim_link'
+             AND subject_user_id = $1::uuid",
+        )
+        .bind(&bo)
+        .fetch_one(&db.owner)
+        .await
+        .expect("audit row");
+        assert_eq!(actor.as_deref(), Some(owner.user_id.as_str()));
+
+        // A second link for Bo replaces the first.
+        let (status, second) = links(json!([bo]), Some(3), token.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let second = token_of(&second);
+        assert_ne!(first, second);
+        assert_eq!(peek(second).await.0, StatusCode::OK);
+        assert_eq!(peek(first).await.0, StatusCode::BAD_REQUEST);
+
+        // A banned member, or one request holding one, mints nothing at all.
+        let (status, body) = links(json!([cy]), None, token.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body, json!({"error": "bad_request"}));
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_claims")
+            .fetch_one(&db.owner)
+            .await
+            .expect("count");
+        let (status, _) = links(json!([owner.user_id, cy]), None, token.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_claims")
+            .fetch_one(&db.owner)
+            .await
+            .expect("count");
+        assert_eq!(before, after, "nothing minted for a refused request");
+
+        let (status, _) = links(json!([bo]), Some(91), token.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = links(json!([bo]), Some(0), token.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A member may not.
+        let bo_token = session(&db, &bo).await;
+        let (status, _) = links(json!([bo]), None, bo_token.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = get_setup(&app, &bo_token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     })
     .await;
 }

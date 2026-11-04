@@ -64,26 +64,24 @@ affected by this choice.
 
 | Value | Effect |
 | --- | --- |
-| `any` (the default) | every method this deployment offers |
+| `provider` (the default) | members sign in through the identity provider and nothing else; passkeys already made keep working but are not offered |
+| `any` | a passkey or the provider; the sign-in page offers both |
 | `passkey` | a sign-in through a provider is refused, and the passkey page stops offering one |
 
-`passkey` closes the provider door for **new sign-ins**. Sessions already open carry on until they
-expire or the person signs out. Passkeys already made keep working. A provider that has just
-vouched for someone, part-way through signing in when the owner chose, is turned away with
-`error=passkey_only`, and the invite they carried is not spent.
+`passkey` closes the provider door for **new sign-ins**, and `provider` closes the passkey door
+the same way. Sessions already open carry on until they expire or the person signs out. A
+provider that has just vouched for someone, part-way through signing in when the owner chose, is
+turned away with `error=passkey_only`, and the invite they carried is not spent.
 
-It is refused, with a reason the owner can act on, unless:
+Moving to `passkey` or `provider` is refused, with a reason the owner can act on, unless:
 
-- **This deployment has passkeys** (`TINYSERVER_AUTH=both` or `passkey`): `409 passkeys_unavailable`.
-- **The owner has a passkey themself**: `409 owner_needs_passkey`. Without one the owner would be
-  locked out at their next sign-in. The owner adds one with a claim link, as any member does.
-- **Every member has a passkey, or the owner says they can wait**: `409 members_without_passkey`
-  with `count`. People with only a provider account cannot sign in until the owner gives them a
-  claim link (`docs/auth-passkeys.md`). `allow_lockout: true` accepts that.
-
-Starting the server without passkeys while `passkey` is chosen (a rollback to `TINYSERVER_AUTH=oidc`)
-does **not** lock everyone out: with no passkeys to honour the choice, the server ignores it and
-providers work as before. The choice is still stored, and applies again when passkeys come back.
+- **The owner has that sign-in themself**: `409 owner_needs_passkey` or `409 owner_needs_provider`.
+  Without one the owner would be locked out at their next sign-in. The owner adds a passkey with
+  a claim link, as any member does.
+- **Every member (banned ones aside) has it, or the owner says they can wait**:
+  `409 members_without_passkey` or `409 members_without_provider`, each with `count`. People
+  without it cannot sign in until the owner gives them a claim link (`docs/auth-passkeys.md`).
+  `allow_lockout: true` accepts that.
 
 ## 3. The two presets
 
@@ -92,7 +90,7 @@ same request.
 
 | | `provider_profile` | `activity_visibility` | `sign_in_methods` |
 | --- | --- | --- | --- |
-| **Convenience** | `full` | `everyone` | `any` |
+| **Convenience** | `full` | `everyone` | `provider` |
 | **Privacy** | `none` | `nobody` | `passkey` |
 
 **Convenience** is how the server worked before there was a setup. **Privacy** keeps the least the
@@ -100,9 +98,9 @@ server can keep and still work. The server describes both, and every option, in 
 the `GET /v1/setup` response, so a client shows what the server will really do and has no copy of
 its own to keep in step.
 
-On a deployment without passkeys, privacy is marked `"available": false` with the reason.
-`{"preset": "privacy", "sign_in_methods": "any"}` takes the rest of it: a named choice overrides the
-preset.
+Both presets are always available. A named choice overrides the preset, so
+`{"preset": "privacy", "sign_in_methods": "any"}` takes the rest of privacy and lets members use
+either sign-in.
 
 ## 4. What setup can erase
 
@@ -147,9 +145,11 @@ Owners only (`403 forbidden` for anyone else, `401` without a session).
 {
   "needed": true,
   "completed_at": null,
-  "current": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "any"},
+  "current": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "provider"},
   "deployment": {"passkeys": true, "sso": false},
-  "counts": {"members": 1, "members_without_passkey": 1, "emails_stored": 1, "owner_has_passkey": false},
+  "counts": {"members": 1, "members_without_passkey": 1, "members_without_provider": 0,
+             "emails_stored": 1, "owner_has_passkey": false, "owner_has_provider": true},
+  "members": [{"user_id": "...", "display_name": "Owner", "passkey": false, "provider": true}],
   "presets": [
     {"id": "convenience", "title": "...", "summary": "...", "choices": {...}, "available": true},
     {"id": "privacy", "title": "...", "summary": "...", "choices": {...}, "available": true, "unavailable": null}
@@ -164,7 +164,7 @@ Owners only (`403 forbidden` for anyone else, `401` without a session).
 
 `needed` is true until `completed_at` is set. `deployment` is what the server was started with.
 `counts` is what a choice would touch, so the page can say "3 members have no passkey yet" before
-the owner chooses. An option's `needs` lists what it depends on (`passkeys`, `owner_has_passkey`).
+the owner chooses. `members` is every member who is not banned, owner included, by name, with which sign-ins each has, so the page can draw a checklist. An option's `needs` lists what it depends on (`owner_has_provider`, `owner_has_passkey`).
 `relevant: false` means the choice has nothing to act on in this deployment; show it dimmed.
 
 ### `PUT /v1/setup`
@@ -190,10 +190,26 @@ applied. The reply:
 {"settings": { ...the whole GET /v1/server object... }, "emails_erased": 0, "last_seen_cleared": 0}
 ```
 
-Refusals are `409` with `error` one of `passkeys_unavailable`, `owner_needs_passkey`,
-`members_without_passkey` (plus `count`). A refusal changes nothing, including setup's "done".
+Refusals are `409` with `error` one of `owner_needs_passkey`, `members_without_passkey`,
+`owner_needs_provider`, `members_without_provider` (the two `members_` ones with `count`). A refusal changes nothing, including setup's "done".
 
 To give the owner a passkey (`owner_needs_passkey`), a client calls `POST /v1/me/passkeys/link`, which returns `{"url"}` to open in the system browser. That call needs a session made in the last 10 minutes; an older one gets `403 recent_sign_in_required`, and the owner signs in again first.
+
+### `POST /v1/setup/claim-links`
+
+Owners only. Makes a passkey claim link for each member named, to hand to people the owner is
+about to leave without a sign-in they can use.
+
+```json
+{"user_ids": ["..."], "days": 14}
+```
+
+`days` is optional (1 to 90, default 14); at most 200 ids. The reply is
+`{"links": [{"user_id": "...", "display_name": "Bo", "url": "https://.../v1/auth/passkey/claim#<token>"}]}`.
+The token is in the fragment and the server keeps only its hash, so the links are shown once and
+never listed. A new link for a member replaces the one before. An id that is not a current member
+(unknown, deleted or banned), a bad `days` or too many ids is `400 bad_request` for the whole
+request, and nothing is made. Each link is audited `passkey.claim_link` with the owner as actor.
 
 Applying is audited `setup.apply` (the choices, the two counts, `allow_lockout`; never a name or an
 address) and emits `server.updated`, so every connected client learns the new choices. The same
@@ -206,14 +222,16 @@ everything else that writes.
 
 `crates/api/tests/setup.rs` and, where passkeys are involved, `crates/api/tests/passkey.rs`:
 
-- a new server says setup is needed, offers every option with a sentence of effect, and lists
+- a new server says setup is needed, offers every option (three for sign-in: `provider`, `any`,
+  `passkey`) with a sentence of effect, lists the members and both presets as available, and lists
   `first_run_setup` in its capabilities;
 - only an owner may read or change the choices (a member and an admin with every permission are
   refused; no session is `401`), and a refused attempt writes nothing and audits nothing;
 - `{}` finishes setup and changes no choice; the first completion time stays the first;
 - an unknown choice, preset or field is refused and does not finish setup;
-- privacy on a deployment with no passkeys is refused whole, and `sign_in_methods: any` alongside
-  it takes the rest;
+- the owner sees who is ready (banned members left out) and makes claim links: the link opens for
+  that member, a second one replaces the first, a banned id or a bad `days` is `400` and a member
+  is `403`, and the audit row names the owner;
 - what a provider may leave: full, name only (and never the start of an email as a name), nothing,
   and none of it reaches existing accounts or a returning sign-in; a name typed for a passkey is
   untouched;

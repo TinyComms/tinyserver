@@ -101,8 +101,9 @@ pub use session::{
     close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,
 };
 pub use setup::{
-    apply_setup, posture, setup_state, ActivityVisibility, Applied, Posture, Preset,
-    ProviderProfile, SetupChange, SetupError, SetupState, SignInMethods,
+    apply_setup, claim_link_for, posture, setup_members, setup_state, ActivityVisibility, Applied,
+    Posture, Preset, ProviderProfile, SetupChange, SetupError, SetupMember, SetupState,
+    SignInMethods,
 };
 pub use sqlx::PgPool;
 pub use sweep::{sweep, Swept};

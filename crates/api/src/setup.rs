@@ -10,7 +10,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use db::{
     ActivityVisibility, PgPool, Preset, ProviderProfile, SetupChange, SetupError, SignInMethods,
@@ -23,12 +23,15 @@ use crate::oidc::SignIn;
 
 /// What this deployment offers, from how the server was started. Fixed for the life of the
 /// process.
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct Deployment {
     /// Built-in passkey sign-in is on.
     pub passkeys: bool,
     /// At least one identity provider is configured.
     pub sso: bool,
+    /// What the first provider is called, for the words the owner reads.
+    #[serde(skip)]
+    pub provider_name: String,
 }
 
 impl Deployment {
@@ -36,18 +39,27 @@ impl Deployment {
         Self {
             passkeys: true,
             sso: sign_in.is_some_and(SignIn::has_providers),
+            provider_name: sign_in
+                .filter(|sign_in| sign_in.has_providers())
+                .map_or_else(
+                    || "your sign-in provider".to_string(),
+                    |sign_in| sign_in.provider_name().to_string(),
+                ),
         }
     }
 }
 
-pub fn routes(deployment: Deployment) -> Router<PgPool> {
+pub fn routes(deployment: Deployment, public_url: String) -> Router<PgPool> {
     Router::new()
         .route("/v1/setup", get(show).put(apply))
+        .route("/v1/setup/claim-links", post(claim_links))
         .layer(Extension(deployment))
+        .layer(Extension(PublicUrl(public_url)))
 }
 
 /// What the owner is told about one choice, option by option.
-fn choices(deployment: Deployment) -> Value {
+fn choices(deployment: &Deployment) -> Value {
+    let name = deployment.provider_name.as_str();
     json!([
         {
             "id": "provider_profile",
@@ -105,39 +117,49 @@ fn choices(deployment: Deployment) -> Value {
             "id": "sign_in_methods",
             "title": "How members sign in",
             "question": "Which sign-in methods should the server accept?",
-            "relevant": deployment.passkeys,
+            "relevant": deployment.sso,
             "options": [
                 {
+                    "id": "provider",
+                    "title": format!("Through {name} only"),
+                    "effect": format!(
+                        "Members sign in through {name} and nothing else. Passkeys already \
+                         made keep working but aren't offered."
+                    ),
+                    "needs": ["owner_has_provider"]
+                },
+                {
                     "id": "any",
-                    "title": "Whatever this server offers",
-                    "effect": if deployment.sso {
-                        "Members sign in with a passkey or with single sign-on."
-                    } else {
-                        "Members sign in with a passkey."
-                    }
+                    "title": format!("Passkeys, or through {name}"),
+                    "effect": format!(
+                        "Members may sign in with a passkey or through {name}. The sign-in \
+                         page offers both."
+                    ),
+                    "needs": []
                 },
                 {
                     "id": "passkey",
                     "title": "Passkeys only",
-                    "effect": "Members sign in with a passkey and nothing else. People who \
-                               only have a single sign-on account cannot sign in until you give \
-                               them a link to add a passkey. Sessions already open carry on.",
-                    "needs": ["passkeys", "owner_has_passkey"]
+                    "effect": format!(
+                        "Members sign in with a passkey and nothing else. People who only \
+                         have a {name} account cannot sign in until you give them a link to \
+                         add a passkey. Sessions already open carry on."
+                    ),
+                    "needs": ["owner_has_passkey"]
                 }
             ]
         }
     ])
 }
 
-fn presets(deployment: Deployment) -> Value {
-    let privacy_available = deployment.passkeys;
+fn presets(_deployment: &Deployment) -> Value {
     json!([
         {
             "id": "convenience",
             "title": "Convenience",
             "summary": "Easiest to run, and how the server worked before this setup. Names and \
                         email addresses from sign-in are kept, everyone sees when others were \
-                        last online, and any sign-in method works.",
+                        last online, and members sign in through your sign-in provider.",
             "choices": Preset::Convenience.posture(),
             "available": true
         },
@@ -148,13 +170,7 @@ fn presets(deployment: Deployment) -> Value {
                         nobody's last-online time is recorded, and members sign in with passkeys \
                         only.",
             "choices": Preset::Privacy.posture(),
-            "available": privacy_available,
-            "unavailable": if privacy_available {
-                Value::Null
-            } else {
-                json!("Needs passkey sign-in, which this server doesn't have turned on. You can \
-                       still choose the other private options one by one below.")
-            }
+            "available": true
         }
     ])
 }
@@ -163,7 +179,7 @@ fn presets(deployment: Deployment) -> Value {
 fn always() -> Value {
     json!([
         "There are no usernames. A member has a display name, which is not unique, and signs in \
-         with a passkey or a single sign-on account.",
+         with a passkey or through a sign-in provider.",
         "The server sends no analytics or crash reports anywhere."
     ])
 }
@@ -175,19 +191,23 @@ async fn show(
 ) -> Result<Json<Value>, SetupFailure> {
     let caller = caller(&pool, &headers).await?;
     let state = db::setup_state(&pool, &caller).await?;
+    let members = db::setup_members(&pool, &caller).await?;
     Ok(Json(json!({
         "needed": state.completed_at.is_none(),
         "completed_at": state.completed_at,
         "current": state.posture,
-        "deployment": deployment,
+        "deployment": &deployment,
         "counts": {
             "members": state.members,
             "members_without_passkey": state.members_without_passkey,
             "emails_stored": state.emails_stored,
+            "members_without_provider": state.members_without_provider,
             "owner_has_passkey": state.owner_has_passkey,
+            "owner_has_provider": state.owner_has_provider,
         },
-        "presets": presets(deployment),
-        "choices": choices(deployment),
+        "members": members,
+        "presets": presets(&deployment),
+        "choices": choices(&deployment),
         "always": always(),
     })))
 }
@@ -245,9 +265,64 @@ async fn apply(
     Ok(Json(applied))
 }
 
+#[derive(Clone)]
+struct PublicUrl(String);
+
+const MOST_LINKS: usize = 200;
+const DEFAULT_DAYS: i32 = 14;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimLinksBody {
+    user_ids: Vec<String>,
+    #[serde(default)]
+    days: Option<i32>,
+}
+
+/// Passkey claim links for the members named, so the owner can hand each person theirs. The
+/// token is in the URL's fragment and the server keeps only its hash, so the links are shown
+/// once here and never listed. Any id that is not a current member refuses the whole request.
+async fn claim_links(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Extension(PublicUrl(public_url)): Extension<PublicUrl>,
+    body: Result<Json<ClaimLinksBody>, JsonRejection>,
+) -> Result<Json<Value>, SetupFailure> {
+    let caller = caller(&pool, &headers).await?;
+    let Json(body) = body.map_err(|_| SetupFailure::BadRequest)?;
+    let days = body.days.unwrap_or(DEFAULT_DAYS);
+    if body.user_ids.len() > MOST_LINKS || !(1..=90).contains(&days) {
+        return Err(SetupFailure::BadRequest);
+    }
+    // Check every id before minting any, so a refused request leaves nothing behind.
+    let members = db::setup_members(&pool, &caller).await?;
+    let mut named = Vec::with_capacity(body.user_ids.len());
+    for id in &body.user_ids {
+        let id = id.to_lowercase();
+        let member = members
+            .iter()
+            .find(|member| member.user_id == id)
+            .ok_or(SetupFailure::BadRequest)?;
+        named.push(member);
+    }
+    let mut links = Vec::with_capacity(named.len());
+    for member in named {
+        let token = db::claim_link_for(&pool, &caller, &member.user_id, days).await?;
+        links.push(json!({
+            "user_id": member.user_id,
+            "display_name": member.display_name,
+            "url": crate::passkey::claim_url(&public_url, &token),
+        }));
+    }
+    tracing::info!(user_id = %caller.user_id, links = links.len(), days, "claim links made");
+    Ok(Json(json!({ "links": links })))
+}
+
 /// A refusal, with the reason the owner can act on.
 enum SetupFailure {
     Api(ApiError),
+    /// A claim-links request that names someone who is not a member, or asks for a bad lifetime.
+    BadRequest,
     OwnerNeedsPasskey,
     MembersWithoutPasskey(i32),
     OwnerNeedsProvider,
@@ -268,6 +343,7 @@ impl From<SetupError> for SetupFailure {
             SetupError::MembersWithoutPasskey(count) => Self::MembersWithoutPasskey(count),
             SetupError::OwnerNeedsProvider => Self::OwnerNeedsProvider,
             SetupError::MembersWithoutProvider(count) => Self::MembersWithoutProvider(count),
+            SetupError::NoSuchMember => Self::BadRequest,
             SetupError::Community(error) => Self::Api(lift(error)),
         }
     }
@@ -277,6 +353,11 @@ impl IntoResponse for SetupFailure {
     fn into_response(self) -> Response {
         match self {
             Self::Api(error) => error.into_response(),
+            Self::BadRequest => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "bad_request"})),
+            )
+                .into_response(),
             Self::OwnerNeedsPasskey => conflict(json!({"error": "owner_needs_passkey"})),
             Self::MembersWithoutPasskey(count) => {
                 conflict(json!({"error": "members_without_passkey", "count": count}))
@@ -322,8 +403,9 @@ mod tests {
         let deployment = Deployment {
             passkeys: true,
             sso: true,
+            provider_name: "Acme".to_string(),
         };
-        for choice in choices(deployment).as_array().expect("choices") {
+        for choice in choices(&deployment).as_array().expect("choices") {
             let id = choice["id"].as_str().expect("id");
             for option in choice["options"].as_array().expect("options") {
                 let option = option["id"].as_str().expect("option");
@@ -343,8 +425,9 @@ mod tests {
         let deployment = Deployment {
             passkeys: true,
             sso: false,
+            provider_name: "your sign-in provider".to_string(),
         };
-        for preset in presets(deployment).as_array().expect("presets") {
+        for preset in presets(&deployment).as_array().expect("presets") {
             let posture: Posture = match preset["id"].as_str().expect("id") {
                 "convenience" => Preset::Convenience.posture(),
                 "privacy" => Preset::Privacy.posture(),
@@ -355,13 +438,15 @@ mod tests {
     }
 
     #[test]
-    fn privacy_is_not_offered_where_passkeys_are_not() {
-        let without = Deployment {
-            passkeys: false,
-            sso: true,
+    fn both_presets_are_offered_whatever_the_deployment() {
+        let deployment = Deployment {
+            passkeys: true,
+            sso: false,
+            provider_name: "your sign-in provider".to_string(),
         };
-        let privacy = &presets(without)[1];
-        assert_eq!(privacy["available"], false);
-        assert!(privacy["unavailable"].is_string());
+        for preset in presets(&deployment).as_array().expect("presets") {
+            assert_eq!(preset["available"], true);
+            assert!(preset.get("unavailable").is_none());
+        }
     }
 }
