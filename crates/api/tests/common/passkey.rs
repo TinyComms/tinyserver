@@ -140,3 +140,71 @@ pub fn note(secret: &str) {
         .unwrap_or_else(|poison| poison.into_inner())
         .push(secret.to_string());
 }
+
+/// Signs a new person up with an invite and a passkey, all the way to a session, on a
+/// deployment that may also have a provider: the start names the passkey page.
+pub async fn sign_up(
+    app: &Router,
+    db: &TestDb,
+    device: &mut Device,
+    invite: &str,
+    name: &str,
+) -> Account {
+    const REDIRECT: &str = "http://127.0.0.1:53121/callback";
+    const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0123456789";
+    let (status, started) = Call::new(Method::POST, "/v1/auth/start")
+        .json(json!({
+            "redirect_uri": REDIRECT,
+            "code_challenge": db::s256(VERIFIER),
+            "code_challenge_method": "S256",
+            "state": "client-state-0123456789abcdef",
+            "invite": invite,
+            "provider": "passkey",
+        }))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let url = Url::parse(started["authorize_url"].as_str().expect("url")).expect("url");
+    assert_eq!(url.path(), "/v1/auth/passkey");
+    let state = url
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .map(|(_, value)| value.into_owned())
+        .expect("state");
+    note(&state);
+    let (status, begun) = Call::new(Method::POST, "/v1/auth/passkey/signup/begin")
+        .json(json!({"state": state, "display_name": name}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{begun}");
+    let credential = device.register(&begun["options"]);
+    let (status, finished) = Call::new(Method::POST, "/v1/auth/passkey/signup/finish")
+        .json(json!({"state": state, "cid": begun["cid"], "credential": credential}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{finished}");
+    let (status, sent) = Call::new(Method::POST, "/v1/auth/passkey/continue")
+        .json(json!({"state": state, "cont": finished["cont"]}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let redirect = Url::parse(sent["redirect"].as_str().expect("redirect")).expect("redirect");
+    let code = redirect
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .expect("code");
+    let (status, token) = Call::new(Method::POST, "/v1/auth/token")
+        .json(json!({"code": code, "code_verifier": VERIFIER}))
+        .send(app)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{token}");
+    let user_id = token["user_id"].as_str().expect("user").to_string();
+    Account {
+        token: token["token"].as_str().expect("token").to_string(),
+        credential_id: raw_id(&credential),
+        subject: subject_of(db, &user_id).await,
+        codes: Vec::new(),
+        user_id,
+    }
+}

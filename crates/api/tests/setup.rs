@@ -4,6 +4,8 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
+use common::oidc::Provider;
+use common::passkey::{sign_up, Device};
 use common::{first_owner, invite_hash, join, run, session, Call, TestDb, ISSUER, OWNER_EMAIL};
 use serde_json::{json, Value};
 
@@ -500,6 +502,106 @@ async fn applying_setup_is_audited_and_reaches_every_connected_client() {
         .await
         .expect("event");
         assert_eq!(event["server"]["activity_visibility"], "admins");
+    })
+    .await;
+}
+
+async fn passkey_invite(db: &TestDb, owner: &db::Caller) -> String {
+    match db::create_invite(&db.runtime, owner, "member", None).await {
+        Ok(db::Wrote::Fresh(issued)) => issued.token,
+        _ => panic!("invite"),
+    }
+}
+
+#[tokio::test]
+async fn going_back_to_a_provider_waits_for_the_owner_to_have_one() {
+    run(|db| async move {
+        let provider = Provider::start().await;
+        let app = api::router(
+            db.runtime.clone(),
+            Some(common::sign_in_with(Some(&provider)).await),
+        );
+        // The owner is made by passkey sign-up with the bootstrap invite: no provider identity.
+        let bootstrap = db::owner_invite(&db.owner, false)
+            .await
+            .expect("owner invite")
+            .expect("no owner yet");
+        let owner = sign_up(&app, &db, &mut Device::new(), &bootstrap.token, "Owner").await;
+        let (status, put) = put_setup(&app, &owner.token, json!({"sign_in_methods": "any"})).await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+
+        let (status, put) =
+            put_setup(&app, &owner.token, json!({"sign_in_methods": "provider"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{put}");
+        assert_eq!(put, json!({"error": "owner_needs_provider"}));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn going_back_to_a_provider_waits_for_the_members_to_have_one() {
+    run(|db| async move {
+        let provider = Provider::start().await;
+        let app = api::router(
+            db.runtime.clone(),
+            Some(common::sign_in_with(Some(&provider)).await),
+        );
+        // The owner has a provider identity; the members join by passkey and have none.
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let (status, put) = put_setup(&app, &token, json!({"sign_in_methods": "any"})).await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+
+        let bo = sign_up(
+            &app,
+            &db,
+            &mut Device::new(),
+            &passkey_invite(&db, &owner).await,
+            "Bo",
+        )
+        .await;
+        let cy = sign_up(
+            &app,
+            &db,
+            &mut Device::new(),
+            &passkey_invite(&db, &owner).await,
+            "Cy",
+        )
+        .await;
+        let (status, banned) = Call::new(Method::POST, "/v1/bans")
+            .token(&token)
+            .json(json!({"user_id": cy.user_id}))
+            .send(&app)
+            .await;
+        assert!(status.is_success(), "{status} {banned}");
+
+        // Bo counts; Cy, banned, does not.
+        let (status, put) = put_setup(&app, &token, json!({"sign_in_methods": "provider"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{put}");
+        assert_eq!(
+            put,
+            json!({"error": "members_without_provider", "count": 1})
+        );
+
+        let (status, put) = put_setup(
+            &app,
+            &token,
+            json!({"sign_in_methods": "provider", "allow_lockout": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let (status, server) = Call::new(Method::GET, "/v1/server")
+            .token(&token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+        assert_eq!(server["sign_in_methods"], "provider", "{server}");
+        // Bo's open session still works.
+        let (status, me) = Call::new(Method::GET, "/v1/me")
+            .token(&bo.token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
     })
     .await;
 }
