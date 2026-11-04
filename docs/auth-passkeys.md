@@ -24,7 +24,7 @@ What the community *accepts* is the owner's choice, made in the client at Server
 | *Passkeys, or through Pocket ID* (`any`) | the passkey page, with "Sign in with Pocket ID instead" | both |
 | *Passkeys only* (`passkey`) | the passkey page, no provider link | passkeys |
 
-A client that names the provider (`"provider": "default"`) goes straight to it under the first two rows, as before; under *Passkeys only* the name is refused. A deployment with no provider configured is always passkeys: the stored value is irrelevant there, the effect is always the last row, and the owner's guards about provider sign-ins do not fire.
+A client that names the provider (`"provider": "default"`) goes straight to it under the first two rows, as before; under *Passkeys only* the name is ignored and the passkey page opens (only under *Through Pocket ID only* is `"provider": "passkey"` refused, with a 400). A deployment with no provider configured is always passkeys: the stored value is irrelevant there, the effect is always the last row, and the owner's guards about provider sign-ins do not fire.
 
 tinyclient needs no change to sign in. It never picks a provider: it calls `/v1/auth/start`, opens the `authorize_url` it gets in the system browser, and listens on `127.0.0.1` for the one-time code, which the passkey page sends exactly as the OIDC callback does. (`GET /v1/auth/config` lists `passkey` as a provider and still says `"methods": ["oidc"]`, so an older client does not meet a value it does not know.)
 
@@ -112,7 +112,7 @@ Until step 9 the move can be undone with one choice in the client (see "Going ba
 
 ### Steps
 
-The owner drives the move from the client. Only the backup, the update and the last, optional step need a shell.
+The owner drives the move from the client. A shell is needed for the backup, the update and the optional last step; steps 5 and 6 give optional shell alternatives.
 
 1. **Back up, and check the backup.** On HOST:
 
@@ -135,17 +135,24 @@ The owner drives the move from the client. Only the backup, the update and the l
 
    Send each person only their own link, by a way you trust (Signal, email, in person). The link carries its token after a `#`, which a browser never sends anywhere, so it is not in any server or proxy log. Anyone who holds an unused link can set up a passkey on that account, so treat a link like a password reset.
 
-   From a shell, `auth claim-links` still makes links for a roster export, for example for everyone at once or for an operator without the client:
+   From a shell, `auth claim-links` still makes links from a roster export. It suits making them for everyone at once, or running without the client. First export the roster:
 
    ```
    install -d -m 700 -o 10001 -g 10001 ./auth-out
    docker compose run --rm --no-deps -v "$PWD/auth-out:/out" \
      --entrypoint tinyserver tinyserver-init auth export-members --out /out/members.tsv
+   ```
+
+   `members.tsv` lists each member: id, name, the email Pocket ID gave (if any), role, joined, last seen, how many passkeys, banned or not, what signs them in, and the provider's own name for them (`identities`, as `issuer subject`). Keep it: after Pocket ID is gone it is how you know who is who, and how a retired identity is put back.
+
+   Then make the links:
+
+   ```
    docker compose run --rm --no-deps -v "$PWD/auth-out:/out" \
      --entrypoint tinyserver tinyserver-init auth claim-links --all-unclaimed --days 14 --out /out/claims.tsv
    ```
 
-   `members.tsv` lists each member: id, name, the email Pocket ID gave (if any), role, joined, last seen, how many passkeys, whether they are banned, what signs them in, and the provider's own name for them (`identities`, as `issuer subject`). It exists so that, after Pocket ID is gone, you still know who is who, and so a retired identity can be put back. In `claims.tsv` the tokens are in the file only: the log gets a count. The files are mode 0600 and are never overwritten. For one person: `--user <id>` instead of `--all-unclaimed`. Then move the files off HOST and delete them there:
+   The tokens are in `claims.tsv` only; the log gets a count. Both files are mode 0600 and never overwritten. For one person use `--user <id>` instead of `--all-unclaimed`. Then move the files off HOST and delete them there:
 
    ```
    sudo chown "$USER" auth-out/*.tsv && mv auth-out/*.tsv /secure/place/ && rmdir auth-out
@@ -205,7 +212,7 @@ Tested (`crates/api/tests/passkey.rs`, `crates/db/src/passkey.rs`, `crates/api/s
 - claim links: hash-only storage, single use, expiry, wrong or mismatched token, replacement by a newer link, a banned member getting none, a ban holding after the Pocket ID identity is retired, the account (id, name, email, creation time) unchanged and both identities kept
 - retiring identities: dry run changes nothing; members without a passkey are skipped; it is audited; the roster is right
 - a second device through a self-made link; account deletion removing everything; the tables holding no address, agent, email or phone, closed to the runtime role with row-level security forced; the migration's functions closed to the world
-- the pages' policy names exactly their script; the passkey routes are mounted whether or not a provider is configured; each of the three choices opens the page it should (`provider` the provider's address, `any` the passkey page with the provider kept on the row, `passkey` the passkey page and a refusal for a named provider); rate limits. (An old `TINYSERVER_AUTH` being ignored with a warning is a few lines in `main.rs` and is not covered by a test.)
+- the pages' policy names exactly their script; the passkey routes are mounted whether or not a provider is configured; each of the three choices opens the page it should (`provider` the provider's address, `any` the passkey page with the provider kept on the row, `passkey` the passkey page whatever provider the request names); rate limits. (An old `TINYSERVER_AUTH` being ignored with a warning is a few lines in `main.rs` and is not covered by a test.)
 - compose: `docker compose config` accepts the default file (Pocket ID is still a service) and the passkey variant (no Pocket ID service, secret or OIDC variable; the owner database password only in `tinyserver-init`). These were validated, not started: no stack was brought up
 - the owner's setup where it meets sign-in (`crates/api/tests/setup.rs`, `passkey.rs`, and [`server-setup.md`](server-setup.md) section 7): every switch refused until the owner has the sign-in it moves to and the other members have it or the owner accepts the lockout; the owner left out of the member counts and the member list; a provider turned away without spending its invite; and, with no provider configured, the stored choice recorded without the provider guards firing while sign-in still opens the passkey page
 - the operator commands, as the real binary against a scratch database seeded like a Pocket ID community: `auth status`, `export-members`, `claim-links` (links only in the file, none in output, log or database; a banned member refused; an existing file never overwritten; bad arguments refused) and `retire-oidc-identities` (nothing to do while nobody has a passkey)

@@ -89,15 +89,17 @@ $$;
 --   'forbidden'                      not an owner.
 --   'owner_needs_passkey'            to 'passkey' while the owner has none, which would lock the
 --                                    owner out at the next sign-in.
---   'members_without_passkey:<n>'    to 'passkey' while n members have none, unless p_allow_lockout.
+--   'members_without_passkey:<n>'    to 'passkey' while n members have none, unless
+--                                    p_allow_lockout.
 --   'owner_needs_provider'           to 'provider' while the owner has no provider sign-in.
 --                                    Both provider refusals apply only when p_providers says a
 --                                    provider is configured; without one the value is irrelevant.
---   'members_without_provider:<n>'   to 'provider' while n members have none, unless p_allow_lockout.
+--   'members_without_provider:<n>'   to 'provider' while n members have none, unless
+--                                    p_allow_lockout.
 --
--- Banned members and the owner themself are not counted. Each argument is the new value, or null to leave a choice as
--- it is. Erasing emails and clearing last-seen are one-way, and only happen when asked for
--- (emails) or when the choice itself says so ('nobody').
+-- Banned members and the owner themself are not counted. Each argument is the new value, or
+-- null to leave a choice as it is. Erasing emails and clearing last-seen are one-way, and only
+-- happen when asked for (emails) or when the choice itself says so ('nobody').
 DROP FUNCTION app_setup_apply(text, text, text, boolean, boolean, boolean);
 CREATE FUNCTION app_setup_apply(
     p_provider_profile text,
@@ -127,7 +129,8 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('tinyserver.owners'));
 
     v_sign_in := coalesce(p_sign_in_methods, (SELECT sign_in_methods FROM server_settings));
-    v_activity := coalesce(p_activity_visibility, (SELECT activity_visibility FROM server_settings));
+    v_activity := coalesce(p_activity_visibility,
+                           (SELECT activity_visibility FROM server_settings));
 
     IF v_sign_in = 'passkey'
        AND p_sign_in_methods IS NOT NULL

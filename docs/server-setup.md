@@ -175,7 +175,7 @@ the owner chooses. The owner is not a "member" in these numbers; their own state
 `owner_has_passkey` and `owner_has_provider`. `members` is the number of non-banned memberships
 other than the caller's, and `members_without_passkey` and `members_without_provider` are counted
 over those same people. `emails_stored` counts every member who has an address on file, the owner
-included. The `members` array lists those same people, by name, with which sign-ins each has, so
+included (in the example, the owner and Bo). The `members` array lists those same people, by name, with which sign-ins each has, so
 the page can draw a checklist (an empty array on a server with only its owner). An option's
 `needs` lists what it depends on (`owner_has_provider`, `owner_has_passkey`).
 `relevant: false` means the choice has nothing to act on in this deployment; show it dimmed.
@@ -262,7 +262,7 @@ everything else that writes.
   a claim link gets a member in;
 - passkeys only turns a provider away at the callback without spending the invite or making an
   account, the passkey page stops offering the provider, and `start` opens the passkey page even
-  when the provider is named;
+  when the provider is named (the name is ignored, not refused);
 - going back to `provider`: refused while the owner has no provider sign-in, refused with a count
   of the other members who have none (banned ones aside), accepted with `allow_lockout`;
 - on a deployment with no provider configured, the owner with no provider identity applies a
