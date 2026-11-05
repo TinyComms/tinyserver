@@ -776,6 +776,7 @@ async fn sweep_every(pool: PgPool, period: Duration) {
                 events = swept.events,
                 logins = swept.logins,
                 reports = swept.reports,
+                link_archives = swept.link_archives,
                 "expired rows deleted"
             ),
             Ok(_) => {}

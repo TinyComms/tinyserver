@@ -170,6 +170,7 @@ pub(crate) enum Error {
     IdTaken,
     RootExists,
     E2eeTwin,
+    ArchiveExists,
 }
 
 impl IntoResponse for Error {
@@ -206,6 +207,7 @@ impl IntoResponse for Error {
             Self::IdTaken => (StatusCode::CONFLICT, "id_taken"),
             Self::RootExists => (StatusCode::CONFLICT, "root_exists"),
             Self::E2eeTwin => (StatusCode::CONFLICT, "e2ee_twin"),
+            Self::ArchiveExists => (StatusCode::CONFLICT, "archive_exists"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -243,6 +245,7 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::IdTaken => "id_taken",
         Error::RootExists => "root_exists",
         Error::E2eeTwin => "e2ee_twin",
+        Error::ArchiveExists => "archive_exists",
     }
 }
 
@@ -287,6 +290,7 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::IdTaken => Error::IdTaken,
         MessageError::RootExists => Error::RootExists,
         MessageError::E2eeTwin => Error::E2eeTwin,
+        MessageError::ArchiveExists => Error::ArchiveExists,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable

@@ -10,6 +10,7 @@ mod bot;
 mod community;
 mod e2ee;
 mod error;
+mod link;
 mod media;
 mod messages;
 mod migrate;
@@ -54,6 +55,12 @@ pub use e2ee::{
     WelcomeFor,
 };
 pub use error::DbError;
+pub use link::{
+    abort_link_archive, begin_link_archive, create_link, delete_link, finish_link_archive,
+    link_archive, link_archive_max, link_archive_part, link_archive_path, link_messages,
+    post_link_message, remove_link_archive, LinkArchive, LinkMessage, LINK_ID_LEN,
+    LINK_MESSAGE_MAX,
+};
 pub use media::prepare_icon;
 pub use messages::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
