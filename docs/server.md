@@ -122,7 +122,7 @@ The routes in this section need a person's session: `Authorization: Bearer <toke
 
 ### Capabilities and me
 
-`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan", "abuse_reports", "e2ee_device_link"], "e2ee_device_link": true, "e2ee_link_archive_max": 100663296}`. `e2ee_device_link` means the [device link](#device-linking) routes exist; `e2ee_link_archive_max` is the largest archive one link may carry, in bytes. `abuse_reports` means [abuse reports](#abuse-reports) exist. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means a chat upload is scanned before `POST /v1/media` returns `201`, and `GET /v1/media/{id}` stays closed until the row is `clean`. This server always lists `file_scan`. There is no upload path that skips the scan.
+`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan", "abuse_reports", "e2ee_device_link", "e2ee_self"], "e2ee_device_link": true, "e2ee_link_archive_max": 100663296, "e2ee_self": true, "e2ee_self_ttl_secs": 604800}`. `e2ee_device_link` means the [device link](#device-linking) routes exist; `e2ee_link_archive_max` is the largest archive one link may carry, in bytes. `e2ee_self` means each person may have a [self conversation](#self-conversation); `e2ee_self_ttl_secs` is how long its messages are kept. `abuse_reports` means [abuse reports](#abuse-reports) exist. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means a chat upload is scanned before `POST /v1/media` returns `201`, and `GET /v1/media/{id}` stays closed until the row is `clean`. This server always lists `file_scan`. There is no upload path that skips the scan.
 
 `GET /v1/me` and `PATCH /v1/me` add `owner`, `roles [id]` (most senior first), `permissions` (base), and `rank`.
 
@@ -326,6 +326,16 @@ A person's new device and one they already have exchange sealed messages, and th
 | `DELETE /v1/e2ee/links/{id}` | the person who made the link | → `204`, idempotent. The messages and the archive file go at once. Someone else's link is left alone and also gets `204`. |
 
 `e2ee_link_archive_max` (bytes, 1 MiB to 16 GiB) and `e2ee_link_ttl_secs` (60 to 3600) are columns of `server_settings`, set in SQL like the sealed-upload limits. The archive lives under `{TINYSERVER_UPLOAD_DIR}/links/`, so it shares the upload volume's disk.
+
+## Self conversation
+
+Each person may have one end-to-end encrypted conversation whose only member is themselves, so their own devices can form a private MLS group (a device asks its siblings for a message it cannot open, and they share verified marks). The protocol is in [`e2ee-text.md`](e2ee-text.md#self-conversation) section 5.
+
+| Route | Who | |
+| --- | --- | --- |
+| `POST /v1/e2ee/self` | a member (not a bot) | → `201 {conversation_id, ttl_secs}` the first time, `200` the same after. `400 e2ee_off` when `e2ee_text` is `off` and the person has none yet. |
+
+Every encrypted-conversation route then takes that `conversation_id`, for that person only; anyone else, the owner included, gets `404`. Its group is that person's active devices, proposed by the server as for a direct. It is not in `GET /v1/directs` or `/v1/channels`, is not audited, and has no unread count. Messages older than `e2ee_self_ttl_secs` (a `server_settings` column, seconds, 3600 to 2592000, 604800 by default, set in SQL) are deleted by the sweep with their sealed files. It is deleted with the account.
 
 ## Avatars
 
