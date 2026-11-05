@@ -920,7 +920,7 @@ async fn capabilities_advertise_device_links() {
             .as_array()
             .expect("features")
             .contains(&json!("e2ee_device_link")));
-        assert_eq!(caps["e2ee_link_archive_max"], 512 * 1024 * 1024);
+        assert_eq!(caps["e2ee_link_archive_max"], 96 * 1024 * 1024);
     })
     .await;
 }

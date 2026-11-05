@@ -13,8 +13,8 @@
 --   P0E20 archive_exists
 
 ALTER TABLE server_settings
-    -- The largest archive one link may carry. 512 MiB by default.
-    ADD COLUMN e2ee_link_archive_max bigint NOT NULL DEFAULT 536870912
+    -- The largest archive one link may carry. 96 MiB by default.
+    ADD COLUMN e2ee_link_archive_max bigint NOT NULL DEFAULT 100663296
         CHECK (e2ee_link_archive_max BETWEEN 1048576 AND 17179869184),
     -- How long a link may be used for messages, and may start an archive upload.
     ADD COLUMN e2ee_link_ttl_secs integer NOT NULL DEFAULT 300
