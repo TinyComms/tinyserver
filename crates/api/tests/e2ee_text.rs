@@ -5107,3 +5107,458 @@ async fn a_plaintext_conversation_upgrades_in_place_and_keeps_its_old_messages()
     })
     .await;
 }
+
+// ---- a person's own devices ------------------------------------------------------------------
+
+/// The caller's self conversation, as `POST /v1/e2ee/self` answers it.
+async fn open_self(w: &World, token: &str) -> (StatusCode, Value) {
+    w.send(Method::POST, "/v1/e2ee/self", token, None).await
+}
+
+async fn self_conv(w: &World, token: &str) -> String {
+    let (status, body) = open_self(w, token).await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "{status} {body}"
+    );
+    body["conversation_id"]
+        .as_str()
+        .expect("conversation id")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_self_conversation_is_one_per_person_and_always_encrypted() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (other, other_token) = w.member("selfie").await;
+
+        let (status, made) = open_self(&w, &w.owner_token).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        assert_eq!(made["ttl_secs"], 604_800);
+        let conv = made["conversation_id"].as_str().expect("id").to_string();
+        // Again is the same conversation.
+        let (status, again) = open_self(&w, &w.owner_token).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again, made);
+        // Another person has their own.
+        let theirs = self_conv(&w, &other_token).await;
+        assert_ne!(theirs, conv);
+
+        // The row is the person on both sides, encrypted. It cannot be made plaintext or a plain
+        // direct, there is no second one, and a real pair cannot carry the mark.
+        let row: (String, String, bool, bool) = sqlx::query_as(
+            "SELECT low_user_id::text, high_user_id::text, e2ee, is_self
+             FROM directs WHERE id = $1::uuid",
+        )
+        .bind(&conv)
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("row");
+        assert_eq!(
+            row,
+            (w.owner.user_id.clone(), w.owner.user_id.clone(), true, true)
+        );
+        for statement in [
+            "UPDATE directs SET e2ee = false WHERE id = $1::uuid",
+            "UPDATE directs SET is_self = false WHERE id = $1::uuid",
+            "INSERT INTO directs (low_user_id, high_user_id, e2ee, is_self)
+             SELECT low_user_id, high_user_id, true, true FROM directs WHERE id = $1::uuid",
+        ] {
+            assert!(
+                sqlx::query(statement)
+                    .bind(&conv)
+                    .execute(&w.db.owner)
+                    .await
+                    .is_err(),
+                "{statement}"
+            );
+        }
+        let (low, high) = if w.owner.user_id < other.user_id {
+            (&w.owner.user_id, &other.user_id)
+        } else {
+            (&other.user_id, &w.owner.user_id)
+        };
+        assert!(sqlx::query(
+            "INSERT INTO directs (low_user_id, high_user_id, e2ee, is_self)
+             VALUES ($1::uuid, $2::uuid, true, true)"
+        )
+        .bind(low)
+        .bind(high)
+        .execute(&w.db.owner)
+        .await
+        .is_err());
+        // A direct with yourself is still refused.
+        let (status, _) = w
+            .send(
+                Method::POST,
+                "/v1/directs",
+                &w.owner_token,
+                Some(json!({"user_id": w.owner.user_id, "e2ee": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Plaintext is refused however it is dressed.
+        let path = format!("/v1/conversations/{conv}/messages");
+        for body in [json!({"body": "hello"}), json!({"client_id": "nothing"})] {
+            let (status, refused) = w
+                .send(Method::POST, &path, &w.owner_token, Some(body))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            assert_eq!(refused["error"], "e2ee_required");
+        }
+        let (_, group) = info(&w.app, &w.owner_token, &conv).await;
+        assert_eq!(group["e2ee"], true, "{group}");
+
+        // With encryption off, nobody makes a new one, and one that exists still answers.
+        sqlx::query("UPDATE server_settings SET e2ee_text = 'off'")
+            .execute(&w.db.owner)
+            .await
+            .expect("off");
+        let (_, late_token) = w.member("late").await;
+        let (status, refused) = open_self(&w, &late_token).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("e2ee_off"))
+        );
+        let (status, kept) = open_self(&w, &w.owner_token).await;
+        assert_eq!(status, StatusCode::OK, "{kept}");
+        assert_eq!(kept["conversation_id"], conv.as_str());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_self_conversation_holds_only_that_persons_devices_as_they_come_and_go() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (nosy, nosy_token) = w.member("nosy-self").await;
+        let conv = self_conv(&w, &w.owner_token).await;
+        let mut first = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let outsider = ready(&w.app, &nosy.user_id, &nosy_token).await;
+        start(&w.app, &mut first, &conv).await;
+        let (_, group) = info(&w.app, &first.token, &conv).await;
+        assert!(
+            group["pending"].as_array().expect("pending").is_empty(),
+            "another person's device is never proposed: {group}"
+        );
+
+        // A second device, cross-signed by the first, is proposed for Add and joins by Welcome.
+        let second = Dev::new(&w.owner.user_id, &w.owner_token);
+        let (status, body) = register_vouched(&w.app, &second, &first).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = upload_packages(&w.app, &second, 3).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, group) = info(&w.app, &first.token, &conv).await;
+        let pending = group["pending"].as_array().expect("pending");
+        assert_eq!(pending.len(), 1, "{group}");
+        assert_eq!(
+            (pending[0]["op"].as_str(), pending[0]["device_id"].as_str()),
+            (Some("add"), Some(second.id()))
+        );
+        let mut devs = [first, second];
+        settle(&w.app, &mut devs, 0, &conv).await;
+        let (status, asked) = say(
+            &w.app,
+            &mut devs[0],
+            &conv,
+            "who has message X?",
+            json!({"client_id": "ask-1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{asked}");
+        assert_eq!(
+            read(&w.app, &mut devs[1], &conv).await,
+            ["who has message X?"]
+        );
+        let (status, answered) = say(&w.app, &mut devs[1], &conv, "I do", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{answered}");
+        let (_, group) = info(&w.app, &devs[0].token, &conv).await;
+        let members = group["members"].as_array().expect("members");
+        assert_eq!(members.len(), 2, "{group}");
+        assert!(members
+            .iter()
+            .all(|member| member["user_id"] == w.owner.user_id.as_str()));
+
+        // A revoked device is proposed for Remove, and the group goes on without it.
+        let (status, body) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/e2ee/devices/{}", devs[1].id()),
+                &devs[0].token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, group) = info(&w.app, &devs[0].token, &conv).await;
+        let pending = group["pending"].as_array().expect("pending");
+        assert_eq!(pending.len(), 1, "{group}");
+        assert_eq!(
+            (pending[0]["op"].as_str(), pending[0]["device_id"].as_str()),
+            (Some("remove"), Some(devs[1].id()))
+        );
+        let (status, body) = commit(&w.app, &mut devs[0], &conv).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, group) = info(&w.app, &devs[0].token, &conv).await;
+        assert_eq!(group["members"].as_array().expect("members").len(), 1);
+
+        // Nobody else reaches any of it.
+        assert_eq!(
+            info(&w.app, &outsider.token, &conv).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            messages(&w.app, &outsider.token, &conv).await.0,
+            StatusCode::NOT_FOUND
+        );
+        for (method, path, body) in [
+            (
+                Method::GET,
+                format!(
+                    "/v1/e2ee/conversations/{conv}/handshake?after=0&device_id={}",
+                    outsider.id()
+                ),
+                None,
+            ),
+            (
+                Method::GET,
+                format!("/v1/e2ee/conversations/{conv}/reactions?after=0"),
+                None,
+            ),
+            (
+                Method::POST,
+                format!("/v1/e2ee/conversations/{conv}/group"),
+                Some(json!({"device_id": outsider.id()})),
+            ),
+            (
+                Method::POST,
+                format!("/v1/conversations/{conv}/messages"),
+                Some(json!({"ciphertext": b64(b"x"), "epoch": 1, "device_id": outsider.id()})),
+            ),
+        ] {
+            let (status, body) = w.send(method, &path, &outsider.token, body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} {body}");
+        }
+
+        // It is in no list: not the directs, not the channels, not the audit log.
+        for token in [&w.owner_token, &nosy_token] {
+            for path in ["/v1/directs", "/v1/channels"] {
+                let (status, listed) = w.send(Method::GET, path, token, None).await;
+                assert_eq!(status, StatusCode::OK, "{listed}");
+                assert!(!listed.to_string().contains(&conv), "{path}: {listed}");
+            }
+        }
+        let (status, audit) = w.send(Method::GET, "/v1/audit", &w.owner_token, None).await;
+        assert_eq!(status, StatusCode::OK, "{audit}");
+        assert!(!audit.to_string().contains(&conv), "{audit}");
+        // Its events went to its owner only.
+        let others: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox
+             WHERE strpos(payload::text, $1) > 0
+               AND (audience IS NULL OR NOT audience <@ ARRAY[$2::uuid])",
+        )
+        .bind(&conv)
+        .bind(&w.owner.user_id)
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("outbox");
+        assert_eq!(others, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn self_conversation_messages_go_after_their_retention_and_with_the_account() {
+    run(|db| async move {
+        let dir = upload_dir();
+        let w = world(db).await;
+        let (member, member_token) = w.member("brief").await;
+        let conv = self_conv(&w, &member_token).await;
+        let mut dev = ready(&w.app, &member.user_id, &member_token).await;
+        start(&w.app, &mut dev, &conv).await;
+        pull_ok(&w.app, &mut dev, &conv).await;
+
+        // An old message with a sealed file, an edit of it, and one from just now.
+        let file_id = fresh_uuid();
+        let blob = sealed::seal(
+            &[7u8; 32],
+            &sealed::context(&uuid16(&conv), &uuid16(&file_id)),
+            b"an old file",
+        );
+        let (status, saved) = upload_sealed_as(&w.app, &dev.token, &blob, &file_id).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        let (status, old) = say(
+            &w.app,
+            &mut dev,
+            &conv,
+            "old",
+            json!({"attachment_ids": [file_id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{old}");
+        let old_id = old["id"].as_str().expect("id").to_string();
+        let (status, edit) = say(
+            &w.app,
+            &mut dev,
+            &conv,
+            "old, edited",
+            json!({"kind": "edit", "target_id": old_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{edit}");
+        let (status, fresh) = say(&w.app, &mut dev, &conv, "fresh", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{fresh}");
+        assert!(dir.join(&file_id).exists());
+
+        // An encrypted direct of the same age is not touched.
+        let (status, direct) = w
+            .send(
+                Method::POST,
+                "/v1/directs",
+                &member_token,
+                Some(json!({"user_id": w.owner.user_id, "e2ee": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let dm = direct["id"].as_str().expect("id").to_string();
+        start(&w.app, &mut dev, &dm).await;
+        let owner_dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let mut devs = [dev, owner_dev];
+        settle(&w.app, &mut devs, 0, &dm).await;
+        let [mut dev, mut owner_dev] = devs;
+        let (status, kept) = say(&w.app, &mut dev, &dm, "kept", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{kept}");
+
+        sqlx::query(
+            "UPDATE messages SET created_at = now() - interval '8 days'
+             WHERE id = $1::uuid OR id = $2::uuid",
+        )
+        .bind(&old_id)
+        .bind(kept["id"].as_str().expect("id"))
+        .execute(&w.db.owner)
+        .await
+        .expect("age");
+        db::sweep(&w.db.runtime).await.expect("sweep");
+        let left: Vec<String> = sqlx::query_scalar(
+            "SELECT id::text FROM messages WHERE direct_id = $1::uuid ORDER BY seq",
+        )
+        .bind(&conv)
+        .fetch_all(&w.db.owner)
+        .await
+        .expect("left");
+        assert_eq!(
+            left,
+            [fresh["id"].as_str().expect("id")],
+            "the edit went too"
+        );
+        assert!(!dir.join(&file_id).exists(), "its file went too");
+        assert_eq!(read(&w.app, &mut owner_dev, &dm).await, ["kept"]);
+
+        // The setting is what capabilities say.
+        sqlx::query("UPDATE server_settings SET e2ee_self_ttl_secs = 3600")
+            .execute(&w.db.owner)
+            .await
+            .expect("ttl");
+        let (status, caps) = w
+            .send(Method::GET, "/v1/capabilities", &member_token, None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{caps}");
+        assert_eq!(caps["e2ee_self"], true);
+        assert_eq!(caps["e2ee_self_ttl_secs"], 3600);
+        assert!(caps["features"]
+            .as_array()
+            .expect("features")
+            .contains(&json!("e2ee_self")));
+        assert_eq!(open_self(&w, &member_token).await.1["ttl_secs"], 3600);
+
+        // Deleting the account deletes the conversation, its group and its messages.
+        let (status, body) = w
+            .send(
+                Method::DELETE,
+                "/v1/me",
+                &member_token,
+                Some(json!({"confirm": "delete my account"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let gone: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM directs WHERE id = $1::uuid),
+                    (SELECT count(*) FROM e2ee_groups WHERE conversation_id = $1::uuid),
+                    (SELECT count(*) FROM messages WHERE direct_id = $1::uuid)",
+        )
+        .bind(&conv)
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("gone");
+        assert_eq!(gone, (0, 0, 0));
+        let _ = std::fs::remove_dir_all(dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_canary_said_to_your_own_devices_is_nowhere_on_the_server() {
+    run(|db| async move {
+        const CANARY: &str = "CANARY-3e9b52d1-said-only-to-my-own-devices";
+        let dir = upload_dir();
+        let w = world(db).await;
+        let conv = self_conv(&w, &w.owner_token).await;
+        let first = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let second = Dev::new(&w.owner.user_id, &w.owner_token);
+        let (status, body) = register_vouched(&w.app, &second, &first).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = upload_packages(&w.app, &second, 3).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let mut devs = [first, second];
+        start(&w.app, &mut devs[0], &conv).await;
+        settle(&w.app, &mut devs, 0, &conv).await;
+        let (status, body) = say(
+            &w.app,
+            &mut devs[0],
+            &conv,
+            &format!("verified {CANARY}"),
+            json!({"client_id": "mark-1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let reaction = at(&mut devs[1], &conv).encrypt_with_aad(
+            message_aad_for("reaction", None, Some(&conv)),
+            CANARY.as_bytes(),
+        );
+        let (status, body) = w
+            .send(
+                Method::POST,
+                &format!("/v1/e2ee/conversations/{conv}/reactions"),
+                &devs[1].token,
+                Some(json!({
+                    "ciphertext": b64(&reaction),
+                    "epoch": devs[1].client.epoch(),
+                    "device_id": devs[1].id(),
+                    "client_id": "r-1",
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            read(&w.app, &mut devs[1], &conv).await,
+            [format!("verified {CANARY}")]
+        );
+
+        assert_eq!(tables_holding(&w.db, CANARY).await, Vec::<String>::new());
+        let lines = logs().text();
+        assert!(!lines.contains(CANARY), "a log line holds the canary");
+        assert!(
+            !lines.contains(&hex(CANARY.as_bytes())),
+            "a log line holds it as hex"
+        );
+        for (name, bytes) in files_in(&dir) {
+            assert!(
+                !contains(&bytes, CANARY.as_bytes()),
+                "upload {name} holds it"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    })
+    .await;
+}
