@@ -4497,7 +4497,16 @@ async fn a_suspended_community_takes_no_encrypted_post_upload_or_commit() {
 async fn proposals_wait_out_the_commit_batch_then_issue() {
     run(|db| async move {
         let w = world(db).await;
-        let p = pair(&w, "batch-existing").await;
+        let mut p = pair(&w, "batch-existing").await;
+        let (status, body) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            "audience established",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
         sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 60")
             .execute(&w.db.owner)
             .await
@@ -4557,6 +4566,159 @@ async fn the_initial_audience_is_urgent_and_must_join_before_the_first_message()
         assert_eq!(read(&w.app, &mut devs[1], &conv).await, ["everyone joined"]);
     })
     .await;
+}
+
+#[tokio::test]
+async fn the_initial_audience_stays_urgent_across_bounded_commits() {
+    run(|db| async move {
+        let w = world(db).await;
+        let owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let mut devs = vec![owner];
+        for index in 1..96 {
+            let (person, token) = w.member(&format!("initial-{index}")).await;
+            devs.push(ready(&w.app, &person.user_id, &token).await);
+        }
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch");
+        let conv = w.channel("large-initial-audience", true).await;
+        start(&w.app, &mut devs[0], &conv).await;
+        let (_, first) = info(&w.app, &devs[0].token, &conv).await;
+        assert_eq!(
+            first["pending"].as_array().expect("pending").len(),
+            94,
+            "bounded Welcome copies: {first}"
+        );
+        assert_eq!(first["waiting"], 1, "{first}");
+        let (status, body) = commit(&w.app, &mut devs[0], &conv).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, next) = info(&w.app, &devs[0].token, &conv).await;
+        assert_eq!(next["epoch"], 1);
+        assert_eq!(
+            next["pending"].as_array().expect("pending").len(),
+            1,
+            "{next}"
+        );
+        assert_eq!(
+            next["pending"][0]["issued"], true,
+            "the last initial device must not wait for batching: {next}"
+        );
+        let remaining_id = next["pending"][0]["device_id"].as_str().expect("device");
+        let remaining = devs
+            .iter()
+            .position(|dev| dev.id() == remaining_id)
+            .expect("last device");
+        let (status, body) = say(&w.app, &mut devs[0], &conv, "too early", json!({})).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("proposals_changed")),
+            "{body}"
+        );
+        let (status, body) = commit(&w.app, &mut devs[0], &conv).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, complete) = info(&w.app, &devs[0].token, &conv).await;
+        assert_eq!(complete["members"].as_array().expect("members").len(), 96);
+        assert!(complete["pending"].as_array().expect("pending").is_empty());
+        assert_eq!(complete["waiting"], 0);
+        pull_ok(&w.app, &mut devs[remaining], &conv).await;
+        let (status, body) = say(&w.app, &mut devs[0], &conv, "all 96 ready", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            read(&w.app, &mut devs[remaining], &conv).await,
+            ["all 96 ready"]
+        );
+    })
+    .await;
+}
+
+async fn established_shared_group_stays_batched(db: TestDb, reaction: bool) {
+    let w = world(db).await;
+    sqlx::query(
+        "UPDATE server_settings SET e2ee_audience_groups = true, e2ee_commit_batch_secs = 300",
+    )
+    .execute(&w.db.owner)
+    .await
+    .expect("sharing and batching");
+    let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+    let root = w.channel("established-root", true).await;
+    start(&w.app, &mut owner, &root).await;
+    for first in [true, false] {
+        let alias = w
+            .channel(if first { "first-alias" } else { "fresh-alias" }, true)
+            .await;
+        let (status, body) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{alias}/group"),
+            &owner.token,
+            Some(json!({"device_id": owner.id()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, group) = info(&w.app, &owner.token, &alias).await;
+        assert_eq!(group["group_id"], root, "{group}");
+        assert_eq!(
+            group["epoch"], 0,
+            "accepting ciphertext does not require a membership commit"
+        );
+        if first {
+            let kind = if reaction { "reaction" } else { "message" };
+            let ciphertext = at(&mut owner, &root).encrypt_with_aad(
+                message_aad_for(kind, None, Some(&alias)),
+                &payload("establish once"),
+            );
+            let (status, body) = if reaction {
+                call(
+                    &w.app,
+                    Method::POST,
+                    &format!("/v1/e2ee/conversations/{alias}/reactions"),
+                    &owner.token,
+                    Some(json!({"device_id": owner.id(), "epoch": 0,
+                        "ciphertext": b64(&ciphertext), "client_id": "establish-reaction"})),
+                )
+                .await
+            } else {
+                post_raw(&w.app, &mut owner, &alias, &ciphertext, json!({"epoch": 0})).await
+            };
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            // Retention/deletion can empty history. It must never make an established
+            // audience look initial again, including when the first write used an alias.
+            sqlx::query("DELETE FROM messages WHERE channel_id = $1::uuid")
+                .bind(&alias)
+                .execute(&w.db.owner)
+                .await
+                .expect("expire messages");
+            sqlx::query("DELETE FROM e2ee_reaction_blobs WHERE conversation_id = $1::uuid")
+                .bind(&alias)
+                .execute(&w.db.owner)
+                .await
+                .expect("expire reactions");
+        } else {
+            let (person, token) = w.member("later-person").await;
+            let newcomer = ready(&w.app, &person.user_id, &token).await;
+            let (_, group) = info(&w.app, &owner.token, &alias).await;
+            assert_eq!(group["group_id"], root, "{group}");
+            assert!(
+                group["pending"]
+                    .as_array()
+                    .expect("pending")
+                    .iter()
+                    .any(|item| item["device_id"] == newcomer.id() && item["issued"] == false),
+                "a fresh alias and empty history cannot bypass normal batching: {group}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_established_shared_group_keeps_batching_after_all_messages_expire() {
+    run(|db| async move { established_shared_group_stays_batched(db, false).await }).await;
+}
+
+#[tokio::test]
+async fn an_encrypted_reaction_establishes_the_canonical_shared_group() {
+    run(|db| async move { established_shared_group_stays_batched(db, true).await }).await;
 }
 
 #[tokio::test]
@@ -4626,7 +4788,16 @@ async fn registration_and_revoke_serialize_with_concurrent_ciphertext_posts() {
 async fn a_cross_signed_sibling_is_proposed_without_waiting_for_the_batch() {
     run(|db| async move {
         let w = world(db).await;
-        let p = pair(&w, "urgent-sibling").await;
+        let mut p = pair(&w, "urgent-sibling").await;
+        let (status, body) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            "audience established",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
         sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
             .execute(&w.db.owner)
             .await
@@ -4654,7 +4825,16 @@ async fn a_cross_signed_sibling_is_proposed_without_waiting_for_the_batch() {
 async fn an_urgent_sibling_never_extends_an_outstanding_signed_batch() {
     run(|db| async move {
         let w = world(db).await;
-        let p = pair(&w, "signed-batch").await;
+        let mut p = pair(&w, "signed-batch").await;
+        let (status, body) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            "audience established",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
         sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
             .execute(&w.db.owner)
             .await
@@ -4691,7 +4871,9 @@ async fn an_urgent_sibling_never_extends_an_outstanding_signed_batch() {
 async fn an_urgent_sibling_does_not_accelerate_a_new_persons_pending_add() {
     run(|db| async move {
         let w = world(db).await;
-        let p = pair(&w, "mixed-batch").await;
+        let mut p = pair(&w, "mixed-batch").await;
+        let (status, body) = say(&w.app, &mut p.owner, &p.conv, "audience established", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
         sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
             .execute(&w.db.owner).await.expect("batch");
         let (new_person, token) = w.member("mixed-new-person").await;
