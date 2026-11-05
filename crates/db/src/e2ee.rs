@@ -715,3 +715,33 @@ pub async fn e2ee_text_mode(pool: &PgPool) -> Result<String, DbError> {
         .await?;
     Ok(mode)
 }
+
+/// Gets or makes the caller's self conversation: `{conversation_id, ttl_secs}`. `true` when this
+/// call made it. Only that person can open it, and only their own devices join its group.
+pub async fn open_self(pool: &PgPool, caller: &Caller) -> Result<(Value, bool), MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let row: (Value, bool) = sqlx::query_as("SELECT body, created FROM app_e2ee_self()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(row)
+}
+
+/// How long a message in a self conversation is kept, in seconds, for `GET /v1/capabilities`.
+pub async fn self_ttl_secs(pool: &PgPool) -> Result<i64, DbError> {
+    let secs: i32 = sqlx::query_scalar("SELECT app_e2ee_self_ttl_secs()")
+        .fetch_one(pool)
+        .await?;
+    Ok(i64::from(secs))
+}
+
+/// Deletes the messages and reactions of self conversations past their retention, and the files
+/// attached to them.
+pub(crate) async fn sweep_self(pool: &PgPool) -> Result<(), DbError> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT app_e2ee_self_sweep()")
+        .fetch_one(pool)
+        .await?;
+    crate::messages::remove_files(&ids);
+    Ok(())
+}

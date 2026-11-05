@@ -274,6 +274,7 @@ pub fn routes() -> Router<PgPool> {
             post(put_key_packages).layer(DefaultBodyLimit::max(KEY_PACKAGES_BODY)),
         )
         .route("/v1/e2ee/key_packages/count", get(key_package_count))
+        .route("/v1/e2ee/self", post(open_self))
         .route("/v1/e2ee/conversations/{id}", get(conversation))
         .route("/v1/e2ee/conversations/{id}/group", post(create_group))
         .route(
@@ -566,6 +567,27 @@ fn sign(signer: &Signer, group: &[u8; 16], epoch: u64, items: &[Unissued]) -> Op
     let made: Vec<&[u8]> = proposals.iter().flatten().map(Vec::as_slice).collect();
     let batch = mls::batch(&made)?;
     Some(Issued { proposals, batch })
+}
+
+/// The caller's self conversation, made on first use: `{conversation_id, ttl_secs}`. Every other
+/// route of an encrypted conversation then takes its id, for this person only.
+async fn open_self(
+    State(pool): State<PgPool>,
+    Extension(server): Extension<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>), Error> {
+    let caller = member(&pool, &headers).await?;
+    server.allow(&caller.user_id)?;
+    let (body, created) = db::open_self(&pool, &caller)
+        .await
+        .map_err(lift)
+        .inspect_err(|error| failed(&caller.user_id, "self.open", error))?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(body)))
 }
 
 async fn conversation(

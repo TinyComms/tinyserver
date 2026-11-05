@@ -48,11 +48,11 @@ pub use community::{
 pub use e2ee::{
     active_keys, apply_commit, clear_server_private, commit_snapshot, community_root, create_group,
     device_key, e2ee_text_mode, group_info, handshake_after, invite_capability, issue_proposals,
-    key_package_count, list_e2ee_reactions, mls_target, post_e2ee_message, post_e2ee_reaction,
-    put_device, put_key_packages, ratchet_tree, remember_server_public, revoke_device,
-    server_key_state, set_community_root, set_invite_capability, user_devices, CommitSnapshot,
-    HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage, ServerKeyRow, Unissued,
-    WelcomeFor,
+    key_package_count, list_e2ee_reactions, mls_target, open_self, post_e2ee_message,
+    post_e2ee_reaction, put_device, put_key_packages, ratchet_tree, remember_server_public,
+    revoke_device, self_ttl_secs, server_key_state, set_community_root, set_invite_capability,
+    user_devices, CommitSnapshot, HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage,
+    ServerKeyRow, Unissued, WelcomeFor,
 };
 pub use error::DbError;
 pub use link::{
