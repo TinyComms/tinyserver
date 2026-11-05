@@ -43,6 +43,13 @@ const DENY_EXACT: &[&str] = &[
     "handshake",
     "cross_signature",
     "external_sender",
+    // Device linking: the link id, the code that carries it, the relayed messages and the
+    // archive. All opaque to the server, and none belongs in a log.
+    "link_id",
+    "link_code",
+    "link_message",
+    "archive",
+    "archive_name",
     "password",
     "authorization",
     "cookie",
@@ -968,6 +975,40 @@ mod tests {
             assert!(line.contains("user_id=018f"), "{line}");
             assert!(line.contains("route=commit"), "{line}");
             assert!(line.contains("reason=stale_epoch"), "{line}");
+        }
+    }
+
+    #[test]
+    fn drops_what_a_device_link_could_carry() {
+        let event = EventParts {
+            target: "api::e2ee_link",
+            level: Level::WARN,
+            message: "e2ee link failed",
+            fields: &[
+                ("link_id", "LINKIDMARKER"),
+                ("link_code", "tiny-link-1.CODEMARKER"),
+                ("link_message", "MSGMARKER"),
+                ("archive", "ARCHIVEMARKER"),
+                ("archive_name", "NAMEMARKER"),
+                ("user_id", "018f"),
+                ("route", "links.post"),
+                ("reason", "not_found"),
+            ],
+        };
+        for sink in [Sink::Operator, Sink::Ring] {
+            let line = line_of(render(&LogPolicy::default(), sink, &event));
+            for secret in [
+                "LINKIDMARKER",
+                "CODEMARKER",
+                "MSGMARKER",
+                "ARCHIVEMARKER",
+                "NAMEMARKER",
+            ] {
+                assert!(!line.contains(secret), "{line}");
+            }
+            assert!(line.contains("user_id=018f"), "{line}");
+            assert!(line.contains("route=links.post"), "{line}");
+            assert!(line.contains("reason=not_found"), "{line}");
         }
     }
 
