@@ -68,7 +68,9 @@ Upgrading from the three fixed roles: `owner` became the owner flag, `admin` the
 | `invalid` | 400 | A bad name, time, colour, limit, or id |
 | `last_owner` | 409 | Demoting, kicking, or banning the last owner |
 | `idempotency_conflict` | 409 | `Idempotency-Key` reused with a different body |
-| `slow_down` | 429 | Filing a report past 10 in an hour or 50 in a day |
+| `slow_down` | 429 | Filing a report past 10 in an hour or 50 in a day; a device link past its caps (5 open links, 16 messages, one archive per person) or rate |
+| `archive_exists` | 409 | `PUT /v1/e2ee/links/{id}/archive` on a link that already has its archive |
+| `length_required` | 411 | `PUT /v1/e2ee/links/{id}/archive` without `Content-Length` |
 | `read_only` | 503 | The operator suspended the community read-only, and this route writes. The body has `mode` and `notice`. |
 | `suspended` | 503 | The operator took the community offline. Every route but `/health` and `/v1/status` answers this, with `mode` and `notice`. |
 
@@ -120,7 +122,7 @@ The routes in this section need a person's session: `Authorization: Bearer <toke
 
 ### Capabilities and me
 
-`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan", "abuse_reports"]}`. `abuse_reports` means [abuse reports](#abuse-reports) exist. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means a chat upload is scanned before `POST /v1/media` returns `201`, and `GET /v1/media/{id}` stays closed until the row is `clean`. This server always lists `file_scan`. There is no upload path that skips the scan.
+`GET /v1/capabilities` (any member) → `{"version": "…", "features": ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_calls", "upload_limits", "file_scan", "abuse_reports", "e2ee_device_link"], "e2ee_device_link": true, "e2ee_link_archive_max": 536870912}`. `e2ee_device_link` means the [device link](#device-linking) routes exist; `e2ee_link_archive_max` is the largest archive one link may carry, in bytes. `abuse_reports` means [abuse reports](#abuse-reports) exist. `e2ee_calls` means calls can be end-to-end encrypted ([`calls.md`](calls.md#end-to-end-encryption)): `call.join` takes `e2ee`, the live socket carries `call.e2ee`, and rooms have `e2ee_required`. `file_scan` means a chat upload is scanned before `POST /v1/media` returns `201`, and `GET /v1/media/{id}` stays closed until the row is `clean`. This server always lists `file_scan`. There is no upload path that skips the scan.
 
 `GET /v1/me` and `PATCH /v1/me` add `owner`, `roles [id]` (most senior first), `permissions` (base), and `rank`.
 
@@ -309,6 +311,21 @@ When `TINYSERVER_MEDIA_HMAC_SECRET` is 64 hex characters (32 bytes), attachment 
 Clients send the session and, when they use the signed URL, all three query parameters. No query parameters: the session is enough. Any of the three present: all three must be valid for that id and the current time, or `401 unauthorized`.
 
 `Content-Disposition` is `inline` for PNG, JPEG, WebP, and GIF, and `attachment` for everything else, with `filename` and `filename*`.
+
+## Device linking
+
+A person's new device and one they already have exchange sealed messages, and the old one hands over an archive of history, through these routes. The server cannot read any of it. Only sessions of the person who made a link can touch it; anyone else, the owner included, gets `404`. Bots are refused. The protocol, limits and what the server keeps are in [`e2ee-text.md`](e2ee-text.md#device-linking) section 5.
+
+| Route | Who | |
+| --- | --- | --- |
+| `POST /v1/e2ee/links` | a member | → `201 {link_id, expires_at}`. `link_id` is 16 random bytes, base64url. Lasts `e2ee_link_ttl_secs` (300). At most 5 open per person (`429`). |
+| `POST /v1/e2ee/links/{id}/messages` | the person who made the link | `{from: "new"\|"old", data}` (standard base64, ≤ 8 KiB decoded) → `201 {seq}`. 16 per link. `404` once expired or deleted. |
+| `GET /v1/e2ee/links/{id}/messages?after=&wait=` | the person who made the link | → `[{seq, from, data}]`. `wait` holds the request up to 25 seconds while there is nothing new. |
+| `PUT /v1/e2ee/links/{id}/archive` | the person who made the link | `application/octet-stream`, `Content-Length` required, ≤ `e2ee_link_archive_max` (512 MiB). Once per link; one archive per person at a time. Streamed to disk, never scanned. → `204`. |
+| `GET /v1/e2ee/links/{id}/archive` | the person who made the link | The archive; one `Range: bytes=` range gets `206`. Until the link is deleted or an hour after it expires. |
+| `DELETE /v1/e2ee/links/{id}` | the person who made the link | → `204`, idempotent. The messages and the archive file go at once. Someone else's link is left alone and also gets `204`. |
+
+`e2ee_link_archive_max` (bytes, 1 MiB to 16 GiB) and `e2ee_link_ttl_secs` (60 to 3600) are columns of `server_settings`, set in SQL like the sealed-upload limits. The archive lives under `{TINYSERVER_UPLOAD_DIR}/links/`, so it shares the upload volume's disk.
 
 ## Avatars
 
