@@ -29,6 +29,7 @@ pub const FEATURES: &[&str] = &[
     "file_scan",
     "abuse_reports",
     "first_run_setup",
+    "e2ee_device_link",
 ];
 
 pub fn routes() -> Router<PgPool> {
@@ -63,6 +64,11 @@ struct Capabilities {
     /// Whether a new conversation may or must be end-to-end encrypted: `off`, `optional` or
     /// `new_required`. The `e2ee_text` feature says the server speaks the protocol at all.
     e2ee_text: String,
+    /// The server relays device links (`/v1/e2ee/links`). Also in `features`; older servers
+    /// have neither, and a client falls back to pasting the device code.
+    e2ee_device_link: bool,
+    /// The largest history archive one link may carry, in bytes.
+    e2ee_link_archive_max: i64,
 }
 
 async fn capabilities(
@@ -70,14 +76,18 @@ async fn capabilities(
     headers: HeaderMap,
 ) -> Result<Json<Capabilities>, ApiError> {
     caller(&pool, &headers).await?;
-    let mode = db::e2ee_text_mode(&pool).await.map_err(|error| {
+    let unavailable = |error: db::DbError| {
         tracing::warn!(%error, "capabilities query failed");
         ApiError::Unavailable
-    })?;
+    };
+    let mode = db::e2ee_text_mode(&pool).await.map_err(unavailable)?;
+    let archive_max = db::link_archive_max(&pool).await.map_err(unavailable)?;
     Ok(Json(Capabilities {
         version: env!("CARGO_PKG_VERSION"),
         features: FEATURES,
         e2ee_text: mode,
+        e2ee_device_link: true,
+        e2ee_link_archive_max: archive_max,
     }))
 }
 
