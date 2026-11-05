@@ -586,7 +586,7 @@ async fn commit(app: &Router, dev: &mut Dev, conv: &str) -> (StatusCode, Value) 
         .as_array()
         .expect("pending")
         .iter()
-        .filter(|item| item["op"] == "add")
+        .filter(|item| item["op"] == "add" && item["issued"] == true)
         .map(|item| item["device_id"].as_str().expect("device").to_string())
         .collect();
     let committed = dev.client.commit();
@@ -2006,7 +2006,8 @@ async fn a_revoked_device_is_removed_and_gets_nothing_more() {
             )
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        // The revoked device gets no log, cannot post and cannot commit, and the rest still can.
+        // The revoked device gets no log, cannot post and cannot commit. The remaining
+        // devices must commit its removal before sending more ciphertext.
         let (status, body) = pull(&w.app, &mut devs[2], &p.conv)
             .await
             .expect_err("refused");
@@ -2035,7 +2036,11 @@ async fn a_revoked_device_is_removed_and_gets_nothing_more() {
             json!({}),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "{said}");
+        assert_eq!(
+            (status, said["error"].as_str()),
+            (StatusCode::CONFLICT, Some("proposals_changed")),
+            "{said}"
+        );
         // Its key packages are gone, and others see it no more.
         let waiting: i64 =
             sqlx::query_scalar("SELECT count(*) FROM e2ee_key_packages WHERE device_id = $1::uuid")
@@ -4093,7 +4098,11 @@ async fn a_group_takes_no_more_devices_than_its_cap_and_says_how_many_wait() {
         };
         assert_eq!(joined(&devs), 1);
         let (status, body) = say(&w.app, &mut devs[0], &conv, "two of us", json!({})).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("e2ee_group_too_large")),
+            "{body}"
+        );
 
         // A new encrypted channel whose audience is over the cap is not made, and says why.
         let (status, refused) = w
@@ -4487,16 +4496,16 @@ async fn a_suspended_community_takes_no_encrypted_post_upload_or_commit() {
 #[tokio::test]
 async fn proposals_wait_out_the_commit_batch_then_issue() {
     run(|db| async move {
+        let w = world(db).await;
+        let p = pair(&w, "batch-existing").await;
         sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 60")
-            .execute(&db.owner)
+            .execute(&w.db.owner)
             .await
             .expect("batch");
-        let w = world(db).await;
         let (other, other_token) = w.member("batch").await;
-        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
         let _other = ready(&w.app, &other.user_id, &other_token).await;
-        let conv = w.channel("batch", true).await;
-        start(&w.app, &mut owner, &conv).await;
+        let owner = p.owner;
+        let conv = p.conv;
         let (_, waiting) = info(&w.app, &owner.token, &conv).await;
         let pending = waiting["pending"].as_array().expect("pending");
         assert!(!pending.is_empty(), "{waiting}");
@@ -4518,6 +4527,453 @@ async fn proposals_wait_out_the_commit_batch_then_issue() {
             pending.iter().any(|item| item["issued"] == true),
             "{issued}"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_initial_audience_is_urgent_and_must_join_before_the_first_message() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (other, token) = w.member("initial-audience").await;
+        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let other = ready(&w.app, &other.user_id, &token).await;
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch");
+        let conv = w.channel("initial-audience", true).await;
+        start(&w.app, &mut owner, &conv).await;
+        let (status, body) = say(&w.app, &mut owner, &conv, "too soon", json!({})).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("proposals_changed")),
+            "{body}"
+        );
+        let mut devs = [owner, other];
+        settle(&w.app, &mut devs, 0, &conv).await;
+        let (status, body) = say(&w.app, &mut devs[0], &conv, "everyone joined", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(read(&w.app, &mut devs[1], &conv).await, ["everyone joined"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn registration_and_revoke_serialize_with_concurrent_ciphertext_posts() {
+    run(|db| async move {
+        let w = world(db).await;
+        let mut p = pair(&w, "membership-race").await;
+        let sibling = Dev::new(p.owner.user(), &p.owner.token);
+        for revoke in [false, true] {
+            // Queue a real device route behind the same lock reconciliation uses. Then
+            // queue a send behind it. Neither may slip ciphertext past the device change.
+            let mut barrier = w.db.owner.begin().await.expect("barrier");
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *barrier).await.expect("pid");
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('tinyserver.e2ee.' || $1, 0))")
+                .bind(&p.conv).execute(&mut *barrier).await.expect("lock");
+            let signature = p.owner.client.vouch_for(sibling.user(), sibling.id(), &sibling.client.signature_key());
+            let app = w.app.clone();
+            let device_path = format!("/v1/e2ee/devices/{}", sibling.id());
+            let token = sibling.token.clone();
+            let body = if revoke { None } else { Some(json!({
+                "signature_key": sibling.client.signature_key_b64(), "cross_signature": b64(&signature)
+            })) };
+            let change = tokio::spawn(async move {
+                call(&app, if revoke { Method::DELETE } else { Method::PUT }, &device_path, &token, body).await
+            });
+            let waiters = || async {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_locks w JOIN pg_locks h
+                    ON w.locktype = h.locktype AND w.database = h.database
+                    AND w.classid = h.classid AND w.objid = h.objid AND w.objsubid = h.objsubid
+                    WHERE w.locktype = 'advisory' AND NOT w.granted AND h.granted AND h.pid = $1")
+                    .bind(pid).fetch_one(&w.db.owner).await.expect("waiters")
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while waiters().await < 1 { tokio::task::yield_now().await; }
+            }).await.expect("device mutation reaches group lock");
+            let epoch = at(&mut p.other, &p.conv).epoch();
+            let ciphertext = at(&mut p.other, &p.conv).encrypt_as("message", None, &payload("race"));
+            let app = w.app.clone();
+            let path = format!("/v1/conversations/{}/messages", p.conv);
+            let token = p.other.token.clone();
+            let body = json!({"device_id": p.other.id(), "epoch": epoch, "ciphertext": b64(&ciphertext)});
+            let post = tokio::spawn(async move { call(&app, Method::POST, &path, &token, Some(body)).await });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while waiters().await < 2 {
+                    assert!(!post.is_finished(), "send bypassed membership's transaction lock");
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("post reaches group lock");
+            barrier.commit().await.expect("release barrier");
+            let (status, body) = change.await.expect("device route");
+            assert_eq!(status, if revoke { StatusCode::NO_CONTENT } else { StatusCode::CREATED }, "{body}");
+            let (status, body) = post.await.expect("post route");
+            assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("proposals_changed")), "{body}");
+            if !revoke {
+                let (status, body) = upload_packages(&w.app, &sibling, 2).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+                let (status, body) = commit(&w.app, &mut p.owner, &p.conv).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+                pull_ok(&w.app, &mut p.other, &p.conv).await;
+            }
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn a_cross_signed_sibling_is_proposed_without_waiting_for_the_batch() {
+    run(|db| async move {
+        let w = world(db).await;
+        let p = pair(&w, "urgent-sibling").await;
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch");
+        let sibling = Dev::new(p.owner.user(), &p.owner.token);
+        let (status, body) = register_vouched(&w.app, &sibling, &p.owner).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = upload_packages(&w.app, &sibling, 2).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, group) = info(&w.app, &p.other.token, &p.conv).await;
+        assert_eq!(status, StatusCode::OK, "{group}");
+        assert!(
+            group["pending"]
+                .as_array()
+                .expect("pending")
+                .iter()
+                .any(|p| p["device_id"] == sibling.id() && p["issued"] == true),
+            "{group}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_urgent_sibling_never_extends_an_outstanding_signed_batch() {
+    run(|db| async move {
+        let w = world(db).await;
+        let p = pair(&w, "signed-batch").await;
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch");
+        let first = Dev::new(p.owner.user(), &p.owner.token);
+        let second = Dev::new(p.owner.user(), &p.owner.token);
+        for (index, sibling) in [&first, &second].into_iter().enumerate() {
+            let (status, body) = register_vouched(&w.app, sibling, &p.owner).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let (status, body) = upload_packages(&w.app, sibling, 2).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+            let (_, group) = info(&w.app, &p.owner.token, &p.conv).await;
+            let pending = group["pending"].as_array().expect("pending");
+            assert_eq!(pending.len(), index + 1, "{group}");
+            assert_eq!(
+                pending.iter().filter(|p| p["issued"] == true).count(),
+                1,
+                "{group}"
+            );
+        }
+        let mut devs = [p.owner, p.other, first, second];
+        settle(&w.app, &mut devs, 0, &p.conv).await;
+        assert_eq!(devs[0].client.epoch(), 3, "one commit per signed batch");
+        let (status, body) = say(&w.app, &mut devs[1], &p.conv, "both siblings", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        for sibling in &mut devs[2..] {
+            assert_eq!(read(&w.app, sibling, &p.conv).await, ["both siblings"]);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_urgent_sibling_does_not_accelerate_a_new_persons_pending_add() {
+    run(|db| async move {
+        let w = world(db).await;
+        let p = pair(&w, "mixed-batch").await;
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
+            .execute(&w.db.owner).await.expect("batch");
+        let (new_person, token) = w.member("mixed-new-person").await;
+        let newcomer = ready(&w.app, &new_person.user_id, &token).await;
+        let sibling = Dev::new(p.owner.user(), &p.owner.token);
+        let (status, body) = register_vouched(&w.app, &sibling, &p.owner).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = upload_packages(&w.app, &sibling, 2).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, group) = info(&w.app, &p.owner.token, &p.conv).await;
+        let pending = group["pending"].as_array().expect("pending");
+        assert!(pending.iter().any(|p| p["device_id"] == sibling.id() && p["issued"] == true), "{group}");
+        assert!(pending.iter().any(|p| p["device_id"] == newcomer.id() && p["issued"] == false), "{group}");
+        let mut owner = p.owner;
+        let (status, body) = commit(&w.app, &mut owner, &p.conv).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, group) = info(&w.app, &owner.token, &p.conv).await;
+        assert_eq!(group["pending"].as_array().expect("pending").len(), 1, "{group}");
+        assert_eq!(group["pending"][0]["issued"], false, "{group}");
+        sqlx::query("UPDATE e2ee_pending SET created_at = now() - interval '6 minutes' WHERE conversation_id = $1::uuid")
+            .bind(&p.conv).execute(&w.db.owner).await.expect("mature batch");
+        let mut devs = [owner, p.other, sibling, newcomer];
+        settle(&w.app, &mut devs, 0, &p.conv).await;
+        let (status, body) = say(&w.app, &mut devs[0], &p.conv, "complete audience", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(read(&w.app, &mut devs[3], &p.conv).await, ["complete audience"]);
+    }).await;
+}
+
+#[tokio::test]
+async fn a_shared_group_split_while_waiting_for_the_lock_rejects_old_group_ciphertext() {
+    run(|db| async move {
+        let w = world(db).await;
+        sqlx::query("UPDATE server_settings SET e2ee_audience_groups = true")
+            .execute(&w.db.owner)
+            .await
+            .expect("sharing");
+        let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let root = w.channel("split-root", true).await;
+        start(&w.app, &mut owner, &root).await;
+        for reaction in [false, true] {
+            let alias = w
+                .channel(
+                    if reaction {
+                        "split-reaction"
+                    } else {
+                        "split-message"
+                    },
+                    true,
+                )
+                .await;
+            let (status, body) = call(
+                &w.app,
+                Method::POST,
+                &format!("/v1/e2ee/conversations/{alias}/group"),
+                &owner.token,
+                Some(json!({"device_id": owner.id()})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let (_, group) = info(&w.app, &owner.token, &alias).await;
+            assert_eq!(group["group_id"], root, "{group}");
+            let kind = if reaction { "reaction" } else { "message" };
+            let ciphertext = at(&mut owner, &root).encrypt_with_aad(
+                message_aad_for(kind, None, Some(&alias)),
+                &payload("old group"),
+            );
+            let body = json!({"device_id": owner.id(), "epoch": owner.client.epoch(),
+                "ciphertext": b64(&ciphertext), "client_id": "split"});
+            let mut barrier = w.db.owner.begin().await.expect("barrier");
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *barrier)
+                .await
+                .expect("pid");
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtextextended('tinyserver.e2ee.' || $1, 0))",
+            )
+            .bind(&root)
+            .execute(&mut *barrier)
+            .await
+            .expect("lock");
+            let app = w.app.clone();
+            let token = owner.token.clone();
+            let path = if reaction {
+                format!("/v1/e2ee/conversations/{alias}/reactions")
+            } else {
+                format!("/v1/conversations/{alias}/messages")
+            };
+            let post =
+                tokio::spawn(
+                    async move { call(&app, Method::POST, &path, &token, Some(body)).await },
+                );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (
+                        SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                    )
+                    .bind(pid)
+                    .fetch_one(&w.db.owner)
+                    .await
+                    .expect("waiter");
+                    if blocked {
+                        break;
+                    }
+                    assert!(
+                        !post.is_finished(),
+                        "post must wait on the resolved group's lock"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("post reaches root lock");
+            // Reconciliation detaches an alias by deleting its group row while holding
+            // the old root's advisory lock. Reproduce that exact mapping change.
+            sqlx::query("DELETE FROM e2ee_groups WHERE conversation_id = $1::uuid")
+                .bind(&alias)
+                .execute(&mut *barrier)
+                .await
+                .expect("detach alias");
+            barrier.commit().await.expect("split");
+            let (status, body) = post.await.expect("post");
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::CONFLICT, Some("stale_epoch")),
+                "{body}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_linked_device_receives_every_post_accepted_after_its_registration() {
+    run(|db| async move {
+        let w = world(db).await;
+        let mut p = pair(&w, "link-gap").await;
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch");
+        let sibling = Dev::new(p.owner.user(), &p.owner.token);
+        let (status, body) = register_vouched(&w.app, &sibling, &p.owner).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        // No key packages yet: no pending Add exists, but accepting old-epoch ciphertext
+        // would already create a permanent hole in the linked device's history.
+        let (status, body) = say(
+            &w.app,
+            &mut p.other,
+            &p.conv,
+            "during link",
+            json!({"client_id": "gap"}),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("proposals_changed")),
+            "{body}"
+        );
+        let (status, body) = upload_packages(&w.app, &sibling, 2).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) = say(
+            &w.app,
+            &mut p.other,
+            &p.conv,
+            "still linking",
+            json!({"client_id": "gap"}),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("proposals_changed")),
+            "{body}"
+        );
+        let mut devs = [p.owner, p.other, sibling];
+        settle(&w.app, &mut devs, 1, &p.conv).await;
+        let (status, body) = say(
+            &w.app,
+            &mut devs[1],
+            &p.conv,
+            "after link",
+            json!({"client_id": "gap"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(read(&w.app, &mut devs[2], &p.conv).await, ["after link"]);
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM messages WHERE channel_id = $1::uuid")
+                .bind(&p.conv)
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("messages");
+        assert_eq!(
+            count, 1,
+            "rejected ciphertext must never be stored or broadcast"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_revoke_immediately_fences_messages_edits_and_reactions_until_the_remove_commits() {
+    run(|db| async move {
+        let w = world(db).await;
+        let mut p = pair(&w, "revoke-fence").await;
+        let (status, first) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            "before",
+            json!({"client_id": "before"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 300")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch");
+        let (status, body) = call(
+            &w.app,
+            Method::DELETE,
+            &format!("/v1/e2ee/devices/{}", p.other.id()),
+            &p.other.token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        for extra in [json!({}), json!({"kind": "edit", "target_id": first["id"]})] {
+            let (status, body) = say(&w.app, &mut p.owner, &p.conv, "after revoke", extra).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::CONFLICT, Some("proposals_changed")),
+                "{body}"
+            );
+        }
+        let epoch = at(&mut p.owner, &p.conv).epoch();
+        let ciphertext = at(&mut p.owner, &p.conv).encrypt_with_aad(
+            message_aad_for("reaction", None, Some(&p.conv)),
+            b"private reaction",
+        );
+        let (status, body) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{}/reactions", p.conv),
+            &p.owner.token,
+            Some(json!({"device_id": p.owner.id(), "epoch": epoch,
+                "ciphertext": b64(&ciphertext), "client_id": "revoke-reaction"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("proposals_changed")),
+            "{body}"
+        );
+        // A duplicate acknowledgment releases no new ciphertext and remains idempotent.
+        let (status, duplicate) = say(
+            &w.app,
+            &mut p.owner,
+            &p.conv,
+            "ignored",
+            json!({"client_id": "before"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{duplicate}");
+        assert_eq!(duplicate["id"], first["id"]);
+        let (_, group) = info(&w.app, &p.owner.token, &p.conv).await;
+        assert!(
+            group["pending"]
+                .as_array()
+                .expect("pending")
+                .iter()
+                .any(|p| p["op"] == "remove" && p["issued"] == true),
+            "{group}"
+        );
+        let (status, body) = commit(&w.app, &mut p.owner, &p.conv).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) = say(&w.app, &mut p.owner, &p.conv, "safe epoch", json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(at(&mut p.other, &p.conv)
+            .decrypt(&unb64(body["ciphertext"].as_str().expect("ciphertext")))
+            .is_none());
     })
     .await;
 }
@@ -4799,7 +5255,7 @@ async fn channels_with_the_same_viewers_share_one_group_when_asked() {
         assert_eq!(status, StatusCode::OK, "{set}");
         let (member, member_token) = w.member("aud").await;
         let mut owner = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
-        let _member = ready(&w.app, &member.user_id, &member_token).await;
+        let member = ready(&w.app, &member.user_id, &member_token).await;
         let alpha = w.channel("alpha", true).await;
         let beta = w.channel("beta", true).await;
         start(&w.app, &mut owner, &alpha).await;
@@ -4812,6 +5268,9 @@ async fn channels_with_the_same_viewers_share_one_group_when_asked() {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+        let mut devs = [owner, member];
+        settle(&w.app, &mut devs, 0, &alpha).await;
+        let [mut owner, _member] = devs;
         let (_, info_a) = info(&w.app, &owner.token, &alpha).await;
         let (_, info_b) = info(&w.app, &owner.token, &beta).await;
         assert_eq!(info_b["group_id"], alpha, "{info_b}");
