@@ -46,13 +46,16 @@ pub use community::{
     NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
 pub use e2ee::{
-    active_keys, apply_commit, clear_server_private, commit_snapshot, community_root, create_group,
-    device_key, e2ee_text_mode, group_info, handshake_after, invite_capability, issue_proposals,
-    key_package_count, list_e2ee_reactions, mls_target, open_self, post_e2ee_message,
-    post_e2ee_reaction, put_device, put_key_packages, ratchet_tree, remember_server_public,
-    revoke_device, self_ttl_secs, server_key_state, set_community_root, set_invite_capability,
-    user_devices, CommitSnapshot, HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage,
-    ServerKeyRow, Unissued, WelcomeFor,
+    active_keys, apply_commit, apply_commit_at, clear_server_private, commit_snapshot,
+    commit_snapshot_at, community_root, create_group, create_group_at, device_key, e2ee_text_mode,
+    generation_chain, group_info, group_info_at, handshake_after, handshake_after_at,
+    invite_capability, issue_proposals, issue_proposals_at, key_package_count, list_e2ee_reactions,
+    mls_target, mls_target_at, open_self, post_e2ee_message, post_e2ee_message_at,
+    post_e2ee_reaction, post_e2ee_reaction_at, put_device, put_key_packages, ratchet_tree,
+    ratchet_tree_at, remember_server_public, repair_group, revoke_device, self_ttl_secs,
+    server_key_state, set_community_root, set_invite_capability, user_devices, CommitSnapshot,
+    HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage, ServerKeyRow, Unissued,
+    WelcomeFor,
 };
 pub use error::DbError;
 pub use link::{

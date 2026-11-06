@@ -31,6 +31,7 @@ pub const FEATURES: &[&str] = &[
     "first_run_setup",
     "e2ee_device_link",
     "e2ee_self",
+    "e2ee_group_generations",
 ];
 
 pub fn routes() -> Router<PgPool> {

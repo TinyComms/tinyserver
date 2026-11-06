@@ -8,6 +8,7 @@
 
 mod key_file;
 pub(crate) mod mls;
+mod repair;
 
 use std::collections::HashMap;
 use std::io;
@@ -276,6 +277,14 @@ pub fn routes() -> Router<PgPool> {
         .route("/v1/e2ee/key_packages/count", get(key_package_count))
         .route("/v1/e2ee/self", post(open_self))
         .route("/v1/e2ee/conversations/{id}", get(conversation))
+        .route(
+            "/v1/e2ee/conversations/{id}/repair",
+            post(repair::repair).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/v1/e2ee/conversations/{id}/generations",
+            get(repair::generations),
+        )
         .route("/v1/e2ee/conversations/{id}/group", post(create_group))
         .route(
             "/v1/e2ee/conversations/{id}/reactions",
@@ -525,8 +534,9 @@ async fn mls_of(
     pool: &PgPool,
     caller: &Caller,
     conversation: &str,
+    generation: Option<u64>,
 ) -> Result<([u8; 16], bool), Error> {
-    let target = db::mls_target(pool, caller, conversation)
+    let target = db::mls_target_at(pool, caller, conversation, generation)
         .await
         .map_err(lift)?;
     let group = mls::uuid_bytes(&target.group_id).ok_or(Error::Invalid)?;
@@ -538,12 +548,16 @@ async fn issue(
     server: &Server,
     caller: &Caller,
     conversation: &str,
+    generation: Option<u64>,
 ) -> Result<(), Error> {
-    let (group, _) = mls_of(pool, caller, conversation).await?;
     let signer = server.signer(pool).await?;
-    db::issue_proposals(pool, caller, conversation, |epoch, items| {
-        sign(&signer, &group, epoch, items)
-    })
+    db::issue_proposals_at(
+        pool,
+        caller,
+        conversation,
+        generation,
+        |group, epoch, items| sign(&signer, &mls::uuid_bytes(group)?, epoch, items),
+    )
     .await
     .map_err(lift)
 }
@@ -590,20 +604,31 @@ async fn open_self(
     Ok((status, Json(body)))
 }
 
+#[derive(Deserialize)]
+struct GenerationQuery {
+    generation: Option<u64>,
+}
+
 async fn conversation(
     State(pool): State<PgPool>,
     Extension(server): Extension<Arc<Server>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<GenerationQuery>,
 ) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
     let result = async {
-        let info = db::group_info(&pool, &caller, &id).await.map_err(lift)?;
+        server.signer(&pool).await?;
+        let info = db::group_info_at(&pool, &caller, &id, query.generation)
+            .await
+            .map_err(lift)?;
         if info.get("e2ee").and_then(Value::as_bool) != Some(true) {
             return Ok(info);
         }
-        issue(&pool, &server, &caller, &id).await?;
-        let mut info = db::group_info(&pool, &caller, &id).await.map_err(lift)?;
+        issue(&pool, &server, &caller, &id, query.generation).await?;
+        let mut info = db::group_info_at(&pool, &caller, &id, query.generation)
+            .await
+            .map_err(lift)?;
         let signer = server.signer(&pool).await?;
         if let Some(object) = info.as_object_mut() {
             object.insert("external_sender".into(), json!(signer.external_sender()));
@@ -618,6 +643,7 @@ async fn conversation(
 
 #[derive(Deserialize)]
 struct GroupBody {
+    generation: Option<u64>,
     device_id: String,
     /// 32 bytes: the group id, then this conversation's id. Omitted when the client has no
     /// declared binding.
@@ -635,6 +661,7 @@ async fn create_group(
     let caller = member(&pool, &headers).await?;
     server.allow(&caller.user_id)?;
     let result = async {
+        server.signer(&pool).await?;
         let context = match body.context.as_deref() {
             Some(text) => {
                 let bytes = mls::decode(text, 32).map_err(refused)?;
@@ -645,11 +672,20 @@ async fn create_group(
             }
             None => None,
         };
-        db::create_group(&pool, &caller, &id, &body.device_id, context.as_deref())
+        db::create_group_at(
+            &pool,
+            &caller,
+            &id,
+            &body.device_id,
+            context.as_deref(),
+            body.generation,
+        )
+        .await
+        .map_err(lift)?;
+        let info = db::group_info_at(&pool, &caller, &id, body.generation)
             .await
             .map_err(lift)?;
-        let info = db::group_info(&pool, &caller, &id).await.map_err(lift)?;
-        issue(&pool, &server, &caller, &id).await?;
+        issue(&pool, &server, &caller, &id, body.generation).await?;
         Ok(info.get("epoch").cloned().unwrap_or(json!(0)))
     }
     .await;
@@ -697,6 +733,7 @@ async fn set_invite_capability(
 
 #[derive(Deserialize)]
 struct ReactionBody {
+    generation: Option<u64>,
     device_id: String,
     epoch: u64,
     ciphertext: String,
@@ -719,12 +756,12 @@ async fn post_reaction(
     let caller = member(&pool, &headers).await?;
     server.allow(&caller.user_id)?;
     let result = async {
-        let (group, _) = mls_of(&pool, &caller, &id).await?;
+        let (group, _) = mls_of(&pool, &caller, &id, body.generation).await?;
         let data = mls::decode(&body.ciphertext, mls::CIPHERTEXT_MAX).map_err(refused)?;
         let conversation = canonical_uuid(&id).ok_or(Error::Invalid)?;
         let aad = mls::message_aad_for("reaction", None, Some(&conversation));
         mls::check_ciphertext(&group, body.epoch, &aad, &data).map_err(refused)?;
-        let value = db::post_e2ee_reaction(
+        let value = db::post_e2ee_reaction_at(
             &pool,
             &caller,
             &id,
@@ -732,6 +769,7 @@ async fn post_reaction(
             body.epoch,
             &body.device_id,
             &body.client_id,
+            body.generation,
         )
         .await
         .map_err(lift)?;
@@ -766,6 +804,7 @@ async fn list_reactions(
 
 #[derive(Deserialize)]
 struct HandshakeQuery {
+    generation: Option<u64>,
     after: Option<i64>,
     device_id: Option<String>,
 }
@@ -782,14 +821,43 @@ async fn handshake(
         return Err(Error::Invalid);
     };
     let result = async {
-        issue(&pool, &server, &caller, &id).await?;
-        let rows = db::handshake_after(
+        server.signer(&pool).await?;
+        let requested = query.generation.unwrap_or(0);
+        let current = db::generation_chain(&pool, &caller, &id, requested.saturating_sub(1), 1)
+            .await
+            .map_err(lift)?;
+        if query.generation.is_none() && current["generation"].as_u64() != Some(0) {
+            return Err(Error::GenerationChanged);
+        }
+        let historic_group = if requested == 0 {
+            if current["generation"].as_u64() == Some(0) {
+                json!(
+                    db::mls_target_at(&pool, &caller, &id, Some(0))
+                        .await
+                        .map_err(lift)?
+                        .group_id
+                )
+            } else {
+                json!(id)
+            }
+        } else {
+            current["bindings"]
+                .get(0)
+                .and_then(|v| v.get("group_id"))
+                .cloned()
+                .ok_or(Error::GenerationChanged)?
+        };
+        if current["generation"].as_u64() == Some(query.generation.unwrap_or(0)) {
+            issue(&pool, &server, &caller, &id, query.generation).await?;
+        }
+        let rows = db::handshake_after_at(
             &pool,
             &caller,
             &id,
             &device_id,
             query.after.unwrap_or(0),
             HANDSHAKE_PAGE,
+            query.generation,
         )
         .await
         .map_err(lift)?;
@@ -797,6 +865,8 @@ async fn handshake(
             .iter()
             .map(|row| {
                 json!({
+                    "generation":query.generation.unwrap_or(0),
+                    "group_id": historic_group,
                     "seq": row.seq,
                     "kind": row.kind,
                     "epoch": row.epoch,
@@ -858,6 +928,7 @@ async fn set_community(
 
 #[derive(Deserialize)]
 struct TreeQuery {
+    generation: Option<u64>,
     device_id: Option<String>,
     epoch: Option<u64>,
 }
@@ -875,7 +946,10 @@ async fn ratchet_tree(
     let (Some(device_id), Some(epoch)) = (query.device_id, query.epoch) else {
         return Err(Error::Invalid);
     };
-    let tree = db::ratchet_tree(&pool, &caller, &id, &device_id, epoch)
+    if query.generation.is_none() {
+        db::mls_target(&pool, &caller, &id).await.map_err(lift)?;
+    }
+    let tree = db::ratchet_tree_at(&pool, &caller, &id, &device_id, epoch, query.generation)
         .await
         .map_err(lift)
         .inspect_err(|error| failed(&caller.user_id, "tree", error))?
@@ -890,6 +964,7 @@ async fn ratchet_tree(
 
 #[derive(Deserialize)]
 struct CommitBody {
+    generation: Option<u64>,
     device_id: String,
     epoch: u64,
     commit: String,
@@ -925,7 +1000,7 @@ async fn commit(
 /// Checks a commit against the proposals signed for its epoch, then applies it. Applying is a
 /// compare-and-swap on the epoch: of two commits for one epoch, one wins.
 async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> Result<(), Error> {
-    let (group, _) = mls_of(pool, caller, id).await?;
+    let (group, _) = mls_of(pool, caller, id, body.generation).await?;
     let commit = mls::decode(&body.commit, mls::COMMIT_MAX).map_err(refused)?;
     let mut total = 0usize;
     let mut sent: HashMap<&str, Vec<u8>> = HashMap::new();
@@ -949,9 +1024,16 @@ async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> R
         None => Vec::new(),
     };
 
-    let snapshot = db::commit_snapshot(pool, caller, id, &body.device_id, body.epoch)
-        .await
-        .map_err(lift)?;
+    let snapshot = db::commit_snapshot_at(
+        pool,
+        caller,
+        id,
+        &body.device_id,
+        body.epoch,
+        body.generation,
+    )
+    .await
+    .map_err(lift)?;
     // Nothing is signed for this epoch, so there is nothing to commit: read the log again.
     if snapshot.issued.is_empty() {
         return Err(Error::ProposalsChanged);
@@ -1011,7 +1093,7 @@ async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> R
         return Err(Error::BadE2ee);
     }
     let ids: Vec<i64> = ids.iter().map(|&index| snapshot.issued[index].id).collect();
-    db::apply_commit(
+    db::apply_commit_at(
         pool,
         caller,
         id,
@@ -1022,6 +1104,7 @@ async fn apply(pool: &PgPool, caller: &Caller, id: &str, body: &CommitBody) -> R
         &welcomes,
         &tree,
         meta.has_path,
+        body.generation,
     )
     .await
     .map_err(lift)?;
@@ -1047,6 +1130,7 @@ pub(crate) fn sealed_framing_ok(bytes: &[u8]) -> bool {
 
 /// The fields of a post that make it ciphertext, as the message route reads them.
 pub(crate) struct PostFields<'a> {
+    pub generation: Option<u64>,
     pub ciphertext: Option<&'a str>,
     pub epoch: Option<u64>,
     pub device_id: Option<&'a str>,
@@ -1105,7 +1189,16 @@ pub(crate) async fn post_ciphertext(
     };
     let data = match mls::decode(text, mls::CIPHERTEXT_MAX) {
         Ok(data) => data,
-        Err(refusal) => return Err(refine(pool, caller, conversation, refused(refusal)).await),
+        Err(refusal) => {
+            return Err(refine(
+                pool,
+                caller,
+                conversation,
+                fields.generation,
+                refused(refusal),
+            )
+            .await)
+        }
     };
     // The kind and target the server stores must be the ones the sender authenticated, with the
     // target in the form the server gives it back in.
@@ -1113,7 +1206,7 @@ pub(crate) async fn post_ciphertext(
         Some(target) => Some(canonical_uuid(target).ok_or(Error::Invalid)?),
         None => None,
     };
-    let (group, audience) = mls_of(pool, caller, conversation).await?;
+    let (group, audience) = mls_of(pool, caller, conversation, fields.generation).await?;
     let bound = if audience {
         Some(canonical_uuid(conversation).ok_or(Error::Invalid)?)
     } else {
@@ -1124,7 +1217,14 @@ pub(crate) async fn post_ciphertext(
         None => mls::message_aad(kind, target.as_deref()),
     };
     if let Err(refusal) = mls::check_ciphertext(&group, epoch, &aad, &data) {
-        return Err(refine(pool, caller, conversation, refused(refusal)).await);
+        return Err(refine(
+            pool,
+            caller,
+            conversation,
+            fields.generation,
+            refused(refusal),
+        )
+        .await);
     }
     post_stored(
         pool,
@@ -1155,8 +1255,14 @@ fn canonical_uuid(id: &str) -> Option<String> {
 
 /// A ciphertext that is no good for an encrypted conversation is `not_e2ee` when the conversation
 /// is not one, and whatever refused it otherwise.
-async fn refine(pool: &PgPool, caller: &Caller, conversation: &str, error: Error) -> Error {
-    match db::group_info(pool, caller, conversation).await {
+async fn refine(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    generation: Option<u64>,
+    error: Error,
+) -> Error {
+    match db::group_info_at(pool, caller, conversation, generation).await {
         Ok(info) if info.get("e2ee").and_then(Value::as_bool) != Some(true) => Error::NotE2ee,
         Ok(_) => error,
         Err(other) => lift(other),
@@ -1184,9 +1290,10 @@ async fn post_stored(
         attachments: fields.attachments,
         has_body: fields.has_body,
     };
-    let (value, created) = db::post_e2ee_message(pool, caller, conversation, &message)
-        .await
-        .map_err(lift)?;
+    let (value, created) =
+        db::post_e2ee_message_at(pool, caller, conversation, &message, fields.generation)
+            .await
+            .map_err(lift)?;
     let status = if created {
         StatusCode::CREATED
     } else {

@@ -3688,6 +3688,39 @@ async fn the_group_is_rebuilt_when_nobody_in_it_can_commit() {
         start(&w.app, &mut third, &conv).await;
         let (status, said) = say(&w.app, &mut third, &conv, "in the new group", json!({})).await;
         assert_eq!(status, StatusCode::CREATED, "{said}");
+        // A legacy reset must also replace the public epoch-zero transcript and
+        // permit a fresh epoch-one tree. Retained pre-reset proposals, commits
+        // or tree keys must not enter this newly created generation-zero group.
+        let fourth = Dev::new(&w.owner.user_id, &w.owner_token);
+        let (status, body) = register_vouched(&w.app, &fourth, &third).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = upload_packages(&w.app, &fourth, 2).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let mut rebuilt = [third, fourth];
+        settle(&w.app, &mut rebuilt, 0, &conv).await;
+        let (_, current) = info(&w.app, &rebuilt[0].token, &conv).await;
+        assert_eq!(current["generation"], 0);
+        assert_eq!(current["epoch"], 1);
+        assert_eq!(current["trees"], json!([1]));
+        let (status, said) = say(
+            &w.app,
+            &mut rebuilt[0],
+            &conv,
+            "after the rebuilt Add",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        assert_eq!(
+            read(&w.app, &mut rebuilt[1], &conv).await,
+            ["after the rebuilt Add"]
+        );
+        let (_, ciphertext_history) = messages(&w.app, &rebuilt[0].token, &conv).await;
+        assert_eq!(
+            ciphertext_history.as_array().expect("history").len(),
+            3,
+            "ciphertext history is retained"
+        );
     })
     .await;
 }
@@ -6200,6 +6233,656 @@ async fn a_canary_said_to_your_own_devices_is_nowhere_on_the_server() {
             );
         }
         let _ = std::fs::remove_dir_all(dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_generations_are_durable_and_fence_legacy_requests() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("repair", true).await;
+        let mut dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        start(&w.app, &mut dev, &conv).await;
+        let (status, old) = info(&w.app, &dev.token, &conv).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(old["generation"], 0, "durable genesis metadata: {old}");
+        let fresh = fresh_uuid();
+        let binding = signed_repair(&w, &dev, &conv, &old, &fresh).await;
+        let path = format!("/v1/e2ee/conversations/{conv}/repair");
+        let (status, repaired) = call(
+            &w.app,
+            Method::POST,
+            &path,
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{repaired}");
+        assert_eq!(repaired["generation"], 1);
+        assert_eq!(repaired["group_id"], fresh);
+        let (status, retry) = call(
+            &w.app,
+            Method::POST,
+            &path,
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retry}");
+        assert_eq!(retry["head_hash"], repaired["head_hash"]);
+        let (status, legacy) = info(&w.app, &dev.token, &conv).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{legacy}");
+        assert_eq!(legacy["error"], "generation_changed");
+        let (status, chain) = call(
+            &w.app,
+            Method::GET,
+            &format!("/v1/e2ee/conversations/{conv}/generations?after=0"),
+            &dev.token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{chain}");
+        assert_eq!(chain["bindings"], json!([binding]));
+        sqlx::query("DELETE FROM e2ee_groups WHERE conversation_id = $1::text::uuid")
+            .bind(&conv)
+            .execute(&w.db.owner)
+            .await
+            .expect("mutable group loss");
+        let (status, chain) = call(
+            &w.app,
+            Method::GET,
+            &format!("/v1/e2ee/conversations/{conv}/generations?after=0"),
+            &dev.token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{chain}");
+        assert_eq!(chain["generation"], 1);
+        let (status, recreate) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/group"),
+            &dev.token,
+            Some(json!({"device_id":dev.id(),"generation":1})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "orphan cannot restart: {recreate}"
+        );
+    })
+    .await;
+}
+
+async fn signed_repair(w: &World, dev: &Dev, conv: &str, old: &Value, fresh: &str) -> Value {
+    signed_repair_with_hash(w, dev, conv, old, fresh).await.0
+}
+async fn signed_repair_with_hash(
+    w: &World,
+    dev: &Dev,
+    conv: &str,
+    old: &Value,
+    fresh: &str,
+) -> (Value, Vec<u8>) {
+    use sha2::{Digest, Sha256};
+    let key: Vec<u8> = sqlx::query_scalar("SELECT signature_key FROM e2ee_server_key")
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("server public key");
+    let server_hash = Sha256::digest(&key);
+    let mut payload = b"tiny-e2ee-v1 group-repair\0".to_vec();
+    payload.push(1);
+    payload.extend_from_slice(&uuid16(conv));
+    payload.extend_from_slice(
+        &old["generation"]
+            .as_u64()
+            .expect("generation")
+            .to_be_bytes(),
+    );
+    payload.extend_from_slice(&(old["generation"].as_u64().expect("generation") + 1).to_be_bytes());
+    payload.extend_from_slice(&uuid16(old["group_id"].as_str().expect("old group")));
+    payload.extend_from_slice(&uuid16(fresh));
+    payload.extend_from_slice(&old["epoch"].as_u64().expect("epoch").to_be_bytes());
+    payload.extend_from_slice(&unb64(old["head_hash"].as_str().expect("head hash")));
+    payload.extend_from_slice(&server_hash);
+    payload.extend_from_slice(&uuid16(dev.user()));
+    payload.extend_from_slice(&uuid16(dev.id()));
+    payload.extend_from_slice(&dev.client.signature_key());
+    let signature = sign_with(&dev.client.provider, &dev.client.keys, &payload);
+    let binding = json!({"version":1,"conversation_id":conv,"from_generation":old["generation"],"to_generation":old["generation"].as_u64().expect("generation")+1,
+            "from_group_id":old["group_id"],"group_id":fresh,"from_epoch":old["epoch"],"previous_hash":old["head_hash"],
+            "server_key_hash":b64(&server_hash),"user_id":dev.user(),"device_id":dev.id(),
+            "signature_key":dev.client.signature_key_b64(),"signature":b64(&signature)});
+
+    (binding, Sha256::digest(payload).to_vec())
+}
+
+#[tokio::test]
+async fn repair_current_and_history_are_generation_scoped() {
+    run(|db|async move {
+  let w=world(db).await;let conv=w.channel("scoped repair",true).await;
+  let mut dev=ready(&w.app,&w.owner.user_id,&w.owner_token).await;start(&w.app,&mut dev,&conv).await;
+  let (status,old)=info(&w.app,&dev.token,&conv).await;assert_eq!(status,StatusCode::OK);
+  let (_,message)=say(&w.app,&mut dev,&conv,"saved old",json!({})).await;
+  assert_eq!(message["generation"],0);assert_eq!(message["group_id"],conv);
+  sqlx::query("INSERT INTO e2ee_handshake(conversation_id,kind,epoch,data) VALUES($1::text::uuid,'proposals',0,$2)").bind(&conv).bind(vec![7u8]).execute(&w.db.owner).await.expect("old handshake");
+  sqlx::query("INSERT INTO e2ee_trees(conversation_id,epoch,part,data) VALUES($1::text::uuid,1,0,$2)").bind(&conv).bind(vec![8u8]).execute(&w.db.owner).await.expect("old tree");
+  let fresh=fresh_uuid();let binding=signed_repair(&w,&dev,&conv,&old,&fresh).await;
+  let (status,repaired)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/repair"),&dev.token,Some(json!({"binding":binding}))).await;assert_eq!(status,StatusCode::CREATED,"{repaired}");
+  let (status,current)=call(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{conv}?generation=1"),&dev.token,None).await;assert_eq!(status,StatusCode::OK,"{current}");assert_eq!(current["group_id"],fresh);assert_eq!(current["trees"],json!([]));
+  for path in [format!("/v1/e2ee/conversations/{conv}/handshake?device_id={}",dev.id()),format!("/v1/e2ee/conversations/{conv}/tree?device_id={}&epoch=1",dev.id())] {
+   let (status,b)=call(&w.app,Method::GET,&path,&dev.token,None).await;assert_eq!(status,StatusCode::CONFLICT,"omitted generation must fail: {b}");assert_eq!(b["error"],"generation_changed");
+  }
+  let (status,history)=call(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{conv}/handshake?device_id={}&generation=0",dev.id()),&dev.token,None).await;assert_eq!(status,StatusCode::OK,"{history}");assert_eq!(history.as_array().expect("rows").len(),1);assert_eq!(history[0]["group_id"],conv);
+  dev.client.create_group(uuid16(&fresh),current["external_sender"].as_str().expect("external sender"));
+  let ciphertext=dev.client.encrypt_as("message",None,&payload("fresh current"));
+  for generation in [None,Some(0)] {
+   let mut body=json!({"device_id":dev.id(),"epoch":0,"ciphertext":b64(&ciphertext)});if let Some(g)=generation {body["generation"]=json!(g);}
+   let (status,b)=call(&w.app,Method::POST,&format!("/v1/conversations/{conv}/messages"),&dev.token,Some(body)).await;assert_eq!(status,StatusCode::CONFLICT,"stale equal epoch {b}");assert_eq!(b["error"],"generation_changed");
+  }
+  let (status,message)=call(&w.app,Method::POST,&format!("/v1/conversations/{conv}/messages"),&dev.token,Some(json!({"device_id":dev.id(),"epoch":0,"ciphertext":b64(&ciphertext),"generation":1}))).await;assert_eq!(status,StatusCode::CREATED,"{message}");assert_eq!(message["generation"],1);assert_eq!(message["group_id"],fresh);
+  let aad=message_aad_for("reaction",None,Some(&conv));let reaction=dev.client.encrypt_with_aad(aad,b"reaction");
+  let (status,reaction)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/reactions"),&dev.token,Some(json!({"device_id":dev.id(),"epoch":0,"ciphertext":b64(&reaction),"client_id":"repair-reaction","generation":1}))).await;assert_eq!(status,StatusCode::CREATED,"{reaction}");assert_eq!(reaction["generation"],1);assert_eq!(reaction["group_id"],fresh);
+  let fresh2=fresh_uuid();let binding2=signed_repair(&w,&dev,&conv,&current,&fresh2).await;
+  sqlx::query("INSERT INTO e2ee_handshake(conversation_id,kind,epoch,data) VALUES($1::text::uuid,'proposals',0,$2)").bind(&conv).bind(vec![9u8]).execute(&w.db.owner).await.expect("generation1 handshake");
+  let (status,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/repair"),&dev.token,Some(json!({"binding":binding2}))).await;assert_eq!(status,StatusCode::CREATED,"{b}");
+  let (status,receipt)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/repair"),&dev.token,Some(json!({"binding":binding}))).await;assert_eq!(status,StatusCode::OK,"{receipt}");assert_eq!(receipt,repaired,"retry receipt remains bound to its accepted generation after later repair");
+  let (status,h)=call(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{conv}/handshake?device_id={}&generation=1",dev.id()),&dev.token,None).await;assert_eq!(status,StatusCode::OK,"{h}");assert_eq!(h[0]["generation"],1);assert_eq!(h[0]["group_id"],fresh);
+ }).await;
+}
+
+#[tokio::test]
+async fn repair_refuses_aliases_and_repaired_groups_cannot_acquire_aliases() {
+    run(|db|async move {
+  let w=world(db).await;sqlx::query("UPDATE server_settings SET e2ee_audience_groups=true").execute(&w.db.owner).await.expect("sharing");
+  let mut dev=ready(&w.app,&w.owner.user_id,&w.owner_token).await;let conv=w.channel("alias repair",true).await;start(&w.app,&mut dev,&conv).await;
+  let alias=w.channel("repair alias",true).await;
+  let (s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{alias}/group"),&dev.token,Some(json!({"device_id":dev.id()}))).await;assert_eq!(s,StatusCode::CREATED,"{b}");
+  sqlx::query("UPDATE server_settings SET e2ee_audience_groups=false").execute(&w.db.owner).await.expect("isolate alias policy from unsupported global framing");
+  for id in [&conv,&alias] {
+   let (_,old)=info(&w.app,&dev.token,id).await;let binding=signed_repair(&w,&dev,id,&old,&fresh_uuid()).await;
+   let (s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{id}/repair"),&dev.token,Some(json!({"binding":binding}))).await;assert_eq!(s,StatusCode::CONFLICT,"{b}");assert_eq!(b["error"],"repair_unavailable");
+  }
+  sqlx::query("DELETE FROM e2ee_groups WHERE conversation_id=$1::text::uuid").bind(&alias).execute(&w.db.owner).await.expect("detach owned alias");
+  sqlx::query("UPDATE server_settings SET e2ee_audience_groups=false").execute(&w.db.owner).await.expect("disable unsupported client framing");
+  let (_,old)=info(&w.app,&dev.token,&conv).await;let binding=signed_repair(&w,&dev,&conv,&old,&fresh_uuid()).await;
+  let (s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/repair"),&dev.token,Some(json!({"binding":binding}))).await;assert_eq!(s,StatusCode::CREATED,"{b}");
+  let attach=sqlx::query("INSERT INTO e2ee_groups(conversation_id,shared_from) VALUES($1::text::uuid,$2::text::uuid)").bind(&alias).bind(&conv).execute(&w.db.owner).await;
+  assert!(attach.is_err(),"repaired canonical group must reject later alias insertion");
+ }).await;
+}
+
+#[tokio::test]
+async fn repair_requires_the_exact_active_old_leaf_and_current_epoch() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("repair authorization", true).await;
+        let mut dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        start(&w.app, &mut dev, &conv).await;
+        let (_, old) = info(&w.app, &dev.token, &conv).await;
+        let other = Dev::new(&w.owner.user_id, &w.owner_token);
+        let (s, b) = register_vouched(&w.app, &other, &dev).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let binding = signed_repair(&w, &other, &conv, &old, &fresh_uuid()).await;
+        let path = format!("/v1/e2ee/conversations/{conv}/repair");
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &path,
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert_eq!(b["error"], "not_in_group");
+        let mut epoch = old.clone();
+        epoch["epoch"] = json!(1);
+        let binding = signed_repair(&w, &dev, &conv, &epoch, &fresh_uuid()).await;
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &path,
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert_eq!(b["error"], "stale_epoch");
+        let binding = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        sqlx::query("UPDATE e2ee_devices SET signature_key=$2 WHERE device_id=$1::text::uuid")
+            .bind(dev.id())
+            .bind(other.client.signature_key())
+            .execute(&w.db.owner)
+            .await
+            .expect("key changed before CAS");
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &path,
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"], "bad_device");
+        sqlx::query("UPDATE e2ee_devices SET signature_key=$2 WHERE device_id=$1::text::uuid")
+            .bind(dev.id())
+            .bind(dev.client.signature_key())
+            .execute(&w.db.owner)
+            .await
+            .expect("restore owned device");
+        let binding = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        sqlx::query("UPDATE e2ee_devices SET revoked_at=now() WHERE device_id=$1::text::uuid")
+            .bind(dev.id())
+            .execute(&w.db.owner)
+            .await
+            .expect("revoke");
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &path,
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"], "bad_device");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_reserves_retired_ids_against_other_conversations() {
+    run(|db|async move {
+  let w=world(db).await;let old_conv=w.channel("retired genesis",true).await;let conv=w.channel("collision target",true).await;
+  let mut dev=ready(&w.app,&w.owner.user_id,&w.owner_token).await;start(&w.app,&mut dev,&old_conv).await;
+  let (_,old)=info(&w.app,&dev.token,&old_conv).await;let internal=fresh_uuid();let binding=signed_repair(&w,&dev,&old_conv,&old,&internal).await;
+  let (s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{old_conv}/repair"),&dev.token,Some(json!({"binding":binding}))).await;assert_eq!(s,StatusCode::CREATED,"{b}");
+  sqlx::query("DELETE FROM channels WHERE id=$1::text::uuid").bind(&old_conv).execute(&w.db.owner).await.expect("delete owned conversation");
+  start(&w.app,&mut dev,&conv).await;let (_,current)=info(&w.app,&dev.token,&conv).await;
+  for collision in [&old_conv,&internal,&conv] {
+   let binding=signed_repair(&w,&dev,&conv,&current,collision).await;
+   let (s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/repair"),&dev.token,Some(json!({"binding":binding}))).await;
+   assert!(s.is_client_error(),"known internal UUID {collision} reused: {b}");
+  }
+  let reused=sqlx::query("INSERT INTO channels(id,name,created_by) VALUES($1::text::uuid,'internal collision',$2::text::uuid)").bind(&internal).bind(&w.owner.user_id).execute(&w.db.owner).await;
+  assert!(reused.is_err(),"an accepted internal UUID cannot later become another conversation");
+ }).await;
+}
+
+#[tokio::test]
+async fn repair_signs_current_uuid_and_preserves_strict_welcome_and_tree_flow() {
+    run(|db|async move {
+  let w=world(db).await;let conv=w.channel("repair strict join",true).await;let mut creator=ready(&w.app,&w.owner.user_id,&w.owner_token).await;start(&w.app,&mut creator,&conv).await;
+  let mut sibling=Dev::new(&w.owner.user_id,&w.owner_token);let(s,b)=register_vouched(&w.app,&sibling,&creator).await;assert_eq!(s,StatusCode::CREATED,"{b}");let(s,b)=upload_packages(&w.app,&sibling,5).await;assert_eq!(s,StatusCode::NO_CONTENT,"{b}");
+  sqlx::query("INSERT INTO e2ee_trees(conversation_id,epoch,part,data) VALUES($1::text::uuid,1,0,$2)").bind(&conv).bind(vec![99u8]).execute(&w.db.owner).await.expect("retained old generation tree");
+  let(_,old)=info(&w.app,&creator.token,&conv).await;let internal=fresh_uuid();let binding=signed_repair(&w,&creator,&conv,&old,&internal).await;
+  let(s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/repair"),&creator.token,Some(json!({"binding":binding}))).await;assert_eq!(s,StatusCode::CREATED,"{b}");
+  creator.client.create_group(uuid16(&internal),old["external_sender"].as_str().expect("sender"));creator.client.inline_tree(false);
+  let(s,rows)=call(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{conv}/handshake?generation=1&device_id={}",creator.id()),&creator.token,None).await;assert_eq!(s,StatusCode::OK,"{rows}");
+  for row in rows.as_array().expect("rows") {assert_eq!(row["group_id"],internal);if row["kind"]=="proposals" {creator.client.take_proposals(&unb64(row["data"].as_str().expect("data")));}}
+  let committed=creator.client.commit();let body=json!({"device_id":creator.id(),"epoch":0,"commit":b64(&committed.commit),"welcomes":[{"device_id":sibling.id(),"data":b64(committed.welcome.as_ref().expect("welcome"))}],"ratchet_tree":b64(&committed.tree)});
+  let(s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/commit"),&creator.token,Some(body.clone())).await;assert_eq!(s,StatusCode::CONFLICT,"{b}");assert_eq!(b["error"],"generation_changed");
+  let mut body=body;body["generation"]=json!(1);let(s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{conv}/commit"),&creator.token,Some(body)).await;assert_eq!(s,StatusCode::NO_CONTENT,"{b}");creator.client.merge();
+  let(s,rows)=call(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{conv}/handshake?generation=1&device_id={}",sibling.id()),&sibling.token,None).await;assert_eq!(s,StatusCode::OK,"{rows}");
+  let welcome=rows.as_array().expect("rows").iter().find(|r|r["kind"]=="welcome").expect("current welcome");
+  let(s,_,tree)=raw(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{conv}/tree?generation=1&device_id={}&epoch=1",sibling.id()),&sibling.token,"",vec![]).await;assert_eq!(s,StatusCode::OK);
+  sibling.client.join_with_tree(&unb64(welcome["data"].as_str().expect("welcome")),Some(&tree));assert!(sibling.client.has_group(&uuid16(&internal)));
+  let ciphertext=creator.client.encrypt(&payload("strict new generation"));let(s,b)=call(&w.app,Method::POST,&format!("/v1/conversations/{conv}/messages"),&creator.token,Some(json!({"device_id":creator.id(),"epoch":1,"generation":1,"ciphertext":b64(&ciphertext)}))).await;assert_eq!(s,StatusCode::CREATED,"{b}");assert_eq!(b["group_id"],internal);
+  assert_eq!(sibling.client.decrypt(&ciphertext),Some(payload("strict new generation")));
+ }).await;
+}
+
+#[tokio::test]
+async fn repair_availability_refuses_unsupported_audience_group_framing() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("repair framing", true).await;
+        let mut dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        start(&w.app, &mut dev, &conv).await;
+        let (_, old) = info(&w.app, &dev.token, &conv).await;
+        assert_eq!(old["repair_available"], true, "{old}");
+        sqlx::query("UPDATE server_settings SET e2ee_audience_groups=true")
+            .execute(&w.db.owner)
+            .await
+            .expect("existing unsupported framing");
+        let (_, unavailable) = info(&w.app, &dev.token, &conv).await;
+        assert_eq!(unavailable["repair_available"], false, "{unavailable}");
+        let binding = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/repair"),
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert_eq!(b["error"], "repair_unavailable");
+        let (_, unchanged) = info(&w.app, &dev.token, &conv).await;
+        assert_eq!(unchanged["generation"], 0);
+        assert_eq!(unchanged["head_hash"], old["head_hash"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_competing_cas_has_one_winner() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("repair race", true).await;
+        let mut dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        start(&w.app, &mut dev, &conv).await;
+        let (_, old) = info(&w.app, &dev.token, &conv).await;
+        let a = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        let b = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        let path = format!("/v1/e2ee/conversations/{conv}/repair");
+        let (a, b) = tokio::join!(
+            call(
+                &w.app,
+                Method::POST,
+                &path,
+                &dev.token,
+                Some(json!({"binding":a}))
+            ),
+            call(
+                &w.app,
+                Method::POST,
+                &path,
+                &dev.token,
+                Some(json!({"binding":b}))
+            )
+        );
+        assert!(
+            (a.0 == StatusCode::CREATED && b.1["error"] == "generation_changed")
+                || (b.0 == StatusCode::CREATED && a.1["error"] == "generation_changed"),
+            "{a:?} {b:?}"
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM e2ee_generation_bindings WHERE conversation_id=$1::text::uuid",
+        )
+        .bind(&conv)
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("ledger count");
+        assert_eq!(count, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_winning_while_issuance_waits_fences_the_old_generation() {
+    run(|db|async move {
+  let w=world(db).await;let conv=w.channel("issuance repair race",true).await;let mut dev=ready(&w.app,&w.owner.user_id,&w.owner_token).await;start(&w.app,&mut dev,&conv).await;
+  let(_,old)=info(&w.app,&dev.token,&conv).await;let (binding,hash)=signed_repair_with_hash(&w,&dev,&conv,&old,&fresh_uuid()).await;
+  let mut barrier=w.db.owner.begin().await.expect("owned race barrier");
+  sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('tinyserver.e2ee.' || $1,0)),set_config('app.user_id',$2,true),set_config('app.role','owner',true)").bind(&conv).bind(&w.owner.user_id).execute(&mut *barrier).await.expect("lock and caller");
+  let pid:i32=sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *barrier).await.expect("pid");
+  let pool=w.db.runtime.clone();let caller=w.owner.clone();let cid=conv.clone();let signed=Arc::new(std::sync::atomic::AtomicBool::new(false));let was_signed=signed.clone();
+  let issue=tokio::spawn(async move {db::issue_proposals_at(&pool,&caller,&cid,Some(0),move|_,_,_| {was_signed.store(true,std::sync::atomic::Ordering::SeqCst);None}).await});
+  tokio::time::timeout(Duration::from_secs(10),async {loop {
+   let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))").bind(pid).fetch_one(&w.db.owner).await.expect("waiter");if waiting {break}assert!(!issue.is_finished());tokio::task::yield_now().await;
+  }}).await.expect("issuance reaches lock");
+  let accepted:Value=sqlx::query_scalar("SELECT app_e2ee_repair($1::text::uuid,$2,$3)").bind(&conv).bind(binding).bind(hash).fetch_one(&mut *barrier).await.expect("signed repair wins under same lock");assert_eq!(accepted["generation"],1);
+  barrier.commit().await.expect("publish repair");
+  assert!(matches!(issue.await.expect("issuer"),Err(db::MessageError::GenerationChanged)));assert!(!signed.load(std::sync::atomic::Ordering::SeqCst),"old generation must never reach signer");
+ }).await;
+}
+
+#[tokio::test]
+async fn repair_creator_loss_keeps_the_durable_head_and_cannot_restart_epoch_zero() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("repair creator loss", true).await;
+        let mut creator = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        start(&w.app, &mut creator, &conv).await;
+        let (_, old) = info(&w.app, &creator.token, &conv).await;
+        let internal = fresh_uuid();
+        let binding = signed_repair(&w, &creator, &conv, &old, &internal).await;
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/repair"),
+            &creator.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let sibling = Dev::new(&w.owner.user_id, &w.owner_token);
+        let (s, b) = register_vouched(&w.app, &sibling, &creator).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = call(
+            &w.app,
+            Method::DELETE,
+            &format!("/v1/e2ee/devices/{}", creator.id()),
+            &creator.token,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+        let (s, current) = call(
+            &w.app,
+            Method::GET,
+            &format!("/v1/e2ee/conversations/{conv}?generation=1"),
+            &sibling.token,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{current}");
+        assert_eq!(current["generation"], 1);
+        assert_eq!(current["group_id"], internal);
+        assert!(current["epoch"].is_null());
+        assert_eq!(current["repair_available"], false);
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/group"),
+            &sibling.token,
+            Some(json!({"device_id":sibling.id(),"generation":1})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert_eq!(b["error"], "no_group");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_routes_bound_queries_bodies_and_reject_private_state_fields() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("repair limits", true).await;
+        let mut dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        start(&w.app, &mut dev, &conv).await;
+        for query in [
+            "limit=0",
+            "limit=101",
+            "limit=-1",
+            "after=18446744073709551615",
+            "after=-1",
+        ] {
+            let (s, _, b) = raw(
+                &w.app,
+                Method::GET,
+                &format!("/v1/e2ee/conversations/{conv}/generations?{query}"),
+                &dev.token,
+                "",
+                vec![],
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{query} {b:?}");
+        }
+        let (_, old) = info(&w.app, &dev.token, &conv).await;
+        let mut binding = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        binding["private_key"] = json!("must never be accepted");
+        let body = serde_json::to_vec(&json!({"binding":binding})).expect("JSON");
+        let (s, _, b) = raw(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/repair"),
+            &dev.token,
+            "application/json",
+            body,
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b:?}");
+        let body = serde_json::to_vec(&json!({"binding":"x".repeat(5000)})).expect("JSON");
+        let (s, _, b) = raw(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/repair"),
+            &dev.token,
+            "application/json",
+            body,
+        )
+        .await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_generation_zero_alias_metadata_keeps_the_canonical_group_uuid() {
+    run(|db|async move {
+  let w=world(db).await;sqlx::query("UPDATE server_settings SET e2ee_audience_groups=true").execute(&w.db.owner).await.expect("sharing");
+  let conv=w.channel("metadata canonical",true).await;let alias=w.channel("metadata alias",true).await;let mut dev=ready(&w.app,&w.owner.user_id,&w.owner_token).await;start(&w.app,&mut dev,&conv).await;
+  let(s,b)=call(&w.app,Method::POST,&format!("/v1/e2ee/conversations/{alias}/group"),&dev.token,Some(json!({"device_id":dev.id()}))).await;assert_eq!(s,StatusCode::CREATED,"{b}");
+  sqlx::query("INSERT INTO e2ee_handshake(conversation_id,kind,epoch,data) VALUES($1::text::uuid,'proposals',0,$2)").bind(&conv).bind(vec![3u8]).execute(&w.db.owner).await.expect("legacy public handshake");
+  let(s,rows)=call(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{alias}/handshake?generation=0&device_id={}",dev.id()),&dev.token,None).await;assert_eq!(s,StatusCode::OK,"{rows}");assert_eq!(rows[0]["group_id"],conv,"alias must keep canonical cryptographic ID");
+ }).await;
+}
+
+#[tokio::test]
+async fn repair_rechecks_speak_permission_after_waiting_for_the_lock() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("repair permission race", true).await;
+        let (speaker, token) = w.member("repair-speaker").await;
+        let mut dev = ready(&w.app, &speaker.user_id, &token).await;
+        start(&w.app, &mut dev, &conv).await;
+        let (_, old) = info(&w.app, &dev.token, &conv).await;
+        let binding = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        let everyone = w.everyone().await;
+        let mut barrier = w.db.owner.begin().await.expect("permission race barrier");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('tinyserver.e2ee.' || $1,0))")
+            .bind(&conv).execute(&mut *barrier).await.expect("hold reconciliation lock");
+        let pid:i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *barrier).await.expect("barrier pid");
+        let app=w.app.clone(); let token=dev.token.clone();
+        let path=format!("/v1/e2ee/conversations/{conv}/repair");
+        let repair=tokio::spawn(async move {call(&app,Method::POST,&path,&token,Some(json!({"binding":binding}))).await});
+        tokio::time::timeout(Duration::from_secs(10),async {
+            loop {
+                let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))")
+                    .bind(pid).fetch_one(&w.db.owner).await.expect("repair waiter");
+                if waiting {break;}
+                assert!(!repair.is_finished(),"repair must reach the held lock");
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("repair waits after its initial permission check");
+        sqlx::query("INSERT INTO channel_overrides(channel_id,role_id,allow,deny) VALUES($1::text::uuid,$2::text::uuid,0,4)")
+            .bind(&conv).bind(&everyone).execute(&mut *barrier).await.expect("remove only speak permission");
+        barrier.commit().await.expect("publish permission change");
+        let (status,body)=repair.await.expect("repair response");
+        assert_eq!(status,StatusCode::FORBIDDEN,"permission must be checked under lock: {body}");
+        let (info_status,info)=call(&w.app,Method::GET,&format!("/v1/e2ee/conversations/{conv}?generation=0"),&dev.token,None).await;
+        assert_eq!(info_status,StatusCode::OK,"view-only info remains readable: {info}");
+        assert_eq!(info["repair_available"],false,"view-only caller must not prepare a candidate");
+        let leaf_count:i64=sqlx::query_scalar("SELECT count(*) FROM e2ee_leaves WHERE conversation_id=$1::text::uuid AND device_id=$2::text::uuid")
+            .bind(&conv).bind(dev.id()).fetch_one(&w.db.owner).await.expect("old leaf retained");
+        assert_eq!(leaf_count,1,"view and MLS membership remain; only speak was removed");
+        let ledger_count:i64=sqlx::query_scalar("SELECT count(*) FROM e2ee_generation_bindings WHERE conversation_id=$1::text::uuid")
+            .bind(&conv).fetch_one(&w.db.owner).await.expect("ledger unchanged");
+        assert_eq!(ledger_count,0);
+    }).await;
+}
+
+#[tokio::test]
+async fn repair_current_generation_malformed_ciphertext_does_not_report_a_head_change() {
+    run(|db| async move {
+        let w = world(db).await;
+        let conv = w.channel("current malformed frame", true).await;
+        let mut dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        start(&w.app, &mut dev, &conv).await;
+        let (_, old) = info(&w.app, &dev.token, &conv).await;
+        let binding = signed_repair(&w, &dev, &conv, &old, &fresh_uuid()).await;
+        let (s, b) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{conv}/repair"),
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        for ciphertext in ["not base64".to_string(), b64(&[0])] {
+            let (s, b) = call(
+                &w.app,
+                Method::POST,
+                &format!("/v1/conversations/{conv}/messages"),
+                &dev.token,
+                Some(
+                    json!({"device_id":dev.id(),"epoch":0,"generation":1,"ciphertext":ciphertext}),
+                ),
+            )
+            .await;
+            assert_eq!(
+                s,
+                StatusCode::BAD_REQUEST,
+                "current generation malformed bytes must retain their actual error: {b}"
+            );
+            assert_eq!(b["error"], "bad_e2ee");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_cannot_reuse_a_genesis_created_before_the_first_info_read() {
+    run(|db| async move {
+        let w = world(db).await;
+        let vanished = w.channel("created before info", true).await;
+        let target = w.channel("crash-gap collision target", true).await;
+        let mut dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        // Model a process exit after the create transaction commits, before the
+        // route's separate info read initializes the durable generation head.
+        db::create_group(&w.db.runtime, &w.owner, &vanished, dev.id(), None)
+            .await
+            .expect("committed group creation without info");
+        let head_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM e2ee_generation_heads WHERE conversation_id=$1::text::uuid",
+        )
+        .bind(&vanished)
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("no info-created head");
+        assert_eq!(head_count, 0, "fixture must retain the actual crash gap");
+        sqlx::query("DELETE FROM channels WHERE id=$1::text::uuid")
+            .bind(&vanished)
+            .execute(&w.db.owner)
+            .await
+            .expect("physical deletion after crash");
+        start(&w.app, &mut dev, &target).await;
+        let (_, old) = info(&w.app, &dev.token, &target).await;
+        let binding = signed_repair(&w, &dev, &target, &old, &vanished).await;
+        let (status, body) = call(
+            &w.app,
+            Method::POST,
+            &format!("/v1/e2ee/conversations/{target}/repair"),
+            &dev.token,
+            Some(json!({"binding":binding})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a committed genesis UUID remains reserved without any info read: {body}"
+        );
+        assert_eq!(body["error"], "group_exists");
+        let (_, current) = info(&w.app, &dev.token, &target).await;
+        assert_eq!(current["generation"], 0);
     })
     .await;
 }
