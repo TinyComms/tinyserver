@@ -45,7 +45,7 @@ Community host: `tiny-server`
 Community dir: `/var/lib/tinyserver`
 Build host: `atomicstudio`
 
-`deploy/release-cut.sh` reads those lines. The community is a Cloudzy VPS (1 CPU, 2 GB), reached as `root` through the 1Password SSH agent, so a Git Bash `ssh` cannot open it: use `C:/Windows/System32/OpenSSH/ssh.exe` (the script does when it exists), and batch each visit into one call, because every call is one approval. It cannot build the image. `atomicstudio` (Tailscale SSH, no prompt) builds it. `atomicstudio` also runs a tinyserver of its own; that one is not the community.
+`deploy/release-cut.sh` reads those lines. Do not write the community's provider, hostname, IP, or plan size into this repository, the project board, or public docs. Reach the community host as `root` through the 1Password SSH agent: a Git Bash `ssh` cannot open it, so use `C:/Windows/System32/OpenSSH/ssh.exe` (the script does when it exists), and batch each visit into one call, because every call is one approval. It cannot build the image. `atomicstudio` (Tailscale SSH, no prompt) builds it. `atomicstudio` also runs a tinyserver of its own; that one is not the community.
 
 ### The deploy
 

@@ -101,7 +101,7 @@ TinyCloud, the managed host, is in the same position as any operator. See `docs/
 
 Keep a plain rule in mind: **a member's account does not change.** They keep their user id, display name, roles, messages and end-to-end device keys. The move adds a passkey identity to the same account. Pocket ID's identity stays until you remove it.
 
-The steps are for the compose deployment in `deploy/` (as run on the Cloudzy host). `HOST` stands for that machine; every `docker compose` command runs in the directory that holds `compose.yml` and `.env`. Nothing here touches a host by itself: you run each step and check it.
+The steps are for the compose deployment in `deploy/`. `HOST` stands for the machine that runs it; every `docker compose` command runs in the directory that holds `compose.yml` and `.env`. Nothing here touches a host by itself: you run each step and check it.
 
 Until step 9 the move can be undone with one choice in the client (see "Going back").
 
