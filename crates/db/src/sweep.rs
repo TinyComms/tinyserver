@@ -2,6 +2,9 @@
 //! Unfinished sign-ins and unredeemed one-time codes go once they expire.
 //! Outbox rows are kept 24 hours, which is how far back a live socket can resume.
 //! Resolved abuse reports go after `TINYSERVER_REPORT_RETENTION_DAYS` (90), unless on hold.
+//! Device links go when they expire; their archive files an hour later, and any archive file no
+//! row names (a crash mid-upload, a deleted account) on the next sweep, the first of which runs
+//! at start.
 
 use sqlx::PgPool;
 
@@ -20,6 +23,8 @@ pub struct Swept {
     pub attachments: i64,
     /// Resolved abuse reports past their retention. Reports on legal hold are never counted.
     pub reports: i64,
+    /// Device link archive files deleted: expired, or named by no row.
+    pub link_archives: i64,
 }
 
 impl Swept {
@@ -31,6 +36,7 @@ impl Swept {
             + self.logins
             + self.attachments
             + self.reports
+            + self.link_archives
     }
 }
 
@@ -50,6 +56,7 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
     // Expired key packages, old welcomes and old sealed-upload ledger rows. Not counted above:
     // none of it is a row a person made.
     sqlx::query("SELECT app_e2ee_sweep()").execute(pool).await?;
+    let link_archives = crate::link::sweep_links(pool).await?;
     Ok(Swept {
         sessions,
         invites,
@@ -58,5 +65,6 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
         logins,
         attachments,
         reports,
+        link_archives,
     })
 }
