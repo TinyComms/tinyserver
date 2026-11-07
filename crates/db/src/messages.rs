@@ -109,6 +109,9 @@ pub enum MessageError {
     /// This pair already has an encrypted direct, so the plaintext one stays plaintext.
     #[error("e2ee twin")]
     E2eeTwin,
+    /// A device link already carries its one archive.
+    #[error("archive exists")]
+    ArchiveExists,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -687,6 +690,7 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E17" => MessageError::IdTaken,
         "P0E18" => MessageError::RootExists,
         "P0E19" => MessageError::E2eeTwin,
+        "P0E20" => MessageError::ArchiveExists,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
@@ -842,7 +846,7 @@ fn within(len: usize, limit: i64) -> bool {
     i64::try_from(len).is_ok_and(|len| len <= limit)
 }
 
-fn upload_dir() -> String {
+pub(crate) fn upload_dir() -> String {
     std::env::var("TINYSERVER_UPLOAD_DIR").unwrap_or_else(|_| "uploads".to_string())
 }
 

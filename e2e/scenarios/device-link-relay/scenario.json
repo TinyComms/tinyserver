@@ -1,0 +1,10 @@
+{
+  "id": "device-link-relay",
+  "title": "Only a person's own sessions can relay opaque device-link messages and history archives",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres", "two-sessions"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "API component integration, not native-client certification",
+  "native_client_proof": "pending exact-head device churn and encrypted-history retention proof; merge hold remains"
+}

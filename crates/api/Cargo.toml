@@ -14,6 +14,8 @@ axum = { workspace = true, features = ["ws"] }
 base64.workspace = true
 clamav-client = "2"
 db = { path = "../db" }
+# Streams a device link archive from the request body to disk and back.
+futures-util = { version = "0.3", default-features = false }
 getrandom.workspace = true
 openidconnect.workspace = true
 # End-to-end encrypted calls: the server is the MLS external sender and delivery service. It
@@ -30,7 +32,8 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
-tokio.workspace = true
+# `fs` and `io-util`: a device link archive is written and read as a stream, never held whole.
+tokio = { workspace = true, features = ["fs", "io-util"] }
 # The version axum's `ws` feature uses. Only its error type is read, to tell an oversized frame.
 tokio-tungstenite = { version = "0.29", default-features = false }
 tracing.workspace = true
