@@ -648,3 +648,141 @@ async fn an_app_that_cannot_encrypt_turns_the_call_to_transport_only_unless_requ
     })
     .await;
 }
+
+/// Joins an accepted direct. `media_room` is `d:{ring_id}`, which is the MLS group name.
+async fn dial_direct(
+    mut ws: Ws,
+    user_id: &str,
+    direct_id: &str,
+    media_room: &str,
+    e2ee: bool,
+) -> Result<App, Value> {
+    let mut client = Client::new(SocketAddr::from((LOOPBACK, 0)), SLOTS).expect("client");
+    let mut request =
+        json!({"type": "call.join", "ref": "j", "direct_id": direct_id, "sdp": client.offer()});
+    if e2ee {
+        request["e2ee"] = json!(1);
+    }
+    send(&mut ws, request).await;
+    let answer = until(&mut ws, |value| {
+        (value["type"] == "call.answer" || value["type"] == "error").then(|| value.clone())
+    })
+    .await;
+    if answer["type"] == "error" {
+        return Err(answer);
+    }
+    client
+        .accept(answer["sdp"].as_str().expect("sdp"))
+        .expect("accept the answer");
+    let running = client.start(b'x').expect("client thread");
+    let deadline = Instant::now() + WAIT;
+    while !running.connected() {
+        assert!(Instant::now() < deadline, "media did not connect");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(App {
+        ws,
+        user_id: user_id.to_string(),
+        room_id: media_room.to_string(),
+        _running: running,
+        session: None,
+        off: None,
+        starts: 0,
+        commits: Vec::new(),
+        committed: 0,
+        joined: Vec::new(),
+        payloads: Vec::new(),
+        errors: Vec::new(),
+    })
+}
+
+/// A direct call's MLS group is `d:{ring_id}`, not the conversation id and not a room.
+/// An app that cannot encrypt is let in, and the call becomes transport only.
+#[tokio::test]
+async fn a_direct_call_seals_under_its_media_room_and_need_not() {
+    logs();
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = owner_token(&db).await;
+        let (peer, peer_token) = join(&db, &owner, "peer@tinyserver.test", "member").await;
+        let lobby = room(&db, &owner, "Lobby").await;
+        let server = serve_media(&db).await;
+        let (mut owner_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut peer_ws, _) = connect(&server, &peer_token, None).await;
+        let (direct, _) = db::open_direct(&db.runtime, &owner, &peer.user_id, false)
+            .await
+            .expect("direct");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        until(&mut owner_ws, |value| {
+            (value["type"] == "direct.created").then_some(())
+        })
+        .await;
+        until(&mut peer_ws, |value| {
+            (value["type"] == "direct.created").then_some(())
+        })
+        .await;
+
+        let reply = answer(
+            &mut owner_ws,
+            json!({"type": "call.ring", "ref": "r", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply["type"], "ok");
+        let ringing = until(&mut owner_ws, |value| {
+            (value["type"] == "call.ringing").then(|| value.clone())
+        })
+        .await;
+        let media_room = format!("d:{}", ringing["ring_id"].as_str().expect("ring"));
+        until(&mut peer_ws, |value| {
+            (value["type"] == "call.ringing").then_some(())
+        })
+        .await;
+        let reply = answer(
+            &mut peer_ws,
+            json!({"type": "call.accept", "ref": "a", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply["type"], "ok");
+        until(&mut owner_ws, |value| {
+            (value["type"] == "call.accepted").then_some(())
+        })
+        .await;
+        until(&mut peer_ws, |value| {
+            (value["type"] == "call.accepted").then_some(())
+        })
+        .await;
+
+        assert_ne!(mls_room(&media_room), mls_room(&direct_id));
+        assert_ne!(mls_room(&media_room), mls_room(&lobby.id));
+        let mut a = dial_direct(owner_ws, &owner.user_id, &direct_id, &media_room, true)
+            .await
+            .expect("owner joins");
+        settle(&mut [&mut a], |apps| apps[0].starts == 1).await;
+        assert_eq!(a.room_id, media_room);
+
+        let b = dial_direct(peer_ws, &peer.user_id, &direct_id, &media_room, false)
+            .await
+            .expect("a join without e2ee is not e2ee_required");
+        let peer_id = peer.user_id.clone();
+        let roster = [mls_user(&a.user_id)];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let saw_peer = |app: &App| {
+            app.joined
+                .iter()
+                .any(|joined| joined["user_id"] == peer_id.as_str() && joined["e2ee"] == false)
+        };
+        while a.off.is_none() || !saw_peer(&a) {
+            assert!(
+                Instant::now() < deadline,
+                "off={:?} joined={:?}",
+                a.off,
+                a.joined
+            );
+            a.turn(&roster).await;
+        }
+        assert_eq!(a.off.as_deref(), Some(&[peer_id][..]));
+        assert!(a.session.is_none());
+        assert!(b.errors.is_empty(), "{:?}", b.errors);
+    })
+    .await;
+}

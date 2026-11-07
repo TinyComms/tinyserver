@@ -1479,3 +1479,519 @@ async fn a_timeout_and_a_ban_end_calls_and_a_ban_closes_sockets() {
     })
     .await;
 }
+
+/// A direct call rings the two people, then joins a media room named `d:{ring_id}`. A third
+/// member hears none of it. Moderating that room is `not_found` and writes no audit.
+#[tokio::test]
+async fn a_direct_call_rings_the_pair_and_a_third_person_hears_nothing() {
+    // The operator cache is read when the hub starts. Zero makes the later read-only check
+    // see the row this test writes.
+    std::env::set_var("TINYSERVER_OPERATOR_REFRESH_MS", "0");
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = owner_token(&db).await;
+        let (peer, peer_token) = join(&db, &owner, "peer@tinyserver.test", "member").await;
+        let (other, other_token) = join(&db, &owner, "other@tinyserver.test", "member").await;
+        let server = serve(&db, Limits::default()).await;
+        let (mut owner_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut peer_ws, _) = connect(&server, &peer_token, None).await;
+        let (mut other_ws, _) = connect(&server, &other_token, None).await;
+
+        let (direct, created) =
+            db::open_direct(&db.runtime, &owner, &peer.user_id, false)
+                .await
+                .expect("direct");
+        assert!(created);
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let made = until(&mut owner_ws, "direct.created").await;
+        assert_eq!(made["direct"]["id"], direct_id);
+        assert_eq!(until(&mut peer_ws, "direct.created").await["direct"]["id"], direct_id);
+
+        let reply = ask_call(
+            &mut owner_ws,
+            json!({"type": "call.ring", "ref": "r", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "r"}));
+        let ringing = until(&mut owner_ws, "call.ringing").await;
+        assert_eq!(ringing["direct_id"], direct_id);
+        assert_eq!(ringing["caller_id"], owner.user_id);
+        assert_eq!(ringing["callee_id"], peer.user_id);
+        let ring_id = ringing["ring_id"].as_str().expect("ring id").to_string();
+        assert_eq!(until(&mut peer_ws, "call.ringing").await["ring_id"], ring_id);
+        hears_nothing(&mut other_ws).await;
+
+        // The callee is offline for a moment. Coming back still shows the ring, and does not
+        // start a call.
+        drop(peer_ws);
+        let (mut peer_ws, ready) = connect(&server, &peer_token, None).await;
+        assert_eq!(ready["ring"]["ring_id"], ring_id);
+        assert_eq!(ready["ring"]["accepted"], false);
+        assert!(ready["direct_call"].is_null());
+        assert_eq!(ready["calls"], json!([]));
+
+        let reply = ask_call(
+            &mut peer_ws,
+            json!({"type": "call.decline", "ref": "d", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "d"}));
+        for ws in [&mut owner_ws, &mut peer_ws] {
+            let frame = until(ws, "call.declined").await;
+            assert_eq!(frame["ring_id"], ring_id);
+        }
+        hears_nothing(&mut other_ws).await;
+
+        let reply = ask_call(
+            &mut owner_ws,
+            json!({"type": "call.ring", "ref": "r2", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "r2"}));
+        let again = until(&mut owner_ws, "call.ringing").await;
+        let _ = until(&mut peer_ws, "call.ringing").await;
+        let reply = ask_call(
+            &mut owner_ws,
+            json!({"type": "call.cancel", "ref": "c", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "c"}));
+        assert_eq!(until(&mut owner_ws, "call.cancelled").await["ring_id"], again["ring_id"]);
+        assert_eq!(until(&mut peer_ws, "call.cancelled").await["ring_id"], again["ring_id"]);
+
+        // The other member ringing the owner, who is already ringing the peer, is busy.
+        let (second, _) = db::open_direct(&db.runtime, &owner, &other.user_id, false)
+            .await
+            .expect("second direct");
+        // Drain the pair's `direct.created` so the next ring frames are the call.
+        let _ = until(&mut owner_ws, "direct.created").await;
+        let _ = until(&mut other_ws, "direct.created").await;
+        // Ring, ring, and cancel spent the first socket's burst of three. This socket opens
+        // after that frame, so it does not replay it, and it has its own burst.
+        let (mut owner_ring, _) = connect(&server, &owner_token, None).await;
+        let reply = ask_call(
+            &mut owner_ring,
+            json!({"type": "call.ring", "ref": "r3", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "r3"}));
+        let live = until(&mut owner_ws, "call.ringing").await;
+        let _ = until(&mut owner_ring, "call.ringing").await;
+        let _ = until(&mut peer_ws, "call.ringing").await;
+        let second_id = second["id"].as_str().expect("second direct id");
+        let reply = ask_call(
+            &mut other_ws,
+            json!({"type": "call.ring", "ref": "b", "direct_id": second_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "error", "ref": "b", "code": "busy"}));
+        assert_eq!(
+            until(&mut other_ws, "call.busy").await["direct_id"],
+            second["id"]
+        );
+        // The peer is in the pair, so a late `direct.call` for the cancelled ring may still
+        // arrive. Someone outside the pair must hear neither.
+        hears_nothing_but_history(&mut peer_ws).await;
+        hears_nothing(&mut other_ws).await;
+
+        let reply = ask_call(
+            &mut peer_ws,
+            json!({"type": "call.accept", "ref": "a", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "a"}));
+        assert_eq!(until(&mut owner_ws, "call.accepted").await["ring_id"], live["ring_id"]);
+        assert_eq!(until(&mut peer_ws, "call.accepted").await["ring_id"], live["ring_id"]);
+
+        let reply = answer(
+            &mut owner_ws,
+            json!({"type": "call.join", "ref": "j", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "j"}));
+        let joined_owner = until(&mut owner_ws, "call.joined").await;
+        assert_eq!(joined_owner["user_id"], owner.user_id);
+        assert_eq!(joined_owner["direct_id"], direct_id);
+        let room_id = joined_owner["room_id"].as_str().expect("media room").to_string();
+        let live_ring = live["ring_id"].as_str().expect("ring id");
+        assert_eq!(room_id, format!("d:{live_ring}"));
+        assert!(ready_calls_skip_directs(&server, &owner_token).await);
+
+        for (kind, body) in [
+            (
+                "call.kick",
+                json!({"type": "call.kick", "ref": "k", "room_id": room_id, "user_id": peer.user_id}),
+            ),
+            (
+                "call.moderate",
+                json!({"type": "call.moderate", "ref": "m", "room_id": room_id, "user_id": peer.user_id, "server_muted": true}),
+            ),
+            (
+                "call.move",
+                json!({"type": "call.move", "ref": "v", "room_id": room_id, "user_id": peer.user_id}),
+            ),
+            (
+                "call.share_end",
+                json!({"type": "call.share_end", "ref": "s", "room_id": room_id}),
+            ),
+        ] {
+            let reply = ask_call(&mut owner_ws, body).await;
+            assert_eq!(reply["type"], "error", "{kind}");
+            assert_eq!(reply["code"], "not_found", "{kind} {reply}");
+        }
+        let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action LIKE 'call.%'")
+            .fetch_one(&db.owner)
+            .await
+            .expect("audit");
+        assert_eq!(audited, 0, "moderating a direct call writes no audit");
+
+        db::set_operator_mode(&db.owner, db::Mode::ReadOnly, Some("held"))
+            .await
+            .expect("read only");
+        let reply = ask_call(
+            &mut owner_ws,
+            json!({"type": "call.ring", "ref": "ro", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "error", "ref": "ro", "code": "read_only"}));
+    })
+    .await;
+}
+
+/// `ready.calls` stays rooms. A seated direct is `direct_call`, not a voice channel.
+async fn ready_calls_skip_directs(server: &common::live::Server, token: &str) -> bool {
+    let (_ws, ready) = connect(server, token, None).await;
+    ready["calls"]
+        .as_array()
+        .expect("calls")
+        .iter()
+        .all(|call| !call["room_id"].as_str().unwrap_or("").starts_with("d:"))
+}
+
+/// The next `ok` or `error`. A `direct.call` row is written after the ring frame, so it can
+/// sit ahead of the reply.
+async fn ask_call(ws: &mut Ws, request: Value) -> Value {
+    let mut value = ask(ws, request).await;
+    while value["type"] == "direct.call" {
+        value = durable(ws).await;
+    }
+    value
+}
+
+/// No direct-call frame arrives. Presence is not one.
+async fn hears_nothing(ws: &mut Ws) {
+    quiet(ws, false).await;
+}
+
+/// A person in the pair may still be handed the call's history row. Nothing else.
+async fn hears_nothing_but_history(ws: &mut Ws) {
+    quiet(ws, true).await;
+}
+
+async fn quiet(ws: &mut Ws, history: bool) {
+    let waited = tokio::time::timeout(Duration::from_millis(400), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let value: Value = serde_json::from_str(text.as_str()).expect("json");
+                    if value["type"] == "presence" {
+                        continue;
+                    }
+                    if history && value["type"] == "direct.call" {
+                        continue;
+                    }
+                    panic!("unexpected frame {value}");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("socket: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(waited.is_err(), "a frame arrived");
+}
+
+/// `direct.call` is replayed from `since` to the two people only.
+#[tokio::test]
+async fn a_direct_call_is_replayed_to_the_pair_only() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = owner_token(&db).await;
+        let (peer, peer_token) = join(&db, &owner, "peer@tinyserver.test", "member").await;
+        let (_other, other_token) = join(&db, &owner, "other@tinyserver.test", "member").await;
+        let server = serve(&db, Limits::default()).await;
+        let (mut owner_ws, ready) = connect(&server, &owner_token, None).await;
+        let (mut peer_ws, _) = connect(&server, &peer_token, None).await;
+        let (mut other_ws, other_ready) = connect(&server, &other_token, None).await;
+        let since = seq(&ready);
+        let other_since = seq(&other_ready);
+        let (direct, _) = db::open_direct(&db.runtime, &owner, &peer.user_id, false)
+            .await
+            .expect("direct");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let _ = until(&mut owner_ws, "direct.created").await;
+        let _ = until(&mut peer_ws, "direct.created").await;
+
+        let reply = ask_call(
+            &mut owner_ws,
+            json!({"type": "call.ring", "ref": "r", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "r"}));
+        let ring_id = until(&mut owner_ws, "call.ringing").await["ring_id"]
+            .as_str()
+            .expect("ring id")
+            .to_string();
+        let _ = until(&mut peer_ws, "call.ringing").await;
+        let reply = ask_call(
+            &mut peer_ws,
+            json!({"type": "call.decline", "ref": "d", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "d"}));
+        let logged = until(&mut owner_ws, "direct.call").await;
+        assert_eq!(logged["direct_id"], direct_id.as_str());
+        assert_eq!(logged["ring_id"], ring_id.as_str());
+        assert_eq!(logged["outcome"], "declined");
+        hears_nothing(&mut other_ws).await;
+
+        let (mut owner_ws, ready) = connect(&server, &owner_token, Some(since)).await;
+        assert_eq!(seq(&ready), since);
+        let replayed = until(&mut owner_ws, "direct.call").await;
+        assert_eq!(replayed["ring_id"], ring_id.as_str());
+        assert_eq!(replayed["outcome"], "declined");
+        let (mut peer_ws, _) = connect(&server, &peer_token, Some(since)).await;
+        assert_eq!(
+            until(&mut peer_ws, "direct.call").await["ring_id"],
+            ring_id.as_str()
+        );
+        let (mut other_ws, _) = connect(&server, &other_token, Some(other_since)).await;
+        hears_nothing(&mut other_ws).await;
+    })
+    .await;
+}
+
+/// A restart drops a ring that nobody answered. Nothing is written.
+#[tokio::test]
+async fn a_restart_mid_ring_writes_no_direct_call() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = owner_token(&db).await;
+        let (peer, peer_token) = join(&db, &owner, "peer@tinyserver.test", "member").await;
+        let server = serve(&db, Limits::default()).await;
+        let (mut owner_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut peer_ws, _) = connect(&server, &peer_token, None).await;
+        let (direct, _) = db::open_direct(&db.runtime, &owner, &peer.user_id, false)
+            .await
+            .expect("direct");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let _ = until(&mut owner_ws, "direct.created").await;
+        let _ = until(&mut peer_ws, "direct.created").await;
+        let reply = ask_call(
+            &mut owner_ws,
+            json!({"type": "call.ring", "ref": "r", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "r"}));
+        let _ = until(&mut owner_ws, "call.ringing").await;
+        let _ = until(&mut peer_ws, "call.ringing").await;
+
+        server.live.close();
+        assert_eq!(close_code(&mut owner_ws).await, 1012);
+        assert_eq!(close_code(&mut peer_ws).await, 1012);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM direct_call_log")
+            .fetch_one(&db.owner)
+            .await
+            .expect("log");
+        assert_eq!(rows, 0, "a restart mid-ring writes no row");
+    })
+    .await;
+}
+
+/// Text enrollment is not a prerequisite for ringing a direct, including on a text-required
+/// server. Opening the encrypted conversation does not authorize plaintext text sends.
+#[tokio::test]
+async fn an_encrypted_direct_call_needs_no_text_device() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = owner_token(&db).await;
+        let (peer, peer_token) = join(&db, &owner, "peer@tinyserver.test", "member").await;
+        let (_other, other_token) = join(&db, &owner, "other@tinyserver.test", "member").await;
+        sqlx::query("UPDATE server_settings SET e2ee_text = 'required'")
+            .execute(&db.owner)
+            .await
+            .expect("require encrypted text");
+        let devices: i64 = sqlx::query_scalar("SELECT count(*) FROM e2ee_devices")
+            .fetch_one(&db.owner)
+            .await
+            .expect("devices");
+        assert_eq!(devices, 0, "nobody has enrolled a text device");
+        let server = serve(&db, Limits::default()).await;
+        let http = reqwest::Client::new();
+        let base = format!("http://{}", server.addr);
+        let caps = http
+            .get(format!("{base}/v1/capabilities"))
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .expect("capabilities");
+        assert_eq!(caps.status(), 200);
+        let caps: Value = serde_json::from_str(&caps.text().await.expect("body")).expect("json");
+        assert!(caps["features"]
+            .as_array()
+            .expect("features")
+            .contains(&json!("direct_calls")));
+        let made = http
+            .post(format!("{base}/v1/directs"))
+            .bearer_auth(&owner_token)
+            .header("content-type", "application/json")
+            .body(json!({"user_id": peer.user_id, "e2ee": true}).to_string())
+            .send()
+            .await
+            .expect("open encrypted direct");
+        assert_eq!(made.status(), 201);
+        let direct: Value = serde_json::from_str(&made.text().await.expect("body")).expect("json");
+        assert_eq!(direct["e2ee"], true);
+        let direct_id = direct["id"].as_str().expect("direct id");
+        let (mut caller, _) = connect(&server, &owner_token, None).await;
+        let (mut callee, _) = connect(&server, &peer_token, None).await;
+        let (mut outsider, _) = connect(&server, &other_token, None).await;
+        let denied = ask_call(
+            &mut outsider,
+            json!({"type": "call.ring", "ref": "foreign", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(denied["code"], "not_found");
+        let placed = ask_call(
+            &mut caller,
+            json!({"type": "call.ring", "ref": "r", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(placed["type"], "ok");
+        let ringing = until(&mut caller, "call.ringing").await;
+        assert_eq!(
+            until(&mut callee, "call.ringing").await["ring_id"],
+            ringing["ring_id"]
+        );
+        let early = ask_call(
+            &mut caller,
+            json!({"type": "call.join", "ref": "early", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(
+            early["code"], "not_found",
+            "no media seat before acceptance"
+        );
+        let accepted = ask_call(
+            &mut callee,
+            json!({"type": "call.accept", "ref": "a", "direct_id": direct_id}),
+        )
+        .await;
+        assert_eq!(accepted["type"], "ok");
+        assert_eq!(
+            until(&mut caller, "call.accepted").await["ring_id"],
+            ringing["ring_id"]
+        );
+        let posted = http
+            .post(format!("{base}/v1/conversations/{direct_id}/messages"))
+            .bearer_auth(&owner_token)
+            .header("content-type", "application/json")
+            .body(json!({"body": "must not send plaintext"}).to_string())
+            .send()
+            .await
+            .expect("text request");
+        assert!(
+            !posted.status().is_success(),
+            "call intent must not bypass text encryption"
+        );
+        hears_nothing(&mut outsider).await;
+    })
+    .await;
+}
+
+/// Accept can win a race with the caller cancelling before its media seat exists. Scoped
+/// cleanup must end that direct without hanging up an unrelated voice-room seat.
+#[tokio::test]
+async fn leaving_an_accepted_direct_before_seating_keeps_the_other_room() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let token = owner_token(&db).await;
+        let (peer, peer_token) = join(&db, &owner, "peer@tinyserver.test", "member").await;
+        let voice = room(&db, &owner, "Existing room").await;
+        let (direct, _) = db::open_direct(&db.runtime, &owner, &peer.user_id, false)
+            .await
+            .expect("direct");
+        let direct_id = direct["id"].as_str().expect("direct id");
+        let server = serve(&db, Limits::default()).await;
+        let (mut caller, _) = connect(&server, &token, None).await;
+        let (mut callee, _) = connect(&server, &peer_token, None).await;
+        sit(&mut caller, &voice.id, &owner.user_id).await;
+        assert_eq!(
+            ask_call(
+                &mut caller,
+                json!({"type":"call.ring","ref":"r","direct_id":direct_id})
+            )
+            .await["type"],
+            "ok"
+        );
+        let ringing = until(&mut caller, "call.ringing").await;
+        until(&mut callee, "call.ringing").await;
+        assert_eq!(
+            ask_call(
+                &mut callee,
+                json!({"type":"call.accept","ref":"a","direct_id":direct_id})
+            )
+            .await["type"],
+            "ok"
+        );
+        until(&mut caller, "call.accepted").await;
+        until(&mut callee, "call.accepted").await;
+        assert_eq!(
+            ask_call(
+                &mut callee,
+                json!({"type":"call.join","ref":"j","direct_id":direct_id})
+            )
+            .await["type"],
+            "ok"
+        );
+        until(&mut callee, "call.joined").await;
+        until(&mut caller, "call.joined").await;
+        let stale = ask_call(
+            &mut caller,
+            json!({"type":"call.leave","ref":"stale","direct_id":direct_id,"ring_id":"00000000-0000-0000-0000-000000000001"}),
+        )
+        .await;
+        assert_eq!(stale["code"], "not_found", "a stale attempt cannot end the current one");
+        let reply = ask_call(
+            &mut caller,
+            json!({"type":"call.leave","ref":"l","direct_id":direct_id,"ring_id":ringing["ring_id"]}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type":"ok","ref":"l"}));
+        let (_, ready) = connect(&server, &token, None).await;
+        assert!(
+            ready["calls"]
+                .as_array()
+                .expect("rooms")
+                .iter()
+                .any(|call| {
+                    call["room_id"] == voice.id
+                        && call["participants"]
+                            .as_array()
+                            .expect("participants")
+                            .iter()
+                            .any(|participant| participant["user_id"] == owner.user_id)
+                }),
+            "scoped direct cleanup must preserve the existing room: {ready}"
+        );
+        let left = until(&mut callee, "call.left").await;
+        assert_eq!(left["user_id"], peer.user_id);
+        assert_eq!(left["reason"], "peer_left");
+        assert_eq!(left["direct_id"], direct_id);
+        let logged = until(&mut caller, "direct.call").await;
+        assert_eq!(logged["ring_id"], ringing["ring_id"]);
+        assert_eq!(logged["outcome"], "cancelled");
+        assert!(ready["ring"].is_null());
+    })
+    .await;
+}

@@ -121,7 +121,7 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 
 | `type` | Fields | When |
 | --- | --- | --- |
-| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants [participant]}]` | First frame after connect. Snapshot of everything ephemeral. `online` is sorted, includes the caller, and excludes bots. `calls` lists rooms with anyone in them, sorted by `room_id`, participants in join order. A participant is `{user_id, muted, deafened, camera, sharing, server_muted, server_deafened, suppressed, priority, e2ee}`; later versions may add fields. `e2ee` is whether they joined able to encrypt end to end. |
+| `ready` | `seq`, `me {user_id, role}`, `online [user_id]`, `calls [{room_id, participants [participant]}]`, optional `ring`, optional `direct_call` | First frame after connect. Snapshot of everything ephemeral. `online` is sorted, includes the caller, and excludes bots. `calls` lists rooms with anyone in them, sorted by `room_id`, participants in join order. It does not list direct calls. A participant is `{user_id, muted, deafened, camera, sharing, server_muted, server_deafened, suppressed, priority, e2ee}`; later versions may add fields. `e2ee` is whether they joined able to encrypt end to end. `ring` is this user's direct ring while it is still ringing or accepted and not yet live. `direct_call` is the direct call they are seated in. Both are omitted otherwise. See [Direct calls](#direct-calls). |
 | `server.updated` | `seq`, `server` | Durable. `server` is `GET /v1/server`. |
 | `role.created`, `role.updated` | `seq`, `role` | Durable. `role` is a `GET /v1/roles` row. |
 | `role.deleted` | `seq`, `role_id` | Durable |
@@ -148,6 +148,8 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `call.slots` | `call_id`, `audio [{mid, user_id}]`, `video` | Which receive slot carries whom. The whole map, sent to the socket in the call whenever it changes, and once after `call.answer`. `video` is `{mid, user_id, kind}` while the video slot carries someone, else `null`. `kind` is `camera` or `share`. It becomes `null` as soon as that source stops or the slot is planned empty. It names a new source only when the SFU writes that source's first keyframe, so reset the video decoder then. |
 | `call.speaking` | `room_id`, `user_ids` | Who is audible and speaking, in SFU join order, at most every 250 ms. Omitted when self-muted, server-muted, or suppressed. Sent to the seat socket of each person in that room's call, through the queue of 64. A person's other sockets do not get it. |
 | `call.e2ee` | `room_id`, `op`, and the op's fields | End-to-end encryption for the call this socket holds a seat in: `start`, `off`, `proposals`, `commit`, `welcome`. See [End-to-end encryption](#end-to-end-encryption). |
+| `call.ringing`, `call.accepted`, `call.declined`, `call.cancelled`, `call.missed` | `direct_id`, `ring_id`, `caller_id`, `callee_id` | The two people of a direct call. Not sent to the rest of the community. See [Direct calls](#direct-calls). |
+| `call.busy` | `direct_id` | The caller only. The other person is already in a direct ring or direct call. |
 | `resync` | none | The server closes with `4002` next. Client refetches rooms and members, then reconnects with no `since`. |
 | `error` | `ref`, `code` | A client request failed. `ref` is echoed when the request had one. |
 | `pong` | none | Reply to `ping` |
@@ -157,9 +159,10 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `ping` | none | Keepalive |
-| `call.join` | `ref`, `room_id`, `sdp`, `e2ee` | Join the room's call. Leaves any other call first. `sdp` is the offer. With an SFU configured it is required (`bad_frame` without it). With no SFU, a join with it gets `media_unavailable` and a join without it takes a seat with no audio. If the handle is present but the SFU task has stopped, an offer is `media_unavailable`. `e2ee` is optional: the highest end-to-end encryption version the app speaks, `1` today. |
+| `call.join` | `ref`, exactly one of `room_id` or `direct_id`, `sdp`, `e2ee` | Join a room's call, or an accepted direct call. Leaves any other call first. `sdp` is the offer. With an SFU configured it is required (`bad_frame` without it). With no SFU, a join with it gets `media_unavailable` and a join without it takes a seat with no audio. If the handle is present but the SFU task has stopped, an offer is `media_unavailable`. `e2ee` is optional: the highest end-to-end encryption version the app speaks, `1` today. Both `room_id` and `direct_id` is `bad_frame`. A direct does not use `e2ee_required`. See [Direct calls](#direct-calls). |
+| `call.ring`, `call.accept`, `call.decline`, `call.cancel` | `ref`, `direct_id` | Place, pick up, refuse, or take back a direct ring. Their own rate: 3 at once, then one every 10 s. See [Direct calls](#direct-calls). |
 | `call.e2ee` | `op`, and the op's fields | MLS for the caller's call: `key_package`, `commit`, `invalid`. No `ok`: the frames that follow answer it. See [End-to-end encryption](#end-to-end-encryption). |
-| `call.leave` | `ref` | Hang up. Not being in a call is not an error. Closing the socket that joined does the same after a 10 s grace, unless the same session opens a new socket first. |
+| `call.leave` | `ref`, optional pair `direct_id` and `ring_id` | Hang up. With neither target field, the existing call is left as before; not being in one is not an error. With both, end only that accepted/live direct attempt, even before taking its seat; an unrelated room stays joined. A stale attempt is `not_found`, and an incomplete target pair is `bad_frame`. Closing the socket that joined leaves after a 10 s grace, unless the same session opens a new socket first. |
 | `call.kick` | `ref`, `room_id`, `user_id` | disconnect_members in that room, and a rank above the person. Removes them from that room's call. Audited. |
 | `call.share_end` | `ref`, `room_id` | disconnect_members in that room, and a rank above the sharer. An owner skips the rank check and can end their own share. A member cannot; they stop theirs with `call.offer`. Ends the screen share in that room's call. Audited as `call.share_end`. The sharer's m-line keeps sending until they renegotiate; the SFU drops it, and the share stays ended until an offer sets that m-line `inactive` and a later one starts it again. |
 | `call.offer` | `ref`, `sdp` | Renegotiate the caller's media session, for example to start a camera or a share. The reply is `call.answer`. A camera or share that started or stopped is shown to everyone as `call.state`. A share someone else in the room holds is `share_taken`. Counts against the join and leave rate, so a client sending them fast gets `slow_down`. |
@@ -174,10 +177,11 @@ Error codes:
 
 | Code | Meaning |
 | --- | --- |
-| `not_found` | `call.join`: no such room, a room the caller cannot see (no view_channel), or `room_id` is not a room id. `call.kick` and `call.moderate`: that person is not in that room's call. `call.move`: that person is not in a call, or the room does not exist. `call.share_end`: nobody shares in that room's call. For kick, moderate, and share-end this is decided before the permission check, so a caller without the bit can still learn it. Occupancy is already sent to every member. `call.offer`, `call.state`, and `call.quality`: the caller is not in a call with media, or in a call at all. |
+| `not_found` | `call.join`: no such room, a room the caller cannot see (no view_channel), or `room_id` is not a room id. A `direct_id` the caller is not a party of, or a direct that has no accepted ring, is also `not_found`. `call.ring`, `call.accept`, `call.decline`, and `call.cancel` use `not_found` the same way, including when the wrong person sends the frame. `call.kick`, `call.moderate`, `call.move`, and `call.share_end` against a direct call are `not_found` and write no audit. `call.kick` and `call.moderate`: that person is not in that room's call. `call.move`: that person is not in a call, or the room does not exist. `call.share_end`: nobody shares in that room's call. For kick, moderate, and share-end this is decided before the permission check, so a caller without the bit can still learn it. Occupancy is already sent to every member. `call.offer`, `call.state`, and `call.quality`: the caller is not in a call with media, or in a call at all. |
+| `busy` | `call.ring` when the caller or the other person already has a direct ring or an accepted direct call. The caller also gets `call.busy`. The other person is not told. |
 | `forbidden` | `call.join` without connect in that room. `call.kick`, `call.share_end`, `call.moderate`, or `call.move` without the permission it needs. A member may not send `call.share_end` even for their own share; they stop it with `call.offer`. |
 | `hierarchy` | `call.kick`, `call.share_end`, `call.moderate`, or `call.move` against someone whose rank is not strictly below the caller's. An owner skips this and can act on anyone, including themselves. Anyone else cannot act on an owner, on an equal or higher role, or on themselves. |
-| `timed_out` | `call.join` from someone in a timeout |
+| `timed_out` | `call.join`, `call.ring`, `call.accept`, `call.decline`, or `call.cancel` while either person of that direct, or the room joiner, is in a timeout |
 | `room_full` | The room's call has as many people as its `user_limit`, or 12 when it has none (`TINYSERVER_CALL_ROOM_MAX`). Earlier versions sent `full`. |
 | `server_full` | 32 people are in calls on the server |
 | `slow_down` | With a `ref`: too many joins and leaves from this socket. Without one: too many messages. |
@@ -206,6 +210,7 @@ Error codes:
 | `timed_out` | A timeout started |
 | `media_timeout` | The SFU participant was not connected within 15 s of the SFU accepting the join (`sfu::Config::connect_timeout`). That is slightly before `call.answer` is written. |
 | `media_lost` | After connect, the SFU heard nothing for 15 s (`sfu::Config::consent_timeout`), or the RTC closed, died, or failed a poll. |
+| `peer_left` | The other person left a direct call. A room call does not use this. |
 
 ```json
 {"type":"ready","seq":41,"me":{"user_id":"9d1e…","role":"member"},"online":["5a0c…","9d1e…"],"calls":[]}
@@ -668,12 +673,28 @@ Cost, budgeted as if every byte both ways is billed: a 6-person camera call is a
 | mediad size | str0m and its crypto add a few MB, well under the "tens of MB" a full WebRTC stack would. Not measured yet; measure when `mediad` adopts it. |
 | Reconnect | A Tiny call survives a server restart by rejoining. `Reconnecting` already exists in `CallState`. |
 
+## Direct calls
+
+A direct call is not a room and not a message. The ring lives in memory. A restart drops it and writes no row. When it ends, `direct_call_log` stores `missed`, `declined`, `cancelled`, or `ended`, and `direct.call` goes to the two people. `GET /v1/directs` includes `last_call` from that row. There is no duration, SDP, token, key, or message body on it.
+
+`call.ring` `{direct_id}` from one party. Both must still be members, neither banned, neither timed out. Not a bot. The other person already in a direct ring or accepted direct call, or the caller already in one, is `busy`. The first of two people ringing each other wins. A ring lasts 30 s. Both sockets get `call.ringing` `{direct_id, ring_id, caller_id, callee_id}`. No seat yet, and no SFU join. Someone who connects before it ends sees `ring` on `ready`.
+
+The callee sends `call.accept`, `call.decline`, or the caller sends `call.cancel`. After accept, each side sends `call.join` with `direct_id` (not `room_id`), plus `sdp` and `e2ee` as for a room. The media room is `d:` plus the ring id, so the next call on the same direct is a new MLS group. That key is not a client field except as `room_id` on `call.joined`, `call.left`, `call.state`, and `call.speaking`, which also carry `direct_id`. Those frames go to the two people, not to every member and not to a `rooms.read` bot. `ready.calls` omits them.
+
+Both have 15 s to take a seat. The first can sit alone. If the window ends first, both get `call.left` `media_timeout` and the outcome is `ended`. Once both have media, one leaving ends the other with `peer_left`. A community room still leaves only that person, as `joined_elsewhere`, and the community sees that `call.left`.
+
+`call.kick`, `call.moderate`, `call.move`, and `call.share_end` on a direct seat are `not_found` and write no audit. A person stops their own share with `call.offer`. `call.leave` with no seat cancels a ring that person placed. It does not cancel a ring when they leave a community room. A removal, ban, or timeout that starts cancels a ring they are in. Operator read-only refuses ring, accept, decline, and cancel. A call already up keeps running.
+
+Text end-to-end encryption on the direct does not force call encryption. Both apps that send `e2ee: 1` get an in-memory group. One that cannot turns that call to transport only. `e2ee_required` is not used. The group id is the hash of `tiny-e2ee-v1 room ` plus `d:{ring_id}`, not a room's group and not the text MLS group.
+
+The capability is `direct_calls` on `GET /v1/capabilities`. Ring, accept, decline, and cancel share a rate of 3, then one every 10 s, separate from the join and leave rate.
+
 ## Open questions for the owner
 
 | Question | Recommended default |
 | --- | --- |
 | Text messages in voice rooms? | No. Voice rooms have no messages. Text channels and direct messages already ride this socket. |
-| Ringing and 1:1 calls? | No. Drop-in rooms only. A two-person room covers a 1:1. |
+| Ringing and 1:1 calls? | Yes, for a direct message. Rooms stay drop-in. See [Direct calls](#direct-calls). |
 | Screen share? | Yes, built in slice 6. One H.264 share per room, one layer. Other listeners see it instead of a camera. The sharer keeps a camera, and nobody sees their own picture. |
 | Recording? | None. The SFU never writes media to disk. Revisit only with a per-call consent prompt. |
 | E2EE? | DAVE version 1. The server is the MLS delivery service and external sender and seals no frames. tinyclient seals Opus and the H.264 picture when the call is end to end. The picture's one-byte NAL header stays clear. The server does not read NAL headers and does not implement a video sealer. See [End-to-end encryption](#end-to-end-encryption). |

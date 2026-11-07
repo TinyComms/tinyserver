@@ -1086,3 +1086,178 @@ async fn server_mute_and_deafen_reach_the_sfu() {
     })
     .await;
 }
+
+/// Joins an accepted direct. The media room is `d:{ring_id}`, named on the joined frames.
+async fn dial_direct(mut ws: Ws, user_id: &str, direct_id: &str, marker: u8) -> Person {
+    let mut client = Client::new(SocketAddr::from((LOOPBACK, 0)), SLOTS).expect("client");
+    let request =
+        json!({"type": "call.join", "ref": "j", "direct_id": direct_id, "sdp": client.offer()});
+    ws.send(Message::text(request.to_string()))
+        .await
+        .expect("send");
+    let answer = until(&mut ws, |value| {
+        (value["type"] == "call.answer" || value["type"] == "error").then(|| value.clone())
+    })
+    .await;
+    assert_eq!(answer["type"], "call.answer", "{answer}");
+    let call_id = answer["call_id"].as_str().expect("call id").to_string();
+    client
+        .accept(answer["sdp"].as_str().expect("sdp"))
+        .expect("accept the answer");
+    let running = client.start(marker).expect("client thread");
+    let deadline = Instant::now() + WAIT;
+    while !running.connected() {
+        assert!(Instant::now() < deadline, "media did not connect");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Person {
+        ws,
+        user_id: user_id.to_string(),
+        call_id,
+        running,
+    }
+}
+
+/// Rings, the other person accepts, and both join with media.
+/// The token is the owner's session, so a later socket is the same device.
+async fn accepted_pair(db: &TestDb) -> (Server, String, String, String, Person, Person) {
+    let owner = first_owner(db).await;
+    let owner_token = owner_token(db).await;
+    let (peer, peer_token) = join(db, &owner, "peer@tinyserver.test", "member").await;
+    let server = serve_media(db).await;
+    let (mut owner_ws, _) = connect(&server, &owner_token, None).await;
+    let (mut peer_ws, _) = connect(&server, &peer_token, None).await;
+    let (direct, created) = db::open_direct(&db.runtime, &owner, &peer.user_id, false)
+        .await
+        .expect("direct");
+    assert!(created);
+    let direct_id = direct["id"].as_str().expect("direct id").to_string();
+    until(&mut owner_ws, |value| {
+        (value["type"] == "direct.created").then_some(())
+    })
+    .await;
+    until(&mut peer_ws, |value| {
+        (value["type"] == "direct.created").then_some(())
+    })
+    .await;
+
+    let reply = answer(
+        &mut owner_ws,
+        json!({"type": "call.ring", "ref": "r", "direct_id": direct_id}),
+    )
+    .await;
+    assert_eq!(reply, json!({"type": "ok", "ref": "r"}));
+    let ringing = until(&mut owner_ws, |value| {
+        (value["type"] == "call.ringing").then(|| value.clone())
+    })
+    .await;
+    let ring_id = ringing["ring_id"].as_str().expect("ring id").to_string();
+    until(&mut peer_ws, |value| {
+        (value["type"] == "call.ringing").then_some(())
+    })
+    .await;
+    let reply = answer(
+        &mut peer_ws,
+        json!({"type": "call.accept", "ref": "a", "direct_id": direct_id}),
+    )
+    .await;
+    assert_eq!(reply, json!({"type": "ok", "ref": "a"}));
+    until(&mut owner_ws, |value| {
+        (value["type"] == "call.accepted").then_some(())
+    })
+    .await;
+    until(&mut peer_ws, |value| {
+        (value["type"] == "call.accepted").then_some(())
+    })
+    .await;
+
+    let a = dial_direct(owner_ws, &owner.user_id, &direct_id, b'A').await;
+    let b = dial_direct(peer_ws, &peer.user_id, &direct_id, b'B').await;
+    (server, direct_id, ring_id, owner_token, a, b)
+}
+
+fn left_frame(value: &Value) -> Option<Value> {
+    (value["type"] == "call.left").then(|| value.clone())
+}
+
+#[tokio::test]
+async fn a_direct_call_carries_voice_one_picture_and_ends_for_both() {
+    run(|db| async move {
+        let (_server, direct_id, ring_id, _owner_token, mut a, mut b) = accepted_pair(&db).await;
+        let room_id = format!("d:{ring_id}");
+        let a_slots = slots(&mut a.ws, &a.call_id, 1).await;
+        let b_slots = slots(&mut b.ws, &b.call_id, 1).await;
+        a.running.sending(true);
+        b.running.sending(true);
+        hears(&b, &mid_for(&b_slots, &a.user_id), b'A').await;
+        hears(&a, &mid_for(&a_slots, &b.user_id), b'B').await;
+
+        camera(&mut a, true).await;
+        video_slot(&mut b.ws, &b.call_id, Some(&a.user_id)).await;
+        assert!(
+            sees(&b, b'A').await[0].keyframe,
+            "the camera starts on a keyframe"
+        );
+
+        let reply = share(&mut a, true).await;
+        assert_eq!(reply["type"], "call.answer", "{reply}");
+        sees_share(&mut b, &a.user_id, b'A').await;
+        let refused = share(&mut b, true).await;
+        assert_eq!(
+            refused,
+            json!({"type": "error", "ref": "s", "code": "share_taken"})
+        );
+
+        let reply = answer(&mut a.ws, json!({"type": "call.leave", "ref": "l"})).await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "l"}));
+        for ws in [&mut a.ws, &mut b.ws] {
+            let leaver = until(ws, left_frame).await;
+            let peer = until(ws, left_frame).await;
+            assert_eq!(leaver["user_id"], a.user_id.as_str());
+            assert_eq!(leaver["reason"], "left");
+            assert_eq!(peer["user_id"], b.user_id.as_str());
+            assert_eq!(peer["reason"], "peer_left");
+            assert_eq!(leaver["room_id"], room_id.as_str());
+            assert_eq!(leaver["direct_id"], direct_id.as_str());
+            assert_eq!(peer["room_id"], room_id.as_str());
+            assert_eq!(peer["direct_id"], direct_id.as_str());
+        }
+    })
+    .await;
+}
+
+/// Dropping the live socket and coming back on the same session keeps the media.
+#[tokio::test]
+async fn a_direct_blip_keeps_the_media_and_is_not_a_voice_channel() {
+    run(|db| async move {
+        let (server, direct_id, _ring_id, owner_token, mut a, b) = accepted_pair(&db).await;
+        let a_slots = slots(&mut a.ws, &a.call_id, 1).await;
+        b.running.sending(true);
+        hears(&a, &mid_for(&a_slots, &b.user_id), b'B').await;
+
+        let Person {
+            ws,
+            user_id,
+            call_id,
+            running,
+        } = a;
+        drop(ws);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (ws, ready) = connect(&server, &owner_token, None).await;
+        assert_eq!(ready["direct_call"]["direct_id"], direct_id.as_str());
+        assert!(ready["calls"]
+            .as_array()
+            .expect("calls")
+            .iter()
+            .all(|call| !call["room_id"].as_str().unwrap_or("").starts_with("d:")));
+        let mut a = Person {
+            ws,
+            user_id,
+            call_id,
+            running,
+        };
+        assert_eq!(slots(&mut a.ws, &a.call_id, 1).await, a_slots);
+        hears(&a, &mid_for(&a_slots, &b.user_id), b'B').await;
+    })
+    .await;
+}

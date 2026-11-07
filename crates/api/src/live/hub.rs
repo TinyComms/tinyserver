@@ -48,6 +48,7 @@ struct People {
     users: HashMap<String, Person>,
     next_conn: u64,
     calls: Calls,
+    rings: super::ring::Rings,
     /// The latest `call.slots` frame for each SFU participant, seated or not yet.
     slots: HashMap<String, Arc<str>>,
     /// End-to-end encryption: the MLS delivery service for each room's call.
@@ -123,6 +124,8 @@ pub(crate) struct Joined {
     pub proofs: mpsc::UnboundedReceiver<Proof>,
     pub online: Vec<String>,
     pub calls: Vec<Occupancy>,
+    pub ring: Option<super::ring::ReadyRing>,
+    pub direct_call: Option<super::ring::ReadyDirect>,
 }
 
 /// One reserved socket. Dropping it frees the place.
@@ -172,6 +175,7 @@ impl Hub {
         }
         tokio::spawn(remember(hub.clone(), hub.stop.subscribe()));
         tokio::spawn(rekey(hub.clone(), hub.stop.subscribe()));
+        tokio::spawn(sweep_rings(hub.clone(), hub.stop.subscribe()));
         hub
     }
 
@@ -185,6 +189,7 @@ impl Hub {
         self.stop.send_replace(true);
         let mut people = lock(&self.people);
         people.calls.clear();
+        people.rings = super::ring::Rings::default();
         people.slots.clear();
         people.e2ee.clear();
         if let Some(media) = &self.media {
@@ -289,6 +294,8 @@ impl Hub {
             proofs: asked,
             online,
             calls: people.calls.snapshot(),
+            ring: people.rings.ready(user_id),
+            direct_call: direct_ready(&people, user_id),
         }
     }
 
@@ -437,8 +444,26 @@ impl Hub {
         if self.closing() {
             return Err(Refused::Closing);
         }
+        if super::call::is_direct_room(room_id) {
+            let accepted = people
+                .rings
+                .direct_of_room(room_id)
+                .is_some_and(|direct_id| {
+                    people.rings.join_key(direct_id, user_id).ok().as_deref() == Some(room_id)
+                });
+            if !accepted {
+                // SFU preparation awaited outside this lock. A timeout or removal can end
+                // the ring in that interval. Do not seat an orphan or retain its transport.
+                drop(people);
+                if let Some(call_id) = call_id {
+                    self.forget(call_id);
+                }
+                return Err(Refused::NotFound);
+            }
+        }
         let limit = self.room_limit(&people.calls, user_id, room_id, user_limit);
-        let again = people.calls.room_of(user_id) == Some(room_id);
+        let previous = people.calls.room_of(user_id).map(str::to_string);
+        let again = previous.as_deref() == Some(room_id);
         let changes = people.calls.join(
             user_id,
             room_id,
@@ -470,6 +495,20 @@ impl Hub {
                     .set_media(user_id, &answer.call_id, answer.camera, answer.share);
             self.tell(&mut people, change);
         }
+        if people.calls.note_direct_pair(room_id) {
+            people.rings.mark_live(room_id);
+        }
+        let mut notices = Vec::new();
+        if let Some(previous) = previous.as_deref() {
+            if previous != room_id
+                && super::call::is_direct_room(previous)
+                && people.calls.people(previous).is_empty()
+            {
+                if let Some(notice) = people.rings.on_room_empty(previous) {
+                    notices.push(notice);
+                }
+            }
+        }
         // A new SFU participant starts unmoderated.
         if let Some(moderation) = people.calls.moderation(user_id) {
             if moderation.silenced || moderation.hushed {
@@ -480,6 +519,7 @@ impl Hub {
         if let Some(frame) = call_id.and_then(|call_id| people.slots.get(call_id)) {
             people.direct(user_id, conn, frame.clone());
         }
+        self.announce_rings(people, notices);
         Ok(())
     }
 
@@ -571,6 +611,9 @@ impl Hub {
         tokio::spawn(async move {
             let rooms = lock(&hub.people).calls.occupied();
             for (room_id, people) in rooms {
+                if super::call::is_direct_room(&room_id) {
+                    continue;
+                }
                 let permissions = match db::room_permissions(&hub.pool, &room_id, &people).await {
                     Ok(permissions) => permissions,
                     Err(error) => {
@@ -629,11 +672,26 @@ impl Hub {
         true
     }
 
-    /// Ends `user_id`'s call, if they are in one.
-    pub fn call_leave(&self, user_id: &str, reason: Reason) {
+    /// Ends `user_id`'s call, if they are in one. `end_rings` also drops a direct ring they are
+    /// in: a ban or a removal. `call.leave` with no seat only cancels a ring this person placed.
+    pub fn call_leave(&self, user_id: &str, reason: Reason, end_rings: bool) {
         let mut people = lock(&self.people);
-        let change = people.calls.leave(user_id, reason);
-        self.tell(&mut people, change);
+        let room = people.calls.room_of(user_id).map(str::to_string);
+        let mut changes = people.calls.leave(user_id, reason);
+        if end_rings {
+            // Either party may still be preparing media, with no seat of their own yet.
+            // End the other party's accepted seat before removing the ring and its timer.
+            if let Some(ring) = people.rings.ready(user_id).filter(|ring| ring.accepted) {
+                changes.extend(
+                    people
+                        .calls
+                        .end_room(&super::ring::room_key(&ring.ring_id), reason),
+                );
+            }
+        }
+        self.tell(&mut people, changes);
+        let notices = settle_direct(&mut people, room.as_deref(), user_id, end_rings);
+        self.announce_rings(people, notices);
     }
 
     /// Ends `user_id`'s call if it is in `room_id`. False if they were not there.
@@ -644,6 +702,8 @@ impl Hub {
         }
         let change = people.calls.leave(user_id, Reason::Kicked);
         self.tell(&mut people, change);
+        let notices = settle_direct(&mut people, Some(room_id), user_id, false);
+        self.announce_rings(people, notices);
         true
     }
 
@@ -655,6 +715,12 @@ impl Hub {
         let mut people = lock(&self.people);
         let changes = people.calls.end_room(room_id, reason);
         self.tell(&mut people, changes);
+        let notices = if super::call::is_direct_room(room_id) {
+            people.rings.on_room_empty(room_id).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        self.announce_rings(people, notices);
     }
 
     /// Socket `conn` closed with `reason`. If it held its person's seat, they leave now, or
@@ -666,8 +732,11 @@ impl Hub {
                 return;
             };
             if let Some(reason) = reason {
-                let change = people.calls.leave(user_id, reason);
-                self.tell(&mut people, change);
+                let room = people.calls.room_of(user_id).map(str::to_string);
+                let changes = people.calls.leave(user_id, reason);
+                self.tell(&mut people, changes);
+                let notices = settle_direct(&mut people, room.as_deref(), user_id, false);
+                self.announce_rings(people, notices);
                 return;
             }
             epoch
@@ -677,8 +746,16 @@ impl Hub {
         tokio::spawn(async move {
             tokio::time::sleep(hub.limits.presence_grace).await;
             let mut people = lock(&hub.people);
-            let change = people.calls.expire(&user_id, epoch);
-            hub.tell(&mut people, change);
+            let room = people.calls.room_of(&user_id).map(str::to_string);
+            let changes = people.calls.expire(&user_id, epoch);
+            let left = !changes.is_empty();
+            hub.tell(&mut people, changes);
+            let notices = if left {
+                settle_direct(&mut people, room.as_deref(), &user_id, false)
+            } else {
+                Vec::new()
+            };
+            hub.announce_rings(people, notices);
         });
     }
 
@@ -692,17 +769,17 @@ impl Hub {
             }
             "member.removed" => {
                 if let Some(user_id) = &event.subject {
-                    self.call_leave(user_id, Reason::Removed);
+                    self.call_leave(user_id, Reason::Removed, true);
                 }
             }
             "member.banned" => {
                 if let Some(user_id) = &event.subject {
-                    self.call_leave(user_id, Reason::Banned);
+                    self.call_leave(user_id, Reason::Banned, true);
                 }
             }
             "member.timeout" if event.timed_out => {
                 if let Some(user_id) = &event.subject {
-                    self.call_leave(user_id, Reason::TimedOut);
+                    self.call_leave(user_id, Reason::TimedOut, true);
                 }
             }
             "role.updated" | "role.deleted" | "member.roles" | "member.role" | "room.updated" => {
@@ -722,6 +799,7 @@ impl Hub {
                     participant,
                 } => Out::CallJoined {
                     room_id,
+                    direct_id: people.rings.direct_of_room(room_id),
                     participant,
                 }
                 .text(),
@@ -743,6 +821,7 @@ impl Hub {
                     people.e2ee(frames);
                     Out::CallLeft {
                         room_id,
+                        direct_id: people.rings.direct_of_room(room_id),
                         user_id,
                         reason: reason.as_str(),
                     }
@@ -753,11 +832,36 @@ impl Hub {
                     participant,
                 } => Out::CallState {
                     room_id,
+                    direct_id: people.rings.direct_of_room(room_id),
                     participant,
                 }
                 .text(),
             };
-            let _ = self.ephemeral.send(Arc::from(frame));
+            let (room_id, extra) = match &change {
+                Change::Joined { room_id, .. } | Change::State { room_id, .. } => {
+                    (room_id.clone(), None)
+                }
+                Change::Left {
+                    room_id, user_id, ..
+                } => (room_id.clone(), Some(user_id.clone())),
+            };
+            let frame: Arc<str> = Arc::from(frame);
+            if super::call::is_direct_room(&room_id) {
+                let mut users = people
+                    .rings
+                    .parties(&room_id)
+                    .unwrap_or_else(|| people.calls.people(&room_id).to_vec());
+                if let Some(extra) = extra {
+                    if !users.iter().any(|user| user == &extra) {
+                        users.push(extra);
+                    }
+                }
+                for user in users {
+                    people.fanout(&user, Arc::clone(&frame));
+                }
+            } else {
+                let _ = self.ephemeral.send(frame);
+            }
         }
     }
 
@@ -811,6 +915,183 @@ impl Hub {
         Ok(())
     }
 
+    /// Places a direct ring. `busy` when either person already has one. The caller hears
+    /// `call.busy`; both hear `call.ringing` when it is placed.
+    pub fn start_ring(
+        &self,
+        direct_id: &str,
+        caller_id: &str,
+        callee_id: &str,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let notice = match people.rings.start(direct_id, caller_id, callee_id) {
+            super::ring::Start::Placed(notice) | super::ring::Start::Busy(notice) => notice,
+        };
+        let busy = matches!(notice.kind, super::ring::Kind::Busy { .. });
+        self.announce_rings(people, [notice]);
+        if busy {
+            Err("busy")
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn accept_ring(&self, direct_id: &str, user_id: &str) -> Result<(), &'static str> {
+        self.finish_ring(|rings| rings.accept(direct_id, user_id))
+    }
+
+    pub fn decline_ring(&self, direct_id: &str, user_id: &str) -> Result<(), &'static str> {
+        self.finish_ring(|rings| rings.decline(direct_id, user_id))
+    }
+
+    pub fn cancel_ring(&self, direct_id: &str, user_id: &str) -> Result<(), &'static str> {
+        self.finish_ring(|rings| rings.cancel(direct_id, user_id))
+    }
+
+    /// The media room for an accepted direct, or `not_found`.
+    pub fn direct_join_key(&self, direct_id: &str, user_id: &str) -> Result<String, &'static str> {
+        lock(&self.people).rings.join_key(direct_id, user_id)
+    }
+
+    /// Ends one accepted/live direct attempt, including when this party has not taken a
+    /// media seat yet. Their current unrelated room stays. A stale attempt has no effects.
+    pub fn leave_direct(
+        &self,
+        direct_id: &str,
+        ring_id: &str,
+        user_id: &str,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let room_id = people.rings.join_key(direct_id, user_id)?;
+        if room_id != super::ring::room_key(ring_id) {
+            return Err("not_found");
+        }
+        if people.calls.room_of(user_id) == Some(room_id.as_str()) {
+            let changes = people.calls.leave(user_id, Reason::Left);
+            self.tell(&mut people, changes);
+        }
+        let changes = people.calls.end_room(&room_id, Reason::PeerLeft);
+        self.tell(&mut people, changes);
+        let notice = people
+            .rings
+            .drop_user(user_id)
+            .expect("validated direct attempt");
+        self.announce_rings(people, [notice]);
+        Ok(())
+    }
+
+    fn finish_ring(
+        &self,
+        action: impl FnOnce(&mut super::ring::Rings) -> Result<super::ring::Notice, &'static str>,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let notice = action(&mut people.rings)?;
+        self.announce_rings(people, [notice]);
+        Ok(())
+    }
+
+    /// Queue ring frames before releasing the mutation lock. Another socket's accept or a
+    /// timer must not publish a later state first. Database work begins after the lock drops.
+    fn announce_rings(
+        &self,
+        people: MutexGuard<'_, People>,
+        notices: impl IntoIterator<Item = super::ring::Notice>,
+    ) {
+        let notices: Vec<_> = notices.into_iter().collect();
+        use super::ring::Kind;
+        for notice in &notices {
+            let frame = match &notice.kind {
+                Kind::Ringing(card) => Some(Out::CallRinging { card }.text()),
+                Kind::Accepted(card) => Some(Out::CallAccepted { card }.text()),
+                Kind::Declined(card) => Some(Out::CallDeclined { card }.text()),
+                Kind::Cancelled(card) => Some(Out::CallCancelled { card }.text()),
+                Kind::Missed(card) => Some(Out::CallMissed { card }.text()),
+                Kind::Busy { direct_id } => Some(Out::CallBusy { direct_id }.text()),
+                Kind::MediaTimeout(_) | Kind::Ended(_) => None,
+            };
+            if let Some(frame) = frame {
+                let frame: Arc<str> = Arc::from(frame);
+                for user in &notice.users {
+                    people.fanout(user, Arc::clone(&frame));
+                }
+            }
+        }
+        drop(people);
+        for notice in notices {
+            self.record_ring(notice);
+        }
+    }
+
+    fn record_ring(&self, notice: super::ring::Notice) {
+        if let Some(record) = &notice.record {
+            tracing::info!(
+                direct_id = %record.direct_id,
+                ring_id = %record.ring_id,
+                user_id = %record.caller_id,
+                callee_id = %record.callee_id,
+                outcome = record.outcome,
+                "direct call ended"
+            );
+        }
+        if let Some(record) = notice.record {
+            let call = db::DirectCallRecord {
+                ring_id: record.ring_id,
+                direct_id: record.direct_id,
+                caller_id: record.caller_id,
+                callee_id: record.callee_id,
+                outcome: record.outcome,
+                accepted_at: record.accepted_at,
+            };
+            let pool = self.pool.clone();
+            tokio::spawn(async move {
+                if let Err(error) = db::record_direct_call(&pool, &call).await {
+                    tracing::warn!(
+                        %error,
+                        direct_id = %call.direct_id,
+                        ring_id = %call.ring_id,
+                        outcome = call.outcome,
+                        "direct call not recorded"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Ends rings whose wait is over. An accepted call's seats go first, while the ring still
+    /// names the pair, so `call.left` reaches both.
+    fn expire_rings(&self) {
+        let now = std::time::Instant::now();
+        let due = lock(&self.people).rings.due(now);
+        for item in due {
+            let mut people = lock(&self.people);
+            if people.rings.accepted_due(&item.id, now) {
+                let seated = people.calls.people(&item.room_id).to_vec();
+                for user_id in &seated {
+                    let changes = people.calls.leave(user_id, Reason::MediaTimeout);
+                    self.tell(&mut people, changes);
+                }
+                for user_id in [&item.caller_id, &item.callee_id] {
+                    if seated.iter().any(|seated_id| seated_id == user_id) {
+                        continue;
+                    }
+                    let frame: Arc<str> = Arc::from(
+                        Out::CallLeft {
+                            room_id: &item.room_id,
+                            direct_id: Some(&item.direct_id),
+                            user_id,
+                            reason: "media_timeout",
+                        }
+                        .text(),
+                    );
+                    people.fanout(&item.caller_id, Arc::clone(&frame));
+                    people.fanout(&item.callee_id, frame);
+                }
+            }
+            let notice = people.rings.take_due(&item.id, now);
+            self.announce_rings(people, notice);
+        }
+    }
+
     /// Acts on what the SFU reports.
     fn hear(&self, event: sfu::Event) {
         let mut people = lock(&self.people);
@@ -849,9 +1130,11 @@ impl Hub {
                 people.slots.insert(call_id, frame);
             }
             sfu::Event::Speaking { room_id, user_ids } => {
+                let direct_id = people.rings.direct_of_room(&room_id).map(str::to_string);
                 let frame: Arc<str> = Arc::from(
                     Out::CallSpeaking {
                         room_id: &room_id,
+                        direct_id: direct_id.as_deref(),
                         user_ids: &user_ids,
                     }
                     .text(),
@@ -865,12 +1148,15 @@ impl Hub {
                 let Some(user_id) = people.calls.holder(&call_id).map(str::to_string) else {
                     return;
                 };
+                let room = people.calls.room_of(&user_id).map(str::to_string);
                 let reason = match lost {
                     sfu::Lost::Timeout => Reason::MediaTimeout,
                     sfu::Lost::Gone => Reason::MediaLost,
                 };
-                let change = people.calls.leave(&user_id, reason);
-                self.tell(&mut people, change);
+                let changes = people.calls.leave(&user_id, reason);
+                self.tell(&mut people, changes);
+                let notices = settle_direct(&mut people, room.as_deref(), &user_id, false);
+                self.announce_rings(people, notices);
             }
             sfu::Event::Load {
                 egress_kbps,
@@ -899,6 +1185,19 @@ async fn remember(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
         if last {
             return;
         }
+    }
+}
+
+/// Ends direct rings whose answer window, or seat window, has run out.
+async fn sweep_rings(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stop.wait_for(|stopped| *stopped) => return,
+            _ = ticks.tick() => {}
+        }
+        hub.expire_rings();
     }
 }
 
@@ -1042,6 +1341,203 @@ impl Hub {
     }
 }
 
+fn direct_ready(people: &People, user_id: &str) -> Option<super::ring::ReadyDirect> {
+    let room = people.calls.room_of(user_id)?;
+    if !super::call::is_direct_room(room) {
+        return None;
+    }
+    let direct_id = people.rings.direct_of_room(room)?.to_string();
+    let ring_id = room.strip_prefix("d:")?.to_string();
+    Some(super::ring::ReadyDirect {
+        direct_id,
+        ring_id,
+        participants: people.calls.participants_of(room),
+    })
+}
+
+/// A direct room that just emptied writes its outcome. `end_rings` also drops a ring when a
+/// ban, removal, or timeout ends membership. `call.leave` with no seat only cancels a ring
+/// this person placed. Leaving a community room does not.
+fn settle_direct(
+    people: &mut People,
+    room: Option<&str>,
+    user_id: &str,
+    end_rings: bool,
+) -> Vec<super::ring::Notice> {
+    let mut notices = Vec::new();
+    if let Some(room) = room {
+        if super::call::is_direct_room(room) && people.calls.people(room).is_empty() {
+            if let Some(notice) = people.rings.on_room_empty(room) {
+                notices.push(notice);
+            }
+        }
+    }
+    if end_rings {
+        if let Some(notice) = people.rings.drop_user(user_id) {
+            notices.push(notice);
+        }
+    } else if room.is_none() {
+        if let Some(notice) = people.rings.cancel_outgoing(user_id) {
+            notices.push(notice);
+        }
+    }
+    notices
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_accept_never_overtakes_the_ringing_frame() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/direct_call_unit")
+            .expect("lazy pool");
+        let hub = Hub::start(pool, Limits::default(), None);
+        let (sent, mut heard) = mpsc::channel(16);
+        let (kick, _kicked) = oneshot::channel();
+        let (proofs, _proof_requests) = mpsc::unbounded_channel();
+        lock(&hub.people).users.insert(
+            "caller".into(),
+            Person {
+                conns: vec![Conn {
+                    id: 1,
+                    kick,
+                    direct: sent,
+                    proofs,
+                }],
+                ..Person::default()
+            },
+        );
+        for _ in 0..512 {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let observer_hub = hub.clone();
+            let observer_barrier = barrier.clone();
+            let observer = std::thread::spawn(move || {
+                observer_barrier.wait();
+                loop {
+                    if lock(&observer_hub.people).rings.ready("callee").is_some() {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                observer_hub
+                    .accept_ring("direct", "callee")
+                    .expect("accept");
+            });
+            barrier.wait();
+            hub.start_ring("direct", "caller", "callee").expect("ring");
+            observer.join().expect("observer");
+            let first: serde_json::Value =
+                serde_json::from_str(&heard.try_recv().expect("first event")).expect("json");
+            let second: serde_json::Value =
+                serde_json::from_str(&heard.try_recv().expect("second event")).expect("json");
+            assert_eq!(
+                first["type"], "call.ringing",
+                "mutation order is delivery order"
+            );
+            assert_eq!(second["type"], "call.accepted");
+            lock(&hub.people).rings.drop_user("caller");
+        }
+        hub.close();
+    }
+
+    #[tokio::test]
+    async fn a_direct_that_expired_while_media_was_prepared_cannot_take_a_seat() {
+        // Prepare and connect real media before the final admission. A ring can expire
+        // while the socket awaits SFU preparation, so rejecting only its seat is insufficient.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/direct_call_unit")
+            .expect("lazy pool");
+        let loopback = std::net::Ipv4Addr::LOCALHOST;
+        let config = sfu::Config::new((loopback, 0).into(), loopback.into());
+        let (media, events) = sfu::start(config).expect("SFU");
+        let hub = Hub::start(pool, Limits::default(), Some((media.clone(), events)));
+        let room_id = {
+            let mut people = lock(&hub.people);
+            people.rings.start("direct", "caller", "callee");
+            people.rings.accept("direct", "callee").expect("accepted");
+            people.rings.join_key("direct", "caller").expect("join key")
+        };
+        let mut client = sfu::client::Client::new((loopback, 0).into(), 1).expect("media client");
+        let offer = client.offer().to_owned();
+        let answer = media
+            .join(&room_id, "caller", &offer)
+            .await
+            .expect("media prepared");
+        client.accept(&answer.sdp).expect("media answer");
+        let running = client.start(b'A').expect("media transport");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !running.connected() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "media never connected"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let mut people = lock(&hub.people);
+            let notices = people
+                .rings
+                .expire_due(std::time::Instant::now() + super::super::ring::SEAT_FOR);
+            assert_eq!(notices.len(), 1, "the ring ended during media preparation");
+        }
+        let result = hub.call_join(
+            "caller",
+            &room_id,
+            1,
+            Some(&answer),
+            2,
+            Access::default(),
+            false,
+            [0; 32],
+        );
+        assert!(
+            result.is_err(),
+            "an expired direct cannot gain a ghost seat"
+        );
+        assert!(hub.room_of("caller").is_none());
+        assert_eq!(
+            media.offer(&answer.call_id, &offer).await,
+            Err(sfu::Refused::NotFound),
+            "rejected media and its connected transport must be removed"
+        );
+        hub.close();
+    }
+
+    #[tokio::test]
+    async fn removing_an_unseated_callee_ends_the_callers_accepted_seat() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/direct_call_unit")
+            .expect("lazy pool");
+        let hub = Hub::start(pool, Limits::default(), None);
+        let room_id = {
+            let mut people = lock(&hub.people);
+            people.rings.start("direct", "caller", "callee");
+            people.rings.accept("direct", "callee").expect("accepted");
+            people.rings.join_key("direct", "caller").expect("join key")
+        };
+        hub.call_join(
+            "caller",
+            &room_id,
+            1,
+            None,
+            2,
+            Access::default(),
+            false,
+            [0; 32],
+        )
+        .expect("the caller has a seat; the callee is still connecting");
+        hub.call_leave("callee", Reason::Removed, true);
+        assert!(
+            hub.room_of("caller").is_none(),
+            "removing either party ends the accepted call"
+        );
+        assert!(lock(&hub.people).rings.ready("caller").is_none());
+        hub.close();
+    }
 }
