@@ -7,6 +7,7 @@ mod call;
 mod e2ee;
 pub(crate) mod frame;
 mod hub;
+mod ring;
 mod socket;
 
 use std::sync::Arc;

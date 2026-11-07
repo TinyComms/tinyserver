@@ -8,6 +8,7 @@ mod auth;
 mod bootstrap;
 mod bot;
 mod community;
+mod direct_call;
 mod e2ee;
 mod error;
 mod media;
@@ -44,6 +45,7 @@ pub use community::{
     AuditQuery, AuditRow, Caller, CommunityError, Invite, InviteIssued, InviteOptions, Member,
     NewRoom, Override, Room, RoomPatch, Wrote, DEFAULT_INVITE_SECS,
 };
+pub use direct_call::{direct_parties, record_direct_call, DirectCallRecord, DirectParties};
 pub use e2ee::{
     active_keys, apply_commit, clear_server_private, commit_snapshot, community_root, create_group,
     device_key, e2ee_text_mode, group_info, handshake_after, invite_capability, issue_proposals,

@@ -1,0 +1,10 @@
+{
+  "id": "direct-calls",
+  "title": "Two members ring, accept, exchange direct-call media and leave privately",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres", "two-people"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "pending the matching direct-call client integration"
+}

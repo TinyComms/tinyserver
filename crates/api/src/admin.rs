@@ -24,6 +24,7 @@ pub const FEATURES: &[&str] = &[
     "audit_query",
     "voice_moderation",
     "e2ee_calls",
+    "direct_calls",
     "e2ee_text",
     "upload_limits",
     "file_scan",

@@ -126,6 +126,10 @@ pub(crate) struct Incoming {
     #[serde(rename = "ref")]
     pub reference: Option<Value>,
     pub room_id: Option<String>,
+    /// `call.ring`, `call.accept`, `call.decline`, `call.cancel`, and `call.join` of a direct.
+    pub direct_id: Option<String>,
+    /// Scoped `call.leave`: the accepted/live attempt, so stale cleanup cannot end a new ring.
+    pub ring_id: Option<String>,
     /// `typing`: the channel or direct conversation.
     pub conversation_id: Option<String>,
     pub user_id: Option<String>,
@@ -166,6 +170,22 @@ impl Incoming {
 }
 
 #[derive(Serialize)]
+pub(crate) struct RingReady<'a> {
+    pub direct_id: &'a str,
+    pub ring_id: &'a str,
+    pub caller_id: &'a str,
+    pub callee_id: &'a str,
+    pub accepted: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DirectReady<'a> {
+    pub direct_id: &'a str,
+    pub ring_id: &'a str,
+    pub participants: &'a [Participant],
+}
+
+#[derive(Serialize)]
 pub(crate) struct Me<'a> {
     pub user_id: &'a str,
     pub role: &'a str,
@@ -193,24 +213,37 @@ pub(crate) enum Out<'a> {
         me: Me<'a>,
         online: &'a [String],
         calls: &'a [Occupancy],
+        /// A direct ring this person is in, still waiting or accepted. Not a room.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ring: Option<RingReady<'a>>,
+        /// The direct call this person is seated in. Kept out of `calls`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        direct_call: Option<DirectReady<'a>>,
     },
     #[serde(rename = "presence")]
     Presence { user_id: &'a str, online: bool },
     #[serde(rename = "call.joined")]
     CallJoined {
         room_id: &'a str,
+        /// Set when `room_id` is a direct call's media key, so the pair can name the conversation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        direct_id: Option<&'a str>,
         #[serde(flatten)]
         participant: &'a Participant,
     },
     #[serde(rename = "call.left")]
     CallLeft {
         room_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        direct_id: Option<&'a str>,
         user_id: &'a str,
         reason: &'static str,
     },
     #[serde(rename = "call.state")]
     CallState {
         room_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        direct_id: Option<&'a str>,
         #[serde(flatten)]
         participant: &'a Participant,
     },
@@ -235,8 +268,37 @@ pub(crate) enum Out<'a> {
     #[serde(rename = "call.speaking")]
     CallSpeaking {
         room_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        direct_id: Option<&'a str>,
         user_ids: &'a [String],
     },
+    #[serde(rename = "call.ringing")]
+    CallRinging {
+        #[serde(flatten)]
+        card: &'a super::ring::Card,
+    },
+    #[serde(rename = "call.accepted")]
+    CallAccepted {
+        #[serde(flatten)]
+        card: &'a super::ring::Card,
+    },
+    #[serde(rename = "call.declined")]
+    CallDeclined {
+        #[serde(flatten)]
+        card: &'a super::ring::Card,
+    },
+    #[serde(rename = "call.cancelled")]
+    CallCancelled {
+        #[serde(flatten)]
+        card: &'a super::ring::Card,
+    },
+    #[serde(rename = "call.missed")]
+    CallMissed {
+        #[serde(flatten)]
+        card: &'a super::ring::Card,
+    },
+    #[serde(rename = "call.busy")]
+    CallBusy { direct_id: &'a str },
     /// A client request succeeded.
     #[serde(rename = "ok")]
     Ok {
@@ -399,6 +461,7 @@ mod tests {
         );
         let speaking = Out::CallSpeaking {
             room_id: "r",
+            direct_id: None,
             user_ids: &["u".to_string()],
         };
         assert_eq!(
@@ -419,6 +482,7 @@ mod tests {
         };
         let state = Out::CallState {
             room_id: "r",
+            direct_id: None,
             participant: &participant,
         };
         assert_eq!(
@@ -427,6 +491,7 @@ mod tests {
         );
         let joined = Out::CallJoined {
             room_id: "r",
+            direct_id: None,
             participant: &participant,
         };
         assert!(joined
@@ -476,6 +541,8 @@ mod tests {
                     e2ee: false,
                 }],
             }],
+            ring: None,
+            direct_call: None,
         };
         assert_eq!(
             ready.text(),
@@ -501,6 +568,7 @@ mod tests {
         assert_eq!(
             Out::CallLeft {
                 room_id: "r",
+                direct_id: None,
                 user_id: "u",
                 reason: "kicked"
             }

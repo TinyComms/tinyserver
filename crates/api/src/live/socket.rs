@@ -9,9 +9,10 @@ use db::{Caller, CommunityError, SessionError};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::call::{Moves, Reason, Refused, Session};
-use super::frame::{Audience, Event, Incoming, Me as MeFrame, Out};
+use super::call::{Access, Moves, Reason, Refused, Session};
+use super::frame::{Audience, DirectReady, Event, Incoming, Me as MeFrame, Out, RingReady};
 use super::hub::{access, Hub, Joined, Slot};
+use super::ring::{RING_BURST, RING_EVERY};
 
 /// Why the server closed a socket. The code and reason are in `docs/calls.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +218,8 @@ async fn serve(
         mut proofs,
         online,
         calls,
+        ring,
+        direct_call,
     } = joined;
     // Subscribed before the outbox is read, so nothing falls between the replay and the stream.
     let mut events = hub.events.subscribe();
@@ -247,6 +250,18 @@ async fn serve(
         },
         online: online_frame,
         calls: calls_frame,
+        ring: ring.as_ref().map(|ring| RingReady {
+            direct_id: &ring.direct_id,
+            ring_id: &ring.ring_id,
+            caller_id: &ring.caller_id,
+            callee_id: &ring.callee_id,
+            accepted: ring.accepted,
+        }),
+        direct_call: direct_call.as_ref().map(|call| DirectReady {
+            direct_id: &call.direct_id,
+            ring_id: &call.ring_id,
+            participants: &call.participants,
+        }),
     };
     if let Err(end) = send(hub, socket, ready.text()).await {
         return end;
@@ -279,11 +294,13 @@ async fn serve(
     let mut bucket = Bucket::new(limits.messages_per_second, limits.message_burst);
     let mut moves = Moves::new(limits.call_move_burst, limits.call_move_every);
     let mut rekeys = Moves::new(limits.e2ee_rekey_burst, limits.e2ee_rekey_every);
+    let mut rings = Moves::new(RING_BURST, RING_EVERY);
     let mut asking = Asking {
         conn,
         bucket: &mut bucket,
         moves: &mut moves,
         rekeys: &mut rekeys,
+        rings: &mut rings,
     };
     let mut proving = Vec::new();
 
@@ -436,6 +453,8 @@ struct Asking<'a> {
     moves: &'a mut Moves,
     /// End-to-end encryption key packages and `invalid`s.
     rekeys: &'a mut Moves,
+    /// Ring, accept, decline, and cancel. Separate from joins and leaves.
+    rings: &'a mut Moves,
 }
 
 async fn receive(
@@ -504,6 +523,7 @@ async fn receive(
         return send(hub, socket, reply.text()).await;
     }
     let room_id = incoming.room_id.as_deref();
+    let direct_id = incoming.direct_id.as_deref();
     let sdp = incoming.sdp.as_deref();
     let e2ee = incoming.e2ee_version() >= u64::from(super::e2ee::VERSION);
     let answer = match incoming.kind.as_str() {
@@ -513,8 +533,12 @@ async fn receive(
             Ok(()) => return Ok(()),
             Err(code) => Err(code),
         },
-        "call.join" => call_join(hub, me, asking, room_id, sdp, e2ee).await?,
-        "call.leave" => call_leave(hub, me, asking),
+        "call.join" => call_join(hub, me, asking, room_id, direct_id, sdp, e2ee).await?,
+        "call.ring" => call_ring(hub, me, asking, direct_id).await?,
+        "call.accept" => call_accept(hub, me, asking, direct_id).await?,
+        "call.decline" => call_decline(hub, me, asking, direct_id).await?,
+        "call.cancel" => call_cancel(hub, me, asking, direct_id).await?,
+        "call.leave" => call_leave(hub, me, asking, direct_id, incoming.ring_id.as_deref()),
         "call.kick" => call_kick(hub, me, room_id, incoming.user_id.as_deref()).await?,
         "call.moderate" => call_moderate(hub, me, &incoming).await?,
         "call.move" => call_move(hub, me, room_id, incoming.user_id.as_deref()).await?,
@@ -655,17 +679,137 @@ async fn call_access(hub: &Hub, me: &Me, room_id: &str) -> Result<db::CallAccess
     }
 }
 
-/// A member with connect may join a room they can see, up to its limit. Leaves the person's
-/// other call first. With an SFU running the join must carry an offer, and the reply is the
-/// answer. Without speak they join suppressed: nothing they send is forwarded.
+/// A direct call's media key. Moderation of that seat is `not_found` and writes no audit.
+fn direct_media(room_id: &str) -> bool {
+    super::call::is_direct_room(room_id)
+}
+
+/// Both people of `direct_id` are current members, neither is banned, and neither is timed out.
+async fn direct_open(hub: &Hub, direct_id: &str, user_id: &str) -> Result<(), &'static str> {
+    match db::direct_parties(&hub.pool, direct_id, user_id).await {
+        Ok(Some(parties)) => parties.open_to(user_id),
+        Ok(None) => Err("not_found"),
+        Err(error) => {
+            tracing::warn!(%error, "direct check failed");
+            Err("unavailable")
+        }
+    }
+}
+
+/// The other person of an open direct.
+async fn direct_peer(hub: &Hub, direct_id: &str, user_id: &str) -> Result<String, &'static str> {
+    match db::direct_parties(&hub.pool, direct_id, user_id).await {
+        Ok(Some(parties)) => {
+            parties.open_to(user_id)?;
+            parties
+                .peer_of(user_id)
+                .map(str::to_string)
+                .ok_or("not_found")
+        }
+        Ok(None) => Err("not_found"),
+        Err(error) => {
+            tracing::warn!(%error, "direct check failed");
+            Err("unavailable")
+        }
+    }
+}
+
+async fn call_ring(
+    hub: &Hub,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
+    direct_id: Option<&str>,
+) -> Result<Answer, End> {
+    let Some(direct_id) = direct_id else {
+        return Ok(Err("bad_frame"));
+    };
+    if !asking.rings.take() {
+        return Ok(Err("slow_down"));
+    }
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    let peer = match direct_peer(hub, direct_id, &me.user_id).await {
+        Ok(peer) => peer,
+        Err(code) => return Ok(Err(code)),
+    };
+    match hub.start_ring(direct_id, &me.user_id, &peer) {
+        Ok(()) => Ok(Ok(Done::Ok)),
+        Err(code) => Ok(Err(code)),
+    }
+}
+
+async fn call_accept(
+    hub: &Hub,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
+    direct_id: Option<&str>,
+) -> Result<Answer, End> {
+    ring_reply(hub, me, asking, direct_id, Hub::accept_ring).await
+}
+
+async fn call_decline(
+    hub: &Hub,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
+    direct_id: Option<&str>,
+) -> Result<Answer, End> {
+    ring_reply(hub, me, asking, direct_id, Hub::decline_ring).await
+}
+
+async fn call_cancel(
+    hub: &Hub,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
+    direct_id: Option<&str>,
+) -> Result<Answer, End> {
+    ring_reply(hub, me, asking, direct_id, Hub::cancel_ring).await
+}
+
+async fn ring_reply(
+    hub: &Hub,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
+    direct_id: Option<&str>,
+    act: fn(&Hub, &str, &str) -> Result<(), &'static str>,
+) -> Result<Answer, End> {
+    let Some(direct_id) = direct_id else {
+        return Ok(Err("bad_frame"));
+    };
+    if !asking.rings.take() {
+        return Ok(Err("slow_down"));
+    }
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    if let Err(code) = direct_open(hub, direct_id, &me.user_id).await {
+        return Ok(Err(code));
+    }
+    match act(hub, direct_id, &me.user_id) {
+        Ok(()) => Ok(Ok(Done::Ok)),
+        Err(code) => Ok(Err(code)),
+    }
+}
+
+/// A member with connect may join a room they can see, up to its limit. A direct joins the
+/// accepted ring's media room instead: no room permission, no `e2ee_required`, cap 2.
+/// Leaves the person's other call first. With an SFU running the join must carry an offer,
+/// and the reply is the answer. Without speak a room join is suppressed.
 async fn call_join(
     hub: &Hub,
     me: &mut Me,
     asking: &mut Asking<'_>,
     room_id: Option<&str>,
+    direct_id: Option<&str>,
     sdp: Option<&str>,
     e2ee: bool,
 ) -> Result<Answer, End> {
+    if room_id.is_some() && direct_id.is_some() {
+        return Ok(Err("bad_frame"));
+    }
+    if let Some(direct_id) = direct_id {
+        return call_join_direct(hub, me, asking, direct_id, sdp, e2ee).await;
+    }
     let Some(room_id) = room_id else {
         return Ok(Err("bad_frame"));
     };
@@ -721,6 +865,71 @@ async fn call_join(
     if let Err("not_found") = room_exists(hub, me, room_id).await {
         hub.end_room(room_id, Reason::RoomDeleted);
         return Ok(Err("not_found"));
+    }
+    Ok(Ok(answer.map_or(Done::Ok, Done::Answer)))
+}
+
+/// Joins an accepted direct. The media room is `d:{ring_id}`. A third person, or a ring that
+/// is still only ringing, is `not_found`. Text encryption on the direct does not force call
+/// encryption.
+async fn call_join_direct(
+    hub: &Hub,
+    me: &mut Me,
+    asking: &mut Asking<'_>,
+    direct_id: &str,
+    sdp: Option<&str>,
+    e2ee: bool,
+) -> Result<Answer, End> {
+    let media = match (&hub.media, sdp) {
+        (None, None) => None,
+        (Some(_), None) => return Ok(Err("bad_frame")),
+        (None, Some(_)) => return Ok(Err(Refused::NoMedia.code())),
+        (Some(media), Some(_)) if !media.running() => return Ok(Err(Refused::NoMedia.code())),
+        (Some(media), Some(sdp)) => Some((media, sdp)),
+    };
+    if !asking.moves.take() {
+        return Ok(Err("slow_down"));
+    }
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
+    if let Err(code) = direct_open(hub, direct_id, &me.user_id).await {
+        return Ok(Err(code));
+    }
+    let room_id = match hub.direct_join_key(direct_id, &me.user_id) {
+        Ok(room_id) => room_id,
+        Err(code) => return Ok(Err(code)),
+    };
+    // A backstop. The ring already admits only the two parties.
+    const DIRECT_LIMIT: i32 = 2;
+    if let Err(refused) = hub.call_check(&me.user_id, &room_id, DIRECT_LIMIT) {
+        return Ok(Err(refused.code()));
+    }
+    let answer = match media {
+        None => None,
+        Some((media, sdp)) => match media.join(&room_id, &me.user_id, sdp).await {
+            Ok(answer) => Some(answer),
+            Err(refused) => return Ok(Err(media_code(refused))),
+        },
+    };
+    let joined = hub.call_join(
+        &me.user_id,
+        &room_id,
+        asking.conn,
+        answer.as_ref(),
+        DIRECT_LIMIT,
+        Access {
+            suppressed: false,
+            priority_speaker: false,
+        },
+        e2ee && answer.is_some(),
+        me.session,
+    );
+    if let Err(refused) = joined {
+        if let Some(answer) = &answer {
+            hub.forget(&answer.call_id);
+        }
+        return Ok(Err(refused.code()));
     }
     Ok(Ok(answer.map_or(Done::Ok, Done::Answer)))
 }
@@ -813,11 +1022,21 @@ fn call_state(hub: &Hub, me: &Me, incoming: &Incoming) -> Answer {
 }
 
 /// Leaving with no call is not an error.
-fn call_leave(hub: &Hub, me: &Me, asking: &mut Asking<'_>) -> Answer {
+fn call_leave(
+    hub: &Hub,
+    me: &Me,
+    asking: &mut Asking<'_>,
+    direct_id: Option<&str>,
+    ring_id: Option<&str>,
+) -> Answer {
     if !asking.moves.take() {
         return Err("slow_down");
     }
-    hub.call_leave(&me.user_id, Reason::Left);
+    match (direct_id, ring_id) {
+        (Some(direct_id), Some(ring_id)) => hub.leave_direct(direct_id, ring_id, &me.user_id)?,
+        (None, None) => hub.call_leave(&me.user_id, Reason::Left, false),
+        _ => return Err("bad_frame"),
+    }
     Ok(Done::Ok)
 }
 
@@ -845,6 +1064,9 @@ async fn call_kick(
     let (Some(room_id), Some(user_id)) = (room_id, user_id) else {
         return Ok(Err("bad_frame"));
     };
+    if direct_media(room_id) || hub.room_of(user_id).is_some_and(|room| direct_media(&room)) {
+        return Ok(Err("not_found"));
+    }
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }
@@ -865,6 +1087,9 @@ async fn call_moderate(hub: &Hub, me: &mut Me, incoming: &Incoming) -> Result<An
     else {
         return Ok(Err("bad_frame"));
     };
+    if direct_media(room_id) || hub.room_of(user_id).is_some_and(|room| direct_media(&room)) {
+        return Ok(Err("not_found"));
+    }
     let (server_muted, server_deafened) = (incoming.server_muted, incoming.server_deafened);
     if server_muted.is_none() && server_deafened.is_none() {
         return Ok(Err("bad_frame"));
@@ -904,12 +1129,18 @@ async fn call_move(
     let (Some(to_room), Some(user_id)) = (room_id, user_id) else {
         return Ok(Err("bad_frame"));
     };
-    if let Err(code) = fresh(hub, me).await? {
-        return Ok(Err(code));
+    if direct_media(to_room) {
+        return Ok(Err("not_found"));
     }
     let Some(from_room) = hub.room_of(user_id) else {
         return Ok(Err("not_found"));
     };
+    if direct_media(&from_room) {
+        return Ok(Err("not_found"));
+    }
+    if let Err(code) = fresh(hub, me).await? {
+        return Ok(Err(code));
+    }
     if from_room == to_room {
         return Ok(Ok(Done::Ok));
     }
@@ -928,6 +1159,9 @@ async fn call_share_end(hub: &Hub, me: &mut Me, room_id: Option<&str>) -> Result
     let Some(room_id) = room_id else {
         return Ok(Err("bad_frame"));
     };
+    if direct_media(room_id) {
+        return Ok(Err("not_found"));
+    }
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }

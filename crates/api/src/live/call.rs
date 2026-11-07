@@ -1,6 +1,6 @@
 //! Who is in which room's call. Memory only; a restart ends every call.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -37,6 +37,8 @@ pub(crate) enum Reason {
     TimedOut,
     /// Someone with move_members moved them to another room.
     Moved,
+    /// The other person of a direct call left, so this call ends too.
+    PeerLeft,
 }
 
 impl Reason {
@@ -54,6 +56,7 @@ impl Reason {
             Self::Banned => "banned",
             Self::TimedOut => "timed_out",
             Self::Moved => "moved",
+            Self::PeerLeft => "peer_left",
         }
     }
 
@@ -86,6 +89,8 @@ pub(crate) enum Change {
 /// Why a join was refused. The `error` code is in `docs/calls.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
+    /// An accepted direct ended while its media was being prepared.
+    NotFound,
     /// The room's limit, or the server's when it has none.
     Full,
     ServerFull,
@@ -98,6 +103,7 @@ pub(crate) enum Refused {
 impl Refused {
     pub fn code(self) -> &'static str {
         match self {
+            Self::NotFound => "not_found",
             Self::Full => "room_full",
             Self::ServerFull => "server_full",
             Self::Closing => "unavailable",
@@ -203,6 +209,9 @@ pub(crate) struct Calls {
     /// they leave calls altogether.
     moderated: HashMap<String, (bool, bool)>,
     tickets: HashMap<String, Ticket>,
+    /// Direct-call rooms (`d:` plus a ring id) where both people have media. A leave then
+    /// ends the other person too. A room call never enters this set.
+    live_direct: HashSet<String>,
     epoch: u64,
 }
 
@@ -318,23 +327,64 @@ impl Calls {
         Ok(changes)
     }
 
-    pub fn leave(&mut self, user_id: &str, reason: Reason) -> Option<Change> {
-        let seat = self.seats.remove(user_id)?;
+    /// Leaves `user_id`'s call. A direct call does not stay up for the other person: they
+    /// leave as `peer_left`. The first person can sit alone until the other joins. A room
+    /// call leaves only this person.
+    pub fn leave(&mut self, user_id: &str, reason: Reason) -> Vec<Change> {
+        let Some(seat) = self.seats.remove(user_id) else {
+            return Vec::new();
+        };
         if !reason.keeps_moderation() {
             self.moderated.remove(user_id);
         }
-        if let Some(people) = self.rooms.get_mut(&seat.room_id) {
+        let peer = self.rooms.get(&seat.room_id).and_then(|people| {
+            people
+                .iter()
+                .find(|person| person.as_str() != user_id)
+                .cloned()
+        });
+        let room_id = seat.room_id.clone();
+        if let Some(people) = self.rooms.get_mut(&room_id) {
             people.retain(|person| person != user_id);
             if people.is_empty() {
-                self.rooms.remove(&seat.room_id);
+                self.rooms.remove(&room_id);
             }
         }
-        Some(Change::Left {
-            room_id: seat.room_id,
+        let mut changes = vec![Change::Left {
+            room_id: room_id.clone(),
             user_id: user_id.to_string(),
             reason,
             call_id: seat.call_id,
-        })
+        }];
+        if is_direct_room(&room_id) && reason != Reason::PeerLeft {
+            self.live_direct.remove(&room_id);
+            if let Some(peer) = peer {
+                changes.extend(self.leave(&peer, Reason::PeerLeft));
+            }
+        }
+        changes
+    }
+
+    /// Both people in a direct-call room have media. Later, one leaving ends it for both.
+    pub fn note_direct_pair(&mut self, room_id: &str) -> bool {
+        if !is_direct_room(room_id) || self.live_direct.contains(room_id) {
+            return false;
+        }
+        let Some(people) = self.rooms.get(room_id) else {
+            return false;
+        };
+        if people.len() < 2 {
+            return false;
+        }
+        let ready = people.iter().all(|user_id| {
+            self.seats
+                .get(user_id)
+                .is_some_and(|seat| seat.call_id.is_some())
+        });
+        if ready {
+            self.live_direct.insert(room_id.to_string());
+        }
+        ready
     }
 
     /// The room `user_id` is in.
@@ -358,6 +408,14 @@ impl Calls {
             .iter()
             .find(|(_, seat)| seat.call_id.as_deref() == Some(call_id))
             .map(|(user_id, _)| user_id.as_str())
+    }
+
+    /// Everyone in `room_id`'s call, as the wire describes them.
+    pub fn participants_of(&self, room_id: &str) -> Vec<Participant> {
+        self.people(room_id)
+            .iter()
+            .map(|user_id| self.participant(user_id))
+            .collect()
     }
 
     /// Everyone in `room_id`'s call, in join order.
@@ -583,10 +641,12 @@ impl Calls {
     }
 
     /// Leaves if the seat is still the one `orphan` left, with no socket rejoined since.
-    pub fn expire(&mut self, user_id: &str, epoch: u64) -> Option<Change> {
-        let seat = self.seats.get(user_id)?;
+    pub fn expire(&mut self, user_id: &str, epoch: u64) -> Vec<Change> {
+        let Some(seat) = self.seats.get(user_id) else {
+            return Vec::new();
+        };
         if seat.conn.is_some() || seat.epoch != epoch {
-            return None;
+            return Vec::new();
         }
         self.leave(user_id, Reason::Disconnected)
     }
@@ -595,7 +655,7 @@ impl Calls {
         let people = self.rooms.get(room_id).cloned().unwrap_or_default();
         people
             .iter()
-            .filter_map(|user_id| self.leave(user_id, reason))
+            .flat_map(|user_id| self.leave(user_id, reason))
             .collect()
     }
 
@@ -604,11 +664,13 @@ impl Calls {
         self.seats.clear();
         self.moderated.clear();
         self.tickets.clear();
+        self.live_direct.clear();
     }
 
     pub fn snapshot(&self) -> Vec<Occupancy> {
         self.rooms
             .iter()
+            .filter(|(room_id, _)| !is_direct_room(room_id))
             .map(|(room_id, people)| Occupancy {
                 room_id: room_id.clone(),
                 participants: people
@@ -643,6 +705,10 @@ impl Calls {
             participant: self.participant(user_id),
         }
     }
+}
+
+pub(crate) fn is_direct_room(room_id: &str) -> bool {
+    room_id.starts_with("d:")
 }
 
 /// Joins and leaves one socket may make: a burst, then one more every `every`.
@@ -757,7 +823,7 @@ mod tests {
             })
         );
         assert_eq!(calls.conn_of("u"), Some(3));
-        assert_eq!(calls.expire("u", epoch), None);
+        assert_eq!(calls.expire("u", epoch), Vec::new());
         assert_eq!(calls.room_of("u"), Some("a"));
     }
 
@@ -887,7 +953,7 @@ mod tests {
         assert_eq!(calls.orphan("u", 1), None);
         let epoch = calls.orphan("u", 2).expect("seat held by 2");
         assert!(join(&mut calls, "u", "a", 3).is_ok());
-        assert_eq!(calls.expire("u", epoch), None);
+        assert_eq!(calls.expire("u", epoch), Vec::new());
         assert_eq!(calls.room_of("u"), Some("a"));
     }
 
@@ -898,7 +964,7 @@ mod tests {
         let epoch = calls.orphan("u", 1).expect("epoch");
         assert_eq!(
             calls.expire("u", epoch),
-            Some(left("a", "u", Reason::Disconnected))
+            vec![left("a", "u", Reason::Disconnected)]
         );
         assert!(calls.snapshot().is_empty());
     }
@@ -967,7 +1033,7 @@ mod tests {
         assert!(participant.server_muted);
         assert!(!calls.ticket("u", "b"), "a ticket is used once");
         // Leaving calls altogether drops the server mute.
-        assert!(calls.leave("u", Reason::Left).is_some());
+        assert!(!calls.leave("u", Reason::Left).is_empty());
         let changes = join(&mut calls, "u", "a", 1).expect("join");
         let Change::Joined { participant, .. } = &changes[0] else {
             panic!("joined");
@@ -1114,13 +1180,57 @@ mod tests {
         assert_eq!(calls.sharer("a"), None);
         assert_eq!(
             calls.leave("u", Reason::MediaLost),
-            Some(Change::Left {
+            vec![Change::Left {
                 room_id: "a".to_string(),
                 user_id: "u".to_string(),
                 reason: Reason::MediaLost,
                 call_id: Some("c-2".to_string()),
-            })
+            }]
         );
+    }
+
+    #[test]
+    fn a_live_direct_call_ends_for_the_other_person_and_stays_out_of_the_room_list() {
+        let mut calls = Calls::default();
+        let key = "d:11111111-1111-4111-8111-111111111111";
+        calls
+            .join("a", key, 1, Some("c-a".to_string()), 2, 32, FREE, true)
+            .expect("a");
+        calls
+            .join("b", key, 2, Some("c-b".to_string()), 2, 32, FREE, true)
+            .expect("b");
+        assert!(calls.snapshot().is_empty(), "a direct call is not a room");
+        assert!(calls.note_direct_pair(key));
+        let changes = calls.leave("a", Reason::Left);
+        assert_eq!(changes.len(), 2);
+        assert!(matches!(
+            &changes[0],
+            Change::Left { user_id, reason: Reason::Left, call_id, .. }
+                if user_id == "a" && call_id.as_deref() == Some("c-a")
+        ));
+        assert!(matches!(
+            &changes[1],
+            Change::Left { user_id, reason: Reason::PeerLeft, call_id, .. }
+                if user_id == "b" && call_id.as_deref() == Some("c-b")
+        ));
+        assert!(calls.room_of("b").is_none());
+        assert!(!calls.note_direct_pair(key));
+    }
+
+    #[test]
+    fn a_direct_call_ends_for_the_other_person_before_both_have_media() {
+        let mut calls = Calls::default();
+        let key = "d:22222222-2222-4222-8222-222222222222";
+        calls
+            .join("a", key, 1, None, 2, 32, FREE, false)
+            .expect("a");
+        calls
+            .join("b", key, 2, None, 2, 32, FREE, false)
+            .expect("b");
+        let changes = calls.leave("a", Reason::Left);
+        assert_eq!(changes.len(), 2);
+        assert!(calls.room_of("a").is_none());
+        assert!(calls.room_of("b").is_none());
     }
 
     #[test]

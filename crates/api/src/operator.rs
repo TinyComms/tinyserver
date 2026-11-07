@@ -212,5 +212,9 @@ mod tests {
         assert!(!read_only_frame_allowed("call.offer"));
         assert!(!read_only_frame_allowed("typing"));
         assert!(!read_only_frame_allowed("call.kick"));
+        assert!(!read_only_frame_allowed("call.ring"));
+        assert!(!read_only_frame_allowed("call.accept"));
+        assert!(!read_only_frame_allowed("call.decline"));
+        assert!(!read_only_frame_allowed("call.cancel"));
     }
 }
