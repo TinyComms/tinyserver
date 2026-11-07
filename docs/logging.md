@@ -26,7 +26,7 @@ In the published image, `TINYSERVER_DATA_DIR` is `/var/lib/tinyserver` on a tmpf
 
 ## Never recorded
 
-Field names that are dropped, and values that are rewritten to `[redacted]`: message text, filenames, tokens, passwords, cookies, keys, invite secrets, OAuth `code` and verifiers, SDP, `a=ice-pwd`, `a=fingerprint`, PEM, URL userinfo, email, display names, and phone numbers. `user_id`, `room_id`, `call_id`, `req_id`, and a static `reason` stay.
+Field names that are dropped, and values that are rewritten to `[redacted]`: message text, filenames, tokens, passwords, cookies, keys, invite secrets, OAuth `code` and verifiers, SDP, `a=ice-pwd`, `a=fingerprint`, PEM, URL userinfo, email, display names, phone numbers, and device-link ids, codes, messages and archives. `user_id`, `room_id`, `call_id`, `req_id`, and a static `reason` stay.
 
 The owner invite token is not printed. It is written to `{TINYSERVER_DATA_DIR}/owner-invite` (mode `0600`). stdout says `owner invite written to {path}`. In `deploy/compose.yml`, `tinyserver-init` writes it with `TINYSERVER_DATA_DIR=/bootstrap`, a volume the server mounts read only: read it with `docker compose exec tinyserver cat /bootstrap/owner-invite`. The next `bootstrap` after an owner exists removes the file.
 

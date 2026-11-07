@@ -215,26 +215,44 @@ async fn clear_private(pool: &PgPool) -> Result<(), &'static str> {
 }
 
 /// A token bucket per person. Memory only; a restart forgets it.
-#[derive(Default)]
-struct Limiter {
+pub(crate) struct Limiter {
+    burst: f64,
+    refill_per_sec: f64,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
 }
 
+impl Default for Limiter {
+    fn default() -> Self {
+        Self::new(BURST, REFILL_PER_SEC)
+    }
+}
+
 impl Limiter {
+    /// `burst` requests at once, and one more back every `1 / refill_per_sec` seconds.
+    pub(crate) fn new(burst: f64, refill_per_sec: f64) -> Self {
+        Self {
+            burst,
+            refill_per_sec,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, (f64, Instant)>> {
         self.buckets
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn take(&self, user_id: &str, now: Instant) -> bool {
+    pub(crate) fn take(&self, user_id: &str, now: Instant) -> bool {
         let mut buckets = self.lock();
         if buckets.len() > 4096 {
             buckets.retain(|_, (_, at)| now.saturating_duration_since(*at).as_secs() < 600);
         }
-        let entry = buckets.entry(user_id.to_string()).or_insert((BURST, now));
-        let gained = now.saturating_duration_since(entry.1).as_secs_f64() * REFILL_PER_SEC;
-        entry.0 = (entry.0 + gained).min(BURST);
+        let entry = buckets
+            .entry(user_id.to_string())
+            .or_insert((self.burst, now));
+        let gained = now.saturating_duration_since(entry.1).as_secs_f64() * self.refill_per_sec;
+        entry.0 = (entry.0 + gained).min(self.burst);
         entry.1 = now;
         if entry.0 < 1.0 {
             return false;

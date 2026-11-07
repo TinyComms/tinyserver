@@ -18,6 +18,8 @@ How long each kind of data stays, what each deletion path removes, and what a de
 | Messages | Until deleted by the author, the channel is deleted, or the author's account is deleted | Soft delete: body emptied, row kept as a tombstone | No |
 | Attachments | As the message. Unlinked uploads: one hour | Sweep for orphans; `unlink` on delete | No |
 | Reactions, read marks | With the message or the person | Cascade or account deletion | No |
+| Device link messages (`e2ee_link_messages`) | Until the link expires (`e2ee_link_ttl_secs`, 5 minutes by default) or either device deletes it | Sweep every 10 minutes, the first at start; `DELETE /v1/e2ee/links/{id}`; account deletion (trigger, `0035`) | The link's lifetime, 60 to 3600 seconds, in `server_settings` |
+| Device link archive (`/data/uploads/links/`) | Until either device deletes the link, or one hour after it expires | Deleted with the link; the sweep deletes files an hour past expiry and any file no row names (a crash, a deleted account) | No. Its size cap is `e2ee_link_archive_max` (96 MiB by default) |
 | Audit log | **Indefinitely.** No sweep touches it, `report.*` rows included | | No |
 | Abuse reports and moderators' notes, `actioned` or `dismissed` | `TINYSERVER_REPORT_RETENTION_DAYS` after resolution (default 90) | The sweep (`app_reports_sweep`), which writes one `report.expire` row with the count. Test: `the_sweep_deletes_old_resolved_reports_and_keeps_held_ones` | Yes, 7 to 3650 days; anything else stops `serve` |
 | Abuse reports, `open` or `reviewing` | Until a moderator resolves them | Not swept | No |
