@@ -1,0 +1,42 @@
+name: pr-gate
+
+# The cheap half of the merge gate: the pull request says what it is, names the e2e scenario that
+# proves it, and the scenario is in the diff. The expensive half is the lab (e2e/README.md), which
+# records the real app on every platform and posts the `e2e-proof` status. docs/quality-gate.md
+# has the whole picture.
+#
+# `pull_request`, not `pull_request_target`: this reads the body and the file list and never runs
+# code from the branch, but the safe event costs nothing here.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: read
+
+jobs:
+  pr-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The base, not the branch: a pull request that edits the gate is judged by the gate it
+      # found. The script reads the branch's scenarios through the API.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The pull request that adds the gate has no gate on its base to be judged by.
+          if [ ! -f .github/scripts/pr-gate.py ]; then
+            echo "::notice title=pr-gate::the base has no pr-gate yet, so this pull request introduces it"
+            exit 0
+          fi
+          python3 .github/scripts/pr-gate.py check

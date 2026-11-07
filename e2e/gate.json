@@ -1,0 +1,35 @@
+{
+  "_comment": "Read by .github/scripts/pr-gate.py and deploy/release-cut.sh. docs/quality-gate.md says what each line does. A 'platform' here is the last released tinyclient for it, driven against this server build.",
+
+  "types": ["feature", "fix", "perf", "refactor", "chore", "docs"],
+  "proof_types": ["feature", "fix"],
+  "regression_types": ["perf", "refactor", "chore"],
+
+  "labs": ["windows", "macos", "linux", "android", "ios"],
+
+  "no_proof_paths": [
+    "**/*.md",
+    "docs/**",
+    "fuzz/**",
+    ".config/**",
+    ".github/ISSUE_TEMPLATE/**",
+    ".github/pull_request_template.md",
+    "LICENSE"
+  ],
+
+  "platforms": {
+    "windows": ["crates/**", "Cargo.toml", "Cargo.lock"],
+    "macos": ["crates/**", "Cargo.toml", "Cargo.lock"],
+    "linux": ["crates/**", "Cargo.toml", "Cargo.lock", "Dockerfile", "docker/**", "docker-compose.yml", "deploy/**"],
+    "android": ["crates/**", "Cargo.toml", "Cargo.lock"],
+    "ios": ["crates/**", "Cargo.toml", "Cargo.lock"]
+  },
+
+  "platform_excludes": {},
+
+  "rules_enforced": ["template", "scenario"],
+  "lab_actors": [],
+  "proof_context": "e2e-proof",
+  "release_context": "e2e-release",
+  "release_proof": "report"
+}
