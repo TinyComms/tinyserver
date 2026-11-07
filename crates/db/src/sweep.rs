@@ -5,6 +5,8 @@
 //! Device links go when they expire; their archive files an hour later, and any archive file no
 //! row names (a crash mid-upload, a deleted account) on the next sweep, the first of which runs
 //! at start.
+//! Messages in a self conversation go once older than `e2ee_self_ttl_secs` (7 days), with the
+//! sealed files attached to them.
 
 use sqlx::PgPool;
 
@@ -56,6 +58,8 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
     // Expired key packages, old welcomes and old sealed-upload ledger rows. Not counted above:
     // none of it is a row a person made.
     sqlx::query("SELECT app_e2ee_sweep()").execute(pool).await?;
+    // Not counted either: a self conversation is one person's devices talking to each other.
+    crate::e2ee::sweep_self(pool).await?;
     let link_archives = crate::link::sweep_links(pool).await?;
     Ok(Swept {
         sessions,

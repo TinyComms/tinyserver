@@ -31,6 +31,8 @@ pub const FEATURES: &[&str] = &[
     "abuse_reports",
     "first_run_setup",
     "e2ee_device_link",
+    "e2ee_self",
+    "e2ee_group_generations",
 ];
 
 pub fn routes() -> Router<PgPool> {
@@ -70,6 +72,11 @@ struct Capabilities {
     e2ee_device_link: bool,
     /// The largest history archive one link may carry, in bytes.
     e2ee_link_archive_max: i64,
+    /// Each person may have a self conversation for their own devices (`POST /v1/e2ee/self`).
+    /// Also in `features`; older servers have neither.
+    e2ee_self: bool,
+    /// How long a message in a self conversation is kept, in seconds.
+    e2ee_self_ttl_secs: i64,
 }
 
 async fn capabilities(
@@ -83,12 +90,15 @@ async fn capabilities(
     };
     let mode = db::e2ee_text_mode(&pool).await.map_err(unavailable)?;
     let archive_max = db::link_archive_max(&pool).await.map_err(unavailable)?;
+    let self_ttl = db::self_ttl_secs(&pool).await.map_err(unavailable)?;
     Ok(Json(Capabilities {
         version: env!("CARGO_PKG_VERSION"),
         features: FEATURES,
         e2ee_text: mode,
         e2ee_device_link: true,
         e2ee_link_archive_max: archive_max,
+        e2ee_self: true,
+        e2ee_self_ttl_secs: self_ttl,
     }))
 }
 

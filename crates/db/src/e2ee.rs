@@ -304,8 +304,18 @@ pub async fn group_info(
     caller: &Caller,
     conversation: &str,
 ) -> Result<Value, MessageError> {
+    group_info_at(pool, caller, conversation, None).await
+}
+
+pub async fn group_info_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    generation: Option<u64>,
+) -> Result<Value, MessageError> {
     uuid_arg(conversation)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     let value = json_in(&mut tx, "SELECT app_e2ee_info($1::uuid)", |query| {
         query.bind(conversation)
     })
@@ -327,8 +337,18 @@ pub async fn mls_target(
     caller: &Caller,
     conversation: &str,
 ) -> Result<MlsTarget, MessageError> {
+    mls_target_at(pool, caller, conversation, None).await
+}
+
+pub async fn mls_target_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    generation: Option<u64>,
+) -> Result<MlsTarget, MessageError> {
     uuid_arg(conversation)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     let row: (String, bool) =
         sqlx::query_as("SELECT r_group::text, r_audience FROM app_e2ee_mls_target($1::uuid)")
             .bind(conversation)
@@ -351,9 +371,21 @@ pub async fn create_group(
     device_id: &str,
     context: Option<&[u8]>,
 ) -> Result<(), MessageError> {
+    create_group_at(pool, caller, conversation, device_id, context, None).await
+}
+
+pub async fn create_group_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    device_id: &str,
+    context: Option<&[u8]>,
+    generation: Option<u64>,
+) -> Result<(), MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     sqlx::query("SELECT app_e2ee_create_group($1::uuid, $2::uuid, $3)")
         .bind(conversation)
         .bind(device_id)
@@ -378,8 +410,25 @@ pub async fn issue_proposals<F>(
 where
     F: FnOnce(u64, &[Unissued]) -> Option<Issued>,
 {
+    issue_proposals_at(pool, caller, conversation, None, |_, epoch, items| {
+        sign(epoch, items)
+    })
+    .await
+}
+
+pub async fn issue_proposals_at<F>(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    generation: Option<u64>,
+    sign: F,
+) -> Result<(), MessageError>
+where
+    F: FnOnce(&str, u64, &[Unissued]) -> Option<Issued>,
+{
     uuid_arg(conversation)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     type Row = (i64, i64, String, String, Option<i32>, Option<Vec<u8>>);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT r_epoch, r_id, r_op, r_device::text, r_leaf, r_package
@@ -394,6 +443,12 @@ where
         return Ok(());
     };
     let epoch = first.0;
+    let group: String =
+        sqlx::query_scalar("SELECT r_group::text FROM app_e2ee_mls_target($1::uuid)")
+            .bind(conversation)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(message_sql)?;
     let items: Vec<Unissued> = rows
         .into_iter()
         .map(|(_, id, op, device_id, leaf, key_package)| Unissued {
@@ -404,7 +459,7 @@ where
             key_package,
         })
         .collect();
-    let Some(issued) = sign(u64::try_from(epoch).unwrap_or_default(), &items) else {
+    let Some(issued) = sign(&group, u64::try_from(epoch).unwrap_or_default(), &items) else {
         tx.commit().await.map_err(message_sql)?;
         return Ok(());
     };
@@ -434,16 +489,30 @@ pub async fn handshake_after(
     after: i64,
     limit: i32,
 ) -> Result<Vec<HandshakeRow>, MessageError> {
+    handshake_after_at(pool, caller, conversation, device_id, after, limit, None).await
+}
+
+pub async fn handshake_after_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    device_id: &str,
+    after: i64,
+    limit: i32,
+    generation: Option<u64>,
+) -> Result<Vec<HandshakeRow>, MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     let rows: Vec<(i64, String, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT r_seq, r_kind, r_epoch, r_data FROM app_e2ee_handshake($1::uuid, $2::uuid, $3, $4)",
+        "SELECT r_seq, r_kind, r_epoch, r_data FROM app_e2ee_handshake_at($1::uuid, $2::uuid, $3, $4, $5)",
     )
     .bind(conversation)
     .bind(device_id)
     .bind(after)
     .bind(limit)
+    .bind(epoch_arg(generation.unwrap_or(0))?)
     .fetch_all(&mut *tx)
     .await
     .map_err(message_sql)?;
@@ -502,17 +571,31 @@ pub async fn ratchet_tree(
     device_id: &str,
     epoch: u64,
 ) -> Result<Option<Vec<u8>>, MessageError> {
+    ratchet_tree_at(pool, caller, conversation, device_id, epoch, None).await
+}
+
+pub async fn ratchet_tree_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    device_id: &str,
+    epoch: u64,
+    generation: Option<u64>,
+) -> Result<Option<Vec<u8>>, MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
     let epoch = epoch_arg(epoch)?;
     let mut tx = scoped(pool, caller).await?;
-    let parts: Vec<Vec<u8>> = sqlx::query_scalar("SELECT app_e2ee_tree($1::uuid, $2::uuid, $3)")
-        .bind(conversation)
-        .bind(device_id)
-        .bind(epoch)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(message_sql)?;
+    generation_in(&mut tx, generation).await?;
+    let parts: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT app_e2ee_tree_at($1::uuid, $2::uuid, $3, $4)")
+            .bind(conversation)
+            .bind(device_id)
+            .bind(epoch)
+            .bind(epoch_arg(generation.unwrap_or(0))?)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(message_sql)?;
     tx.commit().await.map_err(message_sql)?;
     if parts.is_empty() {
         return Ok(None);
@@ -529,10 +612,22 @@ pub async fn commit_snapshot(
     device_id: &str,
     epoch: u64,
 ) -> Result<CommitSnapshot, MessageError> {
+    commit_snapshot_at(pool, caller, conversation, device_id, epoch, None).await
+}
+
+pub async fn commit_snapshot_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    device_id: &str,
+    epoch: u64,
+    generation: Option<u64>,
+) -> Result<CommitSnapshot, MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
     let epoch = epoch_arg(epoch)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     type Row = (i32, i64, String, String, Vec<u8>, Option<Vec<u8>>);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT r_leaf, r_id, r_op, r_device::text, r_proposal, r_package
@@ -582,6 +677,36 @@ pub async fn apply_commit(
     tree: &[Vec<u8>],
     has_path: bool,
 ) -> Result<i64, MessageError> {
+    apply_commit_at(
+        pool,
+        caller,
+        conversation,
+        device_id,
+        epoch,
+        commit_bytes,
+        ids,
+        welcomes,
+        tree,
+        has_path,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_commit_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    device_id: &str,
+    epoch: u64,
+    commit_bytes: &[u8],
+    ids: &[i64],
+    welcomes: &[WelcomeFor],
+    tree: &[Vec<u8>],
+    has_path: bool,
+    generation: Option<u64>,
+) -> Result<i64, MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
     let epoch = epoch_arg(epoch)?;
@@ -597,6 +722,7 @@ pub async fn apply_commit(
         .map(|welcome| welcome.data.clone())
         .collect();
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     let seq: i64 = sqlx::query_scalar(
         "SELECT app_e2ee_apply_commit($1::uuid, $2::uuid, $3, $4, $5, $6::text[]::uuid[], $7, $8, $9)",
     )
@@ -624,6 +750,16 @@ pub async fn post_e2ee_message(
     conversation: &str,
     message: &NewE2eeMessage<'_>,
 ) -> Result<(Value, bool), MessageError> {
+    post_e2ee_message_at(pool, caller, conversation, message, None).await
+}
+
+pub async fn post_e2ee_message_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    message: &NewE2eeMessage<'_>,
+    generation: Option<u64>,
+) -> Result<(Value, bool), MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(message.device_id)?;
     let target = blank_to_none(message.target_id);
@@ -639,6 +775,7 @@ pub async fn post_e2ee_message(
     };
     let epoch = epoch_arg(message.epoch)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     let row: (Value, bool) = sqlx::query_as(
         "SELECT r_message, r_created FROM app_post_e2ee_message(
             $1::uuid, $2, $3, $4::uuid, $5, $6, $7::uuid, $8::text[]::uuid[], $9)",
@@ -669,10 +806,35 @@ pub async fn post_e2ee_reaction(
     device_id: &str,
     client_id: &str,
 ) -> Result<Value, MessageError> {
+    post_e2ee_reaction_at(
+        pool,
+        caller,
+        conversation,
+        ciphertext,
+        epoch,
+        device_id,
+        client_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn post_e2ee_reaction_at(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    ciphertext: &[u8],
+    epoch: u64,
+    device_id: &str,
+    client_id: &str,
+    generation: Option<u64>,
+) -> Result<Value, MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(device_id)?;
     let epoch = epoch_arg(epoch)?;
     let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
     let value = json_in(
         &mut tx,
         "SELECT app_post_e2ee_reaction($1::uuid, $2, $3, $4::uuid, $5)",
@@ -714,4 +876,83 @@ pub async fn e2ee_text_mode(pool: &PgPool) -> Result<String, DbError> {
         .fetch_one(pool)
         .await?;
     Ok(mode)
+}
+
+/// Gets or makes the caller's self conversation: `{conversation_id, ttl_secs}`. `true` when this
+/// call made it. Only that person can open it, and only their own devices join its group.
+pub async fn open_self(pool: &PgPool, caller: &Caller) -> Result<(Value, bool), MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let row: (Value, bool) = sqlx::query_as("SELECT body, created FROM app_e2ee_self()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(row)
+}
+
+/// How long a message in a self conversation is kept, in seconds, for `GET /v1/capabilities`.
+pub async fn self_ttl_secs(pool: &PgPool) -> Result<i64, DbError> {
+    let secs: i32 = sqlx::query_scalar("SELECT app_e2ee_self_ttl_secs()")
+        .fetch_one(pool)
+        .await?;
+    Ok(i64::from(secs))
+}
+
+/// Deletes the messages and reactions of self conversations past their retention, and the files
+/// attached to them.
+pub(crate) async fn sweep_self(pool: &PgPool) -> Result<(), DbError> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT app_e2ee_self_sweep()")
+        .fetch_one(pool)
+        .await?;
+    crate::messages::remove_files(&ids);
+    Ok(())
+}
+
+async fn generation_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    generation: Option<u64>,
+) -> Result<(), MessageError> {
+    let generation = epoch_arg(generation.unwrap_or(0))?;
+    sqlx::query("SELECT set_config('tiny.e2ee_generation',$1,true)")
+        .bind(generation.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(message_sql)?;
+    Ok(())
+}
+pub async fn repair_group(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    binding: &Value,
+    hash: &[u8],
+) -> Result<Value, MessageError> {
+    uuid_arg(conversation)?;
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(&mut tx, "SELECT app_e2ee_repair($1::uuid,$2,$3)", |q| {
+        q.bind(conversation).bind(binding).bind(hash)
+    })
+    .await?;
+    commit(tx, value).await
+}
+pub async fn generation_chain(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    after: u64,
+    limit: i32,
+) -> Result<Value, MessageError> {
+    uuid_arg(conversation)?;
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_e2ee_generations($1::uuid,$2,$3)",
+        |q| {
+            q.bind(conversation)
+                .bind(i64::try_from(after).unwrap_or(-1))
+                .bind(limit)
+        },
+    )
+    .await?;
+    commit(tx, value).await
 }

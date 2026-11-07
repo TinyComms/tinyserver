@@ -1,0 +1,10 @@
+{
+  "id": "device-link-membership",
+  "title": "Linked devices join the current encrypted audience and removed devices fence new ciphertext",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres", "mls-test-clients"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "API component integration, not native-client certification",
+  "native_client_proof": "pending exact-head device churn and encrypted-history retention proof; MERGE HOLD remains"
+}
