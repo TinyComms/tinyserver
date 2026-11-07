@@ -15,9 +15,11 @@ pub struct DirectParties {
 }
 
 impl DirectParties {
-    /// `user_id` is one of the two, and neither is timed out.
+    /// `user_id` is one of two distinct people, and neither is timed out.
     pub fn open_to(&self, user_id: &str) -> Result<(), &'static str> {
-        if user_id != self.low_user_id && user_id != self.high_user_id {
+        if self.low_user_id == self.high_user_id
+            || (user_id != self.low_user_id && user_id != self.high_user_id)
+        {
             return Err("not_found");
         }
         if self.low_timed_out || self.high_timed_out {

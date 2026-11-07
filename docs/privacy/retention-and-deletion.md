@@ -18,6 +18,7 @@ How long each kind of data stays, what each deletion path removes, and what a de
 | Messages | Until deleted by the author, the channel is deleted, or the author's account is deleted | Soft delete: body emptied, row kept as a tombstone | No |
 | Attachments | As the message. Unlinked uploads: one hour | Sweep for orphans; `unlink` on delete | No |
 | Reactions, read marks | With the message or the person | Cascade or account deletion | No |
+| Self conversation messages and encrypted reactions (a person's own devices, `0036`) | `e2ee_self_ttl_secs` (7 days by default) from when they were posted | Sweep every 10 minutes, the first at start, with the edits of a deleted message and its sealed files; account deletion deletes the conversation (trigger, `0036`). Test: `self_conversation_messages_go_after_their_retention_and_with_the_account` | Yes, 3600 to 2592000 seconds, in `server_settings` |
 | Device link messages (`e2ee_link_messages`) | Until the link expires (`e2ee_link_ttl_secs`, 5 minutes by default) or either device deletes it | Sweep every 10 minutes, the first at start; `DELETE /v1/e2ee/links/{id}`; account deletion (trigger, `0035`) | The link's lifetime, 60 to 3600 seconds, in `server_settings` |
 | Device link archive (`/data/uploads/links/`) | Until either device deletes the link, or one hour after it expires | Deleted with the link; the sweep deletes files an hour past expiry and any file no row names (a crash, a deleted account) | No. Its size cap is `e2ee_link_archive_max` (96 MiB by default) |
 | Audit log | **Indefinitely.** No sweep touches it, `report.*` rows included | | No |
@@ -66,6 +67,7 @@ Implemented in `0014_account_deletion.sql` by `app_delete_account()`, one transa
 | Every message the person wrote: body emptied, `deleted_at` set | The test asserts the other member sees an empty body and a `deleted_at` |
 | Their attachments and the attachments of their messages, and reactions on and by them; files unlinked after the commit | Read; not asserted by the test |
 | `reads`, bots they created, unused invites they created, idempotency keys | Read; not asserted |
+| Their self conversation: the `directs` row, its MLS group and handshake log, its messages and reactions. A trigger from `0036` on the tombstoning does this | `crates/api/tests/e2ee_text.rs`: `self_conversation_messages_go_after_their_retention_and_with_the_account` |
 | `outbox` rows carrying their member events (name, email) | The test asserts the needles "Ada Lovelace" and the email are not in the outbox |
 | `display_name`, `name`, `email` keys inside `audit_log.detail` where they were actor or subject | The test asserts the needles are absent from `audit_log.detail` |
 | On reports they filed: the `reporter` link (always), and the note and evidence (unless the report is held). On reports about them that are not held: the evidence, the reporter's note and the moderators' notes. A trigger from `0015` on the tombstoning does this | `crates/api/tests/reports.rs`: `a_reporter_deleting_their_account_loses_the_link_and_a_hold_keeps_the_report`, `a_person_reported_deleting_their_account_takes_the_evidence_with_them_unless_held` |
