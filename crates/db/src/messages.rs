@@ -41,6 +41,10 @@ impl UploadLimits {
 
 #[derive(Debug, Error)]
 pub enum MessageError {
+    #[error("generation changed")]
+    GenerationChanged,
+    #[error("repair unavailable")]
+    RepairUnavailable,
     #[error("forbidden")]
     Forbidden,
     #[error("banned")]
@@ -691,6 +695,8 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E18" => MessageError::RootExists,
         "P0E19" => MessageError::E2eeTwin,
         "P0E20" => MessageError::ArchiveExists,
+        "P0E21" => MessageError::GenerationChanged,
+        "P0E22" => MessageError::RepairUnavailable,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),

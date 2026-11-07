@@ -92,6 +92,7 @@ struct PageQuery {
 
 #[derive(Deserialize)]
 struct PostBody {
+    generation: Option<u64>,
     body: Option<String>,
     reply_to: Option<String>,
     client_id: Option<String>,
@@ -171,6 +172,8 @@ pub(crate) enum Error {
     RootExists,
     E2eeTwin,
     ArchiveExists,
+    GenerationChanged,
+    RepairUnavailable,
 }
 
 impl IntoResponse for Error {
@@ -208,6 +211,8 @@ impl IntoResponse for Error {
             Self::RootExists => (StatusCode::CONFLICT, "root_exists"),
             Self::E2eeTwin => (StatusCode::CONFLICT, "e2ee_twin"),
             Self::ArchiveExists => (StatusCode::CONFLICT, "archive_exists"),
+            Self::GenerationChanged => (StatusCode::CONFLICT, "generation_changed"),
+            Self::RepairUnavailable => (StatusCode::CONFLICT, "repair_unavailable"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -246,6 +251,8 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::RootExists => "root_exists",
         Error::E2eeTwin => "e2ee_twin",
         Error::ArchiveExists => "archive_exists",
+        Error::GenerationChanged => "generation_changed",
+        Error::RepairUnavailable => "repair_unavailable",
     }
 }
 
@@ -291,6 +298,8 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::RootExists => Error::RootExists,
         MessageError::E2eeTwin => Error::E2eeTwin,
         MessageError::ArchiveExists => Error::ArchiveExists,
+        MessageError::GenerationChanged => Error::GenerationChanged,
+        MessageError::RepairUnavailable => Error::RepairUnavailable,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -469,6 +478,7 @@ async fn add_message(
             &caller,
             &id,
             crate::e2ee_text::PostFields {
+                generation: body.generation,
                 ciphertext: body.ciphertext.as_deref(),
                 epoch: body.epoch,
                 device_id: body.device_id.as_deref(),
