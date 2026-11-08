@@ -68,6 +68,8 @@ const LOAD_EVERY: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 /// Seconds of `audio_kbps` a publisher may run ahead of it, for a burst after a stall.
 const AUDIO_BURST: u32 = 2;
+/// How long deltas dropped after an oversized keyframe keep the layer alive but on hold.
+const DEBT: Duration = Duration::from_secs(2);
 /// Video slots are planned again at least this often.
 const PLAN_EVERY: Duration = Duration::from_millis(50);
 /// Who is speaking and which TCP streams expired are looked at this often. They scan every
@@ -88,6 +90,9 @@ struct Inbound {
     seen: Option<Instant>,
     /// A frame was dropped over budget. Nothing more is forwarded until a keyframe fits.
     broken: bool,
+    /// The last keyframe that passed on half a bucket. Deltas dropped while it is recent do
+    /// not break the layer; they wait for the bucket to refill.
+    debt: Option<Instant>,
     asked: Option<Instant>,
     /// The last keyframe that arrived, forwarded or not.
     keyframe: Option<Instant>,
@@ -102,6 +107,7 @@ impl Inbound {
             budget: Bucket::new(rate, rate, now),
             seen: None,
             broken: false,
+            debt: None,
             asked: None,
             keyframe: None,
         }
@@ -112,6 +118,7 @@ impl Inbound {
         self.arrived = false;
         self.seen = None;
         self.broken = false;
+        self.debt = None;
     }
 
     fn fresh(&self, now: Instant) -> bool {
@@ -121,6 +128,10 @@ impl Inbound {
 
     /// Whether a frame of `size` bytes goes on. Over budget the layer breaks. A broken layer
     /// spends nothing on frames that cannot pass, so the budget fills for the next keyframe.
+    /// A keyframe over the bucket still passes on half a bucket, once it is at most twice the
+    /// burst: detailed content's keyframes are that big, and a layer whose every keyframe is
+    /// refused never reaches a viewer. What it spends, the deltas wait for without the layer
+    /// breaking, so it streams on at the refill.
     fn admit(&mut self, keyframe: bool, size: u32, now: Instant) -> bool {
         if keyframe {
             self.keyframe = Some(now);
@@ -128,12 +139,27 @@ impl Inbound {
         if self.broken && !keyframe {
             return false;
         }
-        let fits = self.budget.take(size, now);
-        self.broken = !fits;
-        if fits {
+        if self.budget.take(size, now) {
             self.seen = Some(now);
+            self.broken = false;
+            return true;
         }
-        fits
+        if keyframe && size <= self.budget.ceiling() && self.budget.half() {
+            self.budget.drain();
+            self.debt = Some(now);
+            self.seen = Some(now);
+            self.broken = false;
+            return true;
+        }
+        if !keyframe
+            && self
+                .debt
+                .is_some_and(|at| now.saturating_duration_since(at) < DEBT)
+        {
+            return false;
+        }
+        self.broken = true;
+        false
     }
 
     /// Whether a keyframe request may go out now. Not right after a keyframe, which the asker
@@ -474,6 +500,8 @@ struct Counts {
     keyframe_asks: u64,
     /// Packets the socket or a TCP stream had no room for.
     send_dropped: u64,
+    /// Packets one source address sent over its per-second budget, audio included.
+    source_dropped: u64,
 }
 
 /// Marks the thread stopped however it ends, a panic included.
@@ -1254,6 +1282,7 @@ impl Engine {
             .entry(source)
             .or_insert_with(|| Bucket::new(rate, burst, now));
         if !budget.take(1, now) {
+            self.counts.source_dropped += 1;
             return None;
         }
         let known = self.by_addr.get(&(proto, source)).copied();
@@ -1429,6 +1458,7 @@ impl Engine {
             audio_dropped = counts.audio_dropped,
             send_dropped = counts.send_dropped,
             video_dropped = counts.video_dropped,
+            source_dropped = counts.source_dropped,
             keyframe_asks = counts.keyframe_asks,
             longest_turn_ms = counts.longest_turn.as_millis() as u64,
             "media counters"
@@ -1635,7 +1665,6 @@ impl Engine {
             if switched && !(keyframe && screen.wanted == Some(source)) {
                 continue;
             }
-            screen.showing = Some(source);
             let mid = screen.mid;
             let out = screen.rebase.map(source, time, now);
             let Some(writer) = peer.rtc.writer(mid) else {
@@ -1644,6 +1673,9 @@ impl Engine {
             let Some(pt) = writer.match_params(data.params) else {
                 continue;
             };
+            // Only a frame that went out moves the slot: a failed writer must not turn the
+            // slot to a source no `call.slots` names.
+            screen.showing = Some(source);
             let at = MediaTime::new(out, Frequency::NINETY_KHZ);
             peer.video_sent += u64::from(size) + AUDIO_HEADERS;
             if let Err(error) = writer.write(pt, data.network_time, at, data.data.clone()) {
@@ -2186,12 +2218,49 @@ mod tests {
     }
 
     #[test]
-    fn a_keyframe_that_does_not_fit_leaves_the_layer_broken() {
+    fn an_oversized_keyframe_passes_on_half_a_bucket_and_the_deltas_wait_for_the_refill() {
         let start = Instant::now();
         let mut layer = broken_layer(start);
-        assert!(!layer.admit(true, 4000, start + AT_30_FPS));
+        // The keyframe is over the bucket but within twice it, and the bucket is more than
+        // half full from the refill: it passes, spending what was there.
+        let at = start + AT_30_FPS;
+        assert!(layer.admit(true, 4000, at), "the keyframe did not pass");
+        assert!(!layer.broken);
+        assert!(layer.fresh(at));
+        // Deltas over the empty bucket are dropped, but they do not break the layer.
+        let at = at + AT_30_FPS;
+        assert!(!layer.admit(false, 200, at));
+        assert!(!layer.broken, "a delta in debt broke the layer");
+        // A second after the keyframe the bucket has refilled and deltas flow again.
+        assert!(layer.admit(false, 200, at + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_keyframe_over_twice_the_bucket_still_breaks_the_layer() {
+        let start = Instant::now();
+        let mut layer = broken_layer(start);
+        assert!(!layer.admit(true, 8000, start + AT_30_FPS));
         assert!(layer.broken);
         assert!(!layer.fresh(start + AT_30_FPS));
+    }
+
+    #[test]
+    fn an_oversized_keyframe_waits_for_half_a_bucket_before_it_passes() {
+        let start = Instant::now();
+        let mut layer = Inbound::new(24, start);
+        layer.arrived = true;
+        // The bucket starts full: the first oversized keyframe passes and spends it.
+        assert!(layer.admit(true, 6000, start), "exactly the ceiling passes");
+        assert!(!layer.broken);
+        // A keyframe before half the bucket has refilled is refused and breaks the layer.
+        assert!(!layer.admit(true, 6000, start + Duration::from_millis(100)));
+        assert!(layer.broken);
+        // Half a bucket of refill at 3,000 bytes a second is 500 ms.
+        assert!(
+            layer.admit(true, 6000, start + Duration::from_millis(500)),
+            "the keyframe passed again on half a bucket"
+        );
+        assert!(!layer.broken);
     }
 
     #[test]

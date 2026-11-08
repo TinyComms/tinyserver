@@ -40,6 +40,28 @@ impl Bucket {
     pub fn used(&self) -> Instant {
         self.at
     }
+
+    /// Whether at least half the burst is in. An oversized keyframe passes on half a bucket,
+    /// so it cannot come more than about twice a second of the rate.
+    pub fn half(&self) -> bool {
+        self.tokens >= self.burst / 2.0
+    }
+
+    /// Empties the bucket. What a debt keyframe spent, the deltas wait for.
+    pub fn drain(&mut self) {
+        self.tokens = 0.0;
+    }
+
+    /// The largest frame a bucket ever accepts: twice the burst, so detailed content's
+    /// keyframes pass while a flood does not.
+    pub fn ceiling(&self) -> u32 {
+        let doubled = self.burst * 2.0;
+        if doubled >= u32::MAX as f64 {
+            u32::MAX
+        } else {
+            doubled as u32
+        }
+    }
 }
 
 #[cfg(test)]
