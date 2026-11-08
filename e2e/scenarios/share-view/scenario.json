@@ -1,0 +1,10 @@
+{
+  "id": "share-view",
+  "title": "A viewer gets the picture of a camera whose keyframes are bigger than the publisher's layer bucket",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "the released client shows this as a camera or share tile that leaves Connecting; the lab records it per platform"
+}
