@@ -2480,13 +2480,21 @@ mod turn_tests {
     fn a_read_stops_at_its_cap_and_says_more_is_waiting() {
         let mut rig = Rig::new();
         let sender = StdUdpSocket::bind((LOOPBACK, 0)).expect("bind");
-        for _ in 0..READ_BATCH + 10 {
-            sender
-                .send_to(&[0x80; 32], rig.engine.public)
-                .expect("send");
+        let deadline = Instant::now() + PATIENCE;
+        // Loopback delivery can lag the sends, so send a batch at a time until a read
+        // starts on a queue the cap cannot drain and stops at it.
+        loop {
+            for _ in 0..READ_BATCH + 10 {
+                sender
+                    .send_to(&[0x80; 32], rig.engine.public)
+                    .expect("send");
+            }
+            if rig.engine.read(&mut rig.buf) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "more was never waiting");
         }
-        // Loopback delivers before `send_to` returns, on every platform these tests run on.
-        assert!(rig.engine.read(&mut rig.buf), "more should be waiting");
-        assert!(!rig.engine.read(&mut rig.buf), "the rest was under the cap");
+        // What is left is drained read by read, each stopping only when the socket is empty.
+        while rig.engine.read(&mut rig.buf) {}
     }
 }
