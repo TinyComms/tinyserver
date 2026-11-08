@@ -187,9 +187,11 @@ async fn call_quality_caps_the_layer_or_turns_video_off() {
 }
 
 #[tokio::test]
-async fn video_over_the_publisher_budget_is_dropped() {
+async fn over_budget_deltas_are_dropped_and_only_keyframes_pass() {
     let mut config = config();
-    // Smaller than one frame of either layer, so nothing fits.
+    // Smaller than one frame of either layer. An oversized keyframe still passes once on
+    // half the bucket, so what reaches the listener is keyframes only, held to a few a
+    // second by the refill; every delta is dropped.
     config.camera_high_kbps = 8;
     config.camera_low_kbps = 8;
     let mut sfu = start(config);
@@ -200,8 +202,17 @@ async fn video_over_the_publisher_budget_is_dropped() {
     a.running.sending(true);
     hears(&b, &mid_of(&b_slots, "a"), b'A').await;
     let seen = seen_over(&b, Duration::from_millis(1500)).await;
-    assert!(seen.is_empty(), "over-budget video was forwarded: {seen:?}");
-    assert_eq!(sfu.video.get(&b.call_id).cloned().flatten(), None);
+    assert!(
+        seen.iter().all(|frame| frame.keyframe),
+        "an over-budget delta was forwarded: {seen:?}"
+    );
+    assert!(
+        seen.len() <= 5,
+        "the bucket is not holding the rate back: {seen:?}"
+    );
+    // The debt keyframe named the listener's slot, and it carries the publisher.
+    let slot = sfu.video_for(&b.call_id, Some("a")).await;
+    assert_eq!(slot.kind, VideoKind::Camera);
 }
 
 #[tokio::test]
