@@ -17,7 +17,7 @@ run() {
     # have actually completed successfully.
     grep -Fq "running 1 test" "$log"
     grep -Fq "test $name ... ok" "$log"
-    grep -Fq 'test result: ok. 1 passed; 0 failed;'
+    grep -Fq 'test result: ok. 1 passed; 0 failed;' "$log"
     if grep -Eq '(^|[[:space:]])skipped:' "$log"; then
         echo 'FAIL: an integration fixture skipped' >&2
         return 1

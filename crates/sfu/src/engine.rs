@@ -68,8 +68,6 @@ const LOAD_EVERY: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 /// Seconds of `audio_kbps` a publisher may run ahead of it, for a burst after a stall.
 const AUDIO_BURST: u32 = 2;
-/// How long deltas dropped after an oversized keyframe keep the layer alive but on hold.
-const DEBT: Duration = Duration::from_secs(2);
 /// Video slots are planned again at least this often.
 const PLAN_EVERY: Duration = Duration::from_millis(50);
 /// Who is speaking and which TCP streams expired are looked at this often. They scan every
@@ -90,9 +88,6 @@ struct Inbound {
     seen: Option<Instant>,
     /// A frame was dropped over budget. Nothing more is forwarded until a keyframe fits.
     broken: bool,
-    /// The last keyframe that passed on half a bucket. Deltas dropped while it is recent do
-    /// not break the layer; they wait for the bucket to refill.
-    debt: Option<Instant>,
     asked: Option<Instant>,
     /// The last keyframe that arrived, forwarded or not.
     keyframe: Option<Instant>,
@@ -107,7 +102,6 @@ impl Inbound {
             budget: Bucket::new(rate, rate, now),
             seen: None,
             broken: false,
-            debt: None,
             asked: None,
             keyframe: None,
         }
@@ -118,7 +112,6 @@ impl Inbound {
         self.arrived = false;
         self.seen = None;
         self.broken = false;
-        self.debt = None;
     }
 
     fn fresh(&self, now: Instant) -> bool {
@@ -126,12 +119,13 @@ impl Inbound {
             .is_some_and(|at| now.saturating_duration_since(at) < video::STALE)
     }
 
-    /// Whether a frame of `size` bytes goes on. Over budget the layer breaks. A broken layer
-    /// spends nothing on frames that cannot pass, so the budget fills for the next keyframe.
-    /// A keyframe over the bucket still passes on half a bucket, once it is at most twice the
-    /// burst: detailed content's keyframes are that big, and a layer whose every keyframe is
-    /// refused never reaches a viewer. What it spends, the deltas wait for without the layer
-    /// breaking, so it streams on at the refill.
+    /// Whether a frame of `size` bytes goes on. Over budget the layer breaks, and a broken
+    /// layer stays broken until a keyframe fits: what the writer renumbers per slot looks
+    /// contiguous, so a forwarded delta after a dropped one would reference a picture the
+    /// viewer never got. A keyframe over the bucket still passes once it is at most twice
+    /// the burst and half the bucket has refilled, drawn as an overdraft the following
+    /// frames repay: detailed content's keyframes are that big, and a layer whose every
+    /// keyframe is refused never reaches a viewer.
     fn admit(&mut self, keyframe: bool, size: u32, now: Instant) -> bool {
         if keyframe {
             self.keyframe = Some(now);
@@ -144,19 +138,10 @@ impl Inbound {
             self.broken = false;
             return true;
         }
-        if keyframe && size <= self.budget.ceiling() && self.budget.half() {
-            self.budget.drain();
-            self.debt = Some(now);
+        if keyframe && self.budget.overdraw(size, now) {
             self.seen = Some(now);
-            self.broken = false;
+            self.broken = true;
             return true;
-        }
-        if !keyframe
-            && self
-                .debt
-                .is_some_and(|at| now.saturating_duration_since(at) < DEBT)
-        {
-            return false;
         }
         self.broken = true;
         false
@@ -2218,21 +2203,30 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_keyframe_passes_on_half_a_bucket_and_the_deltas_wait_for_the_refill() {
+    fn an_oversized_keyframe_passes_once_and_deltas_break_until_the_next_keyframe() {
         let start = Instant::now();
         let mut layer = broken_layer(start);
         // The keyframe is over the bucket but within twice it, and the bucket is more than
-        // half full from the refill: it passes, spending what was there.
+        // half full from the refill: it passes as an overdraft, drawing the balance below
+        // zero.
         let at = start + AT_30_FPS;
         assert!(layer.admit(true, 4000, at), "the keyframe did not pass");
-        assert!(!layer.broken);
         assert!(layer.fresh(at));
-        // Deltas over the empty bucket are dropped, but they do not break the layer.
+        // The deltas over the spent bucket break the layer, exactly as an over-budget frame
+        // on its own would: what the writer renumbers looks contiguous, so the deltas after
+        // a dropped one have to wait for a keyframe, not sneak in on the refill.
         let at = at + AT_30_FPS;
         assert!(!layer.admit(false, 200, at));
-        assert!(!layer.broken, "a delta in debt broke the layer");
-        // A second after the keyframe the bucket has refilled and deltas flow again.
-        assert!(layer.admit(false, 200, at + Duration::from_secs(1)));
+        assert!(layer.broken);
+        assert!(!layer.admit(false, 200, at + AT_30_FPS));
+        // Even a delta the refill could cover is held until the keyframe.
+        let later = at + Duration::from_secs(1);
+        assert!(!layer.admit(false, 100, later));
+        assert!(layer.broken);
+        assert!(layer.admit(true, 2900, later));
+        assert!(layer.fresh(later));
+        // And the deltas stay held past the second keyframe too.
+        assert!(!layer.admit(false, 100, later + AT_30_FPS));
     }
 
     #[test]
@@ -2249,18 +2243,22 @@ mod tests {
         let start = Instant::now();
         let mut layer = Inbound::new(24, start);
         layer.arrived = true;
-        // The bucket starts full: the first oversized keyframe passes and spends it.
+        // The bucket starts full: the first oversized keyframe passes and overdrafts it.
         assert!(layer.admit(true, 6000, start), "exactly the ceiling passes");
-        assert!(!layer.broken);
-        // A keyframe before half the bucket has refilled is refused and breaks the layer.
+        // The deltas behind it are held until the next keyframe fits.
+        assert!(!layer.admit(false, 100, start + AT_30_FPS));
+        assert!(layer.broken);
+        // A keyframe before half the burst has refilled is refused and breaks the layer.
         assert!(!layer.admit(true, 6000, start + Duration::from_millis(100)));
         assert!(layer.broken);
-        // Half a bucket of refill at 3,000 bytes a second is 500 ms.
+        // The overdraft left the balance at −3,000 bytes; half the burst (1,500 bytes) over
+        // that at 3,000 bytes a second is 1.5 seconds.
         assert!(
-            layer.admit(true, 6000, start + Duration::from_millis(500)),
+            layer.admit(true, 6000, start + Duration::from_millis(1500)),
             "the keyframe passed again on half a bucket"
         );
-        assert!(!layer.broken);
+        // And the deltas stay held past the second keyframe too.
+        assert!(!layer.admit(false, 100, start + Duration::from_millis(1500) + AT_30_FPS));
     }
 
     #[test]
@@ -2480,21 +2478,13 @@ mod turn_tests {
     fn a_read_stops_at_its_cap_and_says_more_is_waiting() {
         let mut rig = Rig::new();
         let sender = StdUdpSocket::bind((LOOPBACK, 0)).expect("bind");
-        let deadline = Instant::now() + PATIENCE;
-        // Loopback delivery can lag the sends, so send a batch at a time until a read
-        // starts on a queue the cap cannot drain and stops at it.
-        loop {
-            for _ in 0..READ_BATCH + 10 {
-                sender
-                    .send_to(&[0x80; 32], rig.engine.public)
-                    .expect("send");
-            }
-            if rig.engine.read(&mut rig.buf) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "more was never waiting");
+        for _ in 0..READ_BATCH + 10 {
+            sender
+                .send_to(&[0x80; 32], rig.engine.public)
+                .expect("send");
         }
-        // What is left is drained read by read, each stopping only when the socket is empty.
-        while rig.engine.read(&mut rig.buf) {}
+        // Loopback delivers before `send_to` returns, on every platform these tests run on.
+        assert!(rig.engine.read(&mut rig.buf), "more should be waiting");
+        assert!(!rig.engine.read(&mut rig.buf), "the rest was under the cap");
     }
 }
