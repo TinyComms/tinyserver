@@ -211,7 +211,7 @@ async fn over_budget_deltas_are_dropped_and_only_keyframes_pass() {
         "the bucket is not holding the rate back: {seen:?}"
     );
     // The debt keyframe named the listener's slot, and it carries the publisher.
-    let slot = sfu.video_for(&b.call_id, Some("a")).await;
+    let slot = sfu.video_for(&b.call_id, Some("a")).await.expect("a slot");
     assert_eq!(slot.kind, VideoKind::Camera);
 }
 
