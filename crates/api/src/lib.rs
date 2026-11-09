@@ -23,6 +23,7 @@ mod reports;
 mod scan_clamd;
 mod session;
 mod setup;
+mod turn_api;
 
 #[cfg(feature = "fuzz")]
 pub mod fuzz;
