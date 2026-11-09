@@ -45,16 +45,16 @@ pub(crate) enum TurnEvent {
     TimedOut(&'static str),
 }
 
-// --- Message types. The type field packs a 12-bit method with a 2-bit class: the method's
-// top four bits go into bits 12-9, the class into bits 8-7, the method's next four into bits
-// 6-3, its last four into bits 2-0. ------------------------------------------------------------
+// --- Message types. Our methods are all below 0x10, so the type field is the class in its
+// high bits over the method in its low ones: request 0x0003, success 0x0103, error 0x0113,
+// send indication 0x0016, data indication 0x0017. ------------------------------------------------
 
 const ALLOCATE: u16 = 3;
 const REFRESH: u16 = 4;
 const CREATE_PERMISSION: u16 = 8;
 const CHANNEL_BIND: u16 = 9;
-const SEND_INDICATION: u16 = 0x16;
-const DATA_INDICATION: u16 = 0x17;
+const SEND_INDICATION: u16 = 0x0016;
+const DATA_INDICATION: u16 = 0x0017;
 
 const CLASS_REQUEST: u8 = 0;
 const CLASS_INDICATION: u8 = 1;
@@ -72,22 +72,33 @@ const REBIND_AFTER: Duration = Duration::from_secs(9 * 60);
 /// Permissions re-create a minute before the server drops them at five minutes.
 const REPERMISSION_AFTER: Duration = Duration::from_secs(4 * 60);
 const RETRIES: u32 = 5;
+/// A fixed retransmit interval for now; RFC 5389 §7.2.1's exponential backoff is a later
+/// refinement.
 const RTO: Duration = Duration::from_millis(500);
 /// The largest datagram wrapped for a peer.
 const MAX_PAYLOAD: usize = 1_400;
 
 fn msg_type(method: u16, class: u8) -> u16 {
-    (method >> 8 & 0xF) << 9 | (u16::from(class & 3)) << 7 | (method >> 4 & 7) << 3 | (method & 0xF)
+    let class_base = match class {
+        CLASS_INDICATION => 0x0010,
+        CLASS_SUCCESS => 0x0100,
+        CLASS_ERROR => 0x0110,
+        _ => 0x0000,
+    };
+    class_base | (method & 0xF)
 }
 
 fn method_of(msg_type: u16) -> u16 {
-    // Our methods are at most ChannelBind (9): their value sits unspread in the low bits,
-    // the class in the high ones.
     msg_type & 0xF
 }
 
 fn class_of(msg_type: u16) -> u8 {
-    (msg_type >> 7 & 3) as u8
+    match msg_type & 0x0110 {
+        0x0100 => CLASS_SUCCESS,
+        0x0110 => CLASS_ERROR,
+        0x0010 => CLASS_INDICATION,
+        _ => CLASS_REQUEST,
+    }
 }
 
 fn rand_transaction() -> [u8; 12] {
@@ -262,7 +273,7 @@ impl TurnSession {
     /// CreatePermission for a peer address, as `call.candidate` asked, and its datagram.
     /// Refreshes are `poll`'s job.
     pub fn create_permission(&mut self, peer: SocketAddr, now: Instant) -> Vec<u8> {
-        if !self.active() {
+        if !self.active() || !peer.is_ipv4() {
             return Vec::new();
         }
         let mut address = Vec::new();
@@ -275,7 +286,7 @@ impl TurnSession {
     /// ChannelBind for a peer address, so its media travels as channel data, and its
     /// datagram. Re-binds are `poll`'s job.
     pub fn channel_bind(&mut self, peer: SocketAddr, now: Instant) -> Vec<u8> {
-        if !self.active() || self.peers.contains_key(&peer) {
+        if !self.active() || !peer.is_ipv4() || self.peers.contains_key(&peer) {
             return Vec::new();
         }
         self.bind(peer, now);
@@ -299,7 +310,7 @@ impl TurnSession {
     /// Wraps `payload` for `peer`: channel data once the channel is bound, a send indication
     /// until then. Empty when the session cannot carry it yet.
     pub fn send_to(&self, peer: SocketAddr, payload: &[u8]) -> Vec<u8> {
-        if !self.active() || payload.is_empty() || payload.len() > MAX_PAYLOAD {
+        if !self.active() || !peer.is_ipv4() || payload.is_empty() || payload.len() > MAX_PAYLOAD {
             return Vec::new();
         }
         let mut buf = Vec::with_capacity(payload.len() + 32);
@@ -384,7 +395,11 @@ impl TurnSession {
 
     /// Feeds one datagram from the TURN server in and reports what it said.
     pub fn handle(&mut self, data: &[u8], now: Instant) -> Option<TurnEvent> {
-        // Channel data is smaller than a STUN header, so it is recognized first.
+        // Channel data is smaller than a STUN header, so it is recognized first. A zero-byte
+        // datagram is nothing at all.
+        if data.is_empty() {
+            return None;
+        }
         if (0x40..0x80).contains(&data[0]) {
             return self.channel_data(data);
         }
@@ -422,12 +437,23 @@ impl TurnSession {
             match code {
                 401 | 438 => {
                     // The challenge names the nonce and realm; the same request goes out
-                    // again, now with credentials and integrity.
+                    // again, now with credentials and integrity. The retries stay counted
+                    // across challenges, so a server that never accepts cannot keep this
+                    // session asking forever.
+                    let tries = pending.tries + 1;
+                    if tries > RETRIES {
+                        self.pending = None;
+                        self.failed = true;
+                        return Some(TurnEvent::TimedOut("challenged too often"));
+                    }
                     self.nonce = attributes.nonce.clone().or(self.nonce.clone());
                     self.realm = attributes.realm.clone().or(self.realm.clone());
                     let method = pending.method;
                     let attributes = pending.attributes.clone();
                     self.send_request(method, attributes, now);
+                    if let Some(retried) = self.pending.as_mut() {
+                        retried.tries = tries;
+                    }
                     Some(TurnEvent::Send(self.pending_bytes()))
                 }
                 _ => {
@@ -501,7 +527,9 @@ impl TurnSession {
 
     /// Builds one request and makes it the pending one. Attributes go in first, credentials
     /// and integrity behind them, and the header length counts the integrity attribute as
-    /// present, the RFC's way of signing everything before it.
+    /// present, the RFC's way of signing everything before it. The integrity key for
+    /// long-term credentials is MD5 over `username ":" realm ":" password` (RFC 5389
+    /// §15.4), with the realm this session was challenged with.
     fn send_request(&mut self, method: u16, attributes: Vec<(u16, Vec<u8>)>, now: Instant) {
         let authenticated = self.nonce.is_some() && self.realm.is_some();
         let mut buf = Vec::with_capacity(160);
@@ -513,25 +541,25 @@ impl TurnSession {
         let mut put = |kind: u16, value: &[u8]| {
             buf.extend_from_slice(&kind.to_be_bytes());
             let padded = value.len().div_ceil(4) * 4;
-            buf.extend_from_slice(&(padded as u16).to_be_bytes());
+            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
             buf.extend_from_slice(value);
             buf.resize(buf.len() + padded - value.len(), 0);
         };
         for (kind, value) in &attributes {
             put(*kind, value);
         }
-        if authenticated {
-            put(20, self.realm.as_ref().unwrap().as_bytes());
-            put(21, self.nonce.as_ref().unwrap());
+        if let (Some(nonce), Some(realm)) = (&self.nonce, &self.realm) {
+            put(20, realm.as_bytes());
+            put(21, nonce);
             put(6, self.server.username.as_bytes());
-        }
-        let end = buf.len() + INTEGRITY_LEN;
-        buf[2..4].copy_from_slice(&((end - HEADER) as u16).to_be_bytes());
-        if authenticated {
-            let key = hmac::Key::new(
-                hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-                self.server.credential.as_bytes(),
+            let end = buf.len() + INTEGRITY_LEN;
+            buf[2..4].copy_from_slice(&((end - HEADER) as u16).to_be_bytes());
+            let material = format!(
+                "{}:{}:{}",
+                self.server.username, realm, self.server.credential
             );
+            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::MD5, material.as_bytes());
+            let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, digest.as_ref());
             buf.extend_from_slice(&8u16.to_be_bytes());
             buf.extend_from_slice(&(INTEGRITY_LEN as u16).to_be_bytes());
             buf.extend_from_slice(hmac::sign(&key, &buf).as_ref());
@@ -635,16 +663,12 @@ mod tests {
         assert!(text.contains("turn-key"), "the username is missing");
         assert!(request_type(&session, ALLOCATE, CLASS_REQUEST));
 
-        let event = session.handle(
-            &allocated(second[8..20].try_into().unwrap(), 600),
-            start + RTO * 2,
-        );
-        eprintln!(
-            "DEBUG event: {event:?} | pending: {:?} | second[8..20]: {:?}",
-            session.pending.as_ref().map(|p| p.method),
-            &second[8..20]
-        );
-        let TurnEvent::Allocated { relayed, lifetime } = event.expect("the allocation answered")
+        let TurnEvent::Allocated { relayed, lifetime } = session
+            .handle(
+                &allocated(second[8..20].try_into().unwrap(), 600),
+                start + RTO * 2,
+            )
+            .expect("the allocation answered")
         else {
             panic!("not an allocation");
         };
