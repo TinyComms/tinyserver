@@ -1,0 +1,10 @@
+{
+  "id": "relay-turn-protocol",
+  "title": "The TURN client answers its credentials challenge, retries, and exhausts a server that never accepts",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "protocol-level, not released-client or native GUI certification",
+  "native_client_proof": "the released client shows relay-mode calls connecting where no media port is published; the lab records it per platform"
+}

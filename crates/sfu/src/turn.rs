@@ -373,7 +373,7 @@ impl TurnSession {
             return Some(self.pending_bytes());
         }
         let mut rebind: Option<SocketAddr> = None;
-        for (_channel, (peer, bound)) in &self.channels {
+        for (peer, bound) in self.channels.values() {
             if now.saturating_duration_since(*bound) >= REBIND_AFTER {
                 rebind = Some(*peer);
             }
