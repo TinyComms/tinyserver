@@ -407,12 +407,9 @@ impl TurnSession {
         }
         let msg_type = u16::from_be_bytes([data[0], data[1]]);
         if msg_type == DATA_INDICATION {
-            let Some(attributes) = parse_attributes(&data[HEADER..]) else {
-                return None;
-            };
-            let (Some(peer), Some(payload)) = (attributes.peer, attributes.data) else {
-                return None;
-            };
+            let attributes = parse_attributes(&data[HEADER..])?;
+            let peer = attributes.peer?;
+            let payload = attributes.data?;
             return Some(TurnEvent::Received(peer, payload));
         }
         let class = class_of(msg_type);
@@ -420,25 +417,22 @@ impl TurnSession {
             return None;
         }
         let method = method_of(msg_type);
-        let Some(pending) = &self.pending else {
-            return None;
-        };
+        let pending = self.pending.as_ref()?;
         if pending.transaction != data[8..20] {
             return None;
         }
-        let Some(attributes) = parse_attributes(&data[HEADER..]) else {
-            return None;
-        };
+        let attributes = parse_attributes(&data[HEADER..])?;
         if class == CLASS_ERROR {
-            let Some((code, _)) = attributes.error else {
-                return None;
-            };
+            let (code, _) = attributes.error?;
             match code {
                 401 | 438 => {
                     // The challenge names the nonce and realm; the same request goes out
                     // again, now with credentials and integrity. The retries stay counted
-                    // across challenges, so a server that never accepts cannot keep this
-                    // session asking forever.
+                    // across challenges: the RETRIES-th is still answered, the one after
+                    // it fails the session, so a server that never accepts cannot keep
+                    // this session asking forever.
+                    let method = pending.method;
+                    let attributes = pending.attributes.clone();
                     let tries = pending.tries + 1;
                     if tries > RETRIES {
                         self.pending = None;
@@ -447,8 +441,6 @@ impl TurnSession {
                     }
                     self.nonce = attributes.nonce.clone().or(self.nonce.clone());
                     self.realm = attributes.realm.clone().or(self.realm.clone());
-                    let method = pending.method;
-                    let attributes = pending.attributes.clone();
                     self.send_request(method, attributes, now);
                     if let Some(retried) = self.pending.as_mut() {
                         retried.tries = tries;
@@ -530,7 +522,6 @@ impl TurnSession {
     /// long-term credentials is MD5 over `username ":" realm ":" password` (RFC 5389
     /// §15.4), with the realm this session was challenged with.
     fn send_request(&mut self, method: u16, attributes: Vec<(u16, Vec<u8>)>, now: Instant) {
-        let authenticated = self.nonce.is_some() && self.realm.is_some();
         let mut buf = Vec::with_capacity(160);
         buf.extend_from_slice(&msg_type(method, CLASS_REQUEST).to_be_bytes());
         buf.extend_from_slice(&[0, 0]);
@@ -649,12 +640,40 @@ mod tests {
     }
 
     #[test]
+    fn challenges_exhaust_the_retries_and_fail_the_session() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        let mut request = session.allocate(start);
+        // A server that keeps challenging: each 401 gets the re-request the session emits,
+        // until the retry cap trips and the session fails instead of asking forever.
+        for round in 0..RETRIES {
+            let event = session.handle(
+                &challenge(request[8..20].try_into().expect("a 12-byte transaction id")),
+                start + RTO * (u32::from(round) + 1),
+            );
+            let TurnEvent::Send(re_request) = event.expect("the re-request") else {
+                panic!("not a send");
+            };
+            request = re_request;
+        }
+        let event = session.handle(
+            &challenge(request[8..20].try_into().expect("a 12-byte transaction id")),
+            start + Duration::from_secs(10),
+        );
+        assert!(matches!(event, Some(TurnEvent::TimedOut(_))));
+        assert!(session.failed());
+    }
+
+    #[test]
     fn allocate_runs_the_challenge_and_names_the_relayed_address() {
         let start = Instant::now();
         let mut session = TurnSession::new(credentials());
         let first = session.allocate(start);
         assert!(request_type(&session, ALLOCATE, CLASS_REQUEST));
-        session.handle(&challenge(first[8..20].try_into().unwrap()), start + RTO);
+        session.handle(
+            &challenge(first[8..20].try_into().expect("a 12-byte transaction id")),
+            start + RTO,
+        );
         let second = session.pending_bytes();
         let text = String::from_utf8_lossy(&second).into_owned();
         assert!(text.contains("nonce-1"), "the nonce is missing");
@@ -664,7 +683,10 @@ mod tests {
 
         let TurnEvent::Allocated { relayed, lifetime } = session
             .handle(
-                &allocated(second[8..20].try_into().unwrap(), 600),
+                &allocated(
+                    second[8..20].try_into().expect("a 12-byte transaction id"),
+                    600,
+                ),
                 start + RTO * 2,
             )
             .expect("the allocation answered")
@@ -684,10 +706,16 @@ mod tests {
         let start = Instant::now();
         let mut session = TurnSession::new(credentials());
         let first = session.allocate(start);
-        session.handle(&challenge(first[8..20].try_into().unwrap()), start + RTO);
+        session.handle(
+            &challenge(first[8..20].try_into().expect("a 12-byte transaction id")),
+            start + RTO,
+        );
         let second = session.pending_bytes();
         session.handle(
-            &allocated(second[8..20].try_into().unwrap(), 600),
+            &allocated(
+                second[8..20].try_into().expect("a 12-byte transaction id"),
+                600,
+            ),
             start + RTO * 2,
         );
 
@@ -708,14 +736,22 @@ mod tests {
         let permission = session.create_permission(peer, start + RTO * 2);
         assert!(request_type(&session, CREATE_PERMISSION, CLASS_REQUEST));
         session.handle(
-            &success(CREATE_PERMISSION, permission[8..20].try_into().unwrap()),
+            &success(
+                CREATE_PERMISSION,
+                permission[8..20]
+                    .try_into()
+                    .expect("a 12-byte transaction id"),
+            ),
             start + RTO * 3,
         );
 
         let bind = session.channel_bind(peer, start + RTO * 3);
         assert!(request_type(&session, CHANNEL_BIND, CLASS_REQUEST));
         session.handle(
-            &success(CHANNEL_BIND, bind[8..20].try_into().unwrap()),
+            &success(
+                CHANNEL_BIND,
+                bind[8..20].try_into().expect("a 12-byte transaction id"),
+            ),
             start + RTO * 4,
         );
 
@@ -772,10 +808,16 @@ mod tests {
         let start = Instant::now();
         let mut session = TurnSession::new(credentials());
         let first = session.allocate(start);
-        session.handle(&challenge(first[8..20].try_into().unwrap()), start + RTO);
+        session.handle(
+            &challenge(first[8..20].try_into().expect("a 12-byte transaction id")),
+            start + RTO,
+        );
         let second = session.pending_bytes();
         session.handle(
-            &allocated(second[8..20].try_into().unwrap(), 120),
+            &allocated(
+                second[8..20].try_into().expect("a 12-byte transaction id"),
+                120,
+            ),
             start + RTO * 2,
         );
 
@@ -785,7 +827,10 @@ mod tests {
         let refresh = session.poll(at).expect("the refresh goes out");
         assert!(request_type(&session, REFRESH, CLASS_REQUEST));
         session.handle(
-            &success(REFRESH, refresh[8..20].try_into().unwrap()),
+            &success(
+                REFRESH,
+                refresh[8..20].try_into().expect("a 12-byte transaction id"),
+            ),
             at + RTO,
         );
     }
@@ -795,22 +840,36 @@ mod tests {
         let start = Instant::now();
         let mut session = TurnSession::new(credentials());
         let first = session.allocate(start);
-        session.handle(&challenge(first[8..20].try_into().unwrap()), start + RTO);
+        session.handle(
+            &challenge(first[8..20].try_into().expect("a 12-byte transaction id")),
+            start + RTO,
+        );
         let second = session.pending_bytes();
         session.handle(
-            &allocated(second[8..20].try_into().unwrap(), 3600),
+            &allocated(
+                second[8..20].try_into().expect("a 12-byte transaction id"),
+                3600,
+            ),
             start + RTO * 2,
         );
 
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5004);
         let permission = session.create_permission(peer, start + RTO * 2);
         session.handle(
-            &success(CREATE_PERMISSION, permission[8..20].try_into().unwrap()),
+            &success(
+                CREATE_PERMISSION,
+                permission[8..20]
+                    .try_into()
+                    .expect("a 12-byte transaction id"),
+            ),
             start + RTO * 3,
         );
         let bind = session.channel_bind(peer, start + RTO * 3);
         session.handle(
-            &success(CHANNEL_BIND, bind[8..20].try_into().unwrap()),
+            &success(
+                CHANNEL_BIND,
+                bind[8..20].try_into().expect("a 12-byte transaction id"),
+            ),
             start + RTO * 4,
         );
 
