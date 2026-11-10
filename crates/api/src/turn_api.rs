@@ -186,45 +186,51 @@ mod tests {
             "http://127.0.0.1:{}",
             listener.local_addr().expect("addr").port()
         );
-        let app = Router::new().route(
-            "/turn/keys/the-key/credentials/generate-ice-servers",
-            post(
-                move |headers: axum::http::HeaderMap,
-                      body: Option<Json<serde_json::Value>>|
-                      async move {
-                    if headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
-                        != Some("Bearer the-token")
-                    {
-                        return StatusCode::UNAUTHORIZED.into_response();
-                    }
-                    if body
-                        .as_ref()
-                        .and_then(|Json(body)| body.get("ttl"))
-                        .is_none()
-                    {
-                        return StatusCode::BAD_REQUEST.into_response();
-                    }
-                    let ice_servers = match shape {
-                        "object" => json!({
-                            "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
-                            "username": "the-username",
-                            "credential": "the-credential"
-                        }),
-                        _ => json!([{
-                            "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
-                            "username": "the-username",
-                            "credential": "the-credential"
-                        }]),
-                    };
-                    (StatusCode::CREATED, Json(json!({ "iceServers": ice_servers })))
-                        .into_response()
-                },
-            ),
-        )
-        .route(
-            "/turn/keys/the-key/credentials/the-username/revoke",
-            post(revoke),
-        );
+        let app =
+            Router::new()
+                .route(
+                    "/turn/keys/the-key/credentials/generate-ice-servers",
+                    post(
+                        move |headers: axum::http::HeaderMap,
+                              body: Option<Json<serde_json::Value>>| async move {
+                            if headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                != Some("Bearer the-token")
+                            {
+                                return StatusCode::UNAUTHORIZED.into_response();
+                            }
+                            if body
+                                .as_ref()
+                                .and_then(|Json(body)| body.get("ttl"))
+                                .is_none()
+                            {
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
+                            let ice_servers = match shape {
+                                "object" => json!({
+                                    "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
+                                    "username": "the-username",
+                                    "credential": "the-credential"
+                                }),
+                                _ => json!([{
+                                    "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
+                                    "username": "the-username",
+                                    "credential": "the-credential"
+                                }]),
+                            };
+                            (
+                                StatusCode::CREATED,
+                                Json(json!({ "iceServers": ice_servers })),
+                            )
+                                .into_response()
+                        },
+                    ),
+                )
+                .route(
+                    "/turn/keys/the-key/credentials/the-username/revoke",
+                    post(revoke),
+                );
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
