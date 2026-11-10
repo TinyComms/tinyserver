@@ -505,11 +505,8 @@ impl TurnSession {
         let channel = u16::from_be_bytes([data[0], data[1]]);
         let len = u16::from_be_bytes([data[2], data[3]]) as usize;
         let payload = data.get(4..4 + len)?;
-        let Some((peer, _bound)) = self.channels.get(&channel) else {
-            return None;
-        };
-        let peer = *peer;
-        Some(TurnEvent::Received(peer, payload.to_vec()))
+        let (peer, _bound) = self.channels.get(&channel)?;
+        Some(TurnEvent::Received(*peer, payload.to_vec()))
     }
 
     fn active(&self) -> bool {
