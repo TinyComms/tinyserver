@@ -141,7 +141,7 @@ fn xor_out(buf: &[u8]) -> Option<SocketAddr> {
     let mut port_bytes = [0u8; 2];
     port_bytes.copy_from_slice(&buf[2..4]);
     for (byte, mask) in port_bytes.iter_mut().zip(MAGIC.to_be_bytes()) {
-        *byte ^= mask & 0xFF;
+        *byte ^= mask;
     }
     let port = u16::from_be_bytes(port_bytes);
     let mut octets = [0u8; 4];
@@ -179,9 +179,7 @@ fn parse_attributes(data: &[u8]) -> Option<Attributes> {
     while at + 4 <= data.len() {
         let kind = u16::from_be_bytes([data[at], data[at + 1]]);
         let len = u16::from_be_bytes([data[at + 2], data[at + 3]]) as usize;
-        let Some(value) = data.get(at + 4..at + 4 + len) else {
-            return None;
-        };
+        let value = data.get(at + 4..at + 4 + len)?;
         match kind {
             22 => found.relayed = xor_out(value),
             18 => found.peer = xor_out(value),
@@ -322,7 +320,7 @@ impl TurnSession {
                 buf.extend_from_slice(payload);
             }
             None => {
-                buf.extend_from_slice(&(SEND_INDICATION as u16).to_be_bytes());
+                buf.extend_from_slice(&(SEND_INDICATION).to_be_bytes());
                 buf.extend_from_slice(&[0, 0]);
                 buf.extend_from_slice(&rand_transaction());
                 put_address(&mut buf, 18, peer);
