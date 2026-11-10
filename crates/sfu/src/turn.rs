@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use aws_lc_rs::hmac;
+use md5::{Digest, Md5};
 
 /// The TURN server, and the short-lived credentials `generate-ice-servers` made for this
 /// participant.
@@ -558,7 +559,7 @@ impl TurnSession {
                 "{}:{}:{}",
                 self.server.username, realm, self.server.credential
             );
-            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::MD5, material.as_bytes());
+            let digest = Md5::digest(material.as_bytes());
             let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, digest.as_ref());
             buf.extend_from_slice(&8u16.to_be_bytes());
             buf.extend_from_slice(&(INTEGRITY_LEN as u16).to_be_bytes());
