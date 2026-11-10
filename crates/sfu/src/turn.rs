@@ -9,7 +9,8 @@
 //! the bytes that came back, and the caller owns the socket and the timing. Everything runs
 //! on the SFU thread; no sockets and no threads are owned here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hasher;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -42,7 +43,9 @@ pub(crate) enum TurnEvent {
     Received(SocketAddr, Vec<u8>),
     /// A datagram to send: the re-request after a credentials challenge.
     Send(Vec<u8>),
-    /// The server never answered a request within its retries.
+    /// A request the server never answered within its retries, or refused outright; the
+    /// text says which. For the allocation and its refresh this is the session's end; a
+    /// permission or a bind only drops its own request, whose timer re-arms.
     TimedOut(&'static str),
 }
 
@@ -102,16 +105,32 @@ fn class_of(msg_type: u16) -> u8 {
     }
 }
 
+/// Twelve bytes no observer of the wire can guess (RFC 5389 §6 wants unguessable
+/// transaction ids; a counter, the clock, and the fixed bytes "TURN" were all readable).
+/// Everything std offers without a dependency goes into a `DefaultHasher`, whose keys the
+/// process drew from the operating system: a counter, the clock to the nanosecond, and this
+/// frame's own stack address. None of them is enough alone.
 fn rand_transaction() -> [u8; 12] {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let mut out = [0u8; 12];
-    out[..4].copy_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    out[4..8].copy_from_slice(&nanos.to_be_bytes());
-    out[8..].copy_from_slice(b"TURN");
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .to_le_bytes();
+    let stack = 0u8;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(&counter);
+    hasher.write(&nanos);
+    hasher.write(&(&stack as *const u8 as usize).to_le_bytes());
+    let mixed = hasher.finish();
+    let mut out = [0u8; 12];
+    out[..8].copy_from_slice(&mixed.to_le_bytes());
+    // The last four bytes from a second pass, so all twelve carry the mix.
+    let mut spread = std::collections::hash_map::DefaultHasher::new();
+    spread.write(&mixed.to_le_bytes());
+    spread.write(&counter);
+    out[8..].copy_from_slice(&(spread.finish() as u32).to_le_bytes());
     out
 }
 
@@ -161,10 +180,21 @@ fn put_address(buf: &mut Vec<u8>, attribute: u16, addr: SocketAddr) {
     buf.extend_from_slice(&value);
 }
 
+/// When the next refresh is due: the lifetime minus a minute of margin. A grant shorter
+/// than two minutes halves instead, so a short lifetime refreshes at its halfway point
+/// instead of leaving `poll` due on every call.
+fn refresh_at(now: Instant, lifetime_secs: u64) -> Instant {
+    let margin = 60.min(lifetime_secs / 2);
+    now + Duration::from_secs((lifetime_secs - margin).max(1))
+}
+
 /// What a response carried.
 #[derive(Debug, Default)]
 struct Attributes {
     relayed: Option<SocketAddr>,
+    /// The family byte of the relayed address even when it did not parse as IPv4: family 2
+    /// is IPv6, which this client cannot relay.
+    relayed_family: Option<u8>,
     peer: Option<SocketAddr>,
     lifetime: Option<u64>,
     nonce: Option<Vec<u8>>,
@@ -181,20 +211,24 @@ fn parse_attributes(data: &[u8]) -> Option<Attributes> {
         let len = u16::from_be_bytes([data[at + 2], data[at + 3]]) as usize;
         let value = data.get(at + 4..at + 4 + len)?;
         match kind {
-            22 => found.relayed = xor_out(value),
+            22 => {
+                found.relayed = xor_out(value);
+                found.relayed_family = value.get(1).copied();
+            }
             18 => found.peer = xor_out(value),
             13 => found.lifetime = Some(u32::from_be_bytes(value.try_into().ok()?) as u64),
             21 => found.nonce = Some(value.to_vec()),
             20 => found.realm = Some(String::from_utf8_lossy(value).into_owned()),
             19 => found.data = Some(value.to_vec()),
             9 => {
-                let code = value
-                    .get(2..4)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(|bytes| u16::from_be_bytes(bytes) & 0x3FF)
-                    .unwrap_or(0);
+                // The code rides as class and number in the two bytes after the two zeros
+                // (RFC 5389 §15.6): 401 is bytes 04 01, 438 is 04 26. Reading the pair as
+                // one masked number turns a real 401 into 1 and a 438 into 54, and lands
+                // every real challenge in the wrong arm.
+                let class = u16::from(*value.get(2).unwrap_or(&0));
+                let number = u16::from(*value.get(3).unwrap_or(&0));
                 found.error = Some((
-                    code,
+                    class * 100 + number,
                     String::from_utf8_lossy(value.get(4..).unwrap_or(b"")).into_owned(),
                 ));
             }
@@ -203,6 +237,21 @@ fn parse_attributes(data: &[u8]) -> Option<Attributes> {
         at += 4 + len.div_ceil(4) * 4;
     }
     Some(found)
+}
+
+/// What a request is for, so its answer lands on the right timer and the right event: the
+/// peer a CreatePermission covers, or the channel and peer a ChannelBind binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Subject {
+    Permission(SocketAddr),
+    Bind(u16, SocketAddr),
+}
+
+/// A request waiting for the wire.
+struct Request {
+    method: u16,
+    attributes: Vec<(u16, Vec<u8>)>,
+    subject: Option<Subject>,
 }
 
 /// One request in flight: its attributes (for the credentials round-trip), the bytes to
@@ -214,6 +263,7 @@ struct Pending {
     transaction: [u8; 12],
     deadline: Instant,
     tries: u32,
+    subject: Option<Subject>,
 }
 
 /// One allocation, the relayed address, and everything bound to it. The credentials are the
@@ -229,8 +279,12 @@ pub(crate) struct TurnSession {
     channels: HashMap<u16, (SocketAddr, Instant)>,
     peers: HashMap<SocketAddr, u16>,
     next_channel: u16,
-    /// The channel this pending CHANNEL_BIND will bind, with its peer.
-    pending_bind: Option<(u16, SocketAddr)>,
+    /// Requests waiting for the wire. One transaction is in flight at a time (RFC 5389
+    /// §7.2.1 has the client wait for the response before the next transaction); the queue
+    /// is how a `call.candidate` arriving during a refresh keeps its CreatePermission
+    /// instead of overwriting the refresh. `poll` sends the oldest once the wire frees.
+    queue: VecDeque<Request>,
+    /// The request on the wire, waiting for its response or its next retransmit.
     pending: Option<Pending>,
     /// Set once the allocation failed its retries, so the caller can tear the seat down.
     failed: bool,
@@ -248,7 +302,7 @@ impl TurnSession {
             channels: HashMap::new(),
             peers: HashMap::new(),
             next_channel: CHANNEL_MIN,
-            pending_bind: None,
+            queue: VecDeque::new(),
             pending: None,
             failed: false,
         }
@@ -265,21 +319,42 @@ impl TurnSession {
     /// Starts the allocation and returns its datagram. Re-sending until the server answers
     /// is `poll`'s job.
     pub fn allocate(&mut self, now: Instant) -> Vec<u8> {
-        self.send_request(ALLOCATE, vec![(23, vec![UDP])], now);
-        self.pending_bytes()
+        // REQUESTED-TRANSPORT is the protocol byte plus three reserved ones (RFC 5766
+        // §14.7). A length of one is answered 400 by a server that follows the RFC.
+        self.send_or_queue(ALLOCATE, vec![(23, vec![UDP, 0, 0, 0])], None, now)
     }
 
     /// CreatePermission for a peer address, as `call.candidate` asked, and its datagram.
     /// Refreshes are `poll`'s job.
     pub fn create_permission(&mut self, peer: SocketAddr, now: Instant) -> Vec<u8> {
-        if !self.active() || !peer.is_ipv4() {
+        if !self.active() || !peer.is_ipv4() || self.permission_scheduled(&peer) {
             return Vec::new();
         }
         let mut address = Vec::new();
         put_address(&mut address, 18, peer);
-        self.send_request(CREATE_PERMISSION, vec![(18, address)], now);
+        // The timer starts on the ask, not the answer, so a request queued behind another
+        // still comes round for its re-create even if this one is never answered.
         self.permissions.entry(peer).or_insert(now);
-        self.pending_bytes()
+        self.send_or_queue(
+            CREATE_PERMISSION,
+            vec![(18, address)],
+            Some(Subject::Permission(peer)),
+            now,
+        )
+    }
+
+    /// Whether a CreatePermission for this peer is in flight or queued already: a fresh
+    /// `call.candidate` for an address being permitted has nothing to add.
+    fn permission_scheduled(&self, peer: &SocketAddr) -> bool {
+        let subject = Some(Subject::Permission(*peer));
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.subject == subject)
+        {
+            return true;
+        }
+        self.queue.iter().any(|request| request.subject == subject)
     }
 
     /// ChannelBind for a peer address, so its media travels as channel data, and its
@@ -288,11 +363,10 @@ impl TurnSession {
         if !self.active() || !peer.is_ipv4() || self.peers.contains_key(&peer) {
             return Vec::new();
         }
-        self.bind(peer, now);
-        self.pending_bytes()
+        self.bind(peer, now)
     }
 
-    fn bind(&mut self, peer: SocketAddr, now: Instant) {
+    fn bind(&mut self, peer: SocketAddr, now: Instant) -> Vec<u8> {
         let channel = self.peers.get(&peer).copied().unwrap_or_else(|| {
             let channel = self.next_channel;
             self.next_channel += 1;
@@ -302,8 +376,12 @@ impl TurnSession {
         number.extend_from_slice(&2u16.to_be_bytes());
         let mut address = Vec::new();
         put_address(&mut address, 18, peer);
-        self.send_request(CHANNEL_BIND, vec![(12, number), (18, address)], now);
-        self.pending_bind = Some((channel, peer));
+        self.send_or_queue(
+            CHANNEL_BIND,
+            vec![(12, number), (18, address)],
+            Some(Subject::Bind(channel, peer)),
+            now,
+        )
     }
 
     /// Wraps `payload` for `peer`: channel data once the channel is bound, a send indication
@@ -324,9 +402,14 @@ impl TurnSession {
                 buf.extend_from_slice(&[0, 0]);
                 buf.extend_from_slice(&rand_transaction());
                 put_address(&mut buf, 18, peer);
+                // The DATA value is padded to four bytes and the header length counts the
+                // padding (RFC 5389 §6, §15): a length that is not a multiple of four is
+                // a datagram a conforming server drops.
+                let padded = payload.len().div_ceil(4) * 4;
                 buf.extend_from_slice(&19u16.to_be_bytes());
                 buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 buf.extend_from_slice(payload);
+                buf.resize(buf.len() + padded - payload.len(), 0);
                 let len = (buf.len() - HEADER) as u16;
                 buf[2..4].copy_from_slice(&len.to_be_bytes());
             }
@@ -334,9 +417,10 @@ impl TurnSession {
         buf
     }
 
-    /// Re-sends what is pending, refreshes the allocation, re-creates permissions and re-binds
-    /// channels when they are due, and reports the bytes to send. One thing at a time; the
-    /// next call picks up where this left off.
+    /// Re-sends what is pending, sends the oldest queued request once the wire frees,
+    /// refreshes the allocation, re-creates permissions and re-binds channels when they
+    /// are due, and reports the bytes to send. One thing at a time; the next call picks up
+    /// where this left off.
     pub fn poll(&mut self, now: Instant) -> Option<Vec<u8>> {
         if self.failed {
             return None;
@@ -345,8 +429,29 @@ impl TurnSession {
             if now >= pending.deadline {
                 pending.tries += 1;
                 if pending.tries > RETRIES {
+                    // The allocation and its refresh are the session: without them there
+                    // is nothing to relay on, and the caller tears the seat down. A
+                    // permission or a bind the server never answered drops alone, its
+                    // timer re-armed from now, and the rest of the session carries.
+                    let method = pending.method;
+                    let subject = pending.subject.take();
                     self.pending = None;
-                    self.failed = true;
+                    match method {
+                        ALLOCATE | REFRESH => self.failed = true,
+                        CREATE_PERMISSION => {
+                            if let Some(Subject::Permission(peer)) = subject {
+                                self.permissions.insert(peer, now);
+                            }
+                        }
+                        CHANNEL_BIND => {
+                            if let Some(Subject::Bind(channel, _)) = subject {
+                                if let Some((_, bound)) = self.channels.get_mut(&channel) {
+                                    *bound = now;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     return None;
                 }
                 pending.deadline = now + RTO;
@@ -357,10 +462,25 @@ impl TurnSession {
         if !self.active() {
             return None;
         }
-        if now >= self.lifetime_until {
-            self.send_request(REFRESH, vec![(13, 600u32.to_be_bytes().to_vec())], now);
-            self.lifetime_until = now + Duration::from_secs(600);
+        if let Some(request) = self.queue.pop_front() {
+            self.send_request(request.method, request.attributes, request.subject, now);
             return Some(self.pending_bytes());
+        }
+        if now >= self.lifetime_until {
+            let bytes = self.send_or_queue(
+                REFRESH,
+                vec![(13, 600u32.to_be_bytes().to_vec())],
+                None,
+                now,
+            );
+            // The next refresh is due a full lifetime from the ask. A refresh the server
+            // refuses or never answers ends the session, so this cannot mask a dead
+            // allocation for long.
+            self.lifetime_until = now + Duration::from_secs(600);
+            if bytes.is_empty() {
+                return None;
+            }
+            return Some(bytes);
         }
         let mut due_permission: Option<SocketAddr> = None;
         for (peer, due) in &self.permissions {
@@ -369,8 +489,11 @@ impl TurnSession {
             }
         }
         if let Some(peer) = due_permission {
-            self.create_permission(peer, now);
-            return Some(self.pending_bytes());
+            let bytes = self.create_permission(peer, now);
+            if bytes.is_empty() {
+                return None;
+            }
+            return Some(bytes);
         }
         let mut rebind: Option<SocketAddr> = None;
         for (peer, bound) in self.channels.values() {
@@ -379,8 +502,11 @@ impl TurnSession {
             }
         }
         if let Some(peer) = rebind {
-            self.bind(peer, now);
-            return Some(self.pending_bytes());
+            let bytes = self.bind(peer, now);
+            if bytes.is_empty() {
+                return None;
+            }
+            return Some(bytes);
         }
         None
     }
@@ -403,6 +529,16 @@ impl TurnSession {
             return self.channel_data(data);
         }
         if data.len() < HEADER {
+            return None;
+        }
+        // A STUN message carries the magic cookie, and its length field covers exactly the
+        // attributes (RFC 5389 §5, §6). Anything else is not a message for this session —
+        // a length that does not match would have the attribute walk below read past the
+        // datagram.
+        if data[4..8] != MAGIC.to_be_bytes() {
+            return None;
+        }
+        if u16::from_be_bytes([data[2], data[3]]) as usize != data.len() - HEADER {
             return None;
         }
         let msg_type = u16::from_be_bytes([data[0], data[1]]);
@@ -433,6 +569,7 @@ impl TurnSession {
                     // this session asking forever.
                     let method = pending.method;
                     let retry_attributes = pending.attributes.clone();
+                    let subject = pending.subject.clone();
                     let tries = pending.tries + 1;
                     if tries > RETRIES {
                         self.pending = None;
@@ -441,26 +578,61 @@ impl TurnSession {
                     }
                     self.nonce = attributes.nonce.clone().or(self.nonce.clone());
                     self.realm = attributes.realm.clone().or(self.realm.clone());
-                    self.send_request(method, retry_attributes, now);
+                    self.send_request(method, retry_attributes, subject, now);
                     if let Some(retried) = self.pending.as_mut() {
                         retried.tries = tries;
                     }
                     Some(TurnEvent::Send(self.pending_bytes()))
                 }
                 _ => {
-                    self.failed = true;
-                    self.pending = None;
+                    // The server refused the request outright. The allocation and its
+                    // refresh are the session: without them there is nothing to relay on.
+                    // A refused permission or bind drops alone, its timer re-armed from
+                    // now, and the rest of the session carries.
+                    let pending = self.pending.take()?;
+                    match pending.method {
+                        ALLOCATE | REFRESH => self.failed = true,
+                        CREATE_PERMISSION => {
+                            if let Some(Subject::Permission(peer)) = pending.subject {
+                                self.permissions.insert(peer, now);
+                            }
+                        }
+                        CHANNEL_BIND => {
+                            if let Some(Subject::Bind(channel, _)) = pending.subject {
+                                if let Some((_, bound)) = self.channels.get_mut(&channel) {
+                                    *bound = now;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     Some(TurnEvent::TimedOut("rejected"))
                 }
             }
         } else {
+            let pending = self.pending.take()?;
             match method {
                 ALLOCATE => {
-                    let relayed = attributes.relayed?;
+                    let relayed = match attributes.relayed {
+                        Some(relayed) => relayed,
+                        // No relayed address this client can use: family 2 is IPv6, and
+                        // this client relays IPv4 — its peers are the IPv4
+                        // `call.candidate` addresses. An answer without a relay at all is
+                        // no answer. Neither changes on a re-send, so the session fails
+                        // here instead of spending its retries on the same request.
+                        None => {
+                            self.failed = true;
+                            let reason = if attributes.relayed_family == Some(2) {
+                                "the relayed address is IPv6"
+                            } else {
+                                "no relayed address in the answer"
+                            };
+                            return Some(TurnEvent::TimedOut(reason));
+                        }
+                    };
                     let lifetime = attributes.lifetime.unwrap_or(600);
                     self.relayed = Some(relayed);
-                    self.lifetime_until = now + Duration::from_secs(lifetime.saturating_sub(60));
-                    self.pending = None;
+                    self.lifetime_until = refresh_at(now, lifetime);
                     Some(TurnEvent::Allocated {
                         relayed,
                         lifetime: Duration::from_secs(lifetime),
@@ -468,30 +640,26 @@ impl TurnSession {
                 }
                 REFRESH => {
                     let lifetime = attributes.lifetime.unwrap_or(600);
-                    self.lifetime_until = now + Duration::from_secs(lifetime.saturating_sub(60));
-                    self.pending = None;
+                    self.lifetime_until = refresh_at(now, lifetime);
                     None
                 }
-                CREATE_PERMISSION => {
-                    self.pending = None;
-                    self.permissions = self
-                        .permissions
-                        .keys()
-                        .map(|peer| (*peer, now + REPERMISSION_AFTER))
-                        .collect();
-                    let peer = *self.permissions.keys().next()?;
-                    Some(TurnEvent::Permission(peer))
-                }
-                CHANNEL_BIND => {
-                    self.pending = None;
-                    if let Some((channel, peer)) = self.pending_bind.take() {
+                CREATE_PERMISSION => match pending.subject {
+                    // The server's five minutes start now, for this peer alone; the others
+                    // keep the timers their own successes stamped.
+                    Some(Subject::Permission(peer)) => {
+                        self.permissions.insert(peer, now);
+                        Some(TurnEvent::Permission(peer))
+                    }
+                    _ => None,
+                },
+                CHANNEL_BIND => match pending.subject {
+                    Some(Subject::Bind(channel, peer)) => {
                         self.channels.insert(channel, (peer, now));
                         self.peers.insert(peer, channel);
                         Some(TurnEvent::ChannelBound(peer))
-                    } else {
-                        None
                     }
-                }
+                    _ => None,
+                },
                 _ => None,
             }
         }
@@ -513,12 +681,20 @@ impl TurnSession {
         self.relayed.is_some()
     }
 
-    /// Builds one request and makes it the pending one. Attributes go in first, credentials
-    /// and integrity behind them, and the header length counts the integrity attribute as
-    /// present, the RFC's way of signing everything before it. The integrity key for
-    /// long-term credentials is MD5 over `username ":" realm ":" password` (RFC 5389
-    /// §15.4), with the realm this session was challenged with.
-    fn send_request(&mut self, method: u16, attributes: Vec<(u16, Vec<u8>)>, now: Instant) {
+    /// Builds one request and puts it on the wire as the pending one. Everything goes
+    /// through `send_or_queue`, which only calls this when the wire is free — except the
+    /// credentials round-trip, which replaces its own challenged request. Attributes go in
+    /// first, credentials and integrity behind them, and the header length counts the
+    /// integrity attribute as present, the RFC's way of signing everything before it. The
+    /// integrity key for long-term credentials is MD5 over `username ":" realm ":" password`
+    /// (RFC 5389 §15.4), with the realm this session was challenged with.
+    fn send_request(
+        &mut self,
+        method: u16,
+        attributes: Vec<(u16, Vec<u8>)>,
+        subject: Option<Subject>,
+        now: Instant,
+    ) {
         let mut buf = Vec::with_capacity(160);
         buf.extend_from_slice(&msg_type(method, CLASS_REQUEST).to_be_bytes());
         buf.extend_from_slice(&[0, 0]);
@@ -558,7 +734,31 @@ impl TurnSession {
             transaction,
             deadline: now + RTO,
             tries: 0,
+            subject,
         });
+    }
+
+    /// Puts a request on the wire when it is free, or queues it when one is in flight.
+    /// One transaction at a time is the RFC's model; the queue is how a permission asked
+    /// during a refresh is not lost to it. Returns the bytes to send now — empty when the
+    /// request waits in the queue for `poll`.
+    fn send_or_queue(
+        &mut self,
+        method: u16,
+        attributes: Vec<(u16, Vec<u8>)>,
+        subject: Option<Subject>,
+        now: Instant,
+    ) -> Vec<u8> {
+        if self.pending.is_some() {
+            self.queue.push_back(Request {
+                method,
+                attributes,
+                subject,
+            });
+            return Vec::new();
+        }
+        self.send_request(method, attributes, subject, now);
+        self.pending_bytes()
     }
 }
 
@@ -575,19 +775,41 @@ mod tests {
     }
 
     /// A 401 challenge with nonce and realm, the way a TURN server opens the exchange.
+    /// The code rides as class 4, number 1, behind the two zeros (RFC 5389 §15.6), not as
+    /// a bare number: encoding 401 big-endian is a wire this module reads wrong.
     fn challenge(transaction: [u8; 12]) -> Vec<u8> {
-        let error = {
-            let mut value = vec![0, 0];
-            value.extend_from_slice(&401u16.to_be_bytes());
-            value.extend_from_slice(b"Unauthorized");
-            value
-        };
+        error_answer(transaction, 401, b"Unauthorized", b"nonce-1")
+    }
+
+    /// A 438 stale-nonce error, the way a TURN server re-challenges when the nonce has
+    /// aged out: class 4, number 38, with the fresh nonce and realm.
+    fn stale_nonce(transaction: [u8; 12]) -> Vec<u8> {
+        error_answer(transaction, 438, b"Stale Nonce", b"nonce-2")
+    }
+
+    fn error_answer(transaction: [u8; 12], code: u16, reason: &[u8], nonce: &[u8]) -> Vec<u8> {
+        let mut error = vec![0, 0, (code / 100) as u8, (code % 100) as u8];
+        error.extend_from_slice(reason);
         let parts = [
             (9u16, error),
             (20u16, b"turn.example.org".to_vec()),
-            (21u16, b"nonce-1".to_vec()),
+            (21u16, nonce.to_vec()),
         ];
         answer(msg_type(ALLOCATE, CLASS_ERROR), transaction, &parts)
+    }
+
+    /// The value of the first attribute of this kind in a STUN message.
+    fn attribute(message: &[u8], kind: u16) -> Option<Vec<u8>> {
+        let mut at = HEADER;
+        while at + 4 <= message.len() {
+            let kind_at = u16::from_be_bytes([message[at], message[at + 1]]);
+            let len = u16::from_be_bytes([message[at + 2], message[at + 3]]) as usize;
+            if kind_at == kind {
+                return Some(message[at + 4..at + 4 + len].to_vec());
+            }
+            at += 4 + len.div_ceil(4) * 4;
+        }
+        None
     }
 
     /// An allocate success with the relayed address and a lifetime.
@@ -618,8 +840,10 @@ mod tests {
         buf.extend_from_slice(&transaction);
         for (kind, value) in parts {
             buf.extend_from_slice(&kind.to_be_bytes());
+            // The length field says how long the value is; the padding to four is extra
+            // and unstated (RFC 5389 §15).
             let padded = value.len().div_ceil(4) * 4;
-            buf.extend_from_slice(&(padded as u16).to_be_bytes());
+            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
             buf.extend_from_slice(value);
             buf.resize(buf.len() + padded - value.len(), 0);
         }
@@ -636,18 +860,50 @@ mod tests {
         type_ == msg_type(method, class)
     }
 
+    /// Drives the allocation through its challenge, so a test starts with the session up
+    /// and nothing on the wire.
+    fn handshake(session: &mut TurnSession, start: Instant, lifetime: u32) {
+        let first = session.allocate(start);
+        session.handle(
+            &challenge(first[8..20].try_into().expect("a 12-byte transaction id")),
+            start + RTO,
+        );
+        let second = session.pending_bytes();
+        session.handle(
+            &allocated(
+                second[8..20].try_into().expect("a 12-byte transaction id"),
+                lifetime,
+            ),
+            start + RTO * 2,
+        );
+    }
+
+    /// An allocate success whose relayed address carries family 2, IPv6 — the value this
+    /// client cannot relay.
+    fn allocated_ipv6(transaction: [u8; 12], lifetime: u32) -> Vec<u8> {
+        let mut relayed = vec![0u8, 2];
+        relayed.resize(20, 0xAA);
+        let parts = [(22u16, relayed), (13u16, lifetime.to_be_bytes().to_vec())];
+        answer(msg_type(ALLOCATE, CLASS_SUCCESS), transaction, &parts)
+    }
+
     #[test]
     fn challenges_exhaust_the_retries_and_fail_the_session() {
         let start = Instant::now();
         let mut session = TurnSession::new(credentials());
         let mut request = session.allocate(start);
-        // A server that keeps challenging: each 401 gets the re-request the session emits,
-        // until the retry cap trips and the session fails instead of asking forever.
+        // A server that keeps challenging: each 401 or 438 gets the re-request the session
+        // emits, until the retry cap trips and the session fails instead of asking forever.
+        // The codes alternate, so both wire encodings — 04 01 and 04 26 — are decoded as
+        // challenges, not as rejections.
         for round in 0..RETRIES {
-            let event = session.handle(
-                &challenge(request[8..20].try_into().expect("a 12-byte transaction id")),
-                start + RTO * (u32::from(round) + 1),
-            );
+            let transaction = request[8..20].try_into().expect("a 12-byte transaction id");
+            let error = if round % 2 == 0 {
+                challenge(transaction)
+            } else {
+                stale_nonce(transaction)
+            };
+            let event = session.handle(&error, start + RTO * (round + 1));
             let TurnEvent::Send(re_request) = event.expect("the re-request") else {
                 panic!("not a send");
             };
@@ -667,6 +923,13 @@ mod tests {
         let mut session = TurnSession::new(credentials());
         let first = session.allocate(start);
         assert!(request_type(&session, ALLOCATE, CLASS_REQUEST));
+        // REQUESTED-TRANSPORT is the protocol byte, 17 for UDP, plus three reserved ones
+        // (RFC 5766 §14.7); a length of one is answered 400 by a server that follows it.
+        assert_eq!(
+            attribute(&first, 23).as_deref(),
+            Some(&[UDP, 0, 0, 0][..]),
+            "REQUESTED-TRANSPORT is protocol plus three reserved bytes"
+        );
         session.handle(
             &challenge(first[8..20].try_into().expect("a 12-byte transaction id")),
             start + RTO,
@@ -723,12 +986,28 @@ mod tests {
             0x0016,
             "the send indication"
         );
-        assert!(
-            wrapped.len() >= 30,
-            "the indication lost its attributes: {}",
-            wrapped.len()
+        // The DATA value is five bytes and the datagram is padded to four with it: the
+        // header length is a multiple of four and covers the datagram exactly (RFC 5389
+        // §6, §15), or a conforming server drops the indication.
+        let len = u16::from_be_bytes([wrapped[2], wrapped[3]]) as usize;
+        assert_eq!(
+            wrapped.len(),
+            HEADER + len,
+            "the length covers the datagram"
         );
-        assert!(wrapped.ends_with(b"media"));
+        assert_eq!(len % 4, 0, "the length is a multiple of four");
+        assert_eq!(
+            attribute(&wrapped, 19).as_deref(),
+            Some(&b"media"[..]),
+            "the data"
+        );
+        // The attribute walks the same datagram, so the pad sits behind the value.
+        let data_at = HEADER + 12 + 4;
+        assert_eq!(&wrapped[data_at + 5..data_at + 8], &[0, 0, 0], "the pad");
+        // An aligned payload needs no pad and ends the datagram.
+        let aligned = session.send_to(peer, b"abcd");
+        assert_eq!(&aligned[data_at..], b"abcd");
+        assert_eq!(u16::from_be_bytes([aligned[2], aligned[3]]) % 4, 0);
 
         let permission = session.create_permission(peer, start + RTO * 2);
         assert!(request_type(&session, CREATE_PERMISSION, CLASS_REQUEST));
@@ -875,6 +1154,234 @@ mod tests {
         assert!(
             value.is_none(),
             "poll answered nothing was due, but it sent {value:?}"
+        );
+    }
+
+    #[test]
+    fn transaction_ids_carry_no_constant_bytes_and_repeat_never() {
+        // The ids used to be a counter, the clock's subsecond nanos, and the fixed bytes
+        // "TURN": readable on the wire, and guessable enough to poison a relay. Sixteen in
+        // a row now differ, and none still says TURN anywhere in its twelve bytes.
+        let ids: Vec<[u8; 12]> = (0..16).map(|_| rand_transaction()).collect();
+        for first in 0..ids.len() {
+            for second in first + 1..ids.len() {
+                assert_ne!(ids[first], ids[second], "two transactions shared an id");
+            }
+        }
+        for id in &ids {
+            for window in id.windows(4) {
+                assert_ne!(window, &b"TURN"[..], "the id still carries the fixed tail");
+            }
+        }
+    }
+
+    #[test]
+    fn a_permission_success_stamps_only_the_peer_it_was_for() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        handshake(&mut session, start, 3600);
+
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5004);
+        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 5004);
+
+        let first = session.create_permission(a, start + RTO * 2);
+        let event = session.handle(
+            &success(
+                CREATE_PERMISSION,
+                first[8..20].try_into().expect("a 12-byte transaction id"),
+            ),
+            start + RTO * 3,
+        );
+        assert!(
+            matches!(event, Some(TurnEvent::Permission(peer)) if peer == a),
+            "the success names the peer it was for: {event:?}"
+        );
+        assert_eq!(
+            session.permissions[&a],
+            start + RTO * 3,
+            "the timer runs from the success, not from four minutes after the ask"
+        );
+
+        // A second peer joins two round-trips later; its success names it, and a's timer
+        // stays where a's own success put it.
+        let second = session.create_permission(b, start + RTO * 4);
+        let event = session.handle(
+            &success(
+                CREATE_PERMISSION,
+                second[8..20].try_into().expect("a 12-byte transaction id"),
+            ),
+            start + RTO * 5,
+        );
+        assert!(
+            matches!(event, Some(TurnEvent::Permission(peer)) if peer == b),
+            "the success names the peer it was for: {event:?}"
+        );
+        assert_eq!(
+            session.permissions[&a],
+            start + RTO * 3,
+            "a's timer is untouched"
+        );
+        assert_eq!(session.permissions[&b], start + RTO * 5);
+
+        // Four minutes after a's success, a alone is due: b's window starts one round-trip
+        // later, and poll re-creates a, not whichever peer the map lists first.
+        let at = start + RTO * 3 + Duration::from_secs(4 * 60) + Duration::from_millis(100);
+        session.poll(at).expect("a's re-permission goes out");
+        assert_eq!(
+            session.pending.as_ref().expect("in flight").subject,
+            Some(Subject::Permission(a)),
+            "the re-create is for a"
+        );
+    }
+
+    #[test]
+    fn a_permission_queued_behind_a_refresh_still_goes_out() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        handshake(&mut session, start, 120);
+
+        // The lifetime of 120 s is due sixty seconds after the answer.
+        let at = start + RTO * 2 + Duration::from_secs(60);
+        let refresh = session.poll(at).expect("the refresh goes out");
+        assert!(request_type(&session, REFRESH, CLASS_REQUEST));
+
+        // The candidate arrives while the refresh is on the wire: it queues instead of
+        // overwriting the refresh, and nothing of it goes out now.
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5004);
+        let queued = session.create_permission(peer, at + RTO);
+        assert!(
+            queued.is_empty(),
+            "nothing goes out behind a pending request"
+        );
+        assert!(
+            request_type(&session, REFRESH, CLASS_REQUEST),
+            "the refresh is still the one in flight"
+        );
+
+        // The refresh is answered; the next poll sends the queued permission, not a lost
+        // one.
+        session.handle(
+            &success(
+                REFRESH,
+                refresh[8..20].try_into().expect("a 12-byte transaction id"),
+            ),
+            at + RTO * 2,
+        );
+        session
+            .poll(at + RTO * 2)
+            .expect("the queued permission goes out");
+        assert!(request_type(&session, CREATE_PERMISSION, CLASS_REQUEST));
+        assert_eq!(
+            session.pending.as_ref().expect("in flight").subject,
+            Some(Subject::Permission(peer)),
+            "it is the queued permission, in queue order"
+        );
+    }
+
+    #[test]
+    fn a_permission_timeout_drops_the_request_and_keeps_the_session() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        handshake(&mut session, start, 3600);
+
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5004);
+        let _request = session.create_permission(peer, start + RTO * 2);
+        let mut at = start + RTO * 2;
+        for _ in 0..RETRIES {
+            at += RTO;
+            session.poll(at).expect("a retransmit");
+        }
+        at += RTO;
+        assert!(session.poll(at).is_none(), "the permission gives up");
+        assert!(
+            !session.failed(),
+            "the session carries without the permission"
+        );
+        // The permission's timer re-armed at the timeout: poll does not hammer a server
+        // that is not answering, and comes back on its own schedule.
+        assert!(
+            session.poll(at + Duration::from_secs(1)).is_none(),
+            "not immediately again"
+        );
+        session
+            .poll(at + Duration::from_secs(4 * 60) + Duration::from_secs(1))
+            .expect("the re-create comes round on its timer");
+        assert!(request_type(&session, CREATE_PERMISSION, CLASS_REQUEST));
+    }
+
+    #[test]
+    fn a_short_lifetime_refreshes_at_half_instead_of_every_poll() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        handshake(&mut session, start, 30);
+
+        // Thirty seconds granted: a minute of margin cannot fit, so the halfway mark is
+        // when the refresh goes out — not now, on every call.
+        let due = start + RTO * 2 + Duration::from_secs(15);
+        assert!(
+            session.poll(due - Duration::from_secs(1)).is_none(),
+            "half the grant is not up yet"
+        );
+        session.poll(due).expect("the refresh at half the lifetime");
+        assert!(request_type(&session, REFRESH, CLASS_REQUEST));
+    }
+
+    #[test]
+    fn an_ipv6_relayed_address_fails_the_session_instead_of_retrying() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        let first = session.allocate(start);
+        session.handle(
+            &challenge(first[8..20].try_into().expect("a 12-byte transaction id")),
+            start + RTO,
+        );
+        let second = session.pending_bytes();
+        let event = session.handle(
+            &allocated_ipv6(
+                second[8..20].try_into().expect("a 12-byte transaction id"),
+                600,
+            ),
+            start + RTO * 2,
+        );
+        assert!(
+            matches!(event, Some(TurnEvent::TimedOut(_))),
+            "the answer is a failure, not silence: {event:?}"
+        );
+        assert!(session.failed(), "the session says so");
+        assert!(
+            session.poll(start + RTO * 3).is_none(),
+            "the same request does not go out again"
+        );
+    }
+
+    #[test]
+    fn datagrams_without_the_magic_cookie_or_a_matching_length_are_dropped() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        let first = session.allocate(start);
+        let transaction = first[8..20].try_into().expect("a 12-byte transaction id");
+
+        let mut wrong_cookie = challenge(transaction);
+        wrong_cookie[5] ^= 0xFF;
+        assert!(
+            session.handle(&wrong_cookie, start + RTO).is_none(),
+            "not our cookie"
+        );
+        assert!(session.pending.is_some(), "the request is still in flight");
+
+        let mut wrong_length = challenge(transaction);
+        wrong_length[3] += 1;
+        assert!(
+            session.handle(&wrong_length, start + RTO).is_none(),
+            "the length does not match the datagram"
+        );
+        assert!(session.pending.is_some());
+
+        // The untouched answer still gets through.
+        session.handle(&challenge(transaction), start + RTO);
+        assert!(
+            request_type(&session, ALLOCATE, CLASS_REQUEST),
+            "the challenge was read"
         );
     }
 }
