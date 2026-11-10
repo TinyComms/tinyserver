@@ -432,7 +432,7 @@ impl TurnSession {
                     // it fails the session, so a server that never accepts cannot keep
                     // this session asking forever.
                     let method = pending.method;
-                    let attributes = pending.attributes.clone();
+                    let retry_attributes = pending.attributes.clone();
                     let tries = pending.tries + 1;
                     if tries > RETRIES {
                         self.pending = None;
@@ -441,7 +441,7 @@ impl TurnSession {
                     }
                     self.nonce = attributes.nonce.clone().or(self.nonce.clone());
                     self.realm = attributes.realm.clone().or(self.realm.clone());
-                    self.send_request(method, attributes, now);
+                    self.send_request(method, retry_attributes, now);
                     if let Some(retried) = self.pending.as_mut() {
                         retried.tries = tries;
                     }
