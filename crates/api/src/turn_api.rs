@@ -157,13 +157,6 @@ impl TurnApi {
     }
 }
 
-/// Wired into `live` and the SFU in the relay slice's next step; until then only the tests
-/// exercise it.
-#[allow(dead_code)]
-mod wired_later {
-    pub(super) use super::{IceServers, TurnApi, TurnApiError, TurnConfig};
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
