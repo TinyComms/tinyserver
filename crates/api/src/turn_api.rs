@@ -5,6 +5,11 @@
 //!
 //! Relay mode is opt-in per host: without the key id and the API token nothing here is
 //! called, and the SFU advertises its own addresses as always.
+//!
+//! The live socket and the SFU wire this in with the relay slice's next step; until then
+//! only the tests here construct it.
+
+#![allow(dead_code)]
 
 use std::time::Duration;
 
@@ -171,42 +176,6 @@ mod tests {
 
     /// A fake Cloudflare that checks the bearer token and answers both response shapes.
     async fn spawn_fake(shape: &'static str) -> String {
-        async fn generate(
-            headers: axum::http::HeaderMap,
-            body: Option<Json<serde_json::Value>>,
-        ) -> Response {
-            if headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                != Some("Bearer the-token")
-            {
-                return StatusCode::UNAUTHORIZED.into_response();
-            }
-            if body
-                .as_ref()
-                .and_then(|Json(body)| body.get("ttl"))
-                .is_none()
-            {
-                return StatusCode::BAD_REQUEST.into_response();
-            }
-            let ice_servers = match shape {
-                "object" => json!({
-                    "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
-                    "username": "the-username",
-                    "credential": "the-credential"
-                }),
-                _ => json!([{
-                    "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
-                    "username": "the-username",
-                    "credential": "the-credential"
-                }]),
-            };
-            (
-                StatusCode::CREATED,
-                Json(json!({ "iceServers": ice_servers })),
-            )
-                .into_response()
-        }
         async fn revoke() -> Response {
             StatusCode::NO_CONTENT.into_response()
         }
@@ -217,15 +186,45 @@ mod tests {
             "http://127.0.0.1:{}",
             listener.local_addr().expect("addr").port()
         );
-        let app = Router::new()
-            .route(
-                "/turn/keys/the-key/credentials/generate-ice-servers",
-                post(generate),
-            )
-            .route(
-                "/turn/keys/the-key/credentials/the-username/revoke",
-                post(revoke),
-            );
+        let app = Router::new().route(
+            "/turn/keys/the-key/credentials/generate-ice-servers",
+            post(
+                move |headers: axum::http::HeaderMap,
+                      body: Option<Json<serde_json::Value>>|
+                      async move {
+                    if headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
+                        != Some("Bearer the-token")
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if body
+                        .as_ref()
+                        .and_then(|Json(body)| body.get("ttl"))
+                        .is_none()
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    let ice_servers = match shape {
+                        "object" => json!({
+                            "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
+                            "username": "the-username",
+                            "credential": "the-credential"
+                        }),
+                        _ => json!([{
+                            "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
+                            "username": "the-username",
+                            "credential": "the-credential"
+                        }]),
+                    };
+                    (StatusCode::CREATED, Json(json!({ "iceServers": ice_servers })))
+                        .into_response()
+                },
+            ),
+        )
+        .route(
+            "/turn/keys/the-key/credentials/the-username/revoke",
+            post(revoke),
+        );
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
