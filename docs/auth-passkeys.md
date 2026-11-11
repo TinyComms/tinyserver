@@ -210,7 +210,7 @@ Tested (`crates/api/tests/passkey.rs`, `crates/db/src/passkey.rs`, `crates/api/s
 - a registration made for another origin refused, and nothing created; an invite that is used up or missing refused, and nothing spent
 - a counter that goes back flags the passkey and it stays refused; another account's passkey with a borrowed user handle refused
 - recovery codes: stored as hashes only, case and dashes ignored, single use, two tries letting one in, a new set replacing the old
-- the last passkey kept unless a recovery code remains; an old session refused for removing, replacing codes and making a link
+- the last passkey kept unless a recovery code remains; an old session refused for removing, replacing codes and making a link, and still refused after the same person signs in again elsewhere
 - claim links: hash-only storage, single use, expiry, wrong or mismatched token, replacement by a newer link, a banned member getting none, a ban holding after the Pocket ID identity is retired, the account (id, name, email, creation time) unchanged and both identities kept
 - retiring identities: dry run changes nothing; members without a passkey are skipped; it is audited; the roster is right
 - a second device through a self-made link; account deletion removing everything; the tables holding no address, agent, email or phone, closed to the runtime role with row-level security forced; the migration's functions closed to the world
