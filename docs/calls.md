@@ -606,13 +606,17 @@ The server joins a third network that Docker can publish from. HTTP on 8080 stay
 
 For a host that cannot or will not open a port. Only outbound traffic leaves the host.
 
-1. The owner creates a Realtime TURN key in the Cloudflare account that already runs the tunnel, and sets `TINYSERVER_TURN_KEY_ID` and `TINYSERVER_TURN_API_TOKEN`.
+1. The owner creates a Realtime TURN key in the Cloudflare account that already runs the tunnel, and sets `TINYSERVER_TURN_KEY_ID` and `TINYSERVER_TURN_API_TOKEN_FILE`.
 2. On each `call.join`, tinyserver calls `generate-ice-servers` with a `ttl` of 4 h, and revokes the credential when that participant leaves.
 3. The SFU opens one allocation per participant over UDP 3478, falling back to TLS on 443. One per participant keeps each allocation well under the 5–10 kpps limit.
 4. The SFU advertises only the relay address. The client sends its server-reflexive candidate (one STUN request to `stun.cloudflare.com`) in a `call.candidate` message, and the SFU creates a permission for that address.
 5. Allocation refresh every 5 min, permission refresh every 4 min, channel binding for the data path.
 
 str0m has no TURN client. The slice adds a small sans-IO one in `crates/sfu` (allocate, refresh, permission, channel bind) or adopts a crate after review. TURN credentials are never shown to clients in this design; only the server allocates.
+
+In build. The protocol client is `crates/sfu/src/turn.rs` (one `TurnSession` per participant: allocate with RFC 5389 long-term credentials, refresh before the lifetime, CreatePermission for the participant's address, ChannelBind for the data path, retransmits and a retry cap that fails the session); the credentials API client is `crates/api/src/turn_api.rs`. Both are documented there and tested without a live server. The credentials API: `POST https://rtc.live.cloudflare.com/v1/turn/keys/{key}/credentials/generate-ice-servers` with the API token as the bearer and `{"ttl": seconds}` answers 201 with an `iceServers` entry (`urls`, `username`, `credential`) — shipped as an object and as an array, so both are normalized. Revoke is `POST …/credentials/{username}/revoke`, answered 204.
+
+`call.candidate` rides the participant's own live socket, like `call.state` does: `{"type": "call.candidate", "ref", "candidate": "203.0.113.9:5004"}` — the address is a socket address string, the seat is implicit in the sender. The SFU answers with nothing; what the participant gets back is the allocation's relayed address in the `call.answer`, already sent. Compatibility: a client without `call.candidate` cannot use a relay-mode host, so relay mode stays opt-in per host, and `GET /v1/capabilities` gains the `relay_calls` marker once the advertising lands.
 
 Cost, budgeted as if every byte both ways is billed: a 6-person camera call is about 8 GB an hour; audio only is under 1 GB an hour. The free 1,000 GB covers about 125 camera-call hours a month.
 

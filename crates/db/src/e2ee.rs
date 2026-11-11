@@ -349,13 +349,21 @@ pub async fn mls_target_at(
     uuid_arg(conversation)?;
     let mut tx = scoped(pool, caller).await?;
     generation_in(&mut tx, generation).await?;
+    let target = mls_target_in(&mut tx, conversation).await?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(target)
+}
+
+async fn mls_target_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conversation: &str,
+) -> Result<MlsTarget, MessageError> {
     let row: (String, bool) =
         sqlx::query_as("SELECT r_group::text, r_audience FROM app_e2ee_mls_target($1::uuid)")
             .bind(conversation)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await
             .map_err(message_sql)?;
-    tx.commit().await.map_err(message_sql)?;
     Ok(MlsTarget {
         group_id: row.0,
         audience_groups: row.1,
@@ -762,6 +770,40 @@ pub async fn post_e2ee_message_at(
 ) -> Result<(Value, bool), MessageError> {
     uuid_arg(conversation)?;
     uuid_arg(message.device_id)?;
+    let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
+    post_in(tx, conversation, message).await
+}
+
+/// Like `post_e2ee_message_at`, in one transaction with the read of the conversation's MLS
+/// target. `check` gets that target before anything is stored; when it refuses, nothing is
+/// written, the transaction ends, and its refusal comes back as the inner `Err`. The target is
+/// read first, as it was when it had a transaction of its own, so refusals come in the same
+/// order.
+pub async fn post_e2ee_message_checked<R>(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    message: &NewE2eeMessage<'_>,
+    generation: Option<u64>,
+    check: impl FnOnce(&MlsTarget) -> Result<(), R>,
+) -> Result<Result<(Value, bool), R>, MessageError> {
+    uuid_arg(conversation)?;
+    let mut tx = scoped(pool, caller).await?;
+    generation_in(&mut tx, generation).await?;
+    let mls = mls_target_in(&mut tx, conversation).await?;
+    if let Err(refusal) = check(&mls) {
+        return Ok(Err(refusal));
+    }
+    uuid_arg(message.device_id)?;
+    post_in(tx, conversation, message).await.map(Ok)
+}
+
+async fn post_in(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    conversation: &str,
+    message: &NewE2eeMessage<'_>,
+) -> Result<(Value, bool), MessageError> {
     let target = blank_to_none(message.target_id);
     if let Some(target) = target {
         uuid_arg(target)?;
@@ -774,8 +816,6 @@ pub async fn post_e2ee_message_at(
         return Err(MessageError::Invalid);
     };
     let epoch = epoch_arg(message.epoch)?;
-    let mut tx = scoped(pool, caller).await?;
-    generation_in(&mut tx, generation).await?;
     let row: (Value, bool) = sqlx::query_as(
         "SELECT r_message, r_created FROM app_post_e2ee_message(
             $1::uuid, $2, $3, $4::uuid, $5, $6, $7::uuid, $8::text[]::uuid[], $9)",

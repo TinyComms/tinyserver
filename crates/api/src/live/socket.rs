@@ -666,8 +666,12 @@ async fn room_exists(hub: &Hub, me: &Me, room_id: &str) -> Answer {
 
 /// What the person may do in the room's call. A room they cannot see is `not_found`, no
 /// connect is `forbidden`, a timeout is `timed_out`.
-async fn call_access(hub: &Hub, me: &Me, room_id: &str) -> Result<db::CallAccess, &'static str> {
-    match db::call_access(&hub.pool, &me.user_id, room_id).await {
+async fn call_access(
+    hub: &Hub,
+    user_id: &str,
+    room_id: &str,
+) -> Result<db::CallAccess, &'static str> {
+    match db::call_access(&hub.pool, user_id, room_id).await {
         Ok(Some(found)) if found.timed_out => Err("timed_out"),
         Ok(Some(found)) if !db::perm::has(found.permissions, db::perm::CONNECT) => Err("forbidden"),
         Ok(Some(found)) => Ok(found),
@@ -823,10 +827,14 @@ async fn call_join(
     if !asking.moves.take() {
         return Ok(Err("slow_down"));
     }
-    if let Err(code) = fresh(hub, me).await? {
+    // The session check and the room check do not depend on each other, so they share one
+    // round trip's wait. An ended session still wins.
+    let user_id = me.user_id.clone();
+    let (session, allowed) = tokio::join!(fresh(hub, me), call_access(hub, &user_id, room_id));
+    if let Err(code) = session? {
         return Ok(Err(code));
     }
-    let found = match call_access(hub, me, room_id).await {
+    let found = match allowed {
         Ok(found) => found,
         Err(code) => return Ok(Err(code)),
     };

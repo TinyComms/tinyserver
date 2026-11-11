@@ -1236,6 +1236,9 @@ async fn follow_media(
     }
 }
 
+/// How soon a lost or refused `LISTEN` connection is tried again.
+const LISTEN_RETRY: Duration = Duration::from_millis(500);
+
 /// Reads outbox rows past the last one sent, in seq order, on every wake and every poll.
 /// Ids are handed out in commit order, so a cursor in memory never skips a row.
 async fn dispatch(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
@@ -1263,6 +1266,9 @@ async fn dispatch(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) {
         tokio::select! {
             _ = stop.changed() => return,
             _ = poll.tick() => {}
+            // A listener that is gone is tried again soon, not at the next poll. Rows written
+            // meanwhile are read by the drain below, so the retry loses nothing.
+            () = tokio::time::sleep(LISTEN_RETRY), if listener.is_none() => {}
             woke = wake(listener.as_mut()) => {
                 if let Err(error) = woke {
                     tracing::warn!(%error, "outbox listener lost");

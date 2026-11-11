@@ -726,6 +726,89 @@ async fn an_old_session_cannot_change_how_the_account_signs_in() {
     .await;
 }
 
+/// The token that is old stays old when its person signs in somewhere else: a stolen token
+/// gains nothing from the real person's fresh sign-in.
+#[tokio::test]
+async fn a_newer_session_does_not_make_an_old_one_recent() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let app = passkey_app(&db);
+        let mut device = Device::new();
+        let invite = invite(&db, &owner).await;
+        let account = sign_up(&app, &db, &mut device, &invite, "Ada").await;
+        sqlx::query("UPDATE sessions SET created_at = now() - interval '3 weeks'")
+            .execute(&db.owner)
+            .await
+            .expect("age the session");
+        // The real person signs in on another device, now.
+        let (fresh, user_id) = signed_in(&app, &mut device, &account).await;
+        assert_eq!(user_id, account.user_id);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM sessions WHERE created_at > now() - interval '10 minutes'"
+            )
+            .await,
+            1
+        );
+        let id: String = sqlx::query_scalar("SELECT id::text FROM passkey_credentials")
+            .fetch_one(&db.owner)
+            .await
+            .expect("id");
+
+        // The old token still reads, and is still refused everything that changes sign-in.
+        let (status, _) = Call::new(Method::GET, "/v1/me/passkeys")
+            .token(&account.token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        for (method, path) in [
+            (Method::POST, "/v1/me/passkeys/link".to_string()),
+            (Method::POST, "/v1/me/recovery-codes".to_string()),
+            (Method::DELETE, format!("/v1/me/passkeys/{id}")),
+        ] {
+            let (status, body) = Call::new(method, &path)
+                .token(&account.token)
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+            assert_eq!(body["error"], "recent_sign_in_required", "{path}");
+        }
+        assert_eq!(count(&db, "SELECT count(*) FROM passkey_claims").await, 0);
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM passkey_credentials").await,
+            1
+        );
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM passkey_recovery_codes").await,
+            10
+        );
+
+        // The fresh session is allowed, with the old one still open beside it.
+        let (status, link) = Call::new(Method::POST, "/v1/me/passkeys/link")
+            .token(&fresh)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{link}");
+        let (status, codes) = Call::new(Method::POST, "/v1/me/recovery-codes")
+            .token(&fresh)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{codes}");
+        // A token that is no session is not a recent one.
+        assert!(!db::session_is_recent(&db.runtime, "no such token", 600)
+            .await
+            .expect("read"));
+        assert!(db::session_is_recent(&db.runtime, &fresh, 600)
+            .await
+            .expect("read"));
+        assert!(!db::session_is_recent(&db.runtime, &account.token, 600)
+            .await
+            .expect("read"));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_bot_has_no_passkeys() {
     run(|db| async move {

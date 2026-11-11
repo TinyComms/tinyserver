@@ -401,7 +401,8 @@ async fn serve() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse()
         .context("BIND is not a socket address")?;
-    let pool = db::runtime_pool(&url).await?;
+    let pool_size = env_count("TINYSERVER_DB_POOL", db::POOL_DEFAULT as usize)?;
+    let pool = db::runtime_pool_sized(&url, u32::try_from(pool_size).unwrap_or(u32::MAX)).await?;
     // The private half of the external sender moves out of Postgres before anything is served,
     // so a backup taken of an idle process does not hold it. A lost key stops the start.
     api::seal_external_sender(&pool)
