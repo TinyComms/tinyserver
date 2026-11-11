@@ -67,8 +67,9 @@ const CLASS_ERROR: u8 = 3;
 
 const MAGIC: u32 = 0x2112_A444;
 const HEADER: usize = 20;
-/// MESSAGE-INTEGRITY carries a 20-byte SHA-1 HMAC behind its four-byte header.
-const INTEGRITY_LEN: usize = 24;
+/// MESSAGE-INTEGRITY carries a 20-byte SHA-1 HMAC behind its four-byte header; the
+/// attribute's length field counts the tag alone (RFC 5389 §15.4).
+const INTEGRITY_LEN: usize = 20;
 const CHANNEL_MIN: u16 = 0x4000;
 const UDP: u8 = 17;
 /// Channels re-bind a minute before the server would drop the binding at ten minutes.
