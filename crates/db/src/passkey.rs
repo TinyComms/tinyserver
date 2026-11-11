@@ -713,15 +713,18 @@ pub async fn regenerate_codes(
     tx.commit().await.map_err(from_sql)
 }
 
-/// Whether this session opened less than `secs` ago. Adding and removing sign-in methods asks
-/// for a recent sign-in, so a stolen old session cannot plant a passkey of its own.
-pub async fn session_is_recent(pool: &PgPool, user_id: &str, secs: i32) -> Result<bool, DbError> {
+/// Whether the session `token` belongs to opened less than `secs` ago. Adding and removing
+/// sign-in methods asks for a recent sign-in, so a stolen old session cannot plant a passkey of
+/// its own. It is this session's age and no other's: the person signing in on another device
+/// does not make an old token recent.
+pub async fn session_is_recent(pool: &PgPool, token: &str, secs: i32) -> Result<bool, DbError> {
     let recent: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM sessions
-                        WHERE user_id = $1::uuid
+                        WHERE token_hash = $1
+                          AND expires_at > now()
                           AND created_at > now() - make_interval(secs => $2))",
     )
-    .bind(user_id)
+    .bind(token_digest(token).as_slice())
     .bind(secs)
     .fetch_one(pool)
     .await?;

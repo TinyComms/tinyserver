@@ -587,6 +587,68 @@ async fn an_admin_can_lower_the_image_cap() {
 }
 
 #[tokio::test]
+async fn an_upload_that_says_it_is_over_the_cap_is_refused_unread() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let (status, server) = Call::new(Method::PATCH, "/v1/server")
+            .token(&token)
+            .json(json!({"image_max_bytes": 1024, "file_max_bytes": 1024}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{server}");
+
+        // 3 MiB by its header, far under the 100 MiB an admin may allow and over what this
+        // server allows. The body says when it is first read.
+        let read = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = read.clone();
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            seen.store(true, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(vec![0u8; 16])
+        }));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/media")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "multipart/form-data; boundary=TinyBoundary")
+                    .header("content-length", (3 * 1024 * 1024).to_string())
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let denied: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(denied["error"], "too_large");
+        assert!(!read.load(Ordering::SeqCst), "the body was read");
+
+        // A body that does not say its size is read no further than the cap and its headers.
+        let big = vec![b'a'; 1024 + 1024 * 1024 + 1];
+        let (status, denied) = upload(&app, &token, "big.txt", "text/plain", &big, &[]).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{denied}");
+        // Under the cap still saves.
+        let dir =
+            std::env::temp_dir().join(format!("tinyserver-uploads-unread-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+        let (status, saved) = upload(&app, &token, "note.txt", "text/plain", b"hello", &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_zip_is_unsupported_until_the_server_allows_archives() {
     run(|db| async move {
         let dir =

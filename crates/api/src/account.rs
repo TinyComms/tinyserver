@@ -66,7 +66,7 @@ async fn put_avatar(
     if bytes.len() > db::ICON_MAX {
         return Err(ApiError::TooLarge);
     }
-    let stored = db::prepare_icon(&bytes).map_err(icon_failure)?;
+    let stored = db::prepare_icon(&bytes).await.map_err(icon_failure)?;
     let avatar = set_avatar(&pool, &caller, &stored.bytes, &stored.mime)
         .await
         .map_err(lift)?;

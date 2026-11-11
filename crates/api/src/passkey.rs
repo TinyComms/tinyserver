@@ -43,6 +43,7 @@ use webauthn_rs::prelude::{
 use crate::auth::{client_url, effective, escape, expired, server_trouble, Outcome, STYLE};
 use crate::community::{caller, lift, ApiError};
 use crate::oidc::{ConfigError, SignIn};
+use crate::session::bearer;
 
 /// The provider id passkeys go by in `GET /v1/auth/config` and `POST /v1/auth/start`.
 pub const PROVIDER_ID: &str = "passkey";
@@ -982,8 +983,12 @@ async fn person(pool: &PgPool, headers: &HeaderMap) -> Result<db::Caller, Refusa
     }
 }
 
-async fn recent(pool: &PgPool, caller: &db::Caller) -> Result<(), Refusal> {
-    match db::session_is_recent(pool, &caller.user_id, RECENT_SECS).await {
+/// The age of the session this request presents, not of the newest one the person has.
+async fn recent(pool: &PgPool, headers: &HeaderMap) -> Result<(), Refusal> {
+    let Some(token) = bearer(headers) else {
+        return Err(Refusal::NotRecent);
+    };
+    match db::session_is_recent(pool, token, RECENT_SECS).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(Refusal::NotRecent),
         Err(error) => {
@@ -1056,7 +1061,7 @@ async fn remove_mine(
     Path(id): Path<String>,
 ) -> Result<StatusCode, Refusal> {
     let caller = person(&pool, &headers).await?;
-    recent(&pool, &caller).await?;
+    recent(&pool, &headers).await?;
     db::remove_mine(&pool, &caller, &id).await.map_err(lift)?;
     tracing::info!(user_id = %caller.user_id, "passkey removed");
     Ok(StatusCode::NO_CONTENT)
@@ -1073,7 +1078,7 @@ async fn new_codes(
     headers: HeaderMap,
 ) -> Result<Json<NewCodes>, Refusal> {
     let caller = person(&pool, &headers).await?;
-    recent(&pool, &caller).await?;
+    recent(&pool, &headers).await?;
     let codes = db::new_recovery_codes(RECOVERY_CODES);
     db::regenerate_codes(&pool, &caller, &codes)
         .await
@@ -1095,7 +1100,7 @@ async fn link_mine(
     headers: HeaderMap,
 ) -> Result<Json<Link>, Refusal> {
     let caller = person(&pool, &headers).await?;
-    recent(&pool, &caller).await?;
+    recent(&pool, &headers).await?;
     let token = db::random_id();
     db::claim_link_for_me(&pool, &caller, &token, SELF_LINK_SECS)
         .await

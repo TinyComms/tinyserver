@@ -216,7 +216,7 @@ async fn put_icon(
     db::ensure_manage_server(&pool, &caller)
         .await
         .map_err(lift)?;
-    let stored = db::prepare_icon(&bytes).map_err(icon_failure)?;
+    let stored = db::prepare_icon(&bytes).await.map_err(icon_failure)?;
     let sha = db::set_icon(&pool, &caller, &stored.bytes, &stored.mime)
         .await
         .map_err(lift)?;

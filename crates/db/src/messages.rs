@@ -450,7 +450,11 @@ pub async fn save_attachment(
     let limits = upload_limits(&mut tx).await?;
     let prepared = prepare(upload, limits)?;
     let rewritten = if matches!(prepared.kind, "image" | "gif") {
-        Some(crate::media::rewrite_raster(&upload.bytes, &prepared.mime)?)
+        // The decode may wait for its turn. It does not hold a database connection meanwhile.
+        tx.commit().await.map_err(message_sql)?;
+        let raster = crate::media::rewrite_raster_in_turn(&upload.bytes, &prepared.mime).await?;
+        tx = scope(pool, caller).await.map_err(from_community)?;
+        Some(raster)
     } else {
         None
     };

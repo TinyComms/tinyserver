@@ -9,16 +9,61 @@ use image::codecs::jpeg::JpegDecoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::{AnimationDecoder, ImageDecoder, ImageFormat};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::messages::MessageError;
 
 const MAX_EDGE: u64 = 16_384;
 const MAX_PIXELS: u64 = 40_000_000;
+/// A server icon or an avatar is shown small. A source this size decodes to 16 MiB of RGBA.
+const ICON_MAX_PIXELS: u64 = 4_000_000;
 const MAX_GIF_FRAMES: u64 = 500;
 const MAX_RGBA: u64 = 256 * 1024 * 1024;
 const MAX_ASPECT: u64 = 50;
 const MAX_ZIP_ENTRIES: usize = 1024;
 const MAX_ZIP_UNCOMPRESSED: u64 = 200 * 1024 * 1024;
+
+/// How many images the whole process decodes at once. One decode may hold `MAX_PIXELS` of RGBA
+/// and the re-encoded copy, so uploads that arrive together take turns instead of adding up to
+/// more memory than the container has.
+const DECODES_AT_ONCE: usize = 2;
+static DECODES: Semaphore = Semaphore::const_new(DECODES_AT_ONCE);
+
+/// Waits for a turn to decode. Nothing is refused for being busy.
+async fn decode_turn() -> Result<SemaphorePermit<'static>, MessageError> {
+    DECODES
+        .acquire()
+        .await
+        .map_err(|_| MessageError::Unavailable)
+}
+
+/// Runs `work` on the blocking pool, off the async workers. The turn goes with the work, so a
+/// request that goes away mid-decode keeps its turn until the decode really ends.
+async fn decode_with<T, F>(turn: SemaphorePermit<'static>, work: F) -> Result<T, MessageError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        work()
+    })
+    .await
+    .map_err(|_| MessageError::Unavailable)
+}
+
+/// `rewrite_raster`, in its turn and off the async workers. Every request path decodes through
+/// this.
+pub(crate) async fn rewrite_raster_in_turn(
+    bytes: &[u8],
+    mime: &str,
+) -> Result<Rewritten, MessageError> {
+    let turn = decode_turn().await?;
+    // Copied once the turn has come, so an upload that is waiting holds no second copy.
+    let bytes = bytes.to_vec();
+    let mime = mime.to_string();
+    decode_with(turn, move || rewrite_raster(&bytes, &mime)).await?
+}
 
 /// Whether zip/7z/rar/tar/gz/bz2 may persist as kind `file`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,8 +144,9 @@ pub fn classify(
 
 /// Server icon and user avatar. Sniff, classify, and re-encode so a polyglot trailer is not
 /// what gets stored. The 256 KiB cap applies to the rewritten bytes. A rewrite failure fails
-/// the upload. GIF and every non-image stay unsupported.
-pub fn prepare_icon(bytes: &[u8]) -> Result<Rewritten, MessageError> {
+/// the upload. GIF and every non-image stay unsupported. So does a source over
+/// `ICON_MAX_PIXELS`, which is refused from its header, before a decode and before a turn.
+pub async fn prepare_icon(bytes: &[u8]) -> Result<Rewritten, MessageError> {
     let mime = crate::server::sniff_image(bytes).ok_or(MessageError::UnsupportedMedia)?;
     let name = match mime {
         "image/png" => "icon.png",
@@ -109,7 +155,8 @@ pub fn prepare_icon(bytes: &[u8]) -> Result<Rewritten, MessageError> {
         _ => return Err(MessageError::UnsupportedMedia),
     };
     let classified = classify(name, mime, bytes, Archives::Denied)?;
-    let rewritten = rewrite_raster(bytes, &classified.mime)?;
+    reject_icon_caps(bytes, &classified.mime)?;
+    let rewritten = rewrite_raster_in_turn(bytes, &classified.mime).await?;
     if rewritten.bytes.is_empty() {
         return Err(MessageError::UnsupportedMedia);
     }
@@ -132,6 +179,15 @@ pub fn rewrite_raster(bytes: &[u8], mime: &str) -> Result<Rewritten, MessageErro
         reject_caps(width, height, 1)?;
         rewrite_still(bytes, format, mime, kind)
     }
+}
+
+/// Header only. The same refusal `reject_caps` gives an image with too many pixels.
+fn reject_icon_caps(bytes: &[u8], mime: &str) -> Result<(), MessageError> {
+    let (width, height) = header_dimensions(bytes, format_of(mime)?)?;
+    if u64::from(width).saturating_mul(u64::from(height)) > ICON_MAX_PIXELS {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    Ok(())
 }
 
 fn format_of(mime: &str) -> Result<ImageFormat, MessageError> {
@@ -1300,11 +1356,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_icon_drops_a_polyglot_trailer() {
+    #[tokio::test]
+    async fn an_icon_drops_a_polyglot_trailer() {
         let mut bytes = TINY_PNG.to_vec();
         bytes.extend_from_slice(b"%PDF-1.4");
-        let got = super::prepare_icon(&bytes).expect("rewritten icon");
+        let got = super::prepare_icon(&bytes).await.expect("rewritten icon");
         assert!(
             !got.bytes.windows(4).any(|chunk| chunk == b"%PDF"),
             "stored icon still contains a %PDF trailer"
@@ -1312,13 +1368,83 @@ mod tests {
         assert_eq!(got.mime, "image/png");
         assert!(got.bytes.len() <= crate::server::ICON_MAX);
         assert!(matches!(
-            super::prepare_icon(b"GIF89a"),
+            super::prepare_icon(b"GIF89a").await,
             Err(MessageError::UnsupportedMedia)
         ));
         assert!(matches!(
-            super::prepare_icon(b"not an image"),
+            super::prepare_icon(b"not an image").await,
             Err(MessageError::UnsupportedMedia)
         ));
+    }
+
+    /// A solid image is a few kilobytes as a PNG however many pixels it has.
+    fn solid_png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(width, height)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("png");
+        out.into_inner()
+    }
+
+    #[tokio::test]
+    async fn an_icon_over_four_megapixels_is_refused_from_its_header() {
+        // Cut off where the pixels begin: the signature, IHDR, and the start of the first IDAT.
+        // There is nothing here to decode, so the answer either way came from the header.
+        let bytes = solid_png(2001, 2000);
+        let small = solid_png(2000, 2000);
+        assert!(matches!(
+            super::reject_icon_caps(&bytes[..48], "image/png"),
+            Err(MessageError::UnsupportedMedia)
+        ));
+        assert!(super::reject_icon_caps(&small[..48], "image/png").is_ok());
+        assert!(rewrite_raster(&small[..48], "image/png").is_err());
+
+        // A real image of that size is a fine message image and no icon. Every turn is taken
+        // while the icon is refused, so the refusal waited for none and decoded nothing.
+        assert!(bytes.len() < crate::server::ICON_MAX, "{}", bytes.len());
+        let as_message = rewrite_raster(&bytes, "image/png").expect("a message image");
+        assert_eq!(as_message.width, 2001);
+        let turns = super::DECODES
+            .acquire_many(super::DECODES_AT_ONCE as u32)
+            .await
+            .expect("turns");
+        assert!(matches!(
+            super::prepare_icon(&bytes).await,
+            Err(MessageError::UnsupportedMedia)
+        ));
+        drop(turns);
+        let got = super::prepare_icon(&small).await.expect("four megapixels");
+        assert_eq!((got.width, got.height), (2000, 2000));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_more_than_two_images_are_decoded_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+
+        let mut waiting = Vec::new();
+        for _ in 0..8 {
+            waiting.push(tokio::spawn(async {
+                let turn = super::decode_turn().await.expect("turn");
+                super::decode_with(turn, || {
+                    let running = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+                    MOST.fetch_max(running, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    RUNNING.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await
+                .expect("decode");
+            }));
+        }
+        // All eight finish: the ones past the second waited and were not refused.
+        for task in waiting {
+            task.await.expect("task");
+        }
+        // Never more than two. It is exactly two unless another test in this process is
+        // decoding too, since the turns are the whole process's.
+        let most = MOST.load(Ordering::SeqCst);
+        assert!((1..=super::DECODES_AT_ONCE).contains(&most), "{most}");
     }
 
     #[test]
