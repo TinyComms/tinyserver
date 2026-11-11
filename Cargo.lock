@@ -4915,6 +4915,8 @@ dependencies = [
 name = "sfu"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
+ "md-5",
  "mio",
  "sfu",
  "socket2",

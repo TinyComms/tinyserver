@@ -11,6 +11,8 @@ mod limit;
 mod room;
 mod sdp;
 mod tcp;
+#[allow(dead_code)]
+mod turn;
 mod video;
 
 #[cfg(feature = "headless")]
