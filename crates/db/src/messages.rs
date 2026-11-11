@@ -457,12 +457,9 @@ pub async fn save_attachment(
     };
     let prepared = prepare(upload, limits)?;
     let rewritten = if matches!(prepared.kind, "image" | "gif") {
-        // Decoding and encoding is CPU work: off the async workers.
-        let raw = upload.bytes.clone();
-        let mime = prepared.mime.clone();
-        let raster = tokio::task::spawn_blocking(move || crate::media::rewrite_raster(&raw, &mime))
-            .await
-            .map_err(|_| MessageError::Unavailable)??;
+        // Decoding is CPU work and takes its turn among the process's decodes (at most two at
+        // once); it holds no database connection while it waits or runs.
+        let raster = crate::media::rewrite_raster_in_turn(&upload.bytes, &prepared.mime).await?;
         Some(raster)
     } else {
         None

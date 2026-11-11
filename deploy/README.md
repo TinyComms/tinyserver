@@ -4,7 +4,7 @@ Postgres and Pocket ID sit on the internal `inside` network, which has no route 
 
 tinyserver keeps no passwords. People sign in at an OpenID Connect provider; Pocket ID comes set up as the default one, and people sign in there with a passkey. Signing in proves who someone is to the server. It never grants decryption.
 
-The environment file next to `deploy/compose.yml` is `deploy/.env` when you run compose from `deploy/`. It has to set the database passwords, `TUNNEL_TOKEN`, `TINYSERVER_PUBLIC_URL`, `AUTH_PUBLIC_URL`, and `TINYSERVER_MEDIA_HMAC_SECRET` (64 hex characters, `openssl rand -hex 32`) before `setup.sh`, because that script renders the compose file. There is no `deploy/.env.example`. The repo-root `.env.example` is for a local checkout and does not include `AUTH_PUBLIC_URL` or `TUNNEL_TOKEN`. The sign-in secrets are files in `deploy/secrets`. Neither the env file nor the secrets are committed.
+The environment file next to `deploy/compose.yml` is `deploy/.env` when you run compose from `deploy/`. Start from [`.env.example`](.env.example) in this directory: `cp .env.example .env`. It lists the seven values compose will not start without, each with the command that makes it where it is a secret, and the optional ones below them: `POSTGRES_PASSWORD`, `APP_OWNER_PASSWORD`, `APP_RUNTIME_PASSWORD`, `TINYSERVER_MEDIA_HMAC_SECRET` (64 hex characters, `openssl rand -hex 32`), `TINYSERVER_PUBLIC_URL`, `AUTH_PUBLIC_URL`, and `TUNNEL_TOKEN`. Set them before `setup.sh`, because that script renders the compose file. The repo-root `.env.example` is for a local checkout, not for this stack. The sign-in secrets are files in `deploy/secrets`. Neither the env file nor the secrets are committed.
 
 `deploy/compose.yml` reads them. `TINYSERVER_PG_DIR` and `POCKETID_DATA_DIR` can be host directories. Left unset, Docker keeps named volumes.
 
@@ -267,7 +267,7 @@ The release that moved the database owner password out of the serving container 
 
 ## Scanning off
 
-`docker compose -f compose.yml -f scan-off.yml up -d` runs without clamd and without scanning uploads. Only for a community whose attachments are sealed on the sending device; anywhere else it lets any file through. Without that file nothing changes.
+`docker compose -f compose.yml -f scan-off.yml up -d` runs without clamd and without scanning uploads. Only for a community whose attachments are sealed on the sending device; anywhere else it lets any file through. Without that file nothing changes. It goes with the other files in any order, such as `-f compose.yml -f compose.passkey.yml -f scan-off.yml`.
 
 ## Many communities on one host
 

@@ -1,0 +1,10 @@
+{
+  "id": "stale-session-sign-in-change",
+  "title": "An old session cannot add a passkey, replace recovery codes or remove a passkey after its person signs in again elsewhere",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres", "two-sessions"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "API integration against a real Postgres, not released-client or native GUI certification",
+  "native_client_proof": "no released client has a screen for these calls; an old client sees the same 403 recent_sign_in_required it already handles"
+}

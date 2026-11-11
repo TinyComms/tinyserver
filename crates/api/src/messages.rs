@@ -22,8 +22,11 @@ use serde_json::Value;
 use crate::community::{caller, ApiError};
 use crate::media_sign;
 
+/// Room for the multipart headers and fields around a file.
+const UPLOAD_SLACK: usize = 1024 * 1024;
+
 /// A file plus its multipart headers. A little over the largest cap an admin may set.
-const UPLOAD_BODY: usize = db::UPLOAD_MAX as usize + 1024 * 1024;
+const UPLOAD_BODY: usize = db::UPLOAD_MAX as usize + UPLOAD_SLACK;
 
 /// A message post: the largest ciphertext as base64, and the fields around it.
 const MESSAGE_BODY: usize = 48 * 1024;
@@ -627,11 +630,23 @@ async fn upload(
             return Err(error);
         }
     };
-    let body = match to_bytes(request.into_body(), UPLOAD_BODY).await {
+    // The caps this server has set, read before the body is. A body that says it is bigger is
+    // refused unread, and one that does not say is read no further than this.
+    let limit = upload_body_limit(&pool, &caller).await;
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|declared| declared > limit as u64) {
+        let error = Error::TooLarge;
+        upload_failed(&caller.user_id, &error, limit);
+        return Err(error);
+    }
+    let body = match to_bytes(request.into_body(), limit).await {
         Ok(body) => body,
         Err(_) => {
             let error = Error::TooLarge;
-            upload_failed(&caller.user_id, &error, UPLOAD_BODY);
+            upload_failed(&caller.user_id, &error, limit);
             return Err(error);
         }
     };
@@ -664,6 +679,21 @@ async fn upload(
         error
     })?;
     Ok((StatusCode::CREATED, signed(saved)))
+}
+
+/// The most `POST /v1/media` reads: the larger of the image and file caps, plus the multipart
+/// around it. When the settings cannot be read it is `UPLOAD_BODY`, and the save answers.
+async fn upload_body_limit(pool: &PgPool, caller: &Caller) -> usize {
+    match db::get_server(pool, caller).await {
+        Ok(settings) => {
+            let cap = settings
+                .image_max_bytes
+                .max(settings.file_max_bytes)
+                .clamp(0, db::UPLOAD_MAX);
+            cap as usize + UPLOAD_SLACK
+        }
+        Err(_) => UPLOAD_BODY,
+    }
 }
 
 async fn download(

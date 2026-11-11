@@ -16,15 +16,10 @@ services:
     environment:
       TINYSERVER_SCAN_ENGINE: none
       TINYSERVER_CLAMD_SOCKET: ""
-    depends_on: !override
-      postgres:
-        condition: service_healthy
-      pocket-id:
-        condition: service_healthy
-      tinyserver-uploads:
-        condition: service_completed_successfully
-      tinyserver-init:
-        condition: service_completed_successfully
+    # Only the entry for clamd is taken out, so this file and compose.passkey.yml can be used
+    # together.
+    depends_on:
+      clamd: !reset null
 
   # Kept defined, so the file still merges with compose.yml, but started only on request.
   clamd:

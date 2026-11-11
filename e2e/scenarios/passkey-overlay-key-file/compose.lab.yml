@@ -1,0 +1,24 @@
+# Laid last over deploy/compose.yml by run.sh in this directory, and only by it.
+#
+# It takes out what the scenario cannot have on a lab host and does not need: the Cloudflare
+# tunnel (no token), clamd (a gigabyte of signatures to fetch) and the published media port. It
+# does not touch the key file, its volume, the data directory or sign-in, which are what the
+# scenario is about. It does not use deploy/scan-off.yml, so that on the base, where that file
+# and compose.passkey.yml could not be used together, the run still gets as far as the key.
+
+services:
+  tinyserver:
+    ports: !reset []
+    # A server that will not start stays stopped, so the run reads why instead of a restart loop.
+    restart: "no"
+    environment:
+      TINYSERVER_SCAN_ENGINE: none
+      TINYSERVER_CLAMD_SOCKET: ""
+    depends_on:
+      clamd: !reset null
+
+  clamd:
+    profiles: ["lab-off"]
+
+  tunnel:
+    profiles: ["lab-off"]

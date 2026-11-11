@@ -92,9 +92,10 @@ With `TINYSERVER_PUBLIC_IP` set, as in the example (`127.0.0.1`), `serve` binds 
 
 ### A community
 
-Use [Running a community](deploy/README.md). From `deploy/`, the environment file has to set the database passwords, `TINYSERVER_PUBLIC_URL`, `AUTH_PUBLIC_URL`, `TUNNEL_TOKEN`, and `TINYSERVER_MEDIA_HMAC_SECRET` before `setup.sh`, because that script renders the whole compose file. `TINYAUTH_PUBLIC_URL` still fills `AUTH_PUBLIC_URL` when the new name is unset.
+Use [Running a community](deploy/README.md). From `deploy/`, the environment file has to set the database passwords, `TINYSERVER_PUBLIC_URL`, `AUTH_PUBLIC_URL`, `TUNNEL_TOKEN`, and `TINYSERVER_MEDIA_HMAC_SECRET` before `setup.sh`, because that script renders the whole compose file. [`deploy/.env.example`](deploy/.env.example) lists them, with the command that makes each secret. `TINYAUTH_PUBLIC_URL` still fills `AUTH_PUBLIC_URL` when the new name is unset.
 
 ```sh
+cp .env.example .env    # then fill in the seven values it leaves empty
 sh pocket-id/setup.sh <first-admin-username>
 docker compose up -d
 ```
@@ -103,7 +104,13 @@ To run the image CI published for a commit instead of building on the host, see 
 
 `setup.sh` writes `deploy/secrets` (mode `0700`, secret files `0444`), starts Pocket ID, and registers the OIDC client `tinyserver`. The username is the first Pocket ID admin. The script prints a one-time link `${AUTH_PUBLIC_URL}/lc/<token>`, good for an hour.
 
-The first container start migrates and, while there is no owner, prints one owner invite to the logs. Paste the code into tinyclient. A later start does not print that token again. With an owner, bootstrap prints nothing.
+The first start migrates and, while there is no owner, writes one owner invite to a file. The log names the file and never holds the invite. Read it from the running server:
+
+```sh
+docker compose exec tinyserver cat /bootstrap/owner-invite
+```
+
+Paste the code into tinyclient's "Join a server". A later start does not write that token again; [The first owner](deploy/README.md#the-first-owner) says how to get a new one. With an owner, the file is removed.
 
 HTTP listens on 8080 inside the network and is not published on the host. The tunnel is what carries the chat hostname to `http://tinyserver:8080` and the auth hostname to `http://pocket-id:1411`. Both hostnames are set on the tunnel in Cloudflare. The host publishes only `TINYSERVER_MEDIA_PORT` (50000 unless set), UDP and TCP. Pocket ID and clamd publish no port. clamd is `clamd:3310` on the `media` network, which has a route out so signature updates can run. Postgres and Pocket ID stay on the internal network.
 
