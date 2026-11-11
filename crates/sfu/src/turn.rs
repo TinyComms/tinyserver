@@ -430,6 +430,7 @@ impl TurnSession {
             None => {
                 buf.extend_from_slice(&(SEND_INDICATION).to_be_bytes());
                 buf.extend_from_slice(&[0, 0]);
+                buf.extend_from_slice(&MAGIC.to_be_bytes());
                 buf.extend_from_slice(&rand_transaction());
                 put_address(&mut buf, 18, peer);
                 // The DATA value is padded to four bytes and the header length counts the
