@@ -75,10 +75,12 @@ const UDP: u8 = 17;
 const REBIND_AFTER: Duration = Duration::from_secs(9 * 60);
 /// Permissions re-create a minute before the server drops them at five minutes.
 const REPERMISSION_AFTER: Duration = Duration::from_secs(4 * 60);
-const RETRIES: u32 = 5;
-/// A fixed retransmit interval for now; RFC 5389 §7.2.1's exponential backoff is a later
-/// refinement.
+/// Seven requests go out for one transaction before it fails (RFC 5389 §7.2.1).
+const RETRIES: u32 = 6;
 const RTO: Duration = Duration::from_millis(500);
+/// The wait after the last retransmit, Rm times the RTO (RFC 5389 §7.2.1): the final
+/// request gets an ample chance to be answered before the transaction is called dead.
+const FINAL_GRACE: Duration = Duration::from_millis(16 * 500);
 /// The largest datagram wrapped for a peer.
 const MAX_PAYLOAD: usize = 1_400;
 
@@ -188,6 +190,24 @@ fn refresh_at(now: Instant, lifetime_secs: u64) -> Instant {
     now + Duration::from_secs((lifetime_secs - margin).max(1))
 }
 
+/// The long-term-credentials key (RFC 5389 §15.4): MD5 over `username:realm:password`,
+/// the same derivation on both sides of the wire.
+fn integrity_key(username: &str, realm: &str, credential: &str) -> hmac::Key {
+    let material = format!("{}:{}:{}", username, realm, credential);
+    let digest = Md5::digest(material.as_bytes());
+    hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, digest.as_ref())
+}
+
+/// The wait before the next retransmit, after `retransmits` went out (RFC 5389 §7.2.1):
+/// the interval doubles from the RTO each time, and after the last one the final grace
+/// carries the transaction to its 39.5 seconds — not to the three a fixed interval spent.
+fn retry_wait(retransmits: u32) -> Duration {
+    if retransmits >= RETRIES {
+        return FINAL_GRACE;
+    }
+    RTO.saturating_mul(1u32 << retransmits)
+}
+
 /// What a response carried.
 #[derive(Debug, Default)]
 struct Attributes {
@@ -201,6 +221,11 @@ struct Attributes {
     realm: Option<String>,
     data: Option<Vec<u8>>,
     error: Option<(u16, String)>,
+    /// The MESSAGE-INTEGRITY tag, and where the attribute sits in the slice: the HMAC's
+    /// input ends there, with the header length shortened to match (RFC 5389 §15.4), so
+    /// the position is part of the verification.
+    integrity: Option<Vec<u8>>,
+    integrity_at: Option<usize>,
 }
 
 fn parse_attributes(data: &[u8]) -> Option<Attributes> {
@@ -231,6 +256,10 @@ fn parse_attributes(data: &[u8]) -> Option<Attributes> {
                     class * 100 + number,
                     String::from_utf8_lossy(value.get(4..).unwrap_or(b"")).into_owned(),
                 ));
+            }
+            8 => {
+                found.integrity = Some(value.to_vec());
+                found.integrity_at = Some(at);
             }
             _ => {}
         }
@@ -454,7 +483,7 @@ impl TurnSession {
                     }
                     return None;
                 }
-                pending.deadline = now + RTO;
+                pending.deadline = now + retry_wait(pending.tries);
                 return Some(pending.bytes.clone());
             }
             return None;
@@ -558,6 +587,22 @@ impl TurnSession {
             return None;
         }
         let attributes = parse_attributes(&data[HEADER..])?;
+        // Once the session holds credentials, its request on the wire was signed, and the
+        // answer to it is signed too (RFC 5389 §10.1, §15.4): the tag covers the message
+        // with the header length ending at the integrity attribute. An answer without a
+        // tag that verifies is not the server's, and is dropped as if it never came — the
+        // request stays in flight and its retransmits continue.
+        if let (Some(_), Some(realm)) = (&self.nonce, &self.realm) {
+            let (Some(tag), Some(at)) = (&attributes.integrity, attributes.integrity_at) else {
+                return None;
+            };
+            let mut signed = data[..HEADER + at].to_vec();
+            signed[2..4].copy_from_slice(&(at as u16).to_be_bytes());
+            let key = integrity_key(&self.server.username, realm, &self.server.credential);
+            if hmac::sign(&key, &signed).as_ref() != tag.as_slice() {
+                return None;
+            }
+        }
         if class == CLASS_ERROR {
             let (code, _) = attributes.error?;
             match code {
@@ -684,10 +729,11 @@ impl TurnSession {
     /// Builds one request and puts it on the wire as the pending one. Everything goes
     /// through `send_or_queue`, which only calls this when the wire is free — except the
     /// credentials round-trip, which replaces its own challenged request. Attributes go in
-    /// first, credentials and integrity behind them, and the header length counts the
-    /// integrity attribute as present, the RFC's way of signing everything before it. The
-    /// integrity key for long-term credentials is MD5 over `username ":" realm ":" password`
-    /// (RFC 5389 §15.4), with the realm this session was challenged with.
+    /// first, credentials and integrity behind them: the HMAC signs everything before the
+    /// integrity attribute, over a header length that ends there, and the wire's length
+    /// counts the attribute again (RFC 5389 §15.4). The key for long-term credentials is
+    /// MD5 over `username ":" realm ":" password`, with the realm this session was
+    /// challenged with.
     fn send_request(
         &mut self,
         method: u16,
@@ -715,17 +761,17 @@ impl TurnSession {
             put(20, realm.as_bytes());
             put(21, nonce);
             put(6, self.server.username.as_bytes());
-            let end = buf.len() + INTEGRITY_LEN;
-            buf[2..4].copy_from_slice(&((end - HEADER) as u16).to_be_bytes());
-            let material = format!(
-                "{}:{}:{}",
-                self.server.username, realm, self.server.credential
-            );
-            let digest = Md5::digest(material.as_bytes());
-            let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, digest.as_ref());
+            // The HMAC covers the message with its header length ending before the
+            // integrity attribute (RFC 5389 §15.4); on the wire the length counts the
+            // attribute again, the way a receiver's own length check wants it. So the
+            // length field is written twice: once for the sign, once for the datagram.
+            buf[2..4].copy_from_slice(&((buf.len() - HEADER) as u16).to_be_bytes());
+            let key = integrity_key(&self.server.username, realm, &self.server.credential);
+            let tag = hmac::sign(&key, &buf);
             buf.extend_from_slice(&8u16.to_be_bytes());
             buf.extend_from_slice(&(INTEGRITY_LEN as u16).to_be_bytes());
-            buf.extend_from_slice(hmac::sign(&key, &buf).as_ref());
+            buf.extend_from_slice(tag.as_ref());
+            buf[2..4].copy_from_slice(&((buf.len() - HEADER) as u16).to_be_bytes());
         }
         self.pending = Some(Pending {
             method,
@@ -776,7 +822,10 @@ mod tests {
 
     /// A 401 challenge with nonce and realm, the way a TURN server opens the exchange.
     /// The code rides as class 4, number 1, behind the two zeros (RFC 5389 §15.6), not as
-    /// a bare number: encoding 401 big-endian is a wire this module reads wrong.
+    /// a bare number: encoding 401 big-endian is a wire this module reads wrong. The tag
+    /// is what a server puts on answers once the exchange is under way; the session
+    /// cannot check the very first one — it holds no credentials yet — so a signed
+    /// opening challenge reads the same as an unsigned one.
     fn challenge(transaction: [u8; 12]) -> Vec<u8> {
         error_answer(transaction, 401, b"Unauthorized", b"nonce-1")
     }
@@ -812,19 +861,27 @@ mod tests {
         None
     }
 
-    /// An allocate success with the relayed address and a lifetime.
-    fn allocated(transaction: [u8; 12], lifetime: u32) -> Vec<u8> {
+    /// The relayed address and the lifetime an allocate success carries.
+    fn allocated_parts(lifetime: u32) -> Vec<(u16, Vec<u8>)> {
         let mut relayed = [0u8; 8];
         relayed[1] = 1;
         xor_into(
             &mut relayed,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 61_924),
         );
-        let parts = [
+        vec![
             (22u16, relayed.to_vec()),
             (13u16, lifetime.to_be_bytes().to_vec()),
-        ];
-        answer(msg_type(ALLOCATE, CLASS_SUCCESS), transaction, &parts)
+        ]
+    }
+
+    /// An allocate success with the relayed address and a lifetime.
+    fn allocated(transaction: [u8; 12], lifetime: u32) -> Vec<u8> {
+        answer(
+            msg_type(ALLOCATE, CLASS_SUCCESS),
+            transaction,
+            &allocated_parts(lifetime),
+        )
     }
 
     /// A success response for `method`, empty attributes.
@@ -832,7 +889,15 @@ mod tests {
         answer(msg_type(method, CLASS_SUCCESS), transaction, &[])
     }
 
+    /// The answer the tests hand the session once it can be checked: signed, the way a
+    /// server signs its answers to a signed request (RFC 5389 §15.4).
     fn answer(msg_type: u16, transaction: [u8; 12], parts: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        with_integrity(raw(msg_type, transaction, parts))
+    }
+
+    /// The same datagram without the tag — what no conforming server sends after the
+    /// client authenticated, and what the session must drop.
+    fn raw(msg_type: u16, transaction: [u8; 12], parts: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&msg_type.to_be_bytes());
         buf.extend_from_slice(&[0, 0]);
@@ -850,6 +915,22 @@ mod tests {
         let len = (buf.len() - HEADER) as u16;
         buf[2..4].copy_from_slice(&len.to_be_bytes());
         buf
+    }
+
+    /// Appends the MESSAGE-INTEGRITY attribute a server's answer carries: HMAC-SHA1 over
+    /// the message with its header length ending at the attribute, keyed with the MD5 of
+    /// this test's `username:realm:password` (RFC 5389 §15.4). On the wire the header
+    /// length counts the attribute again.
+    fn with_integrity(mut message: Vec<u8>) -> Vec<u8> {
+        let server = credentials();
+        let key = integrity_key(&server.username, "turn.example.org", &server.credential);
+        message[2..4].copy_from_slice(&((message.len() - HEADER) as u16).to_be_bytes());
+        let tag = hmac::sign(&key, &message);
+        message.extend_from_slice(&8u16.to_be_bytes());
+        message.extend_from_slice(&(INTEGRITY_LEN as u16).to_be_bytes());
+        message.extend_from_slice(tag.as_ref());
+        message[2..4].copy_from_slice(&((message.len() - HEADER) as u16).to_be_bytes());
+        message
     }
 
     fn request_type(session: &TurnSession, method: u16, class: u8) -> bool {
@@ -915,6 +996,100 @@ mod tests {
         );
         assert!(matches!(event, Some(TurnEvent::TimedOut(_))));
         assert!(session.failed());
+    }
+
+    #[test]
+    fn answers_carry_integrity_once_the_session_holds_credentials() {
+        let start = Instant::now();
+        let mut session = TurnSession::new(credentials());
+        let first = session.allocate(start);
+        // The opening challenge cannot be checked: the session holds no credentials yet,
+        // so it goes through without a tag, and the re-request goes out signed.
+        let transaction = first[8..20].try_into().expect("a 12-byte transaction id");
+        let mut error = vec![0, 0, 4, 1];
+        error.extend_from_slice(b"Unauthorized");
+        let unsigned_challenge = raw(
+            msg_type(ALLOCATE, CLASS_ERROR),
+            transaction,
+            &[
+                (9u16, error),
+                (20u16, b"turn.example.org".to_vec()),
+                (21u16, b"nonce-1".to_vec()),
+            ],
+        );
+        session.handle(&unsigned_challenge, start + RTO);
+        assert!(
+            request_type(&session, ALLOCATE, CLASS_REQUEST),
+            "the unsigned opening challenge was read"
+        );
+        let second = session.pending_bytes();
+
+        // Now the session holds credentials, and its request on the wire was signed: an
+        // answer without a tag is dropped as if it never came.
+        let unsigned = raw(
+            msg_type(ALLOCATE, CLASS_SUCCESS),
+            second[8..20].try_into().expect("a 12-byte transaction id"),
+            &allocated_parts(600),
+        );
+        assert!(
+            session.handle(&unsigned, start + RTO * 2).is_none(),
+            "no tag, no answer"
+        );
+        assert!(session.pending.is_some(), "the request is still in flight");
+
+        let TurnEvent::Allocated { relayed, lifetime } = session
+            .handle(
+                &allocated(
+                    second[8..20].try_into().expect("a 12-byte transaction id"),
+                    600,
+                ),
+                start + RTO * 2,
+            )
+            .expect("the signed answer")
+        else {
+            panic!("not an allocation");
+        };
+        assert_eq!(lifetime, Duration::from_secs(600));
+        assert_eq!(session.relayed(), Some(relayed));
+
+        // The same rule for what follows: a permission's success without a tag, and one
+        // signed over other bytes, are both dropped — the request stays in flight for its
+        // retransmits — and the properly signed one is read.
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5004);
+        let request = session.create_permission(peer, start + RTO * 3);
+        let transaction = request[8..20].try_into().expect("a 12-byte transaction id");
+        let ok = msg_type(CREATE_PERMISSION, CLASS_SUCCESS);
+        let unsigned = raw(ok, transaction, &[]);
+        assert!(
+            session.handle(&unsigned, start + RTO * 4).is_none(),
+            "no tag, no answer"
+        );
+        assert!(session.pending.is_some(), "the request is still in flight");
+
+        let mut tampered = with_integrity(raw(
+            ok,
+            transaction,
+            &[(13u16, 600u32.to_be_bytes().to_vec())],
+        ));
+        tampered[HEADER + 7] ^= 0xFF;
+        assert!(
+            session.handle(&tampered, start + RTO * 4).is_none(),
+            "a tag over other bytes is not the server's"
+        );
+        assert!(session.pending.is_some(), "the request is still in flight");
+
+        let event = session
+            .handle(&success(CREATE_PERMISSION, transaction), start + RTO * 4)
+            .expect("the signed answer");
+        assert!(
+            matches!(event, TurnEvent::Permission(named) if named == peer),
+            "the signed answer went through: {event:?}"
+        );
+        assert_eq!(
+            session.permissions[&peer],
+            start + RTO * 4,
+            "the timer runs from the answer that verified"
+        );
     }
 
     #[test]
@@ -1069,12 +1244,17 @@ mod tests {
         let start = Instant::now();
         let mut session = TurnSession::new(credentials());
         let _first = session.allocate(start);
+        // The waits double (RFC 5389 §7.2.1): half a second in, then 1, 2, 4, 8, and 16
+        // seconds between the six retransmits — and after the last one the eight-second
+        // grace, so the transaction dies at 39.5 seconds, not at three.
         let mut at = start;
+        let mut wait = RTO;
         for _ in 0..RETRIES {
-            at += RTO;
+            at += wait;
             session.poll(at).expect("a retransmit");
+            wait *= 2;
         }
-        at += RTO;
+        at += FINAL_GRACE;
         assert!(session.poll(at).is_none(), "nothing left to send");
         assert!(session.failed());
     }
@@ -1286,12 +1466,16 @@ mod tests {
 
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5004);
         let _request = session.create_permission(peer, start + RTO * 2);
+        // The waits double (RFC 5389 §7.2.1), and after the last retransmit the eight-
+        // second grace closes the transaction at 39.5 seconds.
         let mut at = start + RTO * 2;
+        let mut wait = RTO;
         for _ in 0..RETRIES {
-            at += RTO;
+            at += wait;
             session.poll(at).expect("a retransmit");
+            wait *= 2;
         }
-        at += RTO;
+        at += FINAL_GRACE;
         assert!(session.poll(at).is_none(), "the permission gives up");
         assert!(
             !session.failed(),
