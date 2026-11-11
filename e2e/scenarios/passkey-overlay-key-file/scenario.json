@@ -1,0 +1,10 @@
+{
+  "id": "passkey-overlay-key-file",
+  "title": "A community that retires Pocket ID with compose.passkey.yml starts again and keeps its end-to-end key",
+  "platforms": ["linux"],
+  "needs": ["docker-compose", "server-image"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "deploy integration: the compose stack boots with and without the overlay; not released-client or native GUI certification",
+  "native_client_proof": "the released client shows this as a server that is still there after step 9 and an encrypted conversation with no key-changed warning; the lab records it on linux"
+}

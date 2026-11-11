@@ -12,38 +12,34 @@
 #
 # Passkeys belong to the host of TINYSERVER_PUBLIC_URL. Keep it the same.
 #
-# Needs Docker Compose 2.24.4 or later for `!override`.
+# Needs Docker Compose 2.24.4 or later for `!override` and `!reset`.
 
 services:
   tinyserver:
-    # Starts without Pocket ID, and without its secrets.
-    depends_on: !override
-      postgres:
-        condition: service_healthy
-      tinyserver-uploads:
-        condition: service_completed_successfully
-      tinyserver-init:
-        condition: service_completed_successfully
-      clamd:
-        condition: service_healthy
+    # Starts without Pocket ID, and without its secrets. Only the entry for Pocket ID is taken
+    # out, so this file and scan-off.yml can be used together.
+    depends_on:
+      pocket-id: !reset null
     secrets: !override []
-    environment: !override
-      DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD}@postgres:5432/tinyserver
-      BIND: 0.0.0.0:8080
-      TINYSERVER_PUBLIC_URL: ${TINYSERVER_PUBLIC_URL:?set TINYSERVER_PUBLIC_URL, such as https://chat.example.org}
+    # Only the provider's settings are emptied, and tinyserver reads an empty setting as unset.
+    # Everything else compose.yml gives tinyserver stays, and so does anything added there
+    # later: the key file path, the database address, the scan engine. Do not put `!override`
+    # on this map: it once dropped TINYSERVER_E2EE_KEY_FILE, and a server that had run without
+    # this file could not find its key and did not start. crates/server/tests/deploy_compose.rs
+    # checks it.
+    environment:
       # Shown by the browser when it asks for a passkey.
       TINYSERVER_PASSKEY_RP_NAME: ${TINYSERVER_PASSKEY_RP_NAME:-TinyComms}
-      TINYSERVER_SESSION_MAX_DAYS: ${TINYSERVER_SESSION_MAX_DAYS:-30}
-      TINYSERVER_MEDIA_PORT: ${TINYSERVER_MEDIA_PORT:-50000}
-      TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}
-      TINYSERVER_LAN_IP: ${TINYSERVER_LAN_IP:-}
-      TINYSERVER_MEDIA_EGRESS_KBPS: ${TINYSERVER_MEDIA_EGRESS_KBPS:-}
-      TINYSERVER_CLAMD_SOCKET: clamd:3310
-      TINYSERVER_UPLOAD_DIR: /data/uploads
-      TINYSERVER_MEDIA_HMAC_SECRET: ${TINYSERVER_MEDIA_HMAC_SECRET:?set TINYSERVER_MEDIA_HMAC_SECRET to 64 hex characters (openssl rand -hex 32)}
-      TINYSERVER_TRUSTED_PROXIES: ${TINYSERVER_TRUSTED_PROXIES:-}
-      TINYSERVER_CLIENT_IP_HEADER: ${TINYSERVER_CLIENT_IP_HEADER:-}
-      TINYSERVER_DATA_DIR: /var/lib/tinyserver
+      TINYSERVER_OIDC_ISSUER: ""
+      TINYSERVER_OIDC_INTERNAL_URL: ""
+      TINYSERVER_OIDC_CLIENT_ID: ""
+      TINYSERVER_OIDC_CLIENT_SECRET_FILE: ""
+      TINYSERVER_OIDC_PROVIDER_NAME: ""
+      TINYSERVER_OIDC_SIGNUP: ""
+      TINYSERVER_OIDC_POCKETID_API_KEY_FILE: ""
+      TINYSERVER_OIDC_POCKETID_GROUP_IDS: ""
+      TINYSERVER_OIDC_MEMBER_GROUPS: ""
+      TINYSERVER_OIDC_ADMIN_GROUPS: ""
 
   tunnel:
     depends_on: !override
