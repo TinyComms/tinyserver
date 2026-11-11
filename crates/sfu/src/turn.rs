@@ -765,13 +765,15 @@ impl TurnSession {
             // integrity attribute (RFC 5389 §15.4); on the wire the length counts the
             // attribute again, the way a receiver's own length check wants it. So the
             // length field is written twice: once for the sign, once for the datagram.
-            buf[2..4].copy_from_slice(&((buf.len() - HEADER) as u16).to_be_bytes());
+            let len = (buf.len() - HEADER) as u16;
+            buf[2..4].copy_from_slice(&len.to_be_bytes());
             let key = integrity_key(&self.server.username, realm, &self.server.credential);
             let tag = hmac::sign(&key, &buf);
             buf.extend_from_slice(&8u16.to_be_bytes());
             buf.extend_from_slice(&(INTEGRITY_LEN as u16).to_be_bytes());
             buf.extend_from_slice(tag.as_ref());
-            buf[2..4].copy_from_slice(&((buf.len() - HEADER) as u16).to_be_bytes());
+            let len = (buf.len() - HEADER) as u16;
+            buf[2..4].copy_from_slice(&len.to_be_bytes());
         }
         self.pending = Some(Pending {
             method,
@@ -924,12 +926,14 @@ mod tests {
     fn with_integrity(mut message: Vec<u8>) -> Vec<u8> {
         let server = credentials();
         let key = integrity_key(&server.username, "turn.example.org", &server.credential);
-        message[2..4].copy_from_slice(&((message.len() - HEADER) as u16).to_be_bytes());
+        let len = (message.len() - HEADER) as u16;
+        message[2..4].copy_from_slice(&len.to_be_bytes());
         let tag = hmac::sign(&key, &message);
         message.extend_from_slice(&8u16.to_be_bytes());
         message.extend_from_slice(&(INTEGRITY_LEN as u16).to_be_bytes());
         message.extend_from_slice(tag.as_ref());
-        message[2..4].copy_from_slice(&((message.len() - HEADER) as u16).to_be_bytes());
+        let len = (message.len() - HEADER) as u16;
+        message[2..4].copy_from_slice(&len.to_be_bytes());
         message
     }
 
