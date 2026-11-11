@@ -17,7 +17,7 @@
 | cloudflared | Cloudflare | Unreviewed | `json-file` | Host | 10 MB times 3 |
 | Docker daemon, the host's journal, the hypervisor | Outside this repository | | | Host | Host's choice |
 
-There is **no HTTP access log**: no tower or tracing layer logs requests (`crates/api/src/observe.rs` makes a span, and nothing renders it, see section 4). A request is logged only when a handler emits an event.
+There is **no HTTP access log**: no tower or tracing layer logs requests (`crates/api/src/observe.rs` makes a span, and nothing renders it, see section 4). A request is logged only when a handler emits an event, and `observe.rs` emits one for a request that runs over a second: `slow send` (`warn`, a write to messages, reactions or uploads) or `slow request` (`debug`), with only the route template, status and timings (`ms`, `busy_ms`, `idle_ms`), no user id and no `req_id`. Docker stamps it with a time, so a slow send shows that someone sent something then, not who.
 
 ## 2. What the default `info` stream says about activity
 

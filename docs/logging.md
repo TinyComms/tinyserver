@@ -33,3 +33,5 @@ The owner invite token is not printed. It is written to `{TINYSERVER_DATA_DIR}/o
 The external sender private key is not printed. It is written to `TINYSERVER_E2EE_KEY_FILE` (mode `0600` on Unix). In compose that path is on the `tinyserver_keys` volume. A database dump does not contain it.
 
 Each HTTP request span carries `req_id` (32 hex characters) and the matched route template. The URI, the query string, and the headers are not on the span.
+
+A request that runs over a second logs one line when it ends: `slow send` at `warn` for a write to messages, reactions or uploads, `slow request` at `debug` for anything else. The fields are `route` (the template), `status`, `ms`, and `busy_ms` and `idle_ms` (time on the CPU and time waiting on the database, a lock or the network). The line has no `user_id`, no `req_id`, no URI and no query. A request under a second logs nothing.

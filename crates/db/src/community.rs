@@ -1204,17 +1204,16 @@ pub(crate) async fn scope<'a>(
     caller: &Caller,
 ) -> Result<Transaction<'a, Postgres>, CommunityError> {
     let mut tx = pool.begin().await.map_err(from_sql)?;
-    sqlx::query("SELECT set_config('app.user_id', $1, true), set_config('app.role', $2, true)")
-        .bind(&caller.user_id)
-        .bind(&caller.role)
-        .execute(&mut *tx)
-        .await
-        .map_err(from_sql)?;
-    sqlx::query("SELECT set_config('app.scopes', $1, true)")
-        .bind(scope_list(&caller.scopes))
-        .execute(&mut *tx)
-        .await
-        .map_err(from_sql)?;
+    sqlx::query(
+        "SELECT set_config('app.user_id', $1, true), set_config('app.role', $2, true), \
+         set_config('app.scopes', $3, true)",
+    )
+    .bind(&caller.user_id)
+    .bind(&caller.role)
+    .bind(scope_list(&caller.scopes))
+    .execute(&mut *tx)
+    .await
+    .map_err(from_sql)?;
     Ok(tx)
 }
 

@@ -53,11 +53,11 @@ pub use e2ee::{
     generation_chain, group_info, group_info_at, handshake_after, handshake_after_at,
     invite_capability, issue_proposals, issue_proposals_at, key_package_count, list_e2ee_reactions,
     mls_target, mls_target_at, open_self, post_e2ee_message, post_e2ee_message_at,
-    post_e2ee_reaction, post_e2ee_reaction_at, put_device, put_key_packages, ratchet_tree,
-    ratchet_tree_at, remember_server_public, repair_group, revoke_device, self_ttl_secs,
-    server_key_state, set_community_root, set_invite_capability, user_devices, CommitSnapshot,
-    HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage, ServerKeyRow, Unissued,
-    WelcomeFor,
+    post_e2ee_message_checked, post_e2ee_reaction, post_e2ee_reaction_at, put_device,
+    put_key_packages, ratchet_tree, ratchet_tree_at, remember_server_public, repair_group,
+    revoke_device, self_ttl_secs, server_key_state, set_community_root, set_invite_capability,
+    user_devices, CommitSnapshot, HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage,
+    ServerKeyRow, Unissued, WelcomeFor,
 };
 pub use error::DbError;
 pub use link::{
@@ -125,10 +125,18 @@ use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 
-/// Six connections: five for requests, one held by the live dispatcher's `LISTEN`.
+/// Connections in the serving pool unless `TINYSERVER_DB_POOL` says otherwise. One is held by the
+/// live dispatcher's `LISTEN`; the rest serve requests.
+pub const POOL_DEFAULT: u32 = 16;
+
 pub async fn runtime_pool(url: &str) -> Result<PgPool, DbError> {
+    runtime_pool_sized(url, POOL_DEFAULT).await
+}
+
+/// A pool of `max` connections, at least two (the dispatcher's `LISTEN` keeps one for good).
+pub async fn runtime_pool_sized(url: &str, max: u32) -> Result<PgPool, DbError> {
     PgPoolOptions::new()
-        .max_connections(6)
+        .max_connections(max.max(2))
         .acquire_timeout(Duration::from_secs(3))
         .connect(url)
         .await

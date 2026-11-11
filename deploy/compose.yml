@@ -109,6 +109,8 @@ services:
       TINYSERVER_OIDC_ADMIN_GROUPS: ${TINYSERVER_OIDC_ADMIN_GROUPS:-}
       # Days a sign-in lasts before tinyclient asks for another.
       TINYSERVER_SESSION_MAX_DAYS: ${TINYSERVER_SESSION_MAX_DAYS:-30}
+      # Postgres connections the server keeps open. One is the live socket's LISTEN.
+      TINYSERVER_DB_POOL: ${TINYSERVER_DB_POOL:-16}
       # Calls have media only when the public address is set. Members see it.
       TINYSERVER_MEDIA_PORT: ${TINYSERVER_MEDIA_PORT:-50000}
       TINYSERVER_PUBLIC_IP: ${TINYSERVER_PUBLIC_IP:-}

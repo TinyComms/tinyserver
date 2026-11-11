@@ -1206,37 +1206,56 @@ pub(crate) async fn post_ciphertext(
         Some(target) => Some(canonical_uuid(target).ok_or(Error::Invalid)?),
         None => None,
     };
-    let (group, audience) = mls_of(pool, caller, conversation, fields.generation).await?;
-    let bound = if audience {
-        Some(canonical_uuid(conversation).ok_or(Error::Invalid)?)
-    } else {
-        None
+    // The conversation's MLS target is read in the post's own transaction, and the ciphertext is
+    // checked against it there, so a send takes one connection, not two.
+    let message = db::NewE2eeMessage {
+        ciphertext: &data,
+        epoch,
+        device_id,
+        client_id: fields.client_id,
+        kind,
+        target_id: fields.target_id,
+        attachments: fields.attachments,
+        has_body: fields.has_body,
     };
-    let aad = match bound.as_deref() {
-        Some(id) => mls::message_aad_for(kind, target.as_deref(), Some(id)),
-        None => mls::message_aad(kind, target.as_deref()),
+    let check = |mls: &db::MlsTarget| -> Result<(), (Error, bool)> {
+        let group = mls::uuid_bytes(&mls.group_id).ok_or((Error::Invalid, false))?;
+        let bound = if mls.audience_groups {
+            Some(canonical_uuid(conversation).ok_or((Error::Invalid, false))?)
+        } else {
+            None
+        };
+        let aad = match bound.as_deref() {
+            Some(id) => mls::message_aad_for(kind, target.as_deref(), Some(id)),
+            None => mls::message_aad(kind, target.as_deref()),
+        };
+        mls::check_ciphertext(&group, epoch, &aad, &data)
+            .map_err(|refusal| (refused(refusal), true))
     };
-    if let Err(refusal) = mls::check_ciphertext(&group, epoch, &aad, &data) {
-        return Err(refine(
-            pool,
-            caller,
-            conversation,
-            fields.generation,
-            refused(refusal),
-        )
-        .await);
-    }
-    post_stored(
+    let posted = db::post_e2ee_message_checked(
         pool,
         caller,
         conversation,
-        &data,
-        epoch,
-        device_id,
-        &fields,
-        kind,
+        &message,
+        fields.generation,
+        check,
     )
     .await
+    .map_err(lift)?;
+    match posted {
+        Ok((value, created)) => Ok((
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            signed(value),
+        )),
+        Err((error, false)) => Err(error),
+        Err((error, true)) => {
+            Err(refine(pool, caller, conversation, fields.generation, error).await)
+        }
+    }
 }
 
 /// A uuid as Postgres writes it: lowercase, hyphenated.
