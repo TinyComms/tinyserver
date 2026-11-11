@@ -72,6 +72,9 @@ const COMMANDS: usize = 1024;
 /// keeps the rest until there is room.
 const EVENTS: usize = 1024;
 
+/// How long a join waits for the media thread to answer before it is refused as unavailable.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Where the media thread listens, what it advertises, and its limits.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -346,6 +349,8 @@ impl Media {
     }
 
     /// Adds `user_id` to `room_id` with `offer`, replacing any participant they already are.
+    /// A media thread that does not answer within `JOIN_TIMEOUT` is `Unavailable`, so the
+    /// caller is not left waiting on it for good.
     pub async fn join(&self, room_id: &str, user_id: &str, offer: &str) -> Result<Answer, Refused> {
         self.offers.check(offer)?;
         let (reply, answer) = oneshot::channel();
@@ -355,7 +360,13 @@ impl Media {
             offer: offer.to_string(),
             reply,
         })?;
-        answer.await.unwrap_or(Err(Refused::Unavailable))
+        match tokio::time::timeout(JOIN_TIMEOUT, answer).await {
+            Ok(answer) => answer.unwrap_or(Err(Refused::Unavailable)),
+            Err(_) => {
+                tracing::warn!("media join timed out");
+                Err(Refused::Unavailable)
+            }
+        }
     }
 
     /// Renegotiates with a new offer from the same participant.

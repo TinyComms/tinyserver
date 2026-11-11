@@ -446,14 +446,20 @@ pub async fn save_attachment(
     engine: &Arc<dyn ScanEngine>,
 ) -> Result<Value, MessageError> {
     person(caller)?;
-    let mut tx = scope(pool, caller).await.map_err(from_community)?;
-    let limits = upload_limits(&mut tx).await?;
+    // The limits come from a short transaction of their own. The connection goes back to the
+    // pool before the image is re-encoded and the file is scanned, which can take seconds, and
+    // is taken again only to store the row.
+    let limits = {
+        let mut tx = scope(pool, caller).await.map_err(from_community)?;
+        let limits = upload_limits(&mut tx).await?;
+        tx.commit().await.map_err(message_sql)?;
+        limits
+    };
     let prepared = prepare(upload, limits)?;
     let rewritten = if matches!(prepared.kind, "image" | "gif") {
-        // The decode may wait for its turn. It does not hold a database connection meanwhile.
-        tx.commit().await.map_err(message_sql)?;
+        // Decoding is CPU work and takes its turn among the process's decodes (at most two at
+        // once); it holds no database connection while it waits or runs.
         let raster = crate::media::rewrite_raster_in_turn(&upload.bytes, &prepared.mime).await?;
-        tx = scope(pool, caller).await.map_err(from_community)?;
         Some(raster)
     } else {
         None
@@ -484,6 +490,14 @@ pub async fn save_attachment(
         .as_ref()
         .map(|raster| Some(raster.height))
         .unwrap_or(upload.height);
+    // Scanned before any row exists or any connection is held. A blocked or unscannable file
+    // never reaches the database; the row below is stored only for bytes that came back clean.
+    match scan_bytes(engine, bytes, mime, kind).await {
+        ScanVerdict::Clean => {}
+        ScanVerdict::Blocked { .. } => return Err(MessageError::Blocked),
+        ScanVerdict::Unavailable => return Err(MessageError::Unavailable),
+    }
+    let mut tx = scope(pool, caller).await.map_err(from_community)?;
     let mut row: Value =
         sqlx::query_scalar("SELECT app_save_attachment($1, $2, $3, $4, $5, $6, $7)")
             .bind(&prepared.name)
@@ -507,17 +521,6 @@ pub async fn save_attachment(
     if let Err(error) = set_scan(&mut tx, &id, "scanning").await {
         abort_upload(tx, &id).await;
         return Err(error);
-    }
-    match scan_bytes(engine, bytes, mime, kind).await {
-        ScanVerdict::Clean => {}
-        ScanVerdict::Blocked { .. } => {
-            abort_upload(tx, &id).await;
-            return Err(MessageError::Blocked);
-        }
-        ScanVerdict::Unavailable => {
-            abort_upload(tx, &id).await;
-            return Err(MessageError::Unavailable);
-        }
     }
     if let Err(error) = set_scan(&mut tx, &id, "clean").await {
         abort_upload(tx, &id).await;
