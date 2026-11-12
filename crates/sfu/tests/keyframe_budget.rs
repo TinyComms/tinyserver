@@ -11,7 +11,7 @@ use sfu::{Config, VideoKind};
 fn buckets_below_the_fixture_frames() -> Config {
     let mut config = config();
     // 6 kb/s is a 750-byte burst: no fixture frame fits it, and twice the burst still fits
-    // the `l` keyframe, which is what the debt rule lets through on half a bucket.
+    // the `l` keyframe, which is what the overdraft rule lets through on half a bucket.
     config.camera_high_kbps = 6;
     config.camera_low_kbps = 6;
     config

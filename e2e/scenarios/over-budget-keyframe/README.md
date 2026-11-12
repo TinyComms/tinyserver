@@ -1,8 +1,8 @@
-# Share view: the keyframe that must get through
+# Over-budget keyframe: the keyframe that must get through
 
-Run `sh e2e/scenarios/share-view/run.sh`. It needs no database and no server
-process: the scenario drives the SFU crate on loopback with two headless str0m
-clients, as `crates/sfu/tests/common` does.
+Run `sh e2e/scenarios/over-budget-keyframe/run.sh`. It needs no database and no
+server process: the scenario drives the SFU crate on loopback with two headless
+str0m clients, as `crates/sfu/tests/common` does.
 
 Both camera layer budgets are set to 6 kb/s, so no fixture frame fits either
 bucket. On the base the scenario fails: every frame is refused, the layer never
