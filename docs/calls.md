@@ -363,7 +363,7 @@ As built, behind `sfu::Media` (a cloneable handle) and `sfu::Event`:
 | `quality(call_id, Quality)` | `High`, `Low`, or `Off`, from `call.quality` | | |
 | `end_share(call_id)` | From `call.share_end`. Stops forwarding the share until the m-line stops and starts again. | | |
 | `leave(call_id)` | Drops the participant. No `Left` follows. | `Left {call_id, lost}` | `Timeout`: not connected within 15 s of the SFU accepting the join. `Gone`: no packet for 15 s, or the RTC closed, died, or failed a poll. |
-| `shutdown()` | Graceful stop | `Load {egress_kbps, participants}` | Every 5 s. Logged at debug. Once a minute while anyone is in a call, the media thread also logs one `media counters` line at info: `peers`, `audio_dropped`, `send_dropped`, `video_dropped`, `source_dropped`, `keyframe_asks`, `longest_turn_ms`. Totals only, with no identifiers. |
+| `shutdown()` | Graceful stop | `Load {egress_kbps, participants}` | Every 5 s. Logged at debug. Once a minute while anyone is in a call, the media thread also logs one `media counters` line at info: `peers`, `audio_dropped`, `send_dropped`, `video_dropped`, `source_dropped`, `keyframe_asks`, `longest_turn_ms`, `longest_gap_ms`, `audio_late_ms`, `tcp_sent`. Totals only, with no identifiers. |
 
 There is no `EndRoom`: a deleted room ends each person's seat, and each one sends `leave`. Commands go through a bounded `std::sync::mpsc` channel of 1,024 with `try_send`, and wake the loop with the `Waker`; a full queue refuses a join with `media_unavailable`. Events go back through a bounded `tokio::sync::mpsc` channel of 1,024. `Speaking` and `Load` use `try_send` and are dropped when it is full; the rest wait for room.
 
