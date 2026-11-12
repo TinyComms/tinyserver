@@ -68,6 +68,8 @@ const LOAD_EVERY: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 /// Seconds of `audio_kbps` a publisher may run ahead of it, for a burst after a stall.
 const AUDIO_BURST: u32 = 2;
+/// A wait between a publisher's audio frames longer than this is a pause, not lateness.
+const LATE_PAUSE: Duration = Duration::from_secs(3);
 /// Video slots are planned again at least this often.
 const PLAN_EVERY: Duration = Duration::from_millis(50);
 /// Who is speaking and which TCP streams expired are looked at this often. They scan every
@@ -198,6 +200,8 @@ struct Peer {
     hushed: bool,
     speech: Speech,
     audio: Bucket,
+    /// Their last audio frame, for how late the next one is.
+    arrival: Arrival,
     /// The client's camera m-line: the first video m-line it may send on.
     camera: Option<Mid>,
     /// The camera m-line is sending, as the last offer said.
@@ -258,6 +262,29 @@ impl Peer {
             Layer::Share => self.share_live(),
             Layer::High | Layer::Low => self.camera_live(),
         }
+    }
+}
+
+/// When a publisher's last audio frame reached the server, and its RTP timestamp.
+#[derive(Debug, Default)]
+struct Arrival(Option<(Instant, u32)>);
+
+impl Arrival {
+    /// How much longer this frame took to follow the one before it than its RTP timestamp
+    /// says it was recorded after it, at 48 kHz. A talker's own pause moves both, so it does
+    /// not count. Zero for the first frame, a frame that came early, a timestamp that stepped
+    /// back, and a pause over `LATE_PAUSE`.
+    fn late(&mut self, at: Instant, rtp: u32) -> Duration {
+        let Some((before, last)) = self.0.replace((at, rtp)) else {
+            return Duration::ZERO;
+        };
+        let waited = at.saturating_duration_since(before);
+        // Wrapping: a timestamp past `u32::MAX` still steps forward, and a step back is huge.
+        let step = Duration::from_micros(u64::from(rtp.wrapping_sub(last)) * 1000 / 48);
+        if waited > LATE_PAUSE || step > LATE_PAUSE {
+            return Duration::ZERO;
+        }
+        waited.saturating_sub(step)
     }
 }
 
@@ -477,6 +504,11 @@ pub(crate) struct Engine {
 struct Counts {
     /// The longest turn of the loop, from waking to going back to wait.
     longest_turn: Duration,
+    /// The longest time from one wake of the loop to the next. The wait is `TICK` at most, so
+    /// well over that means the thread, or the whole machine, was not running.
+    longest_gap: Duration,
+    /// The latest an audio frame reached the server, of every publisher: see `Arrival::late`.
+    audio_late: Duration,
     /// Audio frames over a publisher's budget.
     audio_dropped: u64,
     /// Video frames over a layer's budget, or waiting for a keyframe after one.
@@ -487,6 +519,16 @@ struct Counts {
     send_dropped: u64,
     /// Packets one source address sent over its per-second budget, audio included.
     source_dropped: u64,
+    /// Packets handed to a TCP stream, sent or not. Above zero, someone's media is on ICE-TCP.
+    tcp_sent: u64,
+}
+
+impl Counts {
+    /// The loop woke at `now`, and the time before that at `last`.
+    fn wake(&mut self, last: Instant, now: Instant) {
+        let gap = now.saturating_duration_since(last);
+        self.longest_gap = self.longest_gap.max(gap);
+    }
 }
 
 /// Marks the thread stopped however it ends, a panic included.
@@ -570,6 +612,7 @@ impl Engine {
         tracing::info!(addr = %self.public, lan = ?self.lan, "media listening on UDP and TCP");
         let mut events = Events::with_capacity(256);
         let mut buf = vec![0; DATAGRAM];
+        let mut woke_at = Instant::now();
         loop {
             let wait = if self.tcp.unread.is_empty() && !self.socket_unread {
                 self.deadline()
@@ -585,6 +628,8 @@ impl Engine {
                 }
             }
             let woke = Instant::now();
+            self.counts.wake(woke_at, woke);
+            woke_at = woke;
             if !self.commands() {
                 tracing::info!("media stopped");
                 return;
@@ -885,6 +930,7 @@ impl Engine {
             hushed: false,
             speech: Speech::new(),
             audio: audio_budget(self.config.audio_kbps, now),
+            arrival: Arrival::default(),
             camera: None,
             camera_on: false,
             share: None,
@@ -1446,6 +1492,9 @@ impl Engine {
             source_dropped = counts.source_dropped,
             keyframe_asks = counts.keyframe_asks,
             longest_turn_ms = counts.longest_turn.as_millis() as u64,
+            longest_gap_ms = counts.longest_gap.as_millis() as u64,
+            audio_late_ms = counts.audio_late.as_millis() as u64,
+            tcp_sent = counts.tcp_sent,
             "media counters"
         );
     }
@@ -1543,6 +1592,11 @@ impl Engine {
                 self.counts.audio_dropped += 1;
                 continue;
             }
+            // The low 32 bits are the RTP timestamp, whether or not str0m extended it.
+            let late = publisher
+                .arrival
+                .late(data.network_time, data.time.numer() as u32);
+            self.counts.audio_late = self.counts.audio_late.max(late);
             let Some(room) = self.rooms.get(&publisher.room_id) else {
                 continue;
             };
@@ -1897,6 +1951,7 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
             Output::Transmit(transmit) => {
                 *sink.egress += transmit.contents.len() as u64;
                 if transmit.proto == Protocol::Tcp {
+                    sink.counts.tcp_sent += 1;
                     let urgent = peer.audio_pt.is_some()
                         && payload_type(&transmit.contents) == peer.audio_pt;
                     let sent = sink
@@ -2276,6 +2331,80 @@ mod tests {
         healthy.arrived = true;
         assert!(!healthy.may_ask(start), "a keyframe just came");
         assert!(healthy.may_ask(start + video::KEYFRAME_EVERY));
+    }
+
+    #[test]
+    fn the_longest_gap_between_wakes_is_kept() {
+        let start = Instant::now();
+        let mut counts = Counts::default();
+        let mut last = start;
+        for ms in [10, 60, 240, 250] {
+            let woke = start + Duration::from_millis(ms);
+            counts.wake(last, woke);
+            last = woke;
+        }
+        assert_eq!(counts.longest_gap, Duration::from_millis(180));
+        // A clock that reads earlier than the wake before it is no gap.
+        counts.wake(last, start);
+        assert_eq!(counts.longest_gap, Duration::from_millis(180));
+    }
+
+    #[test]
+    fn audio_on_time_is_not_late_and_a_stall_is() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut arrival = Arrival::default();
+        assert_eq!(arrival.late(at(0), 0), Duration::ZERO, "the first frame");
+        assert_eq!(arrival.late(at(20), 960), Duration::ZERO);
+        // 20 ms of audio that took 170 ms to come, and the two held with it right behind.
+        assert_eq!(arrival.late(at(190), 1920), Duration::from_millis(150));
+        assert_eq!(arrival.late(at(190), 2880), Duration::ZERO, "early");
+        assert_eq!(arrival.late(at(191), 3840), Duration::ZERO, "early");
+        // A lost frame: 40 ms of timestamp in 45 ms.
+        assert_eq!(arrival.late(at(236), 5760), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn a_talkers_pause_is_not_lateness() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut arrival = Arrival::default();
+        arrival.late(at(0), 0);
+        // A second of silence the timestamp moved through, and 30 ms more.
+        assert_eq!(arrival.late(at(1030), 48_000), Duration::from_millis(30));
+        // A pause over `LATE_PAUSE`, whether or not the timestamp moved with it.
+        assert_eq!(arrival.late(at(5030), 48_960), Duration::ZERO);
+        assert_eq!(arrival.late(at(9030), 48_960 + 192_000), Duration::ZERO);
+        // A timestamp that stepped back, and then the frame after it measured from there.
+        assert_eq!(arrival.late(at(9050), 960), Duration::ZERO);
+        assert_eq!(arrival.late(at(9100), 1920), Duration::from_millis(30));
+    }
+
+    #[test]
+    fn lateness_is_measured_across_a_timestamp_wrap() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut arrival = Arrival::default();
+        arrival.late(at(0), u32::MAX - 479);
+        // 20 ms of timestamp, over the wrap, in 145 ms.
+        assert_eq!(arrival.late(at(145), 480), Duration::from_millis(125));
+        assert_eq!(arrival.late(at(165), 1440), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_report_starts_every_counter_over() {
+        let start = Instant::now();
+        let mut counts = Counts::default();
+        counts.wake(start, start + Duration::from_millis(300));
+        counts.audio_late = Duration::from_millis(150);
+        counts.tcp_sent = 7;
+        let reported = std::mem::take(&mut counts);
+        assert_eq!(reported.longest_gap, Duration::from_millis(300));
+        assert_eq!(reported.audio_late, Duration::from_millis(150));
+        assert_eq!(reported.tcp_sent, 7);
+        assert_eq!(counts.longest_gap, Duration::ZERO);
+        assert_eq!(counts.audio_late, Duration::ZERO);
+        assert_eq!(counts.tcp_sent, 0);
     }
 
     #[test]
