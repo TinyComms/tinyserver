@@ -326,6 +326,7 @@ impl Client {
                 return;
             };
             if let Some((proto, source, packet)) = packets.pop_front() {
+                shared.count(&packet);
                 if let Some(input) = input(proto, source, self.local, packet.as_slice()) {
                     if self.rtc.handle_input(input).is_err() {
                         return;
@@ -586,6 +587,7 @@ impl Client {
                         marker,
                     };
                     lock(&shared.frames).push(frame);
+                    lock(&shared.heard_at).push(Instant::now());
                 }
                 Output::Event(Event::KeyframeRequest(request)) if request.mid == self.camera => {
                     shared.keyframes_asked.fetch_add(1, Ordering::AcqRel);
@@ -872,6 +874,31 @@ struct Shared {
     sealed: Mutex<Option<Vec<u8>>>,
     /// Every audio frame received, byte for byte, with its m-line.
     payloads: Mutex<Vec<(String, Vec<u8>)>>,
+    /// When each audio frame came in.
+    heard_at: Mutex<Vec<Instant>>,
+    /// RTP received, in bytes, and how much of it was padding: packets, then bytes.
+    rtp: AtomicU64,
+    padding: AtomicU64,
+    padding_bytes: AtomicU64,
+}
+
+impl Shared {
+    /// Counts one packet in, as it came off the wire. RFC 7983 and RFC 5761 say which is RTP;
+    /// its padding bit is set on str0m's padding alone.
+    fn count(&self, packet: &[u8]) {
+        let [first @ 128..=191, second, ..] = packet else {
+            return;
+        };
+        if (192..=223).contains(second) {
+            return;
+        }
+        let bytes = packet.len() as u64;
+        self.rtp.fetch_add(bytes, Ordering::AcqRel);
+        if first & 0x20 != 0 {
+            self.padding.fetch_add(1, Ordering::AcqRel);
+            self.padding_bytes.fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Default for Shared {
@@ -889,6 +916,10 @@ impl Default for Shared {
             video: Mutex::default(),
             sealed: Mutex::default(),
             payloads: Mutex::default(),
+            heard_at: Mutex::default(),
+            rtp: AtomicU64::default(),
+            padding: AtomicU64::default(),
+            padding_bytes: AtomicU64::default(),
         }
     }
 }
@@ -926,6 +957,24 @@ impl Running {
     /// Audio frames received since the last call.
     pub fn take(&self) -> Vec<Frame> {
         std::mem::take(&mut *lock(&self.shared.frames))
+    }
+
+    /// When each audio frame received since the last call came in.
+    pub fn take_heard_at(&self) -> Vec<Instant> {
+        std::mem::take(&mut *lock(&self.shared.heard_at))
+    }
+
+    /// RTP received so far, with headers, in bytes: media and padding.
+    pub fn rtp_received(&self) -> u64 {
+        self.shared.rtp.load(Ordering::Acquire)
+    }
+
+    /// Padding received so far: packets, and their bytes with headers.
+    pub fn padding_received(&self) -> (u64, u64) {
+        (
+            self.shared.padding.load(Ordering::Acquire),
+            self.shared.padding_bytes.load(Ordering::Acquire),
+        )
     }
 
     /// Camera and share frames received since the last call, in order.
