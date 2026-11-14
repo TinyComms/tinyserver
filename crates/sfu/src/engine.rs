@@ -72,6 +72,8 @@ const AUDIO_BURST: u32 = 2;
 const LATE_PAUSE: Duration = Duration::from_secs(3);
 /// Video slots are planned again at least this often.
 const PLAN_EVERY: Duration = Duration::from_millis(50);
+/// How far back str0m's TWCC loss looks.
+const LOSS_SPAN: Duration = Duration::from_secs(1);
 /// Who is speaking and which TCP streams expired are looked at this often. They scan every
 /// room and stream, and the loop turns thousands of times a second under load.
 const SCAN_EVERY: Duration = Duration::from_millis(50);
@@ -171,7 +173,8 @@ struct Screen {
     /// What it should carry. It switches on that source's next keyframe.
     wanted: Option<Source>,
     rebase: Rebase<Source>,
-    /// The bitrate the estimator was last told to probe for, in kb/s.
+    /// The bitrate the estimator was last told to probe for, in kb/s. 0 while there is no video
+    /// to show and none held back: no probes, and `drain` sends no padding.
     probing: Option<u64>,
     /// What this listener's link has room for.
     link: Link,
@@ -233,6 +236,10 @@ struct Peer {
     /// The latest round trip, and the lowest yet: the difference is a queue on the path.
     rtt: Option<Duration>,
     rtt_least: Option<Duration>,
+    /// Padding held back since one last went out. See `drain`.
+    unpadded: u8,
+    /// When padding last started again. TWCC counts what was held back before it as lost.
+    padded_at: Option<Instant>,
     /// The link showed it is full in the last second.
     full: bool,
     /// It did in the second before that too.
@@ -246,6 +253,13 @@ impl Peer {
     /// Their audio is forwarded: not muted by themselves or by moderation.
     fn audible(&self) -> bool {
         !self.muted && !self.silenced
+    }
+
+    /// Nothing is estimated for this listener: see `Screen::probing`.
+    fn idle(&self) -> bool {
+        self.screen
+            .as_ref()
+            .is_some_and(|screen| screen.probing == Some(0))
     }
 
     fn camera_live(&self) -> bool {
@@ -952,6 +966,8 @@ impl Engine {
             loss: None,
             rtt: None,
             rtt_least: None,
+            unpadded: 0,
+            padded_at: None,
             full: false,
             congested: false,
             told_video: None,
@@ -1893,7 +1909,9 @@ impl Engine {
             Some(_) if allowed == Quality::High => video::PROBE_KBPS,
             None if paused && allowed == Quality::High => video::PROBE_KBPS,
             None if paused => video::resume_probe_kbps(peer.audio_kbps),
-            _ => video::LOW_KBPS,
+            Some(_) => video::LOW_KBPS,
+            // Nobody to show, or video is off: a voice call does not pay for an estimate.
+            None => 0,
         };
         let Some(peer) = self.peers.get_mut(&id) else {
             return;
@@ -1905,7 +1923,18 @@ impl Engine {
         screen.wanted = wanted;
         screen.showing = showing;
         if screen.probing != Some(probe) {
+            let idle = screen.probing == Some(0);
             screen.probing = Some(probe);
+            if idle || probe == 0 {
+                peer.twcc = None;
+                peer.loss = None;
+            }
+            // The padding held back read as loss, so the estimate starts again as on a join.
+            // str0m still averages its last 3 s in, so it reads low at first, never high.
+            if let Some(start) = self.config.bwe_start_kbps.filter(|_| idle) {
+                peer.rtc.bwe().reset(Bitrate::kbps(u64::from(start)));
+                peer.padded_at = Some(now);
+            }
             peer.rtc.bwe().set_desired_bitrate(Bitrate::kbps(probe));
             self.drain(id);
         }
@@ -1949,6 +1978,15 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                 return;
             }
             Output::Transmit(transmit) => {
+                // str0m pads at 50 kb/s whenever it sends anything and has no switch for it.
+                // One in 256 still goes, so the receiver never loses count of the RTX stream's
+                // sequence numbers, which SRTP needs when video starts.
+                if peer.idle() && is_padding(&transmit.contents) {
+                    peer.unpadded = peer.unpadded.wrapping_add(1);
+                    if peer.unpadded != 0 {
+                        continue;
+                    }
+                }
                 *sink.egress += transmit.contents.len() as u64;
                 if transmit.proto == Protocol::Tcp {
                     sink.counts.tcp_sent += 1;
@@ -2025,11 +2063,15 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                     sink.asks.push(id);
                 }
                 RtcEvent::PeerStats(stats) => {
-                    peer.loss = stats.egress_loss_fraction;
+                    let padded = !peer.idle()
+                        && peer.padded_at.is_none_or(|at| {
+                            stats.timestamp.saturating_duration_since(at) >= LOSS_SPAN
+                        });
+                    peer.loss = stats.egress_loss_fraction.filter(|_| padded);
                     peer.rtt = stats.rtt;
                     peer.rtt_least = peer.rtt_least.min(stats.rtt).or(stats.rtt);
                 }
-                RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
+                RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) if !peer.idle() => {
                     peer.twcc = Some(kbps(estimate));
                 }
                 RtcEvent::EgressBitrateEstimate(BweKind::Remb { estimate, mid })
@@ -2172,6 +2214,13 @@ fn payload_type(packet: &[u8]) -> Option<Pt> {
         }
         _ => None,
     }
+}
+
+/// RTP with nothing in it but padding. str0m sets the padding bit on no media packet. RFC 5761
+/// says which second bytes are RTCP, whose padding bit is the same one.
+fn is_padding(packet: &[u8]) -> bool {
+    matches!(packet, [first @ 128..=191, second, ..]
+        if first & 0x20 != 0 && !(192..=223).contains(second))
 }
 
 /// RFC 7983: a first byte of 0 to 3 is STUN.
@@ -2421,6 +2470,18 @@ mod tests {
         // str0m's probe padding, its padding bit set, on the audio m-line's payload type.
         assert_eq!(payload_type(&[0xa0, 111, 0, 1]), None);
         assert_eq!(payload_type(&[0xb0, 0x80 | 111, 0, 1]), None);
+    }
+
+    #[test]
+    fn only_rtp_with_its_padding_bit_set_is_padding() {
+        assert!(is_padding(&[0xa0, H264_RTX_PT, 0, 1]));
+        assert!(is_padding(&[0xb0, 0x80 | 111, 0, 1]));
+        // Video, then a sender report with padding, DTLS, and STUN.
+        assert!(!is_padding(&[0x80, H264_PT, 0, 1]));
+        assert!(!is_padding(&[0xa0, 200, 0, 6]));
+        assert!(!is_padding(&[22, 254, 253]));
+        assert!(!is_padding(&[0, 1, 0, 0]));
+        assert!(!is_padding(&[0xa0]));
     }
 
     fn left(call_id: &str) -> Event {
