@@ -549,6 +549,131 @@ async fn a_private_channels_events_reach_only_members_who_can_view_it() {
 }
 
 #[tokio::test]
+async fn a_channel_body_says_what_the_caller_may_do_there() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) = join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (_, roles) = Call::new(Method::GET, "/v1/roles")
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        let everyone = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == "@everyone")
+            .and_then(|role| role["id"].as_str())
+            .expect("everyone")
+            .to_string();
+        let (status, crew) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Mod", "permissions": 0, "color": "#22c55e"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{crew}");
+        let crew = crew["id"].as_str().expect("mod id").to_string();
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", moderator.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({ "role_ids": [crew] }))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        let mut channels = Vec::new();
+        for name in ["open", "staff", "vault"] {
+            let (status, channel) = Call::new(Method::POST, "/v1/channels")
+                .token(&owner_token)
+                .json(json!({ "name": name }))
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{channel}");
+            channels.push(channel["id"].as_str().expect("channel id").to_string());
+        }
+        let (open, staff, vault) = (channels[0].clone(), channels[1].clone(), channels[2].clone());
+        // staff: @everyone may look but not speak; vault: @everyone may not look. Mod manages
+        // staff and vault, in those channels only, and holds nothing server-wide.
+        let overrides = [
+            (staff.clone(), &everyone, 1, 5),
+            (staff.clone(), &crew, 513, 0),
+            (vault.clone(), &everyone, 0, 1),
+            (vault.clone(), &crew, 513, 0),
+        ];
+        for (channel, role, allow, deny) in overrides {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{channel}/overrides/{role}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+
+        // The mask a row reports is the one the checks enforce. An owner keeps every bit
+        // everywhere. The Mod gains manage_channels in staff and vault only. The plain member
+        // loses speak in staff and is not listed vault at all. A role the member does not hold
+        // adds nothing, so a role that vanishes cannot leave a stale bit behind.
+        let mask_of = |listed: &Value, id: &str| {
+            listed
+                .as_array()
+                .expect("channels")
+                .iter()
+                .find(|channel| channel["id"] == id)
+                .and_then(|channel| channel["my_permissions"].as_i64())
+                .expect("my_permissions on every listed channel")
+        };
+        let owner_list = get_json(&app, &owner_token, "/v1/channels").await;
+        assert_eq!(owner_list.as_array().map(Vec::len), Some(3), "{owner_list}");
+        assert_eq!(mask_of(&owner_list, &open), 2097151);
+        assert_eq!(mask_of(&owner_list, &staff), 2097151);
+        assert_eq!(mask_of(&owner_list, &vault), 2097151);
+        let moderator_list = get_json(&app, &moderator_token, "/v1/channels").await;
+        assert_eq!(moderator_list.as_array().map(Vec::len), Some(3));
+        assert_eq!(mask_of(&moderator_list, &open), 63);
+        assert_eq!(mask_of(&moderator_list, &staff), 571);
+        assert_eq!(mask_of(&moderator_list, &vault), 575);
+        let member_list = get_json(&app, &member_token, "/v1/channels").await;
+        assert_eq!(member_list.as_array().map(Vec::len), Some(2), "{member_list}");
+        assert_eq!(mask_of(&member_list, &open), 63);
+        assert_eq!(mask_of(&member_list, &staff), 59);
+        assert_eq!(mask_of(&member_list, &staff) & 512, 0);
+
+        // The same numbers decide. Speak is gone from staff for the plain member and for the
+        // Mod, and the Mod's manage bit works there and nowhere else.
+        let (status, denied) =
+            send_message(&app, &member_token, &staff, json!({"body": "no"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, denied) =
+            send_message(&app, &moderator_token, &staff, json!({"body": "no"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, posted) =
+            send_message(&app, &member_token, &open, json!({"body": "yes"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        let (status, edited) = Call::new(Method::PATCH, &format!("/v1/channels/{staff}"))
+            .token(&moderator_token)
+            .json(json!({"topic": "moderated"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        let (status, refused) = Call::new(Method::PATCH, &format!("/v1/channels/{open}"))
+            .token(&moderator_token)
+            .json(json!({"topic": "no"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn an_admin_can_lower_the_image_cap() {
     run(|db| async move {
         let dir =
