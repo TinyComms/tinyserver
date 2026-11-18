@@ -1130,12 +1130,14 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
             .await;
         assert_eq!(status, StatusCode::CREATED, "{role}");
         let mods = role["id"].as_str().expect("role id").to_string();
-        let (status, given) =
-            Call::new(Method::PUT, &format!("/v1/members/{}/roles", moderator.user_id))
-                .token(&owner_token)
-                .json(json!({ "role_ids": [mods] }))
-                .send(&app)
-                .await;
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", moderator.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({ "role_ids": [mods] }))
+        .send(&app)
+        .await;
         assert_eq!(status, StatusCode::OK, "{given}");
 
         let (status, channel) = Call::new(Method::POST, "/v1/channels")
@@ -1193,12 +1195,14 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
             .await;
         assert_eq!(status, StatusCode::CREATED, "{seers}");
         let seers = seers["id"].as_str().expect("role id").to_string();
-        let (status, given) =
-            Call::new(Method::PUT, &format!("/v1/members/{}/roles", author.user_id))
-                .token(&owner_token)
-                .json(json!({ "role_ids": [seers] }))
-                .send(&app)
-                .await;
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", author.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({ "role_ids": [seers] }))
+        .send(&app)
+        .await;
         assert_eq!(status, StatusCode::OK, "{given}");
         for (role, allow, deny) in [(&everyone, 0, 1), (&seers, 1, 0)] {
             let (status, put) = Call::new(
@@ -1211,8 +1215,13 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
             .await;
             assert_eq!(status, StatusCode::OK, "{put}");
         }
-        let (status, hidden) =
-            send_message(&app, &author_token, &private_id, json!({"body": "in private"})).await;
+        let (status, hidden) = send_message(
+            &app,
+            &author_token,
+            &private_id,
+            json!({"body": "in private"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED, "{hidden}");
         let hidden_id = hidden["id"].as_str().expect("message id").to_string();
         let (status, refused) = Call::new(Method::DELETE, &format!("/v1/messages/{hidden_id}"))

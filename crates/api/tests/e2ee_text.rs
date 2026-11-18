@@ -3402,16 +3402,22 @@ async fn a_moderator_can_delete_another_members_encrypted_message() {
         let said_id = said["id"].as_str().expect("id").to_string();
 
         let (status, _) = w
-            .send(Method::DELETE, &format!("/v1/messages/{said_id}"), &mod_token, None)
+            .send(
+                Method::DELETE,
+                &format!("/v1/messages/{said_id}"),
+                &mod_token,
+                None,
+            )
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         // The row lost its ciphertext with the delete, whoever ran it, and the marker is in
         // nothing the server keeps.
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE ciphertext IS NOT NULL")
-            .fetch_one(&w.db.owner)
-            .await
-            .expect("count");
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM messages WHERE ciphertext IS NOT NULL")
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("count");
         assert_eq!(left, 0);
         let (_, page) = messages(&w.app, &mod_token, &p.conv).await;
         let row = page
