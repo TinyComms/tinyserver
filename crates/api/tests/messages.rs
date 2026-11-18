@@ -1052,7 +1052,8 @@ async fn a_moderator_can_delete_another_members_message() {
         assert_eq!(deleted["message"]["deleted_by"], moderator.user_id);
 
         // The stored page says the same: tombstone, no text, no attachments, who removed it.
-        let page = get_messages(&app, &author_token, &channel_id).await;
+        let (status, page) = get_messages(&app, &author_token, &channel_id).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
         let tombstone = page
             .as_array()
             .expect("page")
@@ -1179,7 +1180,7 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
             .await;
         assert_eq!(status, StatusCode::CREATED, "{private}");
         let private_id = private["id"].as_str().expect("channel id").to_string();
-        let (_, roles) = get_json(&app, &owner_token, "/v1/roles").await;
+        let roles = get_json(&app, &owner_token, "/v1/roles").await;
         let everyone = roles
             .as_array()
             .expect("roles")
