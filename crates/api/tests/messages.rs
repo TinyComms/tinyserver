@@ -10,6 +10,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use common::live::{connect, durable, ping, serve, Ws};
 use common::{first_owner, join, run, session, Call};
+use db::perm;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -989,6 +990,338 @@ async fn a_bad_hmac_is_refused() {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_moderator_can_delete_another_members_message() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) = join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (author, author_token) = join(&db, &owner, "author@tinyserver.test", "member").await;
+        let server = serve(&db, api::Limits::default()).await;
+        let (mut author_ws, _) = connect(&server, &author_token, None).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        // The moderator holds manage_messages and nothing else; view comes from @everyone.
+        let (status, role) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Mods", "permissions": perm::MANAGE_MESSAGES}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{role}");
+        let role = role["id"].as_str().expect("role id").to_string();
+        let (status, given) =
+            Call::new(Method::PUT, &format!("/v1/members/{}/roles", moderator.user_id))
+                .token(&owner_token)
+                .json(json!({ "role_ids": [role] }))
+                .send(&app)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({ "name": "general" }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let (status, posted) =
+            send_message(&app, &author_token, &channel_id, json!({"body": "has to go"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        assert_eq!(
+            next_type(&mut author_ws, "message.created").await["message"]["body"],
+            "has to go"
+        );
+        let message_id = posted["id"].as_str().expect("message id").to_string();
+
+        let (status, removed) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+            .token(&moderator_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{removed}");
+
+        // The frame reaches the channel's members with the actor and none of the content.
+        let deleted = next_type(&mut author_ws, "message.deleted").await;
+        assert_eq!(deleted["message"]["id"], message_id);
+        assert_eq!(deleted["message"]["body"], "");
+        assert_eq!(deleted["message"]["attachments"], json!([]));
+        assert_eq!(deleted["message"]["deleted_by"], moderator.user_id);
+
+        // The stored page says the same: tombstone, no text, no attachments, who removed it.
+        let page = get_messages(&app, &author_token, &channel_id).await;
+        let tombstone = page
+            .as_array()
+            .expect("page")
+            .iter()
+            .find(|message| message["id"] == message_id)
+            .expect("tombstone");
+        assert_eq!(tombstone["body"], "");
+        assert!(tombstone["deleted_at"].is_string());
+        assert_eq!(tombstone["deleted_by"], moderator.user_id);
+
+        // The audit row names the actor and the author and carries ids, never the text.
+        let (actor, subject): (String, String) = sqlx::query_as(
+            "SELECT actor_id::text, subject_user_id::text FROM audit_log WHERE action = 'message.delete'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("audit row");
+        assert_eq!(actor, moderator.user_id);
+        assert_eq!(subject, author.user_id);
+        let (in_detail, channel_in_detail): (String, String) = sqlx::query_as(
+            "SELECT detail #>> '{message_id}', detail #>> '{channel_id}' FROM audit_log WHERE action = 'message.delete'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("audit detail");
+        assert_eq!(in_detail, message_id);
+        assert_eq!(channel_in_detail, channel_id);
+
+        // Deleting scrubs the text out of the stored frames, and the audit row never had it.
+        let leaks: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM outbox WHERE payload::text LIKE '%has to go%'), \
+             (SELECT count(*) FROM audit_log WHERE detail::text LIKE '%has to go%')",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("leaks");
+        assert_eq!(leaks, (0, 0), "{leaks:?}");
+
+        // The author's own delete is unchanged: no actor on the frame, no audit row for it.
+        let (status, mine) =
+            send_message(&app, &author_token, &channel_id, json!({"body": "my own"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{mine}");
+        next_type(&mut author_ws, "message.created").await;
+        let mine_id = mine["id"].as_str().expect("message id").to_string();
+        let (status, _) = Call::new(Method::DELETE, &format!("/v1/messages/{mine_id}"))
+            .token(&author_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let self_deleted = next_type(&mut author_ws, "message.deleted").await;
+        assert_eq!(self_deleted["message"]["deleted_by"], Value::Null);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'message.delete'")
+            .fetch_one(&db.owner)
+            .await
+            .expect("audit count");
+        assert_eq!(rows, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) = join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (author, author_token) = join(&db, &owner, "author@tinyserver.test", "member").await;
+        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, role) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Mods", "permissions": perm::MANAGE_MESSAGES}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{role}");
+        let mods = role["id"].as_str().expect("role id").to_string();
+        let (status, given) =
+            Call::new(Method::PUT, &format!("/v1/members/{}/roles", moderator.user_id))
+                .token(&owner_token)
+                .json(json!({ "role_ids": [mods] }))
+                .send(&app)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({ "name": "general" }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+        let (status, posted) =
+            send_message(&app, &author_token, &channel_id, json!({"body": "kept"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        let message_id = posted["id"].as_str().expect("message id").to_string();
+
+        // A member without the bit gets the refusal a non-author always got, and a message
+        // that is not there stays "not found" for them.
+        let (status, refused) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+            .token(&member_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert_eq!(refused["error"], "forbidden");
+        let (status, missing) = Call::new(
+            Method::DELETE,
+            "/v1/messages/00000000-0000-0000-0000-000000000000",
+        )
+        .token(&member_token)
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        assert_eq!(missing["error"], "not_found");
+
+        // A member who cannot view the channel still gets "not found", so a refusal never
+        // says whether a message they may not see is there.
+        let (status, private) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({ "name": "private" }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{private}");
+        let private_id = private["id"].as_str().expect("channel id").to_string();
+        let (_, roles) = get_json(&app, &owner_token, "/v1/roles").await;
+        let everyone = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == "@everyone")
+            .and_then(|role| role["id"].as_str())
+            .expect("everyone")
+            .to_string();
+        let (status, seers) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Seers", "permissions": perm::VIEW_CHANNEL}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{seers}");
+        let seers = seers["id"].as_str().expect("role id").to_string();
+        let (status, given) =
+            Call::new(Method::PUT, &format!("/v1/members/{}/roles", author.user_id))
+                .token(&owner_token)
+                .json(json!({ "role_ids": [seers] }))
+                .send(&app)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+        for (role, allow, deny) in [(&everyone, 0, 1), (&seers, 1, 0)] {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{private_id}/overrides/{role}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+        let (status, hidden) =
+            send_message(&app, &author_token, &private_id, json!({"body": "in private"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{hidden}");
+        let hidden_id = hidden["id"].as_str().expect("message id").to_string();
+        let (status, refused) = Call::new(Method::DELETE, &format!("/v1/messages/{hidden_id}"))
+            .token(&member_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+
+        // The bit denied in the channel is a refusal. Allowed there, it works, so a server
+        // can hand the delete to one channel only.
+        for (allow, deny) in [(0, perm::MANAGE_MESSAGES), (perm::MANAGE_MESSAGES, 0)] {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{channel_id}/overrides/{mods}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+        let (status, denied) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+            .token(&moderator_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, removed) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+            .token(&moderator_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{removed}");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'message.delete'")
+                .fetch_one(&db.owner)
+                .await
+                .expect("audit count");
+        assert_eq!(rows, 1, "the refusals wrote no audit row");
+
+        // A direct stays author-only: the other person in it has no bit to hold.
+        let (status, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&member_token)
+            .json(json!({"user_id": author.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let (status, said) =
+            send_message(&app, &author_token, &direct_id, json!({"body": "just us"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        let said_id = said["id"].as_str().expect("message id").to_string();
+        let (status, refused) = Call::new(Method::DELETE, &format!("/v1/messages/{said_id}"))
+            .token(&member_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        let (status, _) = Call::new(Method::DELETE, &format!("/v1/messages/{said_id}"))
+            .token(&author_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // An old all-bits value still validates, and a bit the server does not know is
+        // dropped, not refused.
+        let (status, legacy) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Legacy", "permissions": 2097151}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{legacy}");
+        assert_eq!(legacy["permissions"], 2097151);
+        let (status, high) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "High", "permissions": 8388607}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{high}");
+        assert_eq!(high["permissions"], perm::ALL);
+
+        // A room override holds the bit now too.
+        let (status, room) = Call::new(Method::POST, "/v1/rooms")
+            .token(&owner_token)
+            .json(json!({"name": "Lounge"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{room}");
+        let room_id = room["id"].as_str().expect("room id").to_string();
+        let (status, put) = Call::new(
+            Method::PUT,
+            &format!("/v1/rooms/{room_id}/overrides/{mods}"),
+        )
+        .token(&owner_token)
+        .json(json!({"allow": perm::MANAGE_MESSAGES, "deny": 0}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let rooms = get_json(&app, &owner_token, "/v1/rooms").await;
+        let stored = rooms
+            .as_array()
+            .expect("rooms")
+            .iter()
+            .find(|room| room["id"] == room_id)
+            .expect("room")["overrides"]
+            .as_array()
+            .expect("overrides")
+            .iter()
+            .find(|stored| stored["role_id"] == mods)
+            .expect("override")
+            .clone();
+        assert_eq!(stored["allow"], perm::MANAGE_MESSAGES);
     })
     .await;
 }

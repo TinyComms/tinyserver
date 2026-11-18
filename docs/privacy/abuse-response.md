@@ -13,7 +13,7 @@ How a community handles abuse without TinyCloud, or anyone else, reading private
 
 ## What is implemented here
 
-A member can report a message, a member, or a channel. Moderators with the `manage_reports` permission (bit 20) can list, read, triage (`open`, `reviewing`, `actioned`, `dismissed`), annotate, and link an enforcement action (a kick, ban or timeout, by its audit-log id) to a report. Owners can place a report on legal hold (`preserve`). Everything is in migration [`0015_abuse_reports.sql`](../../crates/db/migrations/0015_abuse_reports.sql) and `crates/api/src/reports.rs`.
+A member can report a message, a member, or a channel. Moderators with the `manage_reports` permission (bit 20) can list, read, triage (`open`, `reviewing`, `actioned`, `dismissed`), annotate, and link an enforcement action (a kick, ban or timeout, by its audit-log id) to a report. Owners can place a report on legal hold (`preserve`). Everything is in migration [`0015_abuse_reports.sql`](../../crates/db/migrations/0015_abuse_reports.sql) and `crates/api/src/reports.rs`. A moderator with `manage_messages` (bit 21, [`0043_moderator_message_delete.sql`](../../crates/db/migrations/0043_moderator_message_delete.sql)) can also delete a reported message from the channel it sits in, whoever wrote it. The delete is the same tombstone an author's delete is, it writes a `message.delete` audit row with ids and no text, and it hands the moderator nothing they could not already see: no plaintext, no ciphertext, no attachment.
 
 ### What a report holds
 
