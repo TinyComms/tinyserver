@@ -1,3 +1,5 @@
+-- 0042 is staged by other pull requests; renumber to the next free number at rebase time.
+--
 -- A moderator can delete another member's message. Issue #70.
 --
 -- Permission bit 21, `manage_messages`, is 1 << 21 = 2097152. All bits are now 4194303, and the
@@ -246,8 +248,13 @@ END;
 $$;
 
 -- 3. Who removed it. NULL when the author did, and NULL again if the author's account goes.
+--    The key is attached NOT VALID and validated in a second pass: validating scans messages
+--    under a lock that lets writes continue, where an inline key would stop them for the scan.
 
-ALTER TABLE messages ADD COLUMN deleted_by uuid REFERENCES users (id) ON DELETE SET NULL;
+ALTER TABLE messages ADD COLUMN deleted_by uuid;
+ALTER TABLE messages ADD CONSTRAINT messages_deleted_by_fkey
+    FOREIGN KEY (deleted_by) REFERENCES users (id) ON DELETE SET NULL NOT VALID;
+ALTER TABLE messages VALIDATE CONSTRAINT messages_deleted_by_fkey;
 
 -- 4. The message JSON says so. The key is NULL on every message nobody else removed.
 

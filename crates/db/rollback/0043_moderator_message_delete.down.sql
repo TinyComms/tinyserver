@@ -1,3 +1,5 @@
+-- 0042 is staged by other pull requests; renumber to the next free number at rebase time.
+--
 -- Undoes migrations/0043_moderator_message_delete.sql. Run as the owner role, in one
 -- transaction, then start the previous image. It strips the bit from every row that holds it,
 -- puts the masks and the function bodies back to their 0005, 0008, 0015 and 0022 shapes, drops
@@ -332,9 +334,10 @@ BEGIN
 END;
 $$;
 
--- 3. The column. The message.delete audit rows stay: they say a moderation happened, and
---    deleting history is not what a rollback is for.
+-- 3. The key, then the column. The message.delete audit rows stay: they say a moderation
+--    happened, and deleting history is not what a rollback is for.
 
+ALTER TABLE messages DROP CONSTRAINT messages_deleted_by_fkey;
 ALTER TABLE messages DROP COLUMN deleted_by;
 
 COMMIT;
