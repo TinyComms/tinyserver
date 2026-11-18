@@ -596,7 +596,11 @@ async fn a_channel_body_says_what_the_caller_may_do_there() {
             assert_eq!(status, StatusCode::CREATED, "{channel}");
             channels.push(channel["id"].as_str().expect("channel id").to_string());
         }
-        let (open, staff, vault) = (channels[0].clone(), channels[1].clone(), channels[2].clone());
+        let (open, staff, vault) = (
+            channels[0].clone(),
+            channels[1].clone(),
+            channels[2].clone(),
+        );
         // staff: @everyone may look but not speak; vault: @everyone may not look. Mod manages
         // staff and vault, in those channels only, and holds nothing server-wide.
         let overrides = [
@@ -641,7 +645,11 @@ async fn a_channel_body_says_what_the_caller_may_do_there() {
         assert_eq!(mask_of(&moderator_list, &staff), 571);
         assert_eq!(mask_of(&moderator_list, &vault), 575);
         let member_list = get_json(&app, &member_token, "/v1/channels").await;
-        assert_eq!(member_list.as_array().map(Vec::len), Some(2), "{member_list}");
+        assert_eq!(
+            member_list.as_array().map(Vec::len),
+            Some(2),
+            "{member_list}"
+        );
         assert_eq!(mask_of(&member_list, &open), 63);
         assert_eq!(mask_of(&member_list, &staff), 59);
         assert_eq!(mask_of(&member_list, &staff) & 512, 0);
