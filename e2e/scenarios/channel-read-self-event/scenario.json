@@ -1,0 +1,10 @@
+{
+  "id": "channel-read-self-event",
+  "title": "A channel read tells the reader's own sockets and nobody else",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres", "two-people"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "the released client zeroes the unread count on read.updated for its own user id on any conversation; tinyclient issue 284 makes the count visible on the row"
+}

@@ -286,9 +286,9 @@ Durable topics:
 | `direct.created` | The two people | `direct` with `id`, `low_user_id`, `high_user_id`, `created_at` |
 | `message.created`, `message.edited`, `message.deleted` | Every member socket for a channel. The two people for a direct | `conversation_id`, `kind` (`channel` or `direct`), `message` |
 | `reaction.updated` | Same split as messages | `message_id`, `conversation_id`, `kind`, `emoji`, `on`, `user_id`, `count` |
-| `read.updated` | Both people in a direct | `conversation_id`, `kind` `direct`, `user_id`, `message_id` |
+| `read.updated` | The two people in a direct; in a channel, the reader alone | `conversation_id`, `kind` (`channel` or `direct`), `user_id`, `message_id` |
 
-A channel read is stored and emits nothing. Channel message, reaction and channel events go to every member socket when every member can view the channel, and only to the members who can view it when it can be restricted (`0013_private_channel_events.sql`). The audience is fixed when the event is emitted. `channel.deleted` carries only the id and goes to every member. Direct events set the audience to those two user ids. Bots do not receive these topics.
+A channel read is stored and emits `read.updated` to the reader's own sessions only, so their other devices clear the count; nobody else hears it, and the emit happens only when the cursor moves forward. Channel message, reaction and channel events go to every member socket when every member can view the channel, and only to the members who can view it when it can be restricted (`0013_private_channel_events.sql`). The audience is fixed when the event is emitted. `channel.deleted` carries only the id and goes to every member. Direct events set the audience to those two user ids, a channel read to the reader's one user id. Bots do not receive these topics.
 
 `message.created` and the other message writes are HTTP (`POST /v1/conversations/{id}/messages` and the routes next to it). The frame carries ids and the message object, not file bytes. A message body is at most 4,000 characters. The 64 KiB socket frame cap still applies.
 
