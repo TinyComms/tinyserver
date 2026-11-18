@@ -26,6 +26,6 @@ run() {
 }
 run a_new_community_starts_with_exactly_one_general_channel
 run the_seeded_channel_follows_the_e2ee_text_setting
-run a_seed_over_the_group_device_cap_is_skipped_not_fatal
+run the_seed_happens_with_no_device_enrolled_yet
 run a_deleted_general_is_not_brought_back_by_the_next_owner
 printf '%s\n' 'PASS: 4 fresh-community general API integration tests; no native client proof beyond the channel list released clients already draw.'

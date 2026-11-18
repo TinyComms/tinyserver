@@ -5,9 +5,10 @@
 -- `tinyserver bootstrap` issued: app_accept_invite makes the first membership. From this
 -- migration that same transaction also makes the community's first channel: one text channel
 -- named general, in no category, at position 0, created by that owner. It follows the
--- e2ee_text setting like any new conversation (the rule app_e2ee_may_create applies), and it
--- honours the same device cap an encrypted app_create_channel does: when the seed would be
--- encrypted and the cap refuses it, nothing is seeded and the sign-in is not failed. The seed
+-- e2ee_text setting like any new conversation (the rule app_e2ee_may_create applies). At the
+-- first sign-in no device can be enrolled yet, so an encrypted seed starts over an empty
+-- audience; growth past the device cap afterwards is what the waiting mechanism
+-- (app_e2ee_info) already handles. The seed
 -- writes the channel.create audit row a created channel writes, with no actor, because during
 -- the first sign-in nobody is scoped yet, exactly as bootstrap writes its own row, and emits
 -- the same channel.created event, so every client learns of the channel the way it already
@@ -42,14 +43,6 @@ BEGIN
     INSERT INTO channels (category_id, name, topic, position, created_by, e2ee)
     VALUES (NULL, 'general', '', 0, p_owner, v_e2ee)
     RETURNING id INTO v_id;
-    -- The cap app_create_channel refuses with: an encrypted channel whose audience already has
-    -- more devices than one group may hold could never take everyone in. Here the seed is
-    -- skipped instead of refused, so the owner's sign-in cannot fail on it, and the row goes
-    -- away with the caller's transaction if this one is rolled back.
-    IF v_e2ee AND (SELECT count(*) FROM app_e2ee_desired(v_id)) > app_e2ee_group_devices_max() THEN
-        DELETE FROM channels WHERE id = v_id;
-        RETURN;
-    END IF;
     PERFORM app_audit(
         'channel.create', 'channel',
         jsonb_build_object('id', v_id, 'name', 'general', 'e2ee', v_e2ee, 'seeded', true),

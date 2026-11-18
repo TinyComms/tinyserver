@@ -79,11 +79,11 @@ async fn the_seeded_channel_follows_the_e2ee_text_setting() {
 }
 
 #[tokio::test]
-async fn a_seed_over_the_group_device_cap_is_skipped_not_fatal() {
+async fn the_seed_happens_with_no_device_enrolled_yet() {
     run(|db| async move {
-        // A seed the cap would refuse is skipped: the owner still signs in, and the community
-        // starts without a channel rather than with one nobody could decrypt.
-        sqlx::query("UPDATE server_settings SET e2ee_text = 'new_required', e2ee_group_devices_max = 0")
+        // At the first sign-in no device can be enrolled yet, so an encrypted seed starts over
+        // an empty audience even at the smallest cap: nothing about the device state stops it.
+        sqlx::query("UPDATE server_settings SET e2ee_text = 'new_required', e2ee_group_devices_max = 2")
             .execute(&db.owner)
             .await
             .expect("cap");
@@ -93,7 +93,7 @@ async fn a_seed_over_the_group_device_cap_is_skipped_not_fatal() {
             .fetch_one(&db.owner)
             .await
             .expect("channels");
-        assert_eq!(count, 0, "a seed the cap refuses is not made");
+        assert_eq!(count, 1, "the seed happens whatever the device state");
     })
     .await;
 }
