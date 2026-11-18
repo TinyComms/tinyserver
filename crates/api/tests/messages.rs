@@ -1121,7 +1121,7 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
         let owner_token = session(&db, &owner.user_id).await;
         let (moderator, moderator_token) = join(&db, &owner, "mod@tinyserver.test", "member").await;
         let (author, author_token) = join(&db, &owner, "author@tinyserver.test", "member").await;
-        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
         let app = api::router(db.runtime.clone(), None);
 
         let (status, role) = Call::new(Method::POST, "/v1/roles")
