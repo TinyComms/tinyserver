@@ -12,9 +12,10 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use db::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
-    list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
-    save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction, update_channel,
-    upgrade_conversation, Caller, MessageError, NewAttachment, PgPool, ScanEngine,
+    list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
+    post_message, save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction,
+    unpin_message, update_channel, upgrade_conversation, Caller, MessageError, NewAttachment,
+    PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -61,6 +62,11 @@ pub fn routes() -> Router<PgPool> {
             "/v1/messages/{id}/reactions",
             axum::routing::put(react).delete(unreact),
         )
+        .route(
+            "/v1/messages/{id}/pin",
+            axum::routing::put(pin).delete(unpin),
+        )
+        .route("/v1/conversations/{id}/pins", get(pins))
         .route("/v1/conversations/{id}/read", axum::routing::post(read))
         .route(
             "/v1/conversations/{id}/e2ee",
@@ -177,6 +183,7 @@ pub(crate) enum Error {
     ArchiveExists,
     GenerationChanged,
     RepairUnavailable,
+    PinLimit,
 }
 
 impl IntoResponse for Error {
@@ -216,6 +223,7 @@ impl IntoResponse for Error {
             Self::ArchiveExists => (StatusCode::CONFLICT, "archive_exists"),
             Self::GenerationChanged => (StatusCode::CONFLICT, "generation_changed"),
             Self::RepairUnavailable => (StatusCode::CONFLICT, "repair_unavailable"),
+            Self::PinLimit => (StatusCode::CONFLICT, "pin_limit"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -256,6 +264,7 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::ArchiveExists => "archive_exists",
         Error::GenerationChanged => "generation_changed",
         Error::RepairUnavailable => "repair_unavailable",
+        Error::PinLimit => "pin_limit",
     }
 }
 
@@ -303,6 +312,7 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::ArchiveExists => Error::ArchiveExists,
         MessageError::GenerationChanged => Error::GenerationChanged,
         MessageError::RepairUnavailable => Error::RepairUnavailable,
+        MessageError::PinLimit => Error::PinLimit,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -575,6 +585,55 @@ async fn unreact(
             error
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Pins are ids only, so the same routes serve plaintext and encrypted conversations.
+async fn pin(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    pin_message(&pool, &caller, &id)
+        .await
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, "", &error);
+            error
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unpin(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    unpin_message(&pool, &caller, &id)
+        .await
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, "", &error);
+            error
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pins(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    list_pins(&pool, &caller, &id)
+        .await
+        .map(signed)
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, &id, &error);
+            error
+        })
 }
 
 async fn read(

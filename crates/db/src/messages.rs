@@ -116,6 +116,9 @@ pub enum MessageError {
     /// A device link already carries its one archive.
     #[error("archive exists")]
     ArchiveExists,
+    /// The conversation already holds the most pins it may (50).
+    #[error("pin limit")]
+    PinLimit,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -404,6 +407,45 @@ pub async fn clear_reaction(
         .map_err(message_sql)?;
     tx.commit().await.map_err(message_sql)?;
     Ok(())
+}
+
+/// Pins one message, in a channel with `manage_channels` there or as either person of a direct.
+/// Idempotent. The 51st pin of one conversation is [`MessageError::PinLimit`].
+pub async fn pin_message(pool: &PgPool, caller: &Caller, id: &str) -> Result<(), MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_pin_message($1::uuid)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+/// Takes one pin back. Idempotent: a message that is not pinned answers `Ok` too.
+pub async fn unpin_message(pool: &PgPool, caller: &Caller, id: &str) -> Result<(), MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_unpin_message($1::uuid)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+/// The pinned messages of one conversation, newest pin first, at most 50.
+pub async fn list_pins(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+) -> Result<Value, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(&mut tx, "SELECT app_list_pins($1::uuid)", |query| {
+        query.bind(conversation)
+    })
+    .await?;
+    commit(tx, value).await
 }
 
 pub async fn mark_read(
@@ -704,6 +746,7 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E20" => MessageError::ArchiveExists,
         "P0E21" => MessageError::GenerationChanged,
         "P0E22" => MessageError::RepairUnavailable,
+        "P0E23" => MessageError::PinLimit,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
