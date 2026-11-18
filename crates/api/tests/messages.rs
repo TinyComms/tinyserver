@@ -240,7 +240,7 @@ async fn a_gif_and_a_video_can_be_uploaded_and_downloaded() {
 
         let owner = first_owner(&db).await;
         let owner_token = session(&db, &owner.user_id).await;
-        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
         let app = api::router(db.runtime.clone(), None);
         let (status, channel) = Call::new(Method::POST, "/v1/channels")
             .token(&owner_token)
@@ -833,7 +833,7 @@ async fn an_eicar_upload_is_blocked() {
 
         let owner = first_owner(&db).await;
         let owner_token = session(&db, &owner.user_id).await;
-        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
         let app = api::router(db.runtime.clone(), None);
 
         let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
