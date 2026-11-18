@@ -256,7 +256,9 @@ ALTER TABLE messages ADD CONSTRAINT messages_deleted_by_fkey
     FOREIGN KEY (deleted_by) REFERENCES users (id) ON DELETE SET NULL NOT VALID;
 ALTER TABLE messages VALIDATE CONSTRAINT messages_deleted_by_fkey;
 
--- 4. The message JSON says so. The key is NULL on every message nobody else removed.
+-- 4. The message JSON says so. The key is NULL on every message nobody else removed. The rest
+--    of the body is the one 0039_e2ee_group_generations.sql last gave it: seq, generation and
+--    group_id ride along, and a rebase must keep carrying them.
 
 CREATE OR REPLACE FUNCTION app_message_json(p_id uuid, p_viewer uuid)
 RETURNS jsonb
@@ -308,8 +310,11 @@ AS $$
         'ciphertext', CASE WHEN m.deleted_at IS NULL
             THEN translate(encode(m.ciphertext, 'base64'), E'\n', '') END,
         'epoch', m.epoch,
+        'generation', m.generation,
+        'group_id', m.group_id::text,
         'device_id', m.device_id::text,
-        'target_id', m.target_id::text
+        'target_id', m.target_id::text,
+        'seq', m.seq
     ) ELSE '{}'::jsonb END
     FROM messages m
     WHERE m.id = p_id;

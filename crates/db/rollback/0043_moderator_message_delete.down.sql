@@ -2,9 +2,9 @@
 --
 -- Undoes migrations/0043_moderator_message_delete.sql. Run as the owner role, in one
 -- transaction, then start the previous image. It strips the bit from every row that holds it,
--- puts the masks and the function bodies back to their 0005, 0008, 0015 and 0022 shapes, drops
--- the column, and leaves the tombstones: a message a moderator removed stays removed, and only
--- the record of who removed it goes with the column.
+-- puts the masks and the function bodies back to their 0005, 0008, 0015, 0022 and 0039 shapes,
+-- drops the column, and leaves the tombstones: a message a moderator removed stays removed, and
+-- only the record of who removed it goes with the column.
 
 BEGIN;
 
@@ -36,7 +36,8 @@ ALTER TABLE channel_overrides
     ADD CONSTRAINT channel_overrides_deny_check
         CHECK (deny >= 0 AND deny & ~246399::bigint = 0);
 
--- 2. The function bodies, as 0015, 0005, 0008, 0022 and 0022 had them.
+-- 2. The function bodies, as 0015, 0005, 0008, 0022, 0039 and 0022 had them. The app_message_json
+--    body is 0039's verbatim, epoch-line crampedness included.
 
 CREATE OR REPLACE FUNCTION app_perms_of(p_user uuid)
 RETURNS bigint
@@ -271,9 +272,10 @@ AS $$
         'kind', m.msg_kind,
         'ciphertext', CASE WHEN m.deleted_at IS NULL
             THEN translate(encode(m.ciphertext, 'base64'), E'\n', '') END,
-        'epoch', m.epoch,
+        'epoch', m.epoch, 'generation',m.generation,'group_id',m.group_id::text,
         'device_id', m.device_id::text,
-        'target_id', m.target_id::text
+        'target_id', m.target_id::text,
+        'seq', m.seq
     ) ELSE '{}'::jsonb END
     FROM messages m
     WHERE m.id = p_id;
