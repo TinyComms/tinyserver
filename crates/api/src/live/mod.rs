@@ -7,6 +7,7 @@ mod call;
 mod e2ee;
 pub(crate) mod frame;
 mod hub;
+mod presence;
 mod ring;
 mod socket;
 
@@ -65,6 +66,9 @@ pub struct Limits {
     /// often it gets one more back.
     pub e2ee_rekey_burst: u32,
     pub e2ee_rekey_every: Duration,
+    /// `presence.set` frames one socket may send at once, and how often it gets one more back.
+    pub presence_burst: u32,
+    pub presence_every: Duration,
 }
 
 impl Default for Limits {
@@ -89,6 +93,8 @@ impl Default for Limits {
             seen_every: Duration::from_secs(30),
             e2ee_rekey_burst: 5,
             e2ee_rekey_every: Duration::from_secs(2),
+            presence_burst: 5,
+            presence_every: Duration::from_secs(2),
         }
     }
 }

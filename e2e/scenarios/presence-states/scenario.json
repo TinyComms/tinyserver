@@ -1,0 +1,10 @@
+{
+  "id": "presence-states",
+  "title": "A member sets idle and do-not-disturb with a status text, others hear the presence frame with the new fields, a bot without members.read hears nothing",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres", "two-people"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "pending the matching presence client integration"
+}
