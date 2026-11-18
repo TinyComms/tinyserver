@@ -324,7 +324,13 @@ async fn the_owner_invite_from_bootstrap_makes_the_first_owner() {
                 .expect("audit");
         assert_eq!(
             actions,
-            ["bootstrap", "invite.revoke", "bootstrap", "channel.create", "bootstrap"]
+            [
+                "bootstrap",
+                "invite.revoke",
+                "bootstrap",
+                "channel.create",
+                "bootstrap"
+            ]
         );
     })
     .await;

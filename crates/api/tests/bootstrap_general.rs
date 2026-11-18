@@ -41,7 +41,10 @@ async fn a_new_community_starts_with_exactly_one_general_channel() {
         .fetch_one(&db.owner)
         .await
         .expect("seed audit");
-        assert_eq!((actor.as_deref(), name.as_str(), seeded), (None, "general", true));
+        assert_eq!(
+            (actor.as_deref(), name.as_str(), seeded),
+            (None, "general", true)
+        );
         let announced: String = sqlx::query_scalar(
             "SELECT payload->'channel'->>'id' FROM outbox WHERE topic = 'channel.created'
              ORDER BY id DESC LIMIT 1",
@@ -83,10 +86,12 @@ async fn the_seed_happens_with_no_device_enrolled_yet() {
     run(|db| async move {
         // At the first sign-in no device can be enrolled yet, so an encrypted seed starts over
         // an empty audience even at the smallest cap: nothing about the device state stops it.
-        sqlx::query("UPDATE server_settings SET e2ee_text = 'new_required', e2ee_group_devices_max = 2")
-            .execute(&db.owner)
-            .await
-            .expect("cap");
+        sqlx::query(
+            "UPDATE server_settings SET e2ee_text = 'new_required', e2ee_group_devices_max = 2",
+        )
+        .execute(&db.owner)
+        .await
+        .expect("cap");
         let owner = first_owner(&db).await;
         assert_eq!(owner.role, "owner");
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM channels")
