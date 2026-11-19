@@ -79,10 +79,16 @@ mod tests {
     #[test]
     fn status_text_is_trimmed_and_capped_before_it_is_stored() {
         assert_eq!(check_text("back at 4"), Ok(Some("back at 4".to_string())));
-        assert_eq!(check_text("  back at 4  "), Ok(Some("back at 4".to_string())));
+        assert_eq!(
+            check_text("  back at 4  "),
+            Ok(Some("back at 4".to_string()))
+        );
         assert_eq!(check_text("   "), Ok(None));
         let edge = "x".repeat(TEXT_MAX);
-        assert_eq!(check_text(&edge).map(|text| text.chars().count()), Ok(TEXT_MAX));
+        assert_eq!(
+            check_text(&edge).map(|text| text.chars().count()),
+            Ok(TEXT_MAX)
+        );
         let over = "x".repeat(TEXT_MAX + 1);
         assert_eq!(check_text(&over), Err("bad_frame"));
         assert_eq!(check_text("line\nbreak"), Err("bad_frame"));

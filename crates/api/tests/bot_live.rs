@@ -225,7 +225,14 @@ async fn a_bot_without_members_read_hears_no_set_state_and_cannot_set_one() {
     run(|db| async move {
         let owner = first_owner(&db).await;
         let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
-        let server = serve(&db, Limits { poll: Duration::from_millis(20), ..Limits::default() }).await;
+        let server = serve(
+            &db,
+            Limits {
+                poll: Duration::from_millis(20),
+                ..Limits::default()
+            },
+        )
+        .await;
         let (mut member_ws, _) = connect(&server, &member_token, None).await;
 
         let bot = issue(&db, &owner, "Watcher", &["rooms.read"]).await;
@@ -244,14 +251,20 @@ async fn a_bot_without_members_read_hears_no_set_state_and_cannot_set_one() {
         assert_eq!(own["state"], "idle", "{own}");
 
         let extra = besides_pong(&mut bot_ws).await;
-        assert!(extra.is_empty(), "rooms.read received presence state: {extra:?}");
+        assert!(
+            extra.is_empty(),
+            "rooms.read received presence state: {extra:?}"
+        );
 
         let reply = answer(
             &mut bot_ws,
             json!({"type": "presence.set", "ref": "b1", "state": "dnd"}),
         )
         .await;
-        assert_eq!(reply, json!({"type": "error", "ref": "b1", "code": "forbidden"}));
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "b1", "code": "forbidden"})
+        );
     })
     .await;
 }
