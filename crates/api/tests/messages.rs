@@ -1037,8 +1037,7 @@ async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin(
             &format!("/v1/conversations/{channel_id}/pins"),
         )
         .await;
-        let pins = pins.as_array().expect("pins");
-        assert_eq!(pins.len(), 2, "{pins}");
+        assert_eq!(pins.as_array().expect("pins").len(), 2, "{pins}");
         // Newest pin first.
         assert_eq!(pins[0]["id"], hello_id);
         assert_eq!(pins[1]["id"], rules_id);
@@ -1055,8 +1054,7 @@ async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin(
             &format!("/v1/conversations/{channel_id}/pins"),
         )
         .await;
-        let pins = pins.as_array().expect("pins");
-        assert_eq!(pins.len(), 1, "{pins}");
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
         assert_eq!(pins[0]["id"], rules_id);
 
         // Deleting a pinned message takes the pin with it.
@@ -1098,8 +1096,7 @@ async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin(
             &format!("/v1/conversations/{direct_id}/pins"),
         )
         .await;
-        let pins = pins.as_array().expect("pins");
-        assert_eq!(pins.len(), 1, "{pins}");
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
         assert_eq!(pins[0]["id"], note_id);
 
         // A message that is not there is not pinned either.
@@ -1260,8 +1257,7 @@ async fn pinning_follows_the_channel_override_mask() {
             &format!("/v1/conversations/{channel_id}/pins"),
         )
         .await;
-        let pins = pins.as_array().expect("pins");
-        assert_eq!(pins.len(), 1, "{pins}");
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
         assert_eq!(pins[0]["id"], notice_id);
     })
     .await;
