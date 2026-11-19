@@ -1233,7 +1233,10 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
 
         // The bit denied in the channel is a refusal. Allowed there, it works, so a server
         // can hand the delete to one channel only.
-        for (allow, deny) in [(0, perm::MANAGE_MESSAGES), (perm::MANAGE_MESSAGES, 0)] {
+        for (allow, deny, want) in [
+            (0, perm::MANAGE_MESSAGES, StatusCode::FORBIDDEN),
+            (perm::MANAGE_MESSAGES, 0, StatusCode::NO_CONTENT),
+        ] {
             let (status, put) = Call::new(
                 Method::PUT,
                 &format!("/v1/channels/{channel_id}/overrides/{mods}"),
@@ -1243,17 +1246,12 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
             .send(&app)
             .await;
             assert_eq!(status, StatusCode::OK, "{put}");
+            let (status, gone) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+                .token(&moderator_token)
+                .send(&app)
+                .await;
+            assert_eq!(status, want, "{gone}");
         }
-        let (status, denied) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
-            .token(&moderator_token)
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-        let (status, removed) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
-            .token(&moderator_token)
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::NO_CONTENT, "{removed}");
         let rows: i64 =
             sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'message.delete'")
                 .fetch_one(&db.owner)
