@@ -594,13 +594,11 @@ async fn pin(
     Path(id): Path<String>,
 ) -> Result<StatusCode, Error> {
     let caller = member(&pool, &headers).await?;
-    pin_message(&pool, &caller, &id)
-        .await
-        .map_err(|error| {
-            let error = lift(error);
-            message_failed(&caller.user_id, "", &error);
-            error
-        })?;
+    pin_message(&pool, &caller, &id).await.map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, "", &error);
+        error
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -610,13 +608,11 @@ async fn unpin(
     Path(id): Path<String>,
 ) -> Result<StatusCode, Error> {
     let caller = member(&pool, &headers).await?;
-    unpin_message(&pool, &caller, &id)
-        .await
-        .map_err(|error| {
-            let error = lift(error);
-            message_failed(&caller.user_id, "", &error);
-            error
-        })?;
+    unpin_message(&pool, &caller, &id).await.map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, "", &error);
+        error
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

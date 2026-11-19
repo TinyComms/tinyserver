@@ -1009,8 +1009,13 @@ async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin(
         assert_eq!(status, StatusCode::CREATED, "{channel}");
         let channel_id = channel["id"].as_str().expect("channel id").to_string();
 
-        let (status, rules) =
-            send_message(&app, &owner_token, &channel_id, json!({"body": "the rules"})).await;
+        let (status, rules) = send_message(
+            &app,
+            &owner_token,
+            &channel_id,
+            json!({"body": "the rules"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED, "{rules}");
         let rules_id = rules["id"].as_str().expect("message id").to_string();
         let (status, hello) =
@@ -1076,8 +1081,13 @@ async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin(
             .await;
         assert_eq!(status, StatusCode::CREATED, "{direct}");
         let direct_id = direct["id"].as_str().expect("direct id").to_string();
-        let (status, note) =
-            send_message(&app, &owner_token, &direct_id, json!({"body": "for tonight"})).await;
+        let (status, note) = send_message(
+            &app,
+            &owner_token,
+            &direct_id,
+            json!({"body": "for tonight"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED, "{note}");
         let note_id = note["id"].as_str().expect("message id").to_string();
         let (status, pinned) = pin(&app, &member_token, &note_id).await;
@@ -1093,12 +1103,8 @@ async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin(
         assert_eq!(pins[0]["id"], note_id);
 
         // A message that is not there is not pinned either.
-        let (status, missing) = pin(
-            &app,
-            &owner_token,
-            "00000000-0000-0000-0000-000000000001",
-        )
-        .await;
+        let (status, missing) =
+            pin(&app, &owner_token, "00000000-0000-0000-0000-000000000001").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
         assert_eq!(missing["error"], "not_found");
     })
@@ -1445,7 +1451,10 @@ async fn pin(app: &Router, token: &str, message: &str) -> (StatusCode, Value) {
 
 async fn unpin(app: &Router, token: &str, message: &str) -> (StatusCode, Value) {
     let path = format!("/v1/messages/{message}/pin");
-    Call::new(Method::DELETE, &path).token(token).send(app).await
+    Call::new(Method::DELETE, &path)
+        .token(token)
+        .send(app)
+        .await
 }
 
 async fn next_type(ws: &mut Ws, kind: &str) -> Value {
