@@ -86,8 +86,8 @@ mod tests {
         assert_eq!(check_text("   "), Ok(None));
         let edge = "x".repeat(TEXT_MAX);
         assert_eq!(
-            check_text(&edge).map(|text| text.chars().count()),
-            Ok(TEXT_MAX)
+            check_text(&edge).map(|text| text.as_deref().map(|t| t.chars().count())),
+            Ok(Some(TEXT_MAX))
         );
         let over = "x".repeat(TEXT_MAX + 1);
         assert_eq!(check_text(&over), Err("bad_frame"));
