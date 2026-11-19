@@ -1165,7 +1165,7 @@ async fn pinning_follows_the_channel_override_mask() {
         let owner_token = session(&db, &owner.user_id).await;
         let (moderator, moderator_token) =
             join(&db, &owner, "mod@tinyserver.test", "member").await;
-        let (plain, plain_token) = join(&db, &owner, "plain@tinyserver.test", "member").await;
+        let (_plain, plain_token) = join(&db, &owner, "plain@tinyserver.test", "member").await;
         let app = api::router(db.runtime.clone(), None);
 
         let (status, channel) = Call::new(Method::POST, "/v1/channels")
