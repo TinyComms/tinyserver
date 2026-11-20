@@ -69,10 +69,10 @@ pub use link::{
 pub use media::prepare_icon;
 pub use messages::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
-    list_directs, list_messages, mark_read, open_attachment, open_direct, post_message,
-    save_attachment, save_sealed_attachment, scan_timeout, set_channel_override, toggle_reaction,
-    typing_recipients, update_channel, upgrade_conversation, AttachmentFile, MessageError,
-    NewAttachment,
+    list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
+    post_message, save_attachment, save_sealed_attachment, scan_timeout, set_channel_override,
+    toggle_reaction, typing_recipients, unpin_message, update_channel, upgrade_conversation,
+    AttachmentFile, MessageError, NewAttachment,
 };
 pub use migrate::migrate;
 pub use moderation::{

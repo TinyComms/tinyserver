@@ -1535,6 +1535,418 @@ async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only()
     .await;
 }
 
+#[tokio::test]
+async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (member, member_token) = join(&db, &owner, "pinner@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let (status, rules) = send_message(
+            &app,
+            &owner_token,
+            &channel_id,
+            json!({"body": "the rules"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{rules}");
+        let rules_id = rules["id"].as_str().expect("message id").to_string();
+        let (status, hello) =
+            send_message(&app, &member_token, &channel_id, json!({"body": "hello"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{hello}");
+        let hello_id = hello["id"].as_str().expect("message id").to_string();
+
+        let (status, pinned) = pin(&app, &owner_token, &rules_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        // Idempotent: the same pin again is still 204, and pins nothing twice.
+        let (status, pinned) = pin(&app, &owner_token, &rules_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        let (status, pinned) = pin(&app, &owner_token, &hello_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+
+        let pins = get_json(
+            &app,
+            &member_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 2, "{pins}");
+        // Newest pin first.
+        assert_eq!(pins[0]["id"], hello_id);
+        assert_eq!(pins[1]["id"], rules_id);
+        assert_eq!(pins[1]["body"], "the rules");
+
+        let (status, unpinned) = unpin(&app, &owner_token, &hello_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        // Idempotent: unpinning again is still 204.
+        let (status, unpinned) = unpin(&app, &owner_token, &hello_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        let pins = get_json(
+            &app,
+            &owner_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
+        assert_eq!(pins[0]["id"], rules_id);
+
+        // Deleting a pinned message takes the pin with it.
+        let (status, gone) = Call::new(Method::DELETE, &format!("/v1/messages/{rules_id}"))
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{gone}");
+        let pins = get_json(
+            &app,
+            &owner_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 0, "{pins}");
+
+        // A direct lets either person pin, with no permission bit.
+        let (status, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&owner_token)
+            .json(json!({"user_id": member.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let (status, note) = send_message(
+            &app,
+            &owner_token,
+            &direct_id,
+            json!({"body": "for tonight"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{note}");
+        let note_id = note["id"].as_str().expect("message id").to_string();
+        let (status, pinned) = pin(&app, &member_token, &note_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        let pins = get_json(
+            &app,
+            &member_token,
+            &format!("/v1/conversations/{direct_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
+        assert_eq!(pins[0]["id"], note_id);
+
+        // A message that is not there is not pinned either.
+        let (status, missing) =
+            pin(&app, &owner_token, "00000000-0000-0000-0000-000000000001").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        assert_eq!(missing["error"], "not_found");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_51st_pin_is_pin_limit_and_an_unpin_frees_a_slot() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let mut ids = Vec::new();
+        for n in 0..51 {
+            let (status, message) = send_message(
+                &app,
+                &owner_token,
+                &channel_id,
+                json!({"body": format!("m{n}")}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{message}");
+            ids.push(message["id"].as_str().expect("message id").to_string());
+        }
+        for id in &ids[..50] {
+            let (status, pinned) = pin(&app, &owner_token, id).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        }
+        let (status, refused) = pin(&app, &owner_token, &ids[50]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"], "pin_limit");
+
+        // One pin fewer, and the next fits again.
+        let (status, unpinned) = unpin(&app, &owner_token, &ids[0]).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        let (status, pinned) = pin(&app, &owner_token, &ids[50]).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        let pins = get_json(
+            &app,
+            &owner_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 50);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pinning_follows_the_channel_override_mask() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) =
+            join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (_plain, plain_token) = join(&db, &owner, "plain@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+        let (status, notice) =
+            send_message(&app, &owner_token, &channel_id, json!({"body": "read this"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{notice}");
+        let notice_id = notice["id"].as_str().expect("message id").to_string();
+        let (status, second) =
+            send_message(&app, &owner_token, &channel_id, json!({"body": "and this"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        let second_id = second["id"].as_str().expect("message id").to_string();
+
+        // Crew holds manage_channels; Ghost holds it too, and nobody holds Ghost.
+        let mut crew = String::new();
+        let mut ghost = String::new();
+        for (name, id) in [("Crew", &mut crew), ("Ghost", &mut ghost)] {
+            let (status, role) = Call::new(Method::POST, "/v1/roles")
+                .token(&owner_token)
+                .json(json!({"name": name, "permissions": 512}))
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{role}");
+            *id = role["id"].as_str().expect("role id").to_string();
+        }
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", moderator.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({"role_ids": [crew]}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        // A plain member may not pin; the moderator may.
+        let (status, denied) = pin(&app, &plain_token, &notice_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert_eq!(denied["error"], "forbidden");
+        let (status, pinned) = pin(&app, &moderator_token, &notice_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+
+        // An allow on a role the member does not hold grants nothing.
+        let (status, put) = Call::new(
+            Method::PUT,
+            &format!("/v1/channels/{channel_id}/overrides/{ghost}"),
+        )
+        .token(&owner_token)
+        .json(json!({"allow": 512, "deny": 0}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let (status, denied) = pin(&app, &plain_token, &second_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        // A deny on the role the moderator holds takes the permission away here.
+        let (status, put) = Call::new(
+            Method::PUT,
+            &format!("/v1/channels/{channel_id}/overrides/{crew}"),
+        )
+        .token(&owner_token)
+        .json(json!({"allow": 0, "deny": 512}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let (status, denied) = pin(&app, &moderator_token, &second_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        // A timed out moderator may not pin or unpin either.
+        sqlx::query(
+            "UPDATE memberships SET timeout_until = now() + interval '1 day' WHERE user_id = $1::uuid",
+        )
+        .bind(&moderator.user_id)
+        .execute(&db.owner)
+        .await
+        .expect("timeout");
+        let (status, denied) = unpin(&app, &moderator_token, &notice_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        // The list needs only view, and the still-pinned message is on it.
+        let pins = get_json(
+            &app,
+            &plain_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
+        assert_eq!(pins[0]["id"], notice_id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pin_events_carry_ids_and_reach_only_the_conversations_audience() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (viewer, viewer_token) = join(&db, &owner, "viewer@tinyserver.test", "member").await;
+        let (barred, barred_token) = join(&db, &owner, "barred@tinyserver.test", "member").await;
+        let server = serve(&db, api::Limits::default()).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        // A channel @everyone cannot view; Crew can. Set up before anyone connects.
+        let (_, roles) = Call::new(Method::GET, "/v1/roles")
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        let everyone = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == "@everyone")
+            .and_then(|role| role["id"].as_str())
+            .expect("everyone")
+            .to_string();
+        let (status, crew) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Crew", "permissions": 0, "color": "#22c55e"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{crew}");
+        let crew = crew["id"].as_str().expect("crew id").to_string();
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", viewer.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({"role_ids": [crew]}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+        let (status, staff) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "staff"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{staff}");
+        let staff_id = staff["id"].as_str().expect("channel id").to_string();
+        for (role, allow, deny) in [(&everyone, 0, 1), (&crew, 1, 0)] {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{staff_id}/overrides/{role}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+        let (status, notice) =
+            send_message(&app, &owner_token, &staff_id, json!({"body": "the plan"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{notice}");
+        let notice_id = notice["id"].as_str().expect("message id").to_string();
+
+        let (mut owner_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut viewer_ws, _) = connect(&server, &viewer_token, None).await;
+        let (mut barred_ws, _) = connect(&server, &barred_token, None).await;
+
+        let (status, pinned) = pin(&app, &owner_token, &notice_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        for ws in [&mut owner_ws, &mut viewer_ws] {
+            let event = next_type(ws, "pin.added").await;
+            assert_eq!(event["conversation_id"], staff_id);
+            assert_eq!(event["kind"], "channel");
+            assert_eq!(event["message_id"], notice_id);
+            assert_eq!(event["pinned_by"], owner.user_id);
+            // Ids only: no message object, no text, no ciphertext.
+            assert!(event.get("message").is_none(), "{event}");
+            assert!(event.get("body").is_none(), "{event}");
+            assert!(event.get("ciphertext").is_none(), "{event}");
+        }
+        // The member who cannot view the channel learns nothing.
+        ping(&mut barred_ws).await;
+
+        let (status, unpinned) = unpin(&app, &owner_token, &notice_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        let removed = next_type(&mut owner_ws, "pin.removed").await;
+        assert_eq!(removed["message_id"], notice_id);
+        assert_eq!(removed["pinned_by"], owner.user_id);
+        next_type(&mut viewer_ws, "pin.removed").await;
+        ping(&mut barred_ws).await;
+
+        // A direct: the event goes to the two people and to no one else.
+        let (status, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&owner_token)
+            .json(json!({"user_id": viewer.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let (status, note) =
+            send_message(&app, &owner_token, &direct_id, json!({"body": "psst"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{note}");
+        let note_id = note["id"].as_str().expect("message id").to_string();
+        let (status, pinned) = pin(&app, &owner_token, &note_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        for ws in [&mut owner_ws, &mut viewer_ws] {
+            let event = next_type(ws, "pin.added").await;
+            assert_eq!(event["kind"], "direct");
+            assert_eq!(event["message_id"], note_id);
+        }
+        ping(&mut barred_ws).await;
+
+        // Every stored pin event names its audience, and none names the barred member.
+        let rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT topic, audience::text[] FROM outbox WHERE topic IN ('pin.added', 'pin.removed') ORDER BY id",
+        )
+        .fetch_all(&db.owner)
+        .await
+        .expect("outbox");
+        assert!(rows.len() >= 3, "{rows:?}");
+        for (topic, audience) in rows {
+            let audience = audience.unwrap_or_else(|| panic!("{topic} has no audience"));
+            assert!(!audience.is_empty(), "{topic} has an empty audience");
+            assert!(
+                audience.iter().all(|id| id != &barred.user_id),
+                "{topic} names the barred member"
+            );
+        }
+
+        // Whoever cannot view the channel gets not_found on the list, which says nothing.
+        let (status, hidden) = Call::new(
+            Method::GET,
+            &format!("/v1/conversations/{staff_id}/pins"),
+        )
+        .token(&barred_token)
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+        assert_eq!(hidden["error"], "not_found");
+    })
+    .await;
+}
+
 async fn send_message(
     app: &Router,
     token: &str,
@@ -1568,6 +1980,19 @@ async fn mark_read(app: &Router, token: &str, conversation: &str, message_id: &s
         .send(app)
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+}
+
+async fn pin(app: &Router, token: &str, message: &str) -> (StatusCode, Value) {
+    let path = format!("/v1/messages/{message}/pin");
+    Call::new(Method::PUT, &path).token(token).send(app).await
+}
+
+async fn unpin(app: &Router, token: &str, message: &str) -> (StatusCode, Value) {
+    let path = format!("/v1/messages/{message}/pin");
+    Call::new(Method::DELETE, &path)
+        .token(token)
+        .send(app)
+        .await
 }
 
 async fn next_type(ws: &mut Ws, kind: &str) -> Value {

@@ -34,6 +34,7 @@ pub const FEATURES: &[&str] = &[
     "e2ee_self",
     "e2ee_group_generations",
     "presence_status",
+    "pins",
 ];
 
 pub fn routes() -> Router<PgPool> {
