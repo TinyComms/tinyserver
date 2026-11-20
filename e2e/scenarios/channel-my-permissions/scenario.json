@@ -1,0 +1,10 @@
+{
+  "id": "channel-my-permissions",
+  "title": "Channel list rows report what the caller may do in each channel",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "pending the matching tinyclient integration that reads my_permissions"
+}

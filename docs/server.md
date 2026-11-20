@@ -252,7 +252,7 @@ Live frames for these objects are in [`calls.md`](calls.md#messages): `channel.c
 
 | Route | Who | |
 | --- | --- | --- |
-| `GET /v1/channels` | view_channel on each | Channels the caller can view, ordered by `position`, `name`, `id`. There is no `my_permissions` field. `PUT /v1/layout` does not move these. |
+| `GET /v1/channels` | view_channel on each | Channels the caller can view, ordered by `position`, `name`, `id`. Each row adds `my_permissions`: the caller's bits in that channel, the same number every channel permission check uses; an owner has every bit. `PUT /v1/layout` does not move these. |
 | `POST /v1/channels` | manage_channels | `{name, category_id?, topic?, position?}` → `201` channel. Name 1 to 80 characters. Topic up to 1024, empty when left out. Position defaults to 0. Audited `channel.create`. |
 | `PATCH /v1/channels/{id}` | manage_channels in that channel | Any of `name`, `topic` (`null` clears to empty), `position`, `category_id` (`null` uncategorized). Audited `channel.update`. |
 | `DELETE /v1/channels/{id}` | manage_channels in that channel | `204`. Messages go with the channel. Attachment files are deleted. Audited `channel.delete`. |
@@ -272,7 +272,7 @@ Live frames for these objects are in [`calls.md`](calls.md#messages): `channel.c
 
 A timeout may still read. Posting, reacting, uploading, and typing while timed out are `403 forbidden`, not the call socket's `timed_out`. A banned person is `403 banned`.
 
-Channel JSON: `id`, `category_id`, `name`, `topic`, `position`, `created_by`, `created_at`, `overrides [{role_id, allow, deny}]`, `unread`, `last_message`. Direct JSON: `id`, `created_at`, `peer {user_id, display_name}`, `unread`, `last_read`, `peer_read`, `last_message`. `last_message` is `{id, author_id, body, created_at}` with `body` cut at 200 characters, or `null`. `unread` skips the caller's own messages and deleted ones. Peer pictures are not on the direct object; use the member list.
+Channel JSON: `id`, `category_id`, `name`, `topic`, `position`, `created_by`, `created_at`, `overrides [{role_id, allow, deny}]`, `unread`, `last_message`. Direct JSON: `id`, `created_at`, `peer {user_id, display_name}`, `unread`, `last_read`, `peer_read`, `last_message`. `last_message` is `{id, author_id, body, created_at}` with `body` cut at 200 characters, or `null`. `unread` skips the caller's own messages and deleted ones. The rows of `GET /v1/channels` add `my_permissions`, the caller's bits in that channel; events do not carry it. Peer pictures are not on the direct object; use the member list.
 
 Message JSON: `id`, `author_id`, `body`, `reply_to`, `client_id`, `created_at`, `edited_at`, `deleted_at`, `attachments`, `reactions [{emoji, count, me}]`. An attachment on a message is `{id, name, mime, kind, bytes, width, height, duration}`. `kind` is `image`, `gif`, `video`, or `file`. `scan_status` is on the upload response, not on a message's attachments.
 
