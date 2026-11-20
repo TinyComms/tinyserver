@@ -79,7 +79,7 @@ These are the decisions. A later plan should test them, not reopen them.
 
 ### Membership
 
-6. `POST /v1/groups` takes `user_ids` (the other people), optional `name`, optional `e2ee`, optional `client_id`. The caller is a member. Fewer than two other ids is `400 invalid`, because two people are a direct. There is no maximum on `user_ids`. The server does not answer `group_full`.
+6. `POST /v1/groups` takes `user_ids` (the other people), optional `name`, optional `e2ee`, optional `client_id`. The caller is a member. Fewer than two other ids is `400 invalid`, because two people are a direct. A create takes at most 100 ids, `400 invalid` past that; total membership stays uncapped and further people come in through the add route. The server does not answer `group_full`.
 7. Each other id uses the direct's split: missing or not a member is `404 not_found`, banned is `403 banned`, self or a duplicate is `400 invalid`. A bot is not a user, so it is `404 not_found`. Bots stay `403` from `messages::scoped` before SQL, and group routes use that gate.
 8. Any current member may add one person who would pass create. Already in is `200` and no second row. An add is never refused for size. Roles, overrides, and the owner flag do not add or remove anyone.
 9. Any current member may `PATCH` the name: 1 to 80 characters after trim, or empty. Empty is stored empty. The server does not store a title built from display names. No topic, category, or position.
@@ -96,7 +96,7 @@ These are the decisions. A later plan should test them, not reopen them.
 17. `e2ee` is fixed at create under the same four modes as a direct (`off`, `optional`, `new_required`, `required`). An omitted `e2ee` is false, then `app_e2ee_may_create` applies, the same as `POST /v1/directs`. Upgrade is one-way, the same as a channel, and does not relabel old plaintext. Creating the group does not copy messages out of a direct.
 18. The group never shares an MLS group with a channel or a direct. The audience hash uses a `group:` prefix. `e2ee_audience_groups` does not bind it to a channel.
 19. `app_e2ee_desired` has a group branch: active devices of current unbanned members. It must not fall through to the empty result it returns today for an id that is neither a channel nor a direct. An empty desired set is what reconcile uses to delete a group that still has leaves.
-20. The only size check is the existing MLS device cap, and only for an encrypted group. Create whose devices already exceed `e2ee_group_devices_max` is `400 e2ee_group_too_large`. That setting defaults to 2000 devices and an admin may set it from 2 to 20000. It is not a member cap. A plaintext group has no size check. Adding a person to an encrypted group that then grows past the cap uses the existing waiting behavior: the person is a member, a waiting device is not added and cannot decrypt, and a member who already has a device in the group still receives ciphertext. Welcome copies stay under 4 MiB by the existing `app_e2ee_adds_per_commit` batches. Do not add a member ceiling in front of this.
+20. Beyond the 100-id per-request limit on `POST /v1/groups` (criterion 6), the only size check is the existing MLS device cap, and only for an encrypted group. Create whose devices already exceed `e2ee_group_devices_max` is `400 e2ee_group_too_large`. That setting defaults to 2000 devices and an admin may set it from 2 to 20000. It is not a member cap. A plaintext group has no total-membership cap. Adding a person to an encrypted group that then grows past the cap uses the existing waiting behavior: the person is a member, a waiting device is not added and cannot decrypt, and a member who already has a device in the group still receives ciphertext. Welcome copies stay under 4 MiB by the existing `app_e2ee_adds_per_commit` batches. Do not add a member ceiling in front of this.
 21. Every group event uses an explicit non-empty audience of user ids. Never null, never `{}`. `app_scope_audience` must not widen an explicit audience. `channel.deleted` stays as it is.
 22. Audience for `group.created`, `group.updated`, and `group.member_added` is the current members, including someone just added. Audience for `group.member_left` is the remaining members and the person who left. Audience for `group.deleted` is only the last member. None of these go to the rest of the community.
 23. Read cursors are stored per member and not broadcast. There is no `peer_read` on a group. This follows the channel half of G3.9. The direct exception stays one other person and does not extend here. `app_mark_read` must not emit `read.updated` for a group.
@@ -135,7 +135,7 @@ These are the decisions. A later plan should test them, not reopen them.
 
 `e2ee` on the group is the same one-way flag as on a channel. `app_conv_e2ee`, `app_e2ee_upgrade`, and the forget path learn the third table. Deleting a group deletes its `e2ee_groups` row the way deleting a channel does.
 
-The next migration number is the next free file after `0034_e2ee_upgrade.sql`. This checkout has no `0017`–`0019` or `0026`–`0029`. Do not reuse a missing number.
+The next migration number is the highest existing file plus one (0041 today). This checkout has no `0017`–`0019` or `0026`–`0029`. Do not reuse a missing number.
 
 ### HTTP
 
