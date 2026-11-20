@@ -704,19 +704,19 @@ async fn a_channel_body_says_what_the_caller_may_do_there() {
                 .expect("my_permissions on every listed channel")
         };
         let owner_list = get_json(&app, &owner_token, "/v1/channels").await;
-        assert_eq!(owner_list.as_array().map(Vec::len), Some(3), "{owner_list}");
-        assert_eq!(mask_of(&owner_list, &open), 2097151);
-        assert_eq!(mask_of(&owner_list, &staff), 2097151);
-        assert_eq!(mask_of(&owner_list, &vault), 2097151);
+        assert_eq!(owner_list.as_array().map(Vec::len), Some(4), "{owner_list}");
+        assert_eq!(mask_of(&owner_list, &open), 4194303);
+        assert_eq!(mask_of(&owner_list, &staff), 4194303);
+        assert_eq!(mask_of(&owner_list, &vault), 4194303);
         let moderator_list = get_json(&app, &moderator_token, "/v1/channels").await;
-        assert_eq!(moderator_list.as_array().map(Vec::len), Some(3));
+        assert_eq!(moderator_list.as_array().map(Vec::len), Some(4));
         assert_eq!(mask_of(&moderator_list, &open), 63);
         assert_eq!(mask_of(&moderator_list, &staff), 571);
         assert_eq!(mask_of(&moderator_list, &vault), 575);
         let member_list = get_json(&app, &member_token, "/v1/channels").await;
         assert_eq!(
             member_list.as_array().map(Vec::len),
-            Some(2),
+            Some(3),
             "{member_list}"
         );
         assert_eq!(mask_of(&member_list, &open), 63);
