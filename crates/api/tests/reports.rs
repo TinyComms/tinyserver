@@ -1643,10 +1643,11 @@ async fn upgrading_grants_manage_reports_to_owners_and_manage_server_roles_only(
             .await
             .expect("upgrade to latest");
 
-        // A role with manage_server gets it, and keeps what it had.
+        // A role with manage_server gets it, and keeps what it had. 0045 hands manage_messages
+        // to the same class of role, by the same rule.
         assert_eq!(
             role_perms(&db, &manager).await,
-            perm::MANAGE_SERVER | perm::VIEW_CHANNEL | perm::MANAGE_REPORTS
+            perm::MANAGE_SERVER | perm::VIEW_CHANNEL | perm::MANAGE_REPORTS | perm::MANAGE_MESSAGES
         );
         // A role without it does not.
         assert_eq!(

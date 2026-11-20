@@ -1,0 +1,10 @@
+{
+  "id": "moderator-message-delete",
+  "title": "A moderator deletes another member's message, the tombstone reaches the channel, and a member's delete stays their own",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres", "two-people"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "API component integration, not native-client certification",
+  "native_client_proof": "pending the released client's moderator delete affordance and tombstone rendering"
+}
