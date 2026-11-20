@@ -548,6 +548,72 @@ async fn a_private_channels_events_reach_only_members_who_can_view_it() {
     .await;
 }
 
+/// A channel read tells the reader's own sockets, so their other devices clear the count,
+/// and nobody else hears it. A second read of the same message emits nothing.
+#[tokio::test]
+async fn a_channel_read_reaches_only_the_readers_other_sockets() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (_, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let server = serve(&db, api::Limits::default()).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        // Two sockets for the reader and one for the other member, all viewing the channel.
+        let (mut laptop_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut phone_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut member_ws, _) = connect(&server, &member_token, None).await;
+
+        let (status, message) =
+            send_message(&app, &member_token, &channel_id, json!({"body": "one"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{message}");
+        let message_id = message["id"].as_str().expect("message id").to_string();
+        next_type(&mut laptop_ws, "message.created").await;
+        next_type(&mut phone_ws, "message.created").await;
+        next_type(&mut member_ws, "message.created").await;
+
+        mark_read(&app, &owner_token, &channel_id, &message_id).await;
+
+        // Both of the reader's sockets learn the count is clear.
+        let event = next_type(&mut laptop_ws, "read.updated").await;
+        assert_eq!(event["conversation_id"], channel_id);
+        assert_eq!(event["kind"], "channel");
+        assert_eq!(event["user_id"], owner.user_id);
+        assert_eq!(event["message_id"], message_id);
+        let event = next_type(&mut phone_ws, "read.updated").await;
+        assert_eq!(event["kind"], "channel");
+        assert_eq!(event["message_id"], message_id);
+
+        // The other member hears nothing about it: its next durable frame is the pong.
+        ping(&mut member_ws).await;
+
+        // The cursor did not move, so the same message read again emits nothing.
+        mark_read(&app, &owner_token, &channel_id, &message_id).await;
+        ping(&mut laptop_ws).await;
+        ping(&mut phone_ws).await;
+
+        // The stored row says the same: the event names the reader and nobody else.
+        let (topic, audience): (String, Option<Vec<String>>) = sqlx::query_as(
+            "SELECT topic, audience::text[] FROM outbox WHERE topic = 'read.updated'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("outbox row");
+        assert_eq!(topic, "read.updated");
+        let audience = audience.unwrap_or_else(|| panic!("{topic} has no audience"));
+        assert_eq!(audience, vec![owner.user_id.clone()]);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn an_admin_can_lower_the_image_cap() {
     run(|db| async move {
