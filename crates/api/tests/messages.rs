@@ -30,14 +30,16 @@ async fn a_member_can_post_edit_react_and_read_but_not_create_a_channel() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
         assert_eq!(denied["error"], "forbidden");
 
+        // The community's own #general already exists, so this test makes its channel by
+        // another name: the list orders by position, name, id, and "chat" sorts first.
         let (status, channel) = Call::new(Method::POST, "/v1/channels")
             .token(&owner_token)
-            .json(json!({"name": "general", "topic": "hello"}))
+            .json(json!({"name": "chat", "topic": "hello"}))
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::CREATED, "{channel}");
         let channel_id = channel["id"].as_str().expect("channel id").to_string();
-        assert_eq!(channel["name"], "general");
+        assert_eq!(channel["name"], "chat");
         assert_eq!(channel["unread"], 0);
 
         let (status, first) =

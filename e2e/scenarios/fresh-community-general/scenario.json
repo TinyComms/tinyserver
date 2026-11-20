@@ -1,0 +1,10 @@
+{
+  "id": "fresh-community-general",
+  "title": "A community that has just received its first owner starts with one text channel named general",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "API integration against a real Postgres, not released-client or native GUI certification",
+  "native_client_proof": "a released client joined to a fresh community sees #general in the channel list it already draws; no client change is involved, and the released client cannot yet create, rename or delete it, which is the state of every text channel today"
+}
