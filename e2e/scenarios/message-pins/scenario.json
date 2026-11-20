@@ -1,0 +1,10 @@
+{
+  "id": "message-pins",
+  "title": "Members pin, list and unpin messages in channels and directs, capped at 50, gated by the channel moderation bit",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "API component integration, not native-client certification",
+  "native_client_proof": "pending a released client that drives the pin routes; the API tests are the proof until then"
+}

@@ -12,6 +12,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use super::call::{Access, Moves, Reason, Refused, Session};
 use super::frame::{Audience, DirectReady, Event, Incoming, Me as MeFrame, Out, RingReady};
 use super::hub::{access, Hub, Joined, Slot};
+use super::presence::{self, State};
 use super::ring::{RING_BURST, RING_EVERY};
 
 /// Why the server closed a socket. The code and reason are in `docs/calls.md`.
@@ -295,12 +296,14 @@ async fn serve(
     let mut moves = Moves::new(limits.call_move_burst, limits.call_move_every);
     let mut rekeys = Moves::new(limits.e2ee_rekey_burst, limits.e2ee_rekey_every);
     let mut rings = Moves::new(RING_BURST, RING_EVERY);
+    let mut presence_sets = Moves::new(limits.presence_burst, limits.presence_every);
     let mut asking = Asking {
         conn,
         bucket: &mut bucket,
         moves: &mut moves,
         rekeys: &mut rekeys,
         rings: &mut rings,
+        presence: &mut presence_sets,
     };
     let mut proving = Vec::new();
 
@@ -455,6 +458,8 @@ struct Asking<'a> {
     rekeys: &'a mut Moves,
     /// Ring, accept, decline, and cancel. Separate from joins and leaves.
     rings: &'a mut Moves,
+    /// `presence.set`. Its own small rate.
+    presence: &'a mut Moves,
 }
 
 async fn receive(
@@ -547,6 +552,7 @@ async fn receive(
         "call.state" => call_state(hub, me, &incoming),
         "call.quality" => call_quality(hub, me, incoming.video.as_deref()),
         "typing" => typing(hub, me, incoming.conversation_id.as_deref()).await,
+        "presence.set" => presence_set(hub, me, asking, &incoming),
         _ => Err("unknown_type"),
     };
     let reference = incoming.reference.as_ref();
@@ -613,6 +619,27 @@ async fn typing(hub: &Hub, me: &Me, conversation_id: Option<&str>) -> Answer {
         }
         Err(error) => Err(typing_code(&error)),
     }
+}
+
+/// Sets the person's availability and short status text, and tells everyone as the presence
+/// frame already does. The same audience as today's online and offline, and nothing about
+/// delivery changes. Bots have no presence. The text is checked before anything is stored.
+fn presence_set(hub: &Hub, me: &Me, asking: &mut Asking<'_>, incoming: &Incoming) -> Answer {
+    if me.is_bot() {
+        return Err("forbidden");
+    }
+    let Some(state) = incoming.state.as_deref().and_then(State::parse) else {
+        return Err("bad_frame");
+    };
+    let text = match incoming.text.as_deref() {
+        Some(raw) => presence::check_text(raw)?,
+        None => None,
+    };
+    if !asking.presence.take() {
+        return Err("slow_down");
+    }
+    hub.set_presence(&me.user_id, state, text)?;
+    Ok(Done::Ok)
 }
 
 fn typing_code(error: &db::MessageError) -> &'static str {
@@ -1321,6 +1348,9 @@ mod tests {
         assert!(!members.sees_topic("room.deleted"));
         assert!(members.sees_topic("member.renamed"));
         assert!(members.sees_ephemeral(r#"{"type":"presence","user_id":"u","online":false}"#));
+        assert!(members.sees_ephemeral(
+            r#"{"type":"presence","user_id":"u","online":true,"state":"dnd","text":"back at 4"}"#
+        ));
         assert!(!members.sees_ephemeral(r#"{"type":"call.left","room_id":"r"}"#));
 
         let unknown = bot(&["rooms.write"]);

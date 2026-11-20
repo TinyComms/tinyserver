@@ -10,6 +10,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use common::live::{connect, durable, ping, serve, Ws};
 use common::{first_owner, join, run, session, Call};
+use db::perm;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -30,14 +31,16 @@ async fn a_member_can_post_edit_react_and_read_but_not_create_a_channel() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
         assert_eq!(denied["error"], "forbidden");
 
+        // The community's own #general already exists, so this test makes its channel by
+        // another name: the list orders by position, name, id, and "chat" sorts first.
         let (status, channel) = Call::new(Method::POST, "/v1/channels")
             .token(&owner_token)
-            .json(json!({"name": "general", "topic": "hello"}))
+            .json(json!({"name": "chat", "topic": "hello"}))
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::CREATED, "{channel}");
         let channel_id = channel["id"].as_str().expect("channel id").to_string();
-        assert_eq!(channel["name"], "general");
+        assert_eq!(channel["name"], "chat");
         assert_eq!(channel["unread"], 0);
 
         let (status, first) =
@@ -548,6 +551,205 @@ async fn a_private_channels_events_reach_only_members_who_can_view_it() {
     .await;
 }
 
+/// A channel read tells the reader's own sockets, so their other devices clear the count,
+/// and nobody else hears it. A second read of the same message emits nothing.
+#[tokio::test]
+async fn a_channel_read_reaches_only_the_readers_other_sockets() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (_, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let server = serve(&db, api::Limits::default()).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        // Two sockets for the reader and one for the other member, all viewing the channel.
+        let (mut laptop_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut phone_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut member_ws, _) = connect(&server, &member_token, None).await;
+
+        let (status, message) =
+            send_message(&app, &member_token, &channel_id, json!({"body": "one"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{message}");
+        let message_id = message["id"].as_str().expect("message id").to_string();
+        next_type(&mut laptop_ws, "message.created").await;
+        next_type(&mut phone_ws, "message.created").await;
+        next_type(&mut member_ws, "message.created").await;
+
+        mark_read(&app, &owner_token, &channel_id, &message_id).await;
+
+        // Both of the reader's sockets learn the count is clear.
+        let event = next_type(&mut laptop_ws, "read.updated").await;
+        assert_eq!(event["conversation_id"], channel_id);
+        assert_eq!(event["kind"], "channel");
+        assert_eq!(event["user_id"], owner.user_id);
+        assert_eq!(event["message_id"], message_id);
+        let event = next_type(&mut phone_ws, "read.updated").await;
+        assert_eq!(event["kind"], "channel");
+        assert_eq!(event["message_id"], message_id);
+
+        // The other member hears nothing about it: its next durable frame is the pong.
+        ping(&mut member_ws).await;
+
+        // The cursor did not move, so the same message read again emits nothing.
+        mark_read(&app, &owner_token, &channel_id, &message_id).await;
+        ping(&mut laptop_ws).await;
+        ping(&mut phone_ws).await;
+
+        // The stored row says the same: the event names the reader and nobody else.
+        let (topic, audience): (String, Option<Vec<String>>) = sqlx::query_as(
+            "SELECT topic, audience::text[] FROM outbox WHERE topic = 'read.updated'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("outbox row");
+        assert_eq!(topic, "read.updated");
+        let audience = audience.unwrap_or_else(|| panic!("{topic} has no audience"));
+        assert_eq!(audience, vec![owner.user_id.clone()]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_channel_body_says_what_the_caller_may_do_there() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) = join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (_, roles) = Call::new(Method::GET, "/v1/roles")
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        let everyone = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == "@everyone")
+            .and_then(|role| role["id"].as_str())
+            .expect("everyone")
+            .to_string();
+        let (status, crew) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Mod", "permissions": 0, "color": "#22c55e"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{crew}");
+        let crew = crew["id"].as_str().expect("mod id").to_string();
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", moderator.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({ "role_ids": [crew] }))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        let mut channels = Vec::new();
+        for name in ["open", "staff", "vault"] {
+            let (status, channel) = Call::new(Method::POST, "/v1/channels")
+                .token(&owner_token)
+                .json(json!({ "name": name }))
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{channel}");
+            channels.push(channel["id"].as_str().expect("channel id").to_string());
+        }
+        let (open, staff, vault) = (
+            channels[0].clone(),
+            channels[1].clone(),
+            channels[2].clone(),
+        );
+        // staff: @everyone may look but not speak; vault: @everyone may not look. Mod manages
+        // staff and vault, in those channels only, and holds nothing server-wide.
+        let overrides = [
+            (staff.clone(), &everyone, 1, 5),
+            (staff.clone(), &crew, 513, 0),
+            (vault.clone(), &everyone, 0, 1),
+            (vault.clone(), &crew, 513, 0),
+        ];
+        for (channel, role, allow, deny) in overrides {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{channel}/overrides/{role}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+
+        // The mask a row reports is the one the checks enforce. An owner keeps every bit
+        // everywhere. The Mod gains manage_channels in staff and vault only. The plain member
+        // loses speak in staff and is not listed vault at all. A role the member does not hold
+        // adds nothing, so a role that vanishes cannot leave a stale bit behind.
+        let mask_of = |listed: &Value, id: &str| {
+            listed
+                .as_array()
+                .expect("channels")
+                .iter()
+                .find(|channel| channel["id"] == id)
+                .and_then(|channel| channel["my_permissions"].as_i64())
+                .expect("my_permissions on every listed channel")
+        };
+        let owner_list = get_json(&app, &owner_token, "/v1/channels").await;
+        assert_eq!(owner_list.as_array().map(Vec::len), Some(4), "{owner_list}");
+        assert_eq!(mask_of(&owner_list, &open), 4194303);
+        assert_eq!(mask_of(&owner_list, &staff), 4194303);
+        assert_eq!(mask_of(&owner_list, &vault), 4194303);
+        let moderator_list = get_json(&app, &moderator_token, "/v1/channels").await;
+        assert_eq!(moderator_list.as_array().map(Vec::len), Some(4));
+        assert_eq!(mask_of(&moderator_list, &open), 63);
+        assert_eq!(mask_of(&moderator_list, &staff), 571);
+        assert_eq!(mask_of(&moderator_list, &vault), 575);
+        let member_list = get_json(&app, &member_token, "/v1/channels").await;
+        assert_eq!(
+            member_list.as_array().map(Vec::len),
+            Some(3),
+            "{member_list}"
+        );
+        assert_eq!(mask_of(&member_list, &open), 63);
+        assert_eq!(mask_of(&member_list, &staff), 59);
+        assert_eq!(mask_of(&member_list, &staff) & 512, 0);
+
+        // The same numbers decide. Speak is gone from staff for the plain member and for the
+        // Mod, and the Mod's manage bit works there and nowhere else.
+        let (status, denied) =
+            send_message(&app, &member_token, &staff, json!({"body": "no"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, denied) =
+            send_message(&app, &moderator_token, &staff, json!({"body": "no"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        let (status, posted) =
+            send_message(&app, &member_token, &open, json!({"body": "yes"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        let (status, edited) = Call::new(Method::PATCH, &format!("/v1/channels/{staff}"))
+            .token(&moderator_token)
+            .json(json!({"topic": "moderated"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        let (status, refused) = Call::new(Method::PATCH, &format!("/v1/channels/{open}"))
+            .token(&moderator_token)
+            .json(json!({"topic": "no"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn an_admin_can_lower_the_image_cap() {
     run(|db| async move {
@@ -993,6 +1195,758 @@ async fn a_bad_hmac_is_refused() {
     .await;
 }
 
+#[tokio::test]
+async fn a_moderator_can_delete_another_members_message() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) = join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (author, author_token) = join(&db, &owner, "author@tinyserver.test", "member").await;
+        let server = serve(&db, api::Limits::default()).await;
+        let (mut author_ws, _) = connect(&server, &author_token, None).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        // The moderator holds manage_messages and nothing else; view comes from @everyone.
+        let (status, role) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Mods", "permissions": perm::MANAGE_MESSAGES}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{role}");
+        let role = role["id"].as_str().expect("role id").to_string();
+        let (status, given) =
+            Call::new(Method::PUT, &format!("/v1/members/{}/roles", moderator.user_id))
+                .token(&owner_token)
+                .json(json!({ "role_ids": [role] }))
+                .send(&app)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({ "name": "general" }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let (status, posted) =
+            send_message(&app, &author_token, &channel_id, json!({"body": "has to go"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        assert_eq!(
+            next_type(&mut author_ws, "message.created").await["message"]["body"],
+            "has to go"
+        );
+        let message_id = posted["id"].as_str().expect("message id").to_string();
+
+        let (status, removed) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+            .token(&moderator_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{removed}");
+
+        // The frame reaches the channel's members with the actor and none of the content.
+        let deleted = next_type(&mut author_ws, "message.deleted").await;
+        assert_eq!(deleted["message"]["id"], message_id);
+        assert_eq!(deleted["message"]["body"], "");
+        assert_eq!(deleted["message"]["attachments"], json!([]));
+        assert_eq!(deleted["message"]["deleted_by"], moderator.user_id);
+
+        // The stored page says the same: tombstone, no text, no attachments, who removed it.
+        let (status, page) = get_messages(&app, &author_token, &channel_id).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let tombstone = page
+            .as_array()
+            .expect("page")
+            .iter()
+            .find(|message| message["id"] == message_id)
+            .expect("tombstone");
+        assert_eq!(tombstone["body"], "");
+        assert!(tombstone["deleted_at"].is_string());
+        assert_eq!(tombstone["deleted_by"], moderator.user_id);
+
+        // The audit row names the actor and the author and carries ids, never the text.
+        let (actor, subject): (String, String) = sqlx::query_as(
+            "SELECT actor_id::text, subject_user_id::text FROM audit_log WHERE action = 'message.delete'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("audit row");
+        assert_eq!(actor, moderator.user_id);
+        assert_eq!(subject, author.user_id);
+        let (in_detail, channel_in_detail): (String, String) = sqlx::query_as(
+            "SELECT detail #>> '{message_id}', detail #>> '{channel_id}' FROM audit_log WHERE action = 'message.delete'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("audit detail");
+        assert_eq!(in_detail, message_id);
+        assert_eq!(channel_in_detail, channel_id);
+
+        // Deleting scrubs the text out of the stored frames, and the audit row never had it.
+        let leaks: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM outbox WHERE payload::text LIKE '%has to go%'), \
+             (SELECT count(*) FROM audit_log WHERE detail::text LIKE '%has to go%')",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("leaks");
+        assert_eq!(leaks, (0, 0), "{leaks:?}");
+
+        // The author's own delete is unchanged: no actor on the frame, no audit row for it.
+        let (status, mine) =
+            send_message(&app, &author_token, &channel_id, json!({"body": "my own"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{mine}");
+        next_type(&mut author_ws, "message.created").await;
+        let mine_id = mine["id"].as_str().expect("message id").to_string();
+        let (status, _) = Call::new(Method::DELETE, &format!("/v1/messages/{mine_id}"))
+            .token(&author_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let self_deleted = next_type(&mut author_ws, "message.deleted").await;
+        assert_eq!(self_deleted["message"]["deleted_by"], Value::Null);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'message.delete'")
+            .fetch_one(&db.owner)
+            .await
+            .expect("audit count");
+        assert_eq!(rows, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_member_without_the_bit_cannot_delete_and_a_direct_stays_author_only() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) = join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (author, author_token) = join(&db, &owner, "author@tinyserver.test", "member").await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, role) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Mods", "permissions": perm::MANAGE_MESSAGES}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{role}");
+        let mods = role["id"].as_str().expect("role id").to_string();
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", moderator.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({ "role_ids": [mods] }))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({ "name": "general" }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+        let (status, posted) =
+            send_message(&app, &author_token, &channel_id, json!({"body": "kept"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{posted}");
+        let message_id = posted["id"].as_str().expect("message id").to_string();
+
+        // A member without the bit gets the refusal a non-author always got, and a message
+        // that is not there stays "not found" for them.
+        let (status, refused) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+            .token(&member_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert_eq!(refused["error"], "forbidden");
+        let (status, missing) = Call::new(
+            Method::DELETE,
+            "/v1/messages/00000000-0000-0000-0000-000000000000",
+        )
+        .token(&member_token)
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        assert_eq!(missing["error"], "not_found");
+
+        // A member who cannot view the channel still gets "not found", so a refusal never
+        // says whether a message they may not see is there.
+        let (status, private) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({ "name": "private" }))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{private}");
+        let private_id = private["id"].as_str().expect("channel id").to_string();
+        let roles = get_json(&app, &owner_token, "/v1/roles").await;
+        let everyone = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == "@everyone")
+            .and_then(|role| role["id"].as_str())
+            .expect("everyone")
+            .to_string();
+        let (status, seers) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Seers", "permissions": perm::VIEW_CHANNEL}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{seers}");
+        let seers = seers["id"].as_str().expect("role id").to_string();
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", author.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({ "role_ids": [seers] }))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+        for (role, allow, deny) in [(&everyone, 0, 1), (&seers, 1, 0)] {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{private_id}/overrides/{role}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+        let (status, hidden) = send_message(
+            &app,
+            &author_token,
+            &private_id,
+            json!({"body": "in private"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{hidden}");
+        let hidden_id = hidden["id"].as_str().expect("message id").to_string();
+        let (status, refused) = Call::new(Method::DELETE, &format!("/v1/messages/{hidden_id}"))
+            .token(&member_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+
+        // The bit denied in the channel is a refusal. Allowed there, it works, so a server
+        // can hand the delete to one channel only.
+        for (allow, deny, want) in [
+            (0, perm::MANAGE_MESSAGES, StatusCode::FORBIDDEN),
+            (perm::MANAGE_MESSAGES, 0, StatusCode::NO_CONTENT),
+        ] {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{channel_id}/overrides/{mods}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+            let (status, gone) = Call::new(Method::DELETE, &format!("/v1/messages/{message_id}"))
+                .token(&moderator_token)
+                .send(&app)
+                .await;
+            assert_eq!(status, want, "{gone}");
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'message.delete'")
+                .fetch_one(&db.owner)
+                .await
+                .expect("audit count");
+        assert_eq!(rows, 1, "the refusals wrote no audit row");
+
+        // A direct stays author-only: the other person in it has no bit to hold.
+        let (status, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&member_token)
+            .json(json!({"user_id": author.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let (status, said) =
+            send_message(&app, &author_token, &direct_id, json!({"body": "just us"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        let said_id = said["id"].as_str().expect("message id").to_string();
+        let (status, refused) = Call::new(Method::DELETE, &format!("/v1/messages/{said_id}"))
+            .token(&member_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        let (status, _) = Call::new(Method::DELETE, &format!("/v1/messages/{said_id}"))
+            .token(&author_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // An old all-bits value still validates, and a bit the server does not know is
+        // dropped, not refused.
+        let (status, legacy) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Legacy", "permissions": 2097151}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{legacy}");
+        assert_eq!(legacy["permissions"], 2097151);
+        let (status, high) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "High", "permissions": 8388607}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{high}");
+        assert_eq!(high["permissions"], perm::ALL);
+
+        // A room override holds the bit now too.
+        let (status, room) = Call::new(Method::POST, "/v1/rooms")
+            .token(&owner_token)
+            .json(json!({"name": "Lounge"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{room}");
+        let room_id = room["id"].as_str().expect("room id").to_string();
+        let (status, put) = Call::new(
+            Method::PUT,
+            &format!("/v1/rooms/{room_id}/overrides/{mods}"),
+        )
+        .token(&owner_token)
+        .json(json!({"allow": perm::MANAGE_MESSAGES, "deny": 0}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let rooms = get_json(&app, &owner_token, "/v1/rooms").await;
+        let stored = rooms
+            .as_array()
+            .expect("rooms")
+            .iter()
+            .find(|room| room["id"] == room_id)
+            .expect("room")["overrides"]
+            .as_array()
+            .expect("overrides")
+            .iter()
+            .find(|stored| stored["role_id"] == mods)
+            .expect("override")
+            .clone();
+        assert_eq!(stored["allow"], perm::MANAGE_MESSAGES);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_message_can_be_pinned_listed_and_unpinned_and_a_delete_takes_its_pin() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (member, member_token) = join(&db, &owner, "pinner@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let (status, rules) = send_message(
+            &app,
+            &owner_token,
+            &channel_id,
+            json!({"body": "the rules"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{rules}");
+        let rules_id = rules["id"].as_str().expect("message id").to_string();
+        let (status, hello) =
+            send_message(&app, &member_token, &channel_id, json!({"body": "hello"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{hello}");
+        let hello_id = hello["id"].as_str().expect("message id").to_string();
+
+        let (status, pinned) = pin(&app, &owner_token, &rules_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        // Idempotent: the same pin again is still 204, and pins nothing twice.
+        let (status, pinned) = pin(&app, &owner_token, &rules_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        let (status, pinned) = pin(&app, &owner_token, &hello_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+
+        let pins = get_json(
+            &app,
+            &member_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 2, "{pins}");
+        // Newest pin first.
+        assert_eq!(pins[0]["id"], hello_id);
+        assert_eq!(pins[1]["id"], rules_id);
+        assert_eq!(pins[1]["body"], "the rules");
+
+        let (status, unpinned) = unpin(&app, &owner_token, &hello_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        // Idempotent: unpinning again is still 204.
+        let (status, unpinned) = unpin(&app, &owner_token, &hello_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        let pins = get_json(
+            &app,
+            &owner_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
+        assert_eq!(pins[0]["id"], rules_id);
+
+        // Deleting a pinned message takes the pin with it.
+        let (status, gone) = Call::new(Method::DELETE, &format!("/v1/messages/{rules_id}"))
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{gone}");
+        let pins = get_json(
+            &app,
+            &owner_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 0, "{pins}");
+
+        // A direct lets either person pin, with no permission bit.
+        let (status, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&owner_token)
+            .json(json!({"user_id": member.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let (status, note) = send_message(
+            &app,
+            &owner_token,
+            &direct_id,
+            json!({"body": "for tonight"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{note}");
+        let note_id = note["id"].as_str().expect("message id").to_string();
+        let (status, pinned) = pin(&app, &member_token, &note_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        let pins = get_json(
+            &app,
+            &member_token,
+            &format!("/v1/conversations/{direct_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
+        assert_eq!(pins[0]["id"], note_id);
+
+        // A message that is not there is not pinned either.
+        let (status, missing) =
+            pin(&app, &owner_token, "00000000-0000-0000-0000-000000000001").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        assert_eq!(missing["error"], "not_found");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_51st_pin_is_pin_limit_and_an_unpin_frees_a_slot() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let app = api::router(db.runtime.clone(), None);
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+
+        let mut ids = Vec::new();
+        for n in 0..51 {
+            let (status, message) = send_message(
+                &app,
+                &owner_token,
+                &channel_id,
+                json!({"body": format!("m{n}")}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{message}");
+            ids.push(message["id"].as_str().expect("message id").to_string());
+        }
+        for id in &ids[..50] {
+            let (status, pinned) = pin(&app, &owner_token, id).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        }
+        let (status, refused) = pin(&app, &owner_token, &ids[50]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"], "pin_limit");
+
+        // One pin fewer, and the next fits again.
+        let (status, unpinned) = unpin(&app, &owner_token, &ids[0]).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        let (status, pinned) = pin(&app, &owner_token, &ids[50]).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        let pins = get_json(
+            &app,
+            &owner_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 50);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pinning_follows_the_channel_override_mask() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (moderator, moderator_token) =
+            join(&db, &owner, "mod@tinyserver.test", "member").await;
+        let (_plain, plain_token) = join(&db, &owner, "plain@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let (status, channel) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "general"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_str().expect("channel id").to_string();
+        let (status, notice) =
+            send_message(&app, &owner_token, &channel_id, json!({"body": "read this"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{notice}");
+        let notice_id = notice["id"].as_str().expect("message id").to_string();
+        let (status, second) =
+            send_message(&app, &owner_token, &channel_id, json!({"body": "and this"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        let second_id = second["id"].as_str().expect("message id").to_string();
+
+        // Crew holds manage_channels; Ghost holds it too, and nobody holds Ghost.
+        let mut crew = String::new();
+        let mut ghost = String::new();
+        for (name, id) in [("Crew", &mut crew), ("Ghost", &mut ghost)] {
+            let (status, role) = Call::new(Method::POST, "/v1/roles")
+                .token(&owner_token)
+                .json(json!({"name": name, "permissions": 512}))
+                .send(&app)
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{role}");
+            *id = role["id"].as_str().expect("role id").to_string();
+        }
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", moderator.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({"role_ids": [crew]}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+
+        // A plain member may not pin; the moderator may.
+        let (status, denied) = pin(&app, &plain_token, &notice_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert_eq!(denied["error"], "forbidden");
+        let (status, pinned) = pin(&app, &moderator_token, &notice_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+
+        // An allow on a role the member does not hold grants nothing.
+        let (status, put) = Call::new(
+            Method::PUT,
+            &format!("/v1/channels/{channel_id}/overrides/{ghost}"),
+        )
+        .token(&owner_token)
+        .json(json!({"allow": 512, "deny": 0}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let (status, denied) = pin(&app, &plain_token, &second_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        // A deny on the role the moderator holds takes the permission away here.
+        let (status, put) = Call::new(
+            Method::PUT,
+            &format!("/v1/channels/{channel_id}/overrides/{crew}"),
+        )
+        .token(&owner_token)
+        .json(json!({"allow": 0, "deny": 512}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        let (status, denied) = pin(&app, &moderator_token, &second_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        // A timed out moderator may not pin or unpin either.
+        sqlx::query(
+            "UPDATE memberships SET timeout_until = now() + interval '1 day' WHERE user_id = $1::uuid",
+        )
+        .bind(&moderator.user_id)
+        .execute(&db.owner)
+        .await
+        .expect("timeout");
+        let (status, denied) = unpin(&app, &moderator_token, &notice_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        // The list needs only view, and the still-pinned message is on it.
+        let pins = get_json(
+            &app,
+            &plain_token,
+            &format!("/v1/conversations/{channel_id}/pins"),
+        )
+        .await;
+        assert_eq!(pins.as_array().expect("pins").len(), 1, "{pins}");
+        assert_eq!(pins[0]["id"], notice_id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pin_events_carry_ids_and_reach_only_the_conversations_audience() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (viewer, viewer_token) = join(&db, &owner, "viewer@tinyserver.test", "member").await;
+        let (barred, barred_token) = join(&db, &owner, "barred@tinyserver.test", "member").await;
+        let server = serve(&db, api::Limits::default()).await;
+        let app = api::router(db.runtime.clone(), None);
+
+        // A channel @everyone cannot view; Crew can. Set up before anyone connects.
+        let (_, roles) = Call::new(Method::GET, "/v1/roles")
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        let everyone = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|role| role["name"] == "@everyone")
+            .and_then(|role| role["id"].as_str())
+            .expect("everyone")
+            .to_string();
+        let (status, crew) = Call::new(Method::POST, "/v1/roles")
+            .token(&owner_token)
+            .json(json!({"name": "Crew", "permissions": 0, "color": "#22c55e"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{crew}");
+        let crew = crew["id"].as_str().expect("crew id").to_string();
+        let (status, given) = Call::new(
+            Method::PUT,
+            &format!("/v1/members/{}/roles", viewer.user_id),
+        )
+        .token(&owner_token)
+        .json(json!({"role_ids": [crew]}))
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given}");
+        let (status, staff) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "staff"}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{staff}");
+        let staff_id = staff["id"].as_str().expect("channel id").to_string();
+        for (role, allow, deny) in [(&everyone, 0, 1), (&crew, 1, 0)] {
+            let (status, put) = Call::new(
+                Method::PUT,
+                &format!("/v1/channels/{staff_id}/overrides/{role}"),
+            )
+            .token(&owner_token)
+            .json(json!({"allow": allow, "deny": deny}))
+            .send(&app)
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+        }
+        let (status, notice) =
+            send_message(&app, &owner_token, &staff_id, json!({"body": "the plan"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{notice}");
+        let notice_id = notice["id"].as_str().expect("message id").to_string();
+
+        let (mut owner_ws, _) = connect(&server, &owner_token, None).await;
+        let (mut viewer_ws, _) = connect(&server, &viewer_token, None).await;
+        let (mut barred_ws, _) = connect(&server, &barred_token, None).await;
+
+        let (status, pinned) = pin(&app, &owner_token, &notice_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        for ws in [&mut owner_ws, &mut viewer_ws] {
+            let event = next_type(ws, "pin.added").await;
+            assert_eq!(event["conversation_id"], staff_id);
+            assert_eq!(event["kind"], "channel");
+            assert_eq!(event["message_id"], notice_id);
+            assert_eq!(event["pinned_by"], owner.user_id);
+            // Ids only: no message object, no text, no ciphertext.
+            assert!(event.get("message").is_none(), "{event}");
+            assert!(event.get("body").is_none(), "{event}");
+            assert!(event.get("ciphertext").is_none(), "{event}");
+        }
+        // The member who cannot view the channel learns nothing.
+        ping(&mut barred_ws).await;
+
+        let (status, unpinned) = unpin(&app, &owner_token, &notice_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unpinned}");
+        let removed = next_type(&mut owner_ws, "pin.removed").await;
+        assert_eq!(removed["message_id"], notice_id);
+        assert_eq!(removed["pinned_by"], owner.user_id);
+        next_type(&mut viewer_ws, "pin.removed").await;
+        ping(&mut barred_ws).await;
+
+        // A direct: the event goes to the two people and to no one else.
+        let (status, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&owner_token)
+            .json(json!({"user_id": viewer.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{direct}");
+        let direct_id = direct["id"].as_str().expect("direct id").to_string();
+        let (status, note) =
+            send_message(&app, &owner_token, &direct_id, json!({"body": "psst"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{note}");
+        let note_id = note["id"].as_str().expect("message id").to_string();
+        let (status, pinned) = pin(&app, &owner_token, &note_id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{pinned}");
+        for ws in [&mut owner_ws, &mut viewer_ws] {
+            let event = next_type(ws, "pin.added").await;
+            assert_eq!(event["kind"], "direct");
+            assert_eq!(event["message_id"], note_id);
+        }
+        ping(&mut barred_ws).await;
+
+        // Every stored pin event names its audience, and none names the barred member.
+        let rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT topic, audience::text[] FROM outbox WHERE topic IN ('pin.added', 'pin.removed') ORDER BY id",
+        )
+        .fetch_all(&db.owner)
+        .await
+        .expect("outbox");
+        assert!(rows.len() >= 3, "{rows:?}");
+        for (topic, audience) in rows {
+            let audience = audience.unwrap_or_else(|| panic!("{topic} has no audience"));
+            assert!(!audience.is_empty(), "{topic} has an empty audience");
+            assert!(
+                audience.iter().all(|id| id != &barred.user_id),
+                "{topic} names the barred member"
+            );
+        }
+
+        // Whoever cannot view the channel gets not_found on the list, which says nothing.
+        let (status, hidden) = Call::new(
+            Method::GET,
+            &format!("/v1/conversations/{staff_id}/pins"),
+        )
+        .token(&barred_token)
+        .send(&app)
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+        assert_eq!(hidden["error"], "not_found");
+    })
+    .await;
+}
+
 async fn send_message(
     app: &Router,
     token: &str,
@@ -1026,6 +1980,19 @@ async fn mark_read(app: &Router, token: &str, conversation: &str, message_id: &s
         .send(app)
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+}
+
+async fn pin(app: &Router, token: &str, message: &str) -> (StatusCode, Value) {
+    let path = format!("/v1/messages/{message}/pin");
+    Call::new(Method::PUT, &path).token(token).send(app).await
+}
+
+async fn unpin(app: &Router, token: &str, message: &str) -> (StatusCode, Value) {
+    let path = format!("/v1/messages/{message}/pin");
+    Call::new(Method::DELETE, &path)
+        .token(token)
+        .send(app)
+        .await
 }
 
 async fn next_type(ws: &mut Ws, kind: &str) -> Value {

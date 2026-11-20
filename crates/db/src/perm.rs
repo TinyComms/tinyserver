@@ -24,9 +24,12 @@ pub const MANAGE_SERVER: i64 = 1 << 19;
 /// Lists, reads, triages, annotates and links actions to abuse reports. Not in @everyone and not
 /// in the room override mask.
 pub const MANAGE_REPORTS: i64 = 1 << 20;
+/// Deletes another member's message in a channel the holder can view. A direct stays author-only.
+/// In the room override mask, not in @everyone.
+pub const MANAGE_MESSAGES: i64 = 1 << 21;
 
 /// Every bit this server knows. Unknown bits in a request are dropped.
-pub const ALL: i64 = (1 << 21) - 1;
+pub const ALL: i64 = (1 << 22) - 1;
 const _: () = assert!(ALL < 1 << 53, "permissions must fit in a JSON number");
 
 /// The bits a room override may allow or deny.
@@ -41,7 +44,8 @@ pub const CHANNEL: i64 = VIEW_CHANNEL
     | MUTE_MEMBERS
     | DEAFEN_MEMBERS
     | MOVE_MEMBERS
-    | DISCONNECT_MEMBERS;
+    | DISCONNECT_MEMBERS
+    | MANAGE_MESSAGES;
 
 /// What @everyone has on a new server.
 pub const EVERYONE: i64 = VIEW_CHANNEL | CONNECT | SPEAK | VIDEO | SHARE_SCREEN | VOICE_ACTIVITY;
@@ -74,12 +78,13 @@ mod tests {
 
     #[test]
     fn the_masks_match_the_sql() {
-        assert_eq!(ALL, 2_097_151);
+        assert_eq!(ALL, 4_194_303);
         assert_eq!(MANAGE_REPORTS, 1_048_576);
-        // Not something a member has by default, and not something a room can override.
-        assert_eq!(EVERYONE & MANAGE_REPORTS, 0);
-        assert_eq!(CHANNEL & MANAGE_REPORTS, 0);
-        assert_eq!(CHANNEL, 246_399);
+        assert_eq!(MANAGE_MESSAGES, 2_097_152);
+        // Not something a member has by default, but something a room can override.
+        assert_eq!(EVERYONE & MANAGE_MESSAGES, 0);
+        assert_eq!(CHANNEL & MANAGE_MESSAGES, MANAGE_MESSAGES);
+        assert_eq!(CHANNEL, 2_343_551);
         assert_eq!(EVERYONE, 63);
     }
 

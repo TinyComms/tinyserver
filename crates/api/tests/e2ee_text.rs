@@ -3337,7 +3337,7 @@ async fn an_edit_is_a_row_of_its_own_and_a_delete_removes_the_ciphertext_and_the
         };
         assert_eq!(in_outbox(first["id"].as_str().expect("id").to_string()).await, 1);
         assert_eq!(in_outbox(edit["id"].as_str().expect("id").to_string()).await, 1);
-        // Only the author may delete, and there is no moderator delete.
+        // A member without the bit may not delete it; the author does.
         let (status, _) = w
             .send(Method::DELETE, &format!("/v1/messages/{}", first["id"].as_str().expect("id")), &p.other.token, None)
             .await;
@@ -3365,6 +3365,81 @@ async fn an_edit_is_a_row_of_its_own_and_a_delete_removes_the_ciphertext_and_the
         // A deleted message cannot be edited.
         let (status, refused) = say(&w.app, &mut p.owner, &p.conv, "back", json!({"kind": "edit", "target_id": first["id"]})).await;
         assert_eq!((status, refused["error"].as_str()), (StatusCode::NOT_FOUND, Some("not_found")));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_moderator_can_delete_another_members_encrypted_message() {
+    run(|db| async move {
+        let w = world(db).await;
+        let mut p = pair(&w, "del").await;
+        let (mod_user, mod_token) = w.member("mod").await;
+        // The moderator holds manage_messages and nothing else, and is not in the group:
+        // removing the row needs no key, no plaintext and no say in the group.
+        let (status, role) = w
+            .send(
+                Method::POST,
+                "/v1/roles",
+                &w.owner_token,
+                Some(json!({"name": "Mods", "permissions": db::perm::MANAGE_MESSAGES})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{role}");
+        let role = role["id"].as_str().expect("role").to_string();
+        let (status, _) = w
+            .send(
+                Method::PUT,
+                &format!("/v1/members/{}/roles", mod_user.user_id),
+                &w.owner_token,
+                Some(json!({ "role_ids": [role] })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, said) = say(&w.app, &mut p.owner, &p.conv, MARKER, json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        let said_id = said["id"].as_str().expect("id").to_string();
+
+        let (status, _) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/messages/{said_id}"),
+                &mod_token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The row lost its ciphertext with the delete, whoever ran it, and the marker is in
+        // nothing the server keeps.
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM messages WHERE ciphertext IS NOT NULL")
+                .fetch_one(&w.db.owner)
+                .await
+                .expect("count");
+        assert_eq!(left, 0);
+        let (_, page) = messages(&w.app, &mod_token, &p.conv).await;
+        let row = page
+            .as_array()
+            .expect("page")
+            .iter()
+            .find(|row| row["id"] == said_id)
+            .expect("tombstone");
+        assert!(row["deleted_at"].is_string());
+        assert!(row["ciphertext"].is_null());
+        assert_eq!(row["deleted_by"], mod_user.user_id);
+        let (_, page) = messages(&w.app, &p.other.token, &p.conv).await;
+        for row in page.as_array().expect("page") {
+            assert!(row["ciphertext"].is_null() && row["body"] == "", "{row}");
+        }
+        let in_outbox: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE payload::text LIKE '%ZEPHYR-QUOKKA%'",
+        )
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("count");
+        assert_eq!(in_outbox, 0);
     })
     .await;
 }

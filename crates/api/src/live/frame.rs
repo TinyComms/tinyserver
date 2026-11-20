@@ -126,6 +126,10 @@ pub(crate) struct Incoming {
     #[serde(rename = "ref")]
     pub reference: Option<Value>,
     pub room_id: Option<String>,
+    /// `presence.set`: `online`, `idle`, `dnd`, or `offline`.
+    pub state: Option<String>,
+    /// `presence.set`: a short text shown with the person, at most 128 characters.
+    pub text: Option<String>,
     /// `call.ring`, `call.accept`, `call.decline`, `call.cancel`, and `call.join` of a direct.
     pub direct_id: Option<String>,
     /// Scoped `call.leave`: the accepted/live attempt, so stale cleanup cannot end a new ring.
@@ -221,7 +225,17 @@ pub(crate) enum Out<'a> {
         direct_call: Option<DirectReady<'a>>,
     },
     #[serde(rename = "presence")]
-    Presence { user_id: &'a str, online: bool },
+    Presence {
+        user_id: &'a str,
+        online: bool,
+        /// The availability the person set with `presence.set`, when they set one. Left off
+        /// otherwise, so the plain frame is what it always was.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<&'static str>,
+        /// The text the person set, when they set one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<&'a str>,
+    },
     #[serde(rename = "call.joined")]
     CallJoined {
         room_id: &'a str,
@@ -513,6 +527,40 @@ mod tests {
         assert_eq!(
             slots.text(),
             r#"{"type":"call.slots","call_id":"c-1","audio":[],"video":{"mid":"2","user_id":"u","kind":"share"}}"#
+        );
+    }
+
+    #[test]
+    fn a_presence_frame_carries_what_the_person_set_and_a_plain_one_is_what_it_always_was() {
+        let idle = Out::Presence {
+            user_id: "u",
+            online: true,
+            state: Some("idle"),
+            text: None,
+        };
+        assert_eq!(
+            idle.text(),
+            r#"{"type":"presence","user_id":"u","online":true,"state":"idle"}"#
+        );
+        let dnd = Out::Presence {
+            user_id: "u",
+            online: true,
+            state: Some("dnd"),
+            text: Some("back at 4"),
+        };
+        assert_eq!(
+            dnd.text(),
+            r#"{"type":"presence","user_id":"u","online":true,"state":"dnd","text":"back at 4"}"#
+        );
+        let plain = Out::Presence {
+            user_id: "u",
+            online: false,
+            state: None,
+            text: None,
+        };
+        assert_eq!(
+            plain.text(),
+            r#"{"type":"presence","user_id":"u","online":false}"#
         );
     }
 
