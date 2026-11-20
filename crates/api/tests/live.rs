@@ -430,6 +430,79 @@ async fn two_sockets_for_one_person_are_one_presence() {
 }
 
 #[tokio::test]
+async fn a_member_sets_a_state_and_a_text_and_the_other_sockets_hear_it() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let server = serve(&db, Limits::default()).await;
+        let token = owner_token(&db).await;
+        let (mut watcher, _) = connect(&server, &token, None).await;
+
+        let (mut member_ws, _) = connect(&server, &member_token, None).await;
+        assert_eq!(
+            frame(&mut watcher).await,
+            json!({"type": "presence", "user_id": member.user_id, "online": true})
+        );
+
+        let reply = answer(
+            &mut member_ws,
+            json!({"type": "presence.set", "ref": "p1", "state": "idle"}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "p1"}));
+        assert_eq!(
+            frame(&mut watcher).await,
+            json!({"type": "presence", "user_id": member.user_id, "online": true, "state": "idle"})
+        );
+
+        let reply = answer(
+            &mut member_ws,
+            json!({"type": "presence.set", "ref": "p2", "state": "dnd", "text": "  back at 4  "}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "p2"}));
+        assert_eq!(
+            frame(&mut watcher).await,
+            json!({"type": "presence", "user_id": member.user_id, "online": true, "state": "dnd", "text": "back at 4"})
+        );
+
+        // Over the cap, and a control character: refused, and nothing broadcast.
+        let long = "x".repeat(129);
+        let reply = answer(
+            &mut member_ws,
+            json!({"type": "presence.set", "ref": "p3", "state": "idle", "text": long}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "error", "ref": "p3", "code": "bad_frame"}));
+        let reply = answer(
+            &mut member_ws,
+            json!({"type": "presence.set", "ref": "p4", "state": "idle", "text": "line\nbreak"}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "error", "ref": "p4", "code": "bad_frame"}));
+        let reply = answer(
+            &mut member_ws,
+            json!({"type": "presence.set", "ref": "p5", "state": "away"}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "error", "ref": "p5", "code": "bad_frame"}));
+
+        // The refused frames reached nobody: the next frame the watcher sees is the clear.
+        let reply = answer(
+            &mut member_ws,
+            json!({"type": "presence.set", "ref": "p6", "state": "online"}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "p6"}));
+        assert_eq!(
+            frame(&mut watcher).await,
+            json!({"type": "presence", "user_id": member.user_id, "online": true, "state": "online"})
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_rolled_back_write_emits_nothing() {
     run(|db| async move {
         let owner = first_owner(&db).await;

@@ -221,6 +221,55 @@ async fn a_bot_with_members_read_receives_member_events() {
 }
 
 #[tokio::test]
+async fn a_bot_without_members_read_hears_no_set_state_and_cannot_set_one() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let server = serve(
+            &db,
+            Limits {
+                poll: Duration::from_millis(20),
+                ..Limits::default()
+            },
+        )
+        .await;
+        let (mut member_ws, _) = connect(&server, &member_token, None).await;
+
+        let bot = issue(&db, &owner, "Watcher", &["rooms.read"]).await;
+        let (mut bot_ws, ready) = connect_bot(&server, &bot.token).await;
+        assert_eq!(ready["online"], json!([]));
+        not_a_member(&db, &bot.id).await;
+
+        let reply = answer(
+            &mut member_ws,
+            json!({"type": "presence.set", "ref": "p1", "state": "idle"}),
+        )
+        .await;
+        assert_eq!(reply, json!({"type": "ok", "ref": "p1"}));
+        // The broadcast happened: the member's own socket carries the state it set.
+        let own = frame(&mut member_ws).await;
+        assert_eq!(own["state"], "idle", "{own}");
+
+        let extra = besides_pong(&mut bot_ws).await;
+        assert!(
+            extra.is_empty(),
+            "rooms.read received presence state: {extra:?}"
+        );
+
+        let reply = answer(
+            &mut bot_ws,
+            json!({"type": "presence.set", "ref": "b1", "state": "dnd"}),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            json!({"type": "error", "ref": "b1", "code": "forbidden"})
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_bot_with_no_scope_stays_up_and_receives_no_room_or_member_payload() {
     run(|db| async move {
         let owner = first_owner(&db).await;

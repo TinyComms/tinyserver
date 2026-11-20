@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused, Session};
 use super::e2ee;
 use super::frame::{Event, Out, SlotFrame, VideoSlotFrame};
+use super::presence::{Setting, State};
 use super::socket::Close;
 use super::Limits;
 
@@ -101,6 +102,8 @@ struct Person {
     bot: bool,
     conns: Vec<Conn>,
     epoch: u64,
+    /// The availability and text the person set. Memory only: gone with the entry.
+    presence: Option<Setting>,
 }
 
 struct Conn {
@@ -275,7 +278,7 @@ impl Hub {
             proofs,
         });
         if arrived && !bot {
-            self.announce(user_id, true);
+            self.announce(user_id, true, None);
         }
         // Subscribed under the lock, so every presence frame after this snapshot reaches it.
         let presence = self.ephemeral.subscribe();
@@ -390,16 +393,45 @@ impl Hub {
                 .is_some_and(|person| person.conns.is_empty() && person.epoch == epoch);
             if gone {
                 let person = people.users.remove(&user_id);
-                if person.is_some_and(|person| !person.bot) {
-                    hub.announce(&user_id, false);
+                if let Some(person) = person.filter(|person| !person.bot) {
+                    hub.announce(&user_id, false, person.presence.as_ref());
                 }
             }
         });
     }
 
-    fn announce(&self, user_id: &str, online: bool) {
-        let frame = Out::Presence { user_id, online }.text();
+    fn announce(&self, user_id: &str, online: bool, presence: Option<&Setting>) {
+        let (state, text) = match presence {
+            Some(setting) => (Some(setting.state.as_str()), setting.text.as_deref()),
+            None => (None, None),
+        };
+        let frame = Out::Presence {
+            user_id,
+            online,
+            state,
+            text,
+        }
+        .text();
         let _ = self.ephemeral.send(Arc::from(frame));
+    }
+
+    /// Records the availability `user_id` set and tells everyone, as online and offline are
+    /// told. The same audience as today's presence, and nothing about delivery changes.
+    /// Memory only. `not_found` when the person has no socket on this hub any more.
+    pub fn set_presence(
+        &self,
+        user_id: &str,
+        state: State,
+        text: Option<String>,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let Some(person) = people.users.get_mut(user_id) else {
+            return Err("not_found");
+        };
+        let setting = Setting { state, text };
+        person.presence = Some(setting.clone());
+        self.announce(user_id, true, Some(&setting));
+        Ok(())
     }
 
     /// How many people `room_id` takes for `user_id`: its own limit, else the server's, and
@@ -1397,6 +1429,79 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+
+    /// A hub whose people map holds one plain person, and a subscriber to its presence.
+    fn presence_hub(grace: Duration) -> (Arc<Hub>, broadcast::Receiver<Arc<str>>) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/direct_call_unit")
+            .expect("lazy pool");
+        let limits = Limits {
+            presence_grace: grace,
+            ..Limits::default()
+        };
+        let hub = Hub::start(pool, limits, None);
+        lock(&hub.people)
+            .users
+            .insert("u".into(), Person::default());
+        let watcher = hub.ephemeral.subscribe();
+        (hub, watcher)
+    }
+
+    async fn next_frame(watcher: &mut broadcast::Receiver<Arc<str>>) -> Value {
+        let frame = tokio::time::timeout(Duration::from_secs(2), watcher.recv())
+            .await
+            .expect("a frame in time")
+            .expect("sent");
+        serde_json::from_str(&frame).expect("json")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setting_a_state_is_broadcast_with_the_text_the_person_set() {
+        let (hub, mut watcher) = presence_hub(Limits::default().presence_grace);
+        hub.set_presence("u", State::Idle, None)
+            .expect("the person is on the hub");
+        assert_eq!(
+            next_frame(&mut watcher).await,
+            json!({"type": "presence", "user_id": "u", "online": true, "state": "idle"})
+        );
+        hub.set_presence("u", State::Dnd, Some("back at 4".into()))
+            .expect("the person is on the hub");
+        assert_eq!(
+            next_frame(&mut watcher).await,
+            json!({"type": "presence", "user_id": "u", "online": true, "state": "dnd", "text": "back at 4"})
+        );
+        assert!(hub.set_presence("gone", State::Idle, None).is_err());
+        hub.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn going_offline_announces_the_state_the_person_had_set() {
+        let (hub, mut watcher) = presence_hub(Duration::from_millis(50));
+        let (kick, _kicked) = oneshot::channel();
+        let (direct, _inbox) = mpsc::channel(16);
+        let (proofs, _asked) = mpsc::unbounded_channel();
+        {
+            let mut people = lock(&hub.people);
+            let person = people.users.get_mut("u").expect("person");
+            person.conns.push(Conn {
+                id: 1,
+                kick,
+                direct,
+                proofs,
+            });
+            person.presence = Some(Setting {
+                state: State::Dnd,
+                text: Some("back at 4".into()),
+            });
+        }
+        hub.leave("u", 1);
+        assert_eq!(
+            next_frame(&mut watcher).await,
+            json!({"type": "presence", "user_id": "u", "online": false, "state": "dnd", "text": "back at 4"})
+        );
+        hub.close();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_accept_never_overtakes_the_ringing_frame() {
