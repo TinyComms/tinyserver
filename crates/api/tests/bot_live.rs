@@ -224,7 +224,7 @@ async fn a_bot_with_members_read_receives_member_events() {
 async fn a_bot_without_members_read_hears_no_set_state_and_cannot_set_one() {
     run(|db| async move {
         let owner = first_owner(&db).await;
-        let (member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
         let server = serve(
             &db,
             Limits {
