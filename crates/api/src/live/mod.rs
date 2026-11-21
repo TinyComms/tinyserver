@@ -11,6 +11,7 @@ mod presence;
 mod ring;
 mod socket;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,10 +54,17 @@ pub struct Limits {
     /// Client messages a second, and the burst above that.
     pub messages_per_second: u32,
     pub message_burst: u32,
-    /// People in one room's call. A join past it gets `full`.
-    pub call_room_max: usize,
-    /// People in calls on the server. A join past it gets `server_full`.
-    pub call_server_max: usize,
+    /// Optional operator ceiling on people in one room's call. `None` means no fixed room
+    /// cap (a room's own `user_limit` still applies). A join past it gets `room_full`.
+    pub call_room_max: Option<usize>,
+    /// Optional operator ceiling on people in calls on the server. `None` means admission is
+    /// bounded by measured capacity (egress budget and media thread load). A join past it
+    /// gets `server_full`.
+    pub call_server_max: Option<usize>,
+    /// Server upload budget for calls, in kb/s. `None` means no upload budget.
+    pub call_egress_kbps: Option<u32>,
+    /// Receive audio slots per listener (default 11), used to project audio egress.
+    pub call_audio_slots: usize,
     /// Joins and leaves one socket may make at once, and how often it gets one more back.
     pub call_move_burst: u32,
     pub call_move_every: Duration,
@@ -86,8 +94,10 @@ impl Default for Limits {
             poll: Duration::from_secs(5),
             messages_per_second: 20,
             message_burst: 40,
-            call_room_max: 12,
-            call_server_max: 32,
+            call_room_max: None,
+            call_server_max: None,
+            call_egress_kbps: None,
+            call_audio_slots: 11,
             call_move_burst: 5,
             call_move_every: Duration::from_secs(3),
             seen_every: Duration::from_secs(30),
@@ -220,6 +230,7 @@ async fn upgrade(
     let Ok(since) = parse_since(query.as_deref()) else {
         return live_refused("invalid");
     };
+    let features = parse_features(query.as_deref());
     let ws = match ws {
         Ok(ws) => ws,
         Err(rejection) => {
@@ -242,7 +253,7 @@ async fn upgrade(
     let frame = hub.limits.frame_bytes;
     ws.max_message_size(frame)
         .max_frame_size(frame)
-        .on_upgrade(move |socket| socket::run(hub, socket, slot, me, since))
+        .on_upgrade(move |socket| socket::run(hub, socket, slot, me, since, features))
 }
 
 fn live_refused(reason: &'static str) -> Response {
@@ -265,6 +276,11 @@ fn session_unavailable(error: SessionError) -> Response {
     }
 }
 
+/// Known live-socket feature names an app may declare via `?features=...`.
+const LIVE_FEATURES: &[&str] = &["group_calls"];
+const MAX_FEATURES: usize = 16;
+const MAX_FEATURE_LEN: usize = 32;
+
 /// `since` is a seq the client already has. Other parameters are ignored.
 fn parse_since(query: Option<&str>) -> Result<Option<i64>, ()> {
     let Some(query) = query else {
@@ -282,9 +298,42 @@ fn parse_since(query: Option<&str>) -> Result<Option<i64>, ()> {
     Ok(since)
 }
 
+/// Comma-separated lower-case live feature names from `?features=...`.
+/// Unknown or malformed values are ignored, never a refusal. At most 16 names of at most 32 bytes.
+fn parse_features(query: Option<&str>) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(query) = query else {
+        return out;
+    };
+    let mut seen = 0usize;
+    for pair in query.split('&') {
+        let Some(value) = pair.strip_prefix("features=") else {
+            continue;
+        };
+        for name in value.split(',') {
+            if seen >= MAX_FEATURES {
+                return out;
+            }
+            seen += 1;
+            if name.is_empty()
+                || name.len() > MAX_FEATURE_LEN
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                continue;
+            }
+            if LIVE_FEATURES.contains(&name) {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_since;
+    use super::{parse_features, parse_since};
 
     #[test]
     fn since_is_a_non_negative_seq() {
@@ -292,9 +341,40 @@ mod tests {
         assert_eq!(parse_since(Some("")), Ok(None));
         assert_eq!(parse_since(Some("since=0")), Ok(Some(0)));
         assert_eq!(parse_since(Some("x=1&since=42")), Ok(Some(42)));
+        assert_eq!(
+            parse_since(Some("since=42&features=group_calls")),
+            Ok(Some(42))
+        );
         assert!(parse_since(Some("since=")).is_err());
         assert!(parse_since(Some("since=-1")).is_err());
         assert!(parse_since(Some("since=1e3")).is_err());
         assert!(parse_since(Some("since=99999999999999999999")).is_err());
+    }
+
+    #[test]
+    fn features_parses_known_names_and_ignores_the_rest() {
+        assert!(parse_features(None).is_empty());
+        assert!(parse_features(Some("")).is_empty());
+        assert!(parse_features(Some("features=")).is_empty());
+        assert!(parse_features(Some("since=10")).is_empty());
+
+        let one = parse_features(Some("features=group_calls"));
+        assert_eq!(one.len(), 1);
+        assert!(one.contains("group_calls"));
+
+        let with_since = parse_features(Some(
+            "since=99&features=unknown_one,group_calls,GROUP_CALLS",
+        ));
+        assert_eq!(with_since.len(), 1);
+        assert!(with_since.contains("group_calls"));
+
+        // Over the 16-item cap: the 17th entry is ignored even if it is known.
+        let sixteen_unknown = vec!["x"; 16].join(",");
+        let over_cap = format!("features={sixteen_unknown},group_calls");
+        assert!(parse_features(Some(&over_cap)).is_empty());
+
+        // Over 32 bytes is ignored.
+        let too_long = "a".repeat(33);
+        assert!(parse_features(Some(&format!("features={too_long}"))).is_empty());
     }
 }

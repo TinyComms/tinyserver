@@ -97,7 +97,7 @@ async fn a_room_the_owner_makes_reaches_a_member() {
                 "created_by": owner.user_id,
                 "created_at": made.created_at,
                 "category_id": null,
-                "position": 0,
+                "position": 1,
                 "topic": "",
                 "user_limit": 0,
                 "bitrate_kbps": 64,
@@ -1039,8 +1039,8 @@ async fn caps_refuse_a_full_room_and_a_full_server() {
             people.push(join(&db, &owner, &format!("p{n}@tinyserver.test"), "member").await);
         }
         let limits = Limits {
-            call_room_max: 2,
-            call_server_max: 3,
+            call_room_max: Some(2),
+            call_server_max: Some(3),
             ..Limits::default()
         };
         let server = serve(&db, limits).await;

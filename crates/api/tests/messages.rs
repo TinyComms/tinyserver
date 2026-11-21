@@ -56,8 +56,17 @@ async fn a_member_can_post_edit_react_and_read_but_not_create_a_channel() {
         let second_id = second["id"].as_str().expect("message id").to_string();
 
         let listed = get_json(&app, &owner_token, "/v1/channels").await;
-        assert_eq!(listed[0]["unread"].as_i64(), Some(2));
-        assert_eq!(listed[0]["last_message"]["body"], "two");
+        let chat = |listed: &Value| -> Value {
+            listed
+                .as_array()
+                .expect("channels")
+                .iter()
+                .find(|c| c["id"] == channel_id)
+                .cloned()
+                .expect("chat channel")
+        };
+        assert_eq!(chat(&listed)["unread"].as_i64(), Some(2));
+        assert_eq!(chat(&listed)["last_message"]["body"], "two");
 
         let page = get_json(
             &app,
@@ -78,13 +87,13 @@ async fn a_member_can_post_edit_react_and_read_but_not_create_a_channel() {
 
         mark_read(&app, &owner_token, &channel_id, &first_id).await;
         let listed = get_json(&app, &owner_token, "/v1/channels").await;
-        assert_eq!(listed[0]["unread"].as_i64(), Some(1));
+        assert_eq!(chat(&listed)["unread"].as_i64(), Some(1));
         mark_read(&app, &owner_token, &channel_id, &first_id).await;
         let listed = get_json(&app, &owner_token, "/v1/channels").await;
-        assert_eq!(listed[0]["unread"].as_i64(), Some(1));
+        assert_eq!(chat(&listed)["unread"].as_i64(), Some(1));
         mark_read(&app, &owner_token, &channel_id, &second_id).await;
         let listed = get_json(&app, &owner_token, "/v1/channels").await;
-        assert_eq!(listed[0]["unread"].as_i64(), Some(0));
+        assert_eq!(chat(&listed)["unread"].as_i64(), Some(0));
 
         let (status, edited) = Call::new(Method::PATCH, &format!("/v1/messages/{first_id}"))
             .token(&member_token)
@@ -705,9 +714,9 @@ async fn a_channel_body_says_what_the_caller_may_do_there() {
         };
         let owner_list = get_json(&app, &owner_token, "/v1/channels").await;
         assert_eq!(owner_list.as_array().map(Vec::len), Some(4), "{owner_list}");
-        assert_eq!(mask_of(&owner_list, &open), 4194303);
-        assert_eq!(mask_of(&owner_list, &staff), 4194303);
-        assert_eq!(mask_of(&owner_list, &vault), 4194303);
+        assert_eq!(mask_of(&owner_list, &open), perm::ALL);
+        assert_eq!(mask_of(&owner_list, &staff), perm::ALL);
+        assert_eq!(mask_of(&owner_list, &vault), perm::ALL);
         let moderator_list = get_json(&app, &moderator_token, "/v1/channels").await;
         assert_eq!(moderator_list.as_array().map(Vec::len), Some(4));
         assert_eq!(mask_of(&moderator_list, &open), 63);

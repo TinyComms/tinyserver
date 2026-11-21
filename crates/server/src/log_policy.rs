@@ -83,6 +83,10 @@ const DENY_EXACT: &[&str] = &[
     "notes",
     "report_text",
     "moderator_note",
+    // Message search: what a member searched for never belongs in a log line.
+    "q",
+    "query",
+    "search_query",
 ];
 
 const DENY_SUFFIX: &[&str] = &["_token", "_secret", "_password", "_cookie", "_key"];
@@ -116,6 +120,7 @@ const PARAMS: &[&str] = &[
     "pub_key=",
     "a=ice-pwd:",
     "a=fingerprint:",
+    "q=",
 ];
 const JSON_FIELDS: &[&str] = &[
     "token",
@@ -1188,5 +1193,29 @@ mod tests {
         assert!(!path.exists());
         assert!(fresh.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_queries_are_redacted_as_fields_and_params() {
+        let policy = LogPolicy::default();
+        let line = render(
+            &policy,
+            Sink::Operator,
+            &EventParts {
+                target: "api::messages",
+                level: Level::WARN,
+                message: "GET /v1/search?q=secret-lantern&limit=25",
+                fields: &[
+                    ("q", "secret-lantern"),
+                    ("query", "another-secret"),
+                    ("search_query", "third-secret"),
+                ],
+            },
+        )
+        .expect("rendered");
+        assert!(!line.contains("secret-lantern"), "{line}");
+        assert!(!line.contains("another-secret"), "{line}");
+        assert!(!line.contains("third-secret"), "{line}");
+        assert!(line.contains("q=[redacted]"), "{line}");
     }
 }

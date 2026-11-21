@@ -93,17 +93,40 @@ pub struct Category {
     pub position: i32,
 }
 
-/// One bucket of `PUT /v1/layout`: a category, or `None` for the uncategorized rooms.
+/// What an item inside a `PUT /v1/layout` bucket names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutKind {
+    Channel,
+    Room,
+}
+
+/// One item in a `PUT /v1/layout` bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutItem {
+    pub kind: LayoutKind,
+    pub id: String,
+}
+
+/// One bucket of `PUT /v1/layout`: a category, or `None` for the uncategorized items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutBucket {
     pub category_id: Option<String>,
-    pub room_ids: Vec<String>,
+    pub items: Vec<LayoutItem>,
+}
+
+/// One text channel's position as returned by `PUT /v1/layout`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LayoutChannel {
+    pub id: String,
+    pub category_id: Option<String>,
+    pub position: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Layout {
     pub categories: Vec<Category>,
     pub rooms: Vec<Room>,
+    pub channels: Vec<LayoutChannel>,
 }
 
 fn settings_select() -> String {
@@ -530,9 +553,9 @@ pub async fn delete_category(
     Ok(())
 }
 
-/// Orders categories by their place in `buckets` and puts each listed room in its bucket's
-/// category at its place there. Rooms and categories not listed keep where they are. Needs
-/// manage_channels, and manage_channels in every room moved.
+/// Orders categories by their place in `buckets` and puts each listed room or text channel in its
+/// bucket's category at its place there. Items and categories not listed keep where they are.
+/// Needs manage_channels, and manage_channels in every room and channel moved.
 pub async fn set_layout(
     pool: &PgPool,
     caller: &Caller,
@@ -540,12 +563,16 @@ pub async fn set_layout(
 ) -> Result<Layout, CommunityError> {
     let mut categories = Vec::new();
     let mut rooms = Vec::new();
+    let mut channels = Vec::new();
     for bucket in buckets {
         if let Some(category) = &bucket.category_id {
             categories.push(uuid(category)?);
         }
-        for room in &bucket.room_ids {
-            rooms.push(uuid(room)?);
+        for item in &bucket.items {
+            match item.kind {
+                LayoutKind::Room => rooms.push(uuid(&item.id)?),
+                LayoutKind::Channel => channels.push(uuid(&item.id)?),
+            }
         }
     }
     let unique = |ids: &[String]| {
@@ -554,7 +581,13 @@ pub async fn set_layout(
         sorted.dedup();
         sorted.len() == ids.len()
     };
-    if !unique(&categories) || !unique(&rooms) || buckets.len() > 500 || rooms.len() > 2000 {
+    let total_items = rooms.len().saturating_add(channels.len());
+    if !unique(&categories)
+        || !unique(&rooms)
+        || !unique(&channels)
+        || buckets.len() > 500
+        || total_items > 2000
+    {
         return Err(CommunityError::Invalid);
     }
     let mut tx = scope(pool, caller).await?;
@@ -579,31 +612,49 @@ pub async fn set_layout(
             }
             None => None,
         };
-        for (index, room) in bucket.room_ids.iter().enumerate() {
-            let updated = sqlx::query(
-                "UPDATE rooms SET category_id = $2::uuid, position = $3 WHERE id = $1::uuid",
-            )
-            .bind(uuid(room)?)
-            .bind(category.as_deref())
-            .bind(i32::try_from(index).map_err(|_| CommunityError::Invalid)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(from_sql)?;
-            if updated.rows_affected() == 0 {
-                // Missing, hidden, or no manage_channels there.
-                return Err(CommunityError::NotFound);
+        for (index, item) in bucket.items.iter().enumerate() {
+            let item_pos = i32::try_from(index).map_err(|_| CommunityError::Invalid)?;
+            let item_id = uuid(&item.id)?;
+            match item.kind {
+                LayoutKind::Room => {
+                    let updated = sqlx::query(
+                        "UPDATE rooms SET category_id = $2::uuid, position = $3 WHERE id = $1::uuid",
+                    )
+                    .bind(&item_id)
+                    .bind(category.as_deref())
+                    .bind(item_pos)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(from_sql)?;
+                    if updated.rows_affected() == 0 {
+                        // Missing, hidden, or no manage_channels there.
+                        return Err(CommunityError::NotFound);
+                    }
+                }
+                LayoutKind::Channel => {
+                    let _: bool = sqlx::query_scalar(
+                        "SELECT app_layout_move_channel($1::uuid, $2::uuid, $3)",
+                    )
+                    .bind(&item_id)
+                    .bind(category.as_deref())
+                    .bind(item_pos)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(from_sql)?;
+                }
             }
         }
     }
     let layout = Layout {
         categories: categories_in(&mut tx).await?,
         rooms: rooms_in(&mut tx).await?,
+        channels: layout_channels_in(&mut tx).await?,
     };
     audit(
         &mut tx,
         "layout.update",
         "layout",
-        serde_json::json!({ "categories": categories, "rooms": rooms }),
+        serde_json::json!({ "categories": categories, "rooms": rooms, "channels": channels }),
     )
     .await?;
     let rooms: Vec<Value> = layout
@@ -619,6 +670,29 @@ pub async fn set_layout(
     .await?;
     tx.commit().await.map_err(from_sql)?;
     Ok(layout)
+}
+
+async fn layout_channels_in(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Vec<LayoutChannel>, CommunityError> {
+    let rows = sqlx::query(
+        "SELECT c.id::text, c.category_id::text, c.position
+         FROM channels c
+         LEFT JOIN categories cat ON cat.id = c.category_id
+         ORDER BY (c.category_id IS NOT NULL), cat.position NULLS FIRST, c.position, c.name, c.id",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(from_sql)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(LayoutChannel {
+                id: row.try_get(0).map_err(from_sql)?,
+                category_id: row.try_get(1).map_err(from_sql)?,
+                position: row.try_get(2).map_err(from_sql)?,
+            })
+        })
+        .collect()
 }
 
 fn settings_from(row: &PgRow) -> Result<ServerSettings, CommunityError> {

@@ -20,6 +20,7 @@ pub struct Role {
     pub position: i32,
     pub permissions: i64,
     pub hoist: bool,
+    pub mentionable: bool,
     /// @everyone.
     pub default: bool,
     pub member_count: i64,
@@ -31,6 +32,7 @@ pub struct NewRole {
     pub color: Option<String>,
     pub permissions: Option<i64>,
     pub hoist: Option<bool>,
+    pub mentionable: Option<bool>,
 }
 
 /// `None` leaves a field as it is; `color: Some(None)` clears the colour.
@@ -40,10 +42,11 @@ pub struct RolePatch {
     pub color: Option<Option<String>>,
     pub permissions: Option<i64>,
     pub hoist: Option<bool>,
+    pub mentionable: Option<bool>,
 }
 
 const ROLE_SELECT: &str = "SELECT r.id::text, r.name, r.color, r.position, r.permissions, r.hoist,
-                                  r.is_default,
+                                  r.mentionable, r.is_default,
                                   CASE WHEN r.is_default
                                        THEN (SELECT count(*) FROM memberships)
                                        ELSE (SELECT count(*) FROM member_roles mr
@@ -91,11 +94,12 @@ pub async fn create_role(
     };
     let permissions = input.permissions.unwrap_or(0) & perm::ALL;
     let mut tx = scope(pool, caller).await?;
-    let id: String = sqlx::query_scalar("SELECT app_role_create($1, $2, $3, $4)::text")
+    let id: String = sqlx::query_scalar("SELECT app_role_create($1, $2, $3, $4, $5)::text")
         .bind(&name)
         .bind(color.as_deref())
         .bind(permissions)
         .bind(input.hoist.unwrap_or(false))
+        .bind(input.mentionable.unwrap_or(false))
         .fetch_one(&mut *tx)
         .await
         .map_err(from_sql)?;
@@ -126,12 +130,14 @@ pub async fn update_role(
         .permissions
         .map_or(current.permissions, |bits| bits & perm::ALL);
     let hoist = patch.hoist.unwrap_or(current.hoist);
-    sqlx::query("SELECT app_role_update($1::uuid, $2, $3, $4, $5)")
+    let mentionable = patch.mentionable.unwrap_or(current.mentionable);
+    sqlx::query("SELECT app_role_update($1::uuid, $2, $3, $4, $5, $6)")
         .bind(id)
         .bind(&name)
         .bind(color.as_deref())
         .bind(permissions)
         .bind(hoist)
+        .bind(mentionable)
         .execute(&mut *tx)
         .await
         .map_err(from_sql)?;
@@ -217,8 +223,9 @@ fn role_from(row: &PgRow) -> Result<Role, CommunityError> {
         position: row.try_get(3).map_err(from_sql)?,
         permissions: row.try_get(4).map_err(from_sql)?,
         hoist: row.try_get(5).map_err(from_sql)?,
-        default: row.try_get(6).map_err(from_sql)?,
-        member_count: row.try_get(7).map_err(from_sql)?,
+        mentionable: row.try_get(6).map_err(from_sql)?,
+        default: row.try_get(7).map_err(from_sql)?,
+        member_count: row.try_get(8).map_err(from_sql)?,
     })
 }
 

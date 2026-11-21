@@ -775,7 +775,7 @@ async fn overrides_shape_room_permissions_and_visibility() {
         assert_eq!(room["video_enabled"], false);
         assert_eq!(room["e2ee_required"], true);
         assert_eq!(room["name"], "Stage");
-        for bad in [json!({"bitrate_kbps": 8}), json!({"user_limit": 100})] {
+        for bad in [json!({"bitrate_kbps": 8}), json!({"user_limit": -1})] {
             let (status, _) = send(
                 &app,
                 &owner_token,
@@ -1621,4 +1621,214 @@ fn tiny_png() -> Vec<u8> {
         0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
         0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ]
+}
+
+#[tokio::test]
+async fn layout_orders_text_channels_and_rooms_together_and_respects_permissions() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (_member, member_token) = join(&db, &owner, "member@tinyserver.test", "member").await;
+        let (manager, manager_token) = join(&db, &owner, "manager@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        // Create a role with manage_channels and assign it to `manager`.
+        let (status, mgr_role) = send(
+            &app,
+            &owner_token,
+            Method::POST,
+            "/v1/roles",
+            json!({"name": "ChannelMgr", "permissions": db::perm::VIEW_CHANNEL | db::perm::MANAGE_CHANNELS}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{mgr_role}");
+        let mgr_role_id = mgr_role["id"].as_str().expect("role id").to_string();
+        let (status, _) = send(
+            &app,
+            &owner_token,
+            Method::PUT,
+            &format!("/v1/members/{}/roles", manager.user_id),
+            json!({"role_ids": [mgr_role_id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Create a category, two text channels, and two voice rooms.
+        let (status, cat) = send(
+            &app,
+            &owner_token,
+            Method::POST,
+            "/v1/categories",
+            json!({"name": "Mixed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{cat}");
+        let cat_id = cat["id"].as_str().expect("cat id").to_string();
+
+        let (status, ch_a) = send(
+            &app,
+            &owner_token,
+            Method::POST,
+            "/v1/channels",
+            json!({"name": "alpha"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{ch_a}");
+        let ch_a_id = ch_a["id"].as_str().expect("ch_a id").to_string();
+
+        let (status, ch_b) = send(
+            &app,
+            &owner_token,
+            Method::POST,
+            "/v1/channels",
+            json!({"name": "secret"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{ch_b}");
+        let ch_b_id = ch_b["id"].as_str().expect("ch_b id").to_string();
+
+        let room_a = common::live::room(&db, &owner, "VoiceA").await;
+        let room_b = common::live::room(&db, &owner, "VoiceB").await;
+
+        // Deny view_channel for @everyone on ch_b, and deny manage_channels for ChannelMgr on ch_b.
+        let (_, roles) = get(&app, &owner_token, "/v1/roles").await;
+        let everyone_id = roles
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|r| r["default"] == true)
+            .and_then(|r| r["id"].as_str())
+            .expect("everyone role")
+            .to_string();
+        let (status, _) = send(
+            &app,
+            &owner_token,
+            Method::PUT,
+            &format!("/v1/channels/{ch_b_id}/overrides/{everyone_id}"),
+            json!({"allow": 0, "deny": db::perm::VIEW_CHANNEL}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send(
+            &app,
+            &owner_token,
+            Method::PUT,
+            &format!("/v1/channels/{ch_b_id}/overrides/{mgr_role_id}"),
+            json!({"allow": db::perm::VIEW_CHANNEL, "deny": db::perm::MANAGE_CHANNELS}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Manager cannot move ch_b (manage_channels denied there) -> 404 and nothing changes.
+        let (status, _) = send(
+            &app,
+            &manager_token,
+            Method::PUT,
+            "/v1/layout",
+            json!({"categories": [{
+                "id": cat_id,
+                "items": [
+                    {"kind": "channel", "id": ch_a_id},
+                    {"kind": "channel", "id": ch_b_id}
+                ]
+            }]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, channels_after_fail) = get(&app, &owner_token, "/v1/channels").await;
+        let ch_a_row = channels_after_fail
+            .as_array()
+            .expect("channels")
+            .iter()
+            .find(|c| c["id"] == ch_a_id)
+            .expect("ch_a");
+        assert!(ch_a_row["category_id"].is_null());
+
+        // Sending both room_ids and items in one bucket -> 400 invalid.
+        let (status, _) = send(
+            &app,
+            &owner_token,
+            Method::PUT,
+            "/v1/layout",
+            json!({"categories": [{
+                "id": null,
+                "room_ids": [room_a.id],
+                "items": [{"kind": "room", "id": room_a.id}]
+            }]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Owner sets a mixed layout: ch_b (0), room_a (1), ch_a (2), room_b (3) inside Mixed.
+        let (status, layout) = send(
+            &app,
+            &owner_token,
+            Method::PUT,
+            "/v1/layout",
+            json!({"categories": [{
+                "id": cat_id,
+                "items": [
+                    {"kind": "channel", "id": ch_b_id},
+                    {"kind": "room", "id": room_a.id},
+                    {"kind": "channel", "id": ch_a_id},
+                    {"kind": "room", "id": room_b.id}
+                ]
+            }]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{layout}");
+        let layout_channels = layout["channels"].as_array().expect("channels in layout");
+        let pos_of = |id: &str| {
+            layout_channels
+                .iter()
+                .find(|c| c["id"] == id)
+                .map(|c| (c["category_id"].as_str(), c["position"].as_i64()))
+        };
+        assert_eq!(pos_of(&ch_b_id), Some((Some(cat_id.as_str()), Some(0))));
+        assert_eq!(pos_of(&ch_a_id), Some((Some(cat_id.as_str()), Some(2))));
+
+        let (_, rooms) = get(&app, &owner_token, "/v1/rooms").await;
+        let room_pos = |id: &str| {
+            rooms
+                .as_array()
+                .expect("rooms")
+                .iter()
+                .find(|r| r["id"] == id)
+                .map(|r| (r["category_id"].as_str(), r["position"].as_i64()))
+        };
+        assert_eq!(room_pos(&room_a.id), Some((Some(cat_id.as_str()), Some(1))));
+        assert_eq!(room_pos(&room_b.id), Some((Some(cat_id.as_str()), Some(3))));
+
+        // Member cannot see ch_b in GET /v1/channels.
+        let (_, member_channels) = get(&app, &member_token, "/v1/channels").await;
+        assert!(
+            !member_channels
+                .as_array()
+                .expect("member channels")
+                .iter()
+                .any(|c| c["id"] == ch_b_id),
+            "member should not see hidden channel"
+        );
+
+        // Legacy `room_ids` leaves text channels untouched.
+        let (status, _) = send(
+            &app,
+            &owner_token,
+            Method::PUT,
+            "/v1/layout",
+            json!({"categories": [{"id": cat_id, "room_ids": [room_b.id, room_a.id]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, channels_after_legacy) = get(&app, &owner_token, "/v1/channels").await;
+        let ch_a_after = channels_after_legacy
+            .as_array()
+            .expect("channels")
+            .iter()
+            .find(|c| c["id"] == ch_a_id)
+            .expect("ch_a");
+        assert_eq!(ch_a_after["category_id"], cat_id);
+        assert_eq!(ch_a_after["position"], 2);
+    })
+    .await;
 }

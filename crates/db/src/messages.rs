@@ -119,11 +119,83 @@ pub enum MessageError {
     /// The conversation already holds the most pins it may (50).
     #[error("pin limit")]
     PinLimit,
+    /// The caller already holds the most blocks they may (1000).
+    #[error("block limit")]
+    BlockLimit,
+    /// The community already holds the most emoji or stickers it may (200 per kind).
+    #[error("emoji limit")]
+    EmojiLimit,
+    /// An emoji or sticker with this name already exists.
+    #[error("name taken")]
+    NameTaken,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
     Database(#[from] DbError),
 }
+
+/// One mention span in a plaintext message. Offsets are UTF-8 byte offsets into the trimmed body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionInput {
+    pub kind: String,
+    pub id: Option<String>,
+    pub start: i32,
+    pub end: i32,
+}
+
+/// One sender-supplied link preview on a plaintext message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewInput {
+    pub url: String,
+    pub site: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image_attachment_id: Option<String>,
+}
+
+/// A plaintext message post.
+pub struct NewMessage<'a> {
+    pub body: &'a str,
+    pub reply_to: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+    pub attachments: &'a [String],
+    pub mentions: Option<&'a [MentionInput]>,
+    pub previews: Option<&'a [PreviewInput]>,
+    pub emoji: &'a [crate::EmojiSpan],
+    pub sticker_id: Option<&'a str>,
+}
+
+/// A plaintext message edit. At least one of `body` or `previews` must be present.
+pub struct MessageEdit<'a> {
+    pub body: Option<&'a str>,
+    pub mentions: Option<&'a [MentionInput]>,
+    pub previews: Option<&'a [PreviewInput]>,
+}
+
+/// Maximum number of mention entries accepted on one message.
+pub const MENTIONS_MAX: usize = 50;
+/// Maximum number of link previews accepted on one message.
+pub const PREVIEWS_MAX: usize = 3;
+pub const PREVIEW_URL_MAX: usize = 2048;
+pub const PREVIEW_SITE_MAX: usize = 100;
+pub const PREVIEW_TITLE_MAX: usize = 200;
+pub const PREVIEW_DESCRIPTION_MAX: usize = 500;
+
+/// Parameters for `GET /v1/search`.
+pub struct SearchQuery<'a> {
+    pub q: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub author_id: Option<&'a str>,
+    pub before: Option<&'a str>,
+    pub limit: Option<i32>,
+}
+
+/// Default and maximum page size for message search.
+pub const SEARCH_DEFAULT_LIMIT: i32 = 25;
+pub const SEARCH_MAX_LIMIT: i32 = 50;
+pub const SEARCH_QUERY_MIN: usize = 2;
+pub const SEARCH_QUERY_MAX: usize = 200;
 
 /// One file a member is uploading. Bytes are written next to the row, under the upload directory.
 pub struct NewAttachment {
@@ -294,6 +366,17 @@ pub async fn list_messages(
     before: Option<&str>,
     limit: i32,
 ) -> Result<Value, MessageError> {
+    list_messages_filtered(pool, caller, conversation, before, limit, false).await
+}
+
+pub async fn list_messages_filtered(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    before: Option<&str>,
+    limit: i32,
+    threads_only: bool,
+) -> Result<Value, MessageError> {
     let before = match before {
         Some(before) if !before.is_empty() => Some(before),
         _ => None,
@@ -301,10 +384,175 @@ pub async fn list_messages(
     let mut tx = scoped(pool, caller).await?;
     let value = json_in(
         &mut tx,
-        "SELECT app_list_messages($1::uuid, $2::uuid, $3)",
-        |query| query.bind(conversation).bind(before).bind(limit),
+        "SELECT app_list_messages_filtered($1::uuid, $2::uuid, $3, $4)",
+        |query| {
+            query
+                .bind(conversation)
+                .bind(before)
+                .bind(limit)
+                .bind(threads_only)
+        },
     )
     .await?;
+    commit(tx, value).await
+}
+
+/// Searches plaintext messages the caller may read, newest first.
+/// Bots are refused (`Forbidden`). Rate-limited to 30 searches/min (`SlowDown`).
+pub async fn search_messages(
+    pool: &PgPool,
+    caller: &Caller,
+    params: &SearchQuery<'_>,
+) -> Result<Value, MessageError> {
+    let valid = validate_search(params)?;
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_search_messages($1, $2::uuid, $3::uuid, $4::uuid, $5)",
+        |query| {
+            query
+                .bind(valid.q)
+                .bind(valid.conversation_id)
+                .bind(valid.author_id)
+                .bind(valid.before)
+                .bind(valid.limit)
+        },
+    )
+    .await?;
+    commit(tx, value).await
+}
+
+struct ValidatedSearch<'a> {
+    q: &'a str,
+    conversation_id: Option<&'a str>,
+    author_id: Option<&'a str>,
+    before: Option<&'a str>,
+    limit: i32,
+}
+
+fn validate_search<'a>(params: &SearchQuery<'a>) -> Result<ValidatedSearch<'a>, MessageError> {
+    let q = params.q.trim();
+    let len = q.chars().count();
+    if !(SEARCH_QUERY_MIN..=SEARCH_QUERY_MAX).contains(&len) || q.chars().any(char::is_control) {
+        return Err(MessageError::Invalid);
+    }
+    let conversation_id = blank_to_none(params.conversation_id);
+    if let Some(id) = conversation_id {
+        if !is_uuid(id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let author_id = blank_to_none(params.author_id);
+    if let Some(id) = author_id {
+        if !is_uuid(id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let before = blank_to_none(params.before);
+    if let Some(id) = before {
+        if !is_uuid(id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let limit = params.limit.unwrap_or(SEARCH_DEFAULT_LIMIT);
+    if !(1..=SEARCH_MAX_LIMIT).contains(&limit) {
+        return Err(MessageError::Invalid);
+    }
+    Ok(ValidatedSearch {
+        q,
+        conversation_id,
+        author_id,
+        before,
+        limit,
+    })
+}
+
+pub async fn list_thread_messages(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+    before: Option<&str>,
+    limit: i32,
+) -> Result<Value, MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    let before = match before {
+        Some(before) if !before.is_empty() => Some(before),
+        _ => None,
+    };
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_list_thread_messages($1::uuid, $2::uuid, $3)",
+        |query| query.bind(root_id).bind(before).bind(limit),
+    )
+    .await?;
+    commit(tx, value).await
+}
+
+pub async fn mark_thread_read(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+    message_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    if !is_uuid(message_id) {
+        return Err(MessageError::Invalid);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_mark_thread_read($1::uuid, $2::uuid)")
+        .bind(root_id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+pub async fn follow_thread(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_follow_thread($1::uuid)")
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+pub async fn unfollow_thread(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_unfollow_thread($1::uuid)")
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+pub async fn list_followed_threads(pool: &PgPool, caller: &Caller) -> Result<Value, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(&mut tx, "SELECT app_list_followed_threads()", |query| query).await?;
     commit(tx, value).await
 }
 
@@ -312,32 +560,57 @@ pub async fn post_message(
     pool: &PgPool,
     caller: &Caller,
     conversation: &str,
-    body: &str,
-    reply_to: Option<&str>,
-    client_id: Option<&str>,
-    attachments: &[String],
+    input: &NewMessage<'_>,
 ) -> Result<Value, MessageError> {
-    let reply_to = blank_to_none(reply_to);
+    let reply_to = blank_to_none(input.reply_to);
     if let Some(reply_to) = reply_to {
         if !is_uuid(reply_to) {
             return Err(MessageError::Invalid);
         }
     }
-    let client_id = blank_to_none(client_id);
-    let attachments = uuid_list(attachments)?;
+    let sticker_id = blank_to_none(input.sticker_id);
+    if let Some(sticker_id) = sticker_id {
+        if !is_uuid(sticker_id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let thread_id = blank_to_none(input.thread_id);
+    if let Some(thread_id) = thread_id {
+        if !is_uuid(thread_id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let client_id = blank_to_none(input.client_id);
+    let attachments = uuid_list(input.attachments)?;
+    let trimmed = input.body.trim();
+    let mentions_json = match input.mentions {
+        Some(list) => Some(prepare_mentions(trimmed, list)?),
+        None => None,
+    };
+    let previews_json = match input.previews {
+        Some(list) => Some(prepare_previews(Some(trimmed), list)?),
+        None => None,
+    };
+    let emoji_json = serde_json::to_value(input.emoji).map_err(|_| MessageError::Invalid)?;
     let mut tx = scoped(pool, caller).await?;
     let value = json_in(
         &mut tx,
-        "SELECT app_post_message($1::uuid, $2, $3::uuid, $4,
+        "SELECT app_post_message_thread($1::uuid, $2, $3::uuid, $4,
             CASE WHEN $5::text[] IS NULL THEN NULL
-            ELSE (SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($5::text[]) AS item) END)",
+            ELSE (SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($5::text[]) AS item) END,
+            $6, $7::uuid, $8::uuid, $9, $10)",
         |query| {
             query
                 .bind(conversation)
-                .bind(body)
+                .bind(input.body)
                 .bind(reply_to)
                 .bind(client_id)
                 .bind(attachments)
+                .bind(emoji_json)
+                .bind(sticker_id)
+                .bind(thread_id)
+                .bind(mentions_json)
+                .bind(previews_json)
         },
     )
     .await?;
@@ -348,14 +621,139 @@ pub async fn edit_message(
     pool: &PgPool,
     caller: &Caller,
     id: &str,
-    body: &str,
+    edit: &MessageEdit<'_>,
 ) -> Result<Value, MessageError> {
+    if edit.body.is_none() && edit.previews.is_none() {
+        return Err(MessageError::Invalid);
+    }
+    let trimmed = edit.body.map(str::trim);
+    let mentions_json = match (trimmed, edit.mentions) {
+        (Some(body), Some(list)) => Some(prepare_mentions(body, list)?),
+        (None, Some(_)) => return Err(MessageError::Invalid),
+        (_, None) => None,
+    };
+    let previews_json = match edit.previews {
+        Some(list) => Some(prepare_previews(trimmed, list)?),
+        None => None,
+    };
     let mut tx = scoped(pool, caller).await?;
-    let value = json_in(&mut tx, "SELECT app_edit_message($1::uuid, $2)", |query| {
-        query.bind(id).bind(body)
-    })
-    .await?;
-    commit(tx, value).await
+    let (message, removed): (Value, Vec<String>) = sqlx::query_as(
+        "SELECT r_message, r_removed_files FROM app_edit_message($1::uuid, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(edit.body)
+    .bind(mentions_json)
+    .bind(previews_json)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    remove_files(&removed);
+    Ok(message)
+}
+
+/// Validates sender-supplied link previews. When `body` is known (`Some`), every preview's `url`
+/// must appear in `body`; SQL re-checks against the stored body on edits that omit `body`.
+fn prepare_previews(body: Option<&str>, previews: &[PreviewInput]) -> Result<Value, MessageError> {
+    if previews.len() > PREVIEWS_MAX {
+        return Err(MessageError::Invalid);
+    }
+    let mut out = Vec::with_capacity(previews.len());
+    for preview in previews {
+        let url = preview.url.as_str();
+        if url.is_empty()
+            || url.chars().count() > PREVIEW_URL_MAX
+            || url.chars().any(char::is_control)
+        {
+            return Err(MessageError::Invalid);
+        }
+        let parsed = url::Url::parse(url).map_err(|_| MessageError::Invalid)?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+            return Err(MessageError::Invalid);
+        }
+        if let Some(body) = body {
+            if !body.contains(url) {
+                return Err(MessageError::Invalid);
+            }
+        }
+        let mut obj = Map::new();
+        obj.insert("url".to_string(), Value::String(url.to_string()));
+        if let Some(site) = preview.site.as_deref() {
+            if site.chars().count() > PREVIEW_SITE_MAX || site.chars().any(char::is_control) {
+                return Err(MessageError::Invalid);
+            }
+            if !site.is_empty() {
+                obj.insert("site".to_string(), Value::String(site.to_string()));
+            }
+        }
+        if let Some(title) = preview.title.as_deref() {
+            if title.chars().count() > PREVIEW_TITLE_MAX || title.chars().any(char::is_control) {
+                return Err(MessageError::Invalid);
+            }
+            if !title.is_empty() {
+                obj.insert("title".to_string(), Value::String(title.to_string()));
+            }
+        }
+        if let Some(desc) = preview.description.as_deref() {
+            if desc.chars().count() > PREVIEW_DESCRIPTION_MAX || desc.chars().any(char::is_control)
+            {
+                return Err(MessageError::Invalid);
+            }
+            if !desc.is_empty() {
+                obj.insert("description".to_string(), Value::String(desc.to_string()));
+            }
+        }
+        if let Some(img) = blank_to_none(preview.image_attachment_id.as_deref()) {
+            if !is_uuid(img) {
+                return Err(MessageError::Invalid);
+            }
+            obj.insert(
+                "image_attachment_id".to_string(),
+                Value::String(img.to_string()),
+            );
+        }
+        out.push(Value::Object(obj));
+    }
+    Ok(Value::Array(out))
+}
+
+/// Validates mention entries and drops spans that fall outside `body` or split a UTF-8 code point.
+/// More than [`MENTIONS_MAX`] entries or an unknown `kind` is [`MessageError::Invalid`].
+fn prepare_mentions(body: &str, mentions: &[MentionInput]) -> Result<Value, MessageError> {
+    if mentions.len() > MENTIONS_MAX {
+        return Err(MessageError::Invalid);
+    }
+    let mut out = Vec::with_capacity(mentions.len());
+    for entry in mentions {
+        if !matches!(entry.kind.as_str(), "user" | "role" | "everyone") {
+            return Err(MessageError::Invalid);
+        }
+        let Ok(start) = usize::try_from(entry.start) else {
+            continue;
+        };
+        let Ok(end) = usize::try_from(entry.end) else {
+            continue;
+        };
+        if start >= end
+            || end > body.len()
+            || !body.is_char_boundary(start)
+            || !body.is_char_boundary(end)
+        {
+            continue;
+        }
+        let mut obj = Map::new();
+        obj.insert("kind".to_string(), Value::String(entry.kind.clone()));
+        if entry.kind != "everyone" {
+            let Some(id) = entry.id.as_deref().map(str::trim).filter(|s| is_uuid(s)) else {
+                continue;
+            };
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+        obj.insert("start".to_string(), Value::from(entry.start));
+        obj.insert("end".to_string(), Value::from(entry.end));
+        out.push(Value::Object(obj));
+    }
+    Ok(Value::Array(out))
 }
 
 pub async fn delete_message(
@@ -409,6 +807,45 @@ pub async fn clear_reaction(
     Ok(())
 }
 
+pub async fn toggle_custom_reaction(
+    pool: &PgPool,
+    caller: &Caller,
+    id: &str,
+    emoji_id: &str,
+) -> Result<Value, MessageError> {
+    if !is_uuid(emoji_id) {
+        return Err(MessageError::Invalid);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_toggle_custom_reaction($1::uuid, $2::uuid)",
+        |query| query.bind(id).bind(emoji_id),
+    )
+    .await?;
+    commit(tx, value).await
+}
+
+pub async fn clear_custom_reaction(
+    pool: &PgPool,
+    caller: &Caller,
+    id: &str,
+    emoji_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(emoji_id) {
+        return Err(MessageError::Invalid);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_clear_custom_reaction($1::uuid, $2::uuid)")
+        .bind(id)
+        .bind(emoji_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
 /// Pins one message, in a channel with `manage_channels` there or as either person of a direct.
 /// Idempotent. The 51st pin of one conversation is [`MessageError::PinLimit`].
 pub async fn pin_message(pool: &PgPool, caller: &Caller, id: &str) -> Result<(), MessageError> {
@@ -446,6 +883,48 @@ pub async fn list_pins(
     })
     .await?;
     commit(tx, value).await
+}
+
+/// The caller's own block list: `[{user_id, display_name, created_at}]`.
+pub async fn list_blocks(pool: &PgPool, caller: &Caller) -> Result<Value, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(&mut tx, "SELECT app_list_blocks()", |query| query).await?;
+    commit(tx, value).await
+}
+
+/// Blocks `user_id`. Idempotent. Refuses self-block (`Invalid`), missing user (`NotFound`),
+/// and past the per-person cap (`BlockLimit`).
+pub async fn block_user(pool: &PgPool, caller: &Caller, user_id: &str) -> Result<(), MessageError> {
+    if !is_uuid(user_id) {
+        return Err(MessageError::NotFound);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_block_user($1::uuid)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+/// Unblocks `user_id`. Idempotent.
+pub async fn unblock_user(
+    pool: &PgPool,
+    caller: &Caller,
+    user_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(user_id) {
+        return Ok(());
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_unblock_user($1::uuid)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
 }
 
 pub async fn mark_read(
@@ -747,6 +1226,9 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E21" => MessageError::GenerationChanged,
         "P0E22" => MessageError::RepairUnavailable,
         "P0E23" => MessageError::PinLimit,
+        "P0E24" => MessageError::BlockLimit,
+        "P0E25" => MessageError::EmojiLimit,
+        "23505" => MessageError::NameTaken,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
@@ -1241,4 +1723,238 @@ mod tests {
     }
 
     const FILE_MAX_PLUS: usize = super::FILE_MAX_DEFAULT as usize + 1;
+
+    #[test]
+    fn mentions_drop_bad_spans_and_reject_over_limit_or_unknown_kind() {
+        let uid = "11111111-1111-4111-8111-111111111111".to_string();
+        let body = "hi @Mara 🎉";
+        let prepared = super::prepare_mentions(
+            body,
+            &[
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some(uid.clone()),
+                    start: 3,
+                    end: 8,
+                },
+                // Out of bounds: dropped.
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some(uid.clone()),
+                    start: 0,
+                    end: 99,
+                },
+                // Splits the 4-byte emoji: dropped.
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some(uid.clone()),
+                    start: 9,
+                    end: 10,
+                },
+                // Bad uuid: dropped.
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some("not-a-uuid".into()),
+                    start: 0,
+                    end: 2,
+                },
+                // Valid everyone.
+                super::MentionInput {
+                    kind: "everyone".into(),
+                    id: None,
+                    start: 0,
+                    end: 2,
+                },
+            ],
+        )
+        .expect("ok");
+        assert_eq!(prepared.as_array().map(Vec::len), Some(2));
+
+        let unknown = super::prepare_mentions(
+            body,
+            &[super::MentionInput {
+                kind: "channel".into(),
+                id: None,
+                start: 0,
+                end: 2,
+            }],
+        );
+        assert!(matches!(unknown, Err(MessageError::Invalid)));
+
+        let too_many: Vec<_> = (0..=super::MENTIONS_MAX)
+            .map(|_| super::MentionInput {
+                kind: "everyone".into(),
+                id: None,
+                start: 0,
+                end: 2,
+            })
+            .collect();
+        assert!(matches!(
+            super::prepare_mentions(body, &too_many),
+            Err(MessageError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn search_query_validates_length_controls_uuids_and_limit() {
+        let ok = super::validate_search(&super::SearchQuery {
+            q: "  lantern  ",
+            conversation_id: None,
+            author_id: None,
+            before: None,
+            limit: None,
+        })
+        .expect("ok");
+        assert_eq!(ok.q, "lantern");
+        assert_eq!(ok.limit, super::SEARCH_DEFAULT_LIMIT);
+
+        for bad in [
+            super::SearchQuery {
+                q: "a",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: None,
+            },
+            super::SearchQuery {
+                q: "hi\nthere",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: None,
+            },
+            super::SearchQuery {
+                q: "lantern",
+                conversation_id: Some("not-a-uuid"),
+                author_id: None,
+                before: None,
+                limit: None,
+            },
+            super::SearchQuery {
+                q: "lantern",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: Some(51),
+            },
+            super::SearchQuery {
+                q: "lantern",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: Some(0),
+            },
+        ] {
+            assert!(matches!(
+                super::validate_search(&bad),
+                Err(MessageError::Invalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn previews_enforce_scheme_body_presence_caps_and_controls() {
+        let body = "see https://example.com/a and http://example.org/b";
+        let ok = super::prepare_previews(
+            Some(body),
+            &[super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: Some("Example".into()),
+                title: Some("Title".into()),
+                description: Some("Desc".into()),
+                image_attachment_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            }],
+        )
+        .expect("ok");
+        assert_eq!(ok.as_array().map(Vec::len), Some(1));
+
+        // URL not in body -> Invalid.
+        assert!(matches!(
+            super::prepare_previews(
+                Some(body),
+                &[super::PreviewInput {
+                    url: "https://other.example/c".into(),
+                    site: None,
+                    title: None,
+                    description: None,
+                    image_attachment_id: None,
+                }]
+            ),
+            Err(MessageError::Invalid)
+        ));
+
+        // Non-http(s) scheme -> Invalid.
+        assert!(matches!(
+            super::prepare_previews(
+                Some("javascript:alert(1)"),
+                &[super::PreviewInput {
+                    url: "javascript:alert(1)".into(),
+                    site: None,
+                    title: None,
+                    description: None,
+                    image_attachment_id: None,
+                }]
+            ),
+            Err(MessageError::Invalid)
+        ));
+
+        // Over-long fields & control characters -> Invalid.
+        for bad in [
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: Some("s".repeat(101)),
+                title: None,
+                description: None,
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: Some("t".repeat(201)),
+                description: None,
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: None,
+                description: Some("d".repeat(501)),
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: Some("bad\ntitle".into()),
+                description: None,
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: None,
+                description: None,
+                image_attachment_id: Some("not-a-uuid".into()),
+            },
+        ] {
+            assert!(matches!(
+                super::prepare_previews(Some(body), &[bad]),
+                Err(MessageError::Invalid)
+            ));
+        }
+
+        // More than 3 previews -> Invalid.
+        let four: Vec<_> = (0..4)
+            .map(|_| super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: None,
+                description: None,
+                image_attachment_id: None,
+            })
+            .collect();
+        assert!(matches!(
+            super::prepare_previews(Some(body), &four),
+            Err(MessageError::Invalid)
+        ));
+    }
 }

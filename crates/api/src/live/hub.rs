@@ -54,6 +54,8 @@ struct People {
     slots: HashMap<String, Arc<str>>,
     /// End-to-end encryption: the MLS delivery service for each room's call.
     e2ee: e2ee::Rooms,
+    /// True when the SFU's last load report showed a stalled media tick (>= 50 ms).
+    media_overloaded: bool,
 }
 
 impl People {
@@ -84,6 +86,29 @@ impl People {
         }
     }
 
+    /// Whether `user_id` has at least one connected socket that declared `name`.
+    #[allow(dead_code)]
+    fn has_feature(&self, user_id: &str, name: &str) -> bool {
+        self.users
+            .get(user_id)
+            .is_some_and(|person| person.conns.iter().any(|conn| conn.features.contains(name)))
+    }
+
+    /// Whether the socket currently holding `user_id`'s call seat declared `name`.
+    #[allow(dead_code)]
+    fn seat_has_feature(&self, user_id: &str, name: &str) -> bool {
+        let Some(conn_id) = self.calls.conn_of(user_id) else {
+            return false;
+        };
+        self.users.get(user_id).is_some_and(|person| {
+            person
+                .conns
+                .iter()
+                .find(|conn| conn.id == conn_id)
+                .is_some_and(|conn| conn.features.contains(name))
+        })
+    }
+
     /// Sends `call.e2ee` frames, each to the socket holding its person's seat, or keeps them
     /// for the next one while that seat has none.
     fn e2ee(&mut self, frames: Vec<e2ee::Outgoing>) {
@@ -111,6 +136,7 @@ struct Conn {
     kick: oneshot::Sender<Close>,
     direct: mpsc::Sender<Arc<str>>,
     proofs: mpsc::UnboundedSender<Proof>,
+    features: HashSet<String>,
 }
 
 /// Answered once a socket has shown it is alive. Dropped if it closes first.
@@ -257,7 +283,7 @@ impl Hub {
 
     /// Adds a socket for `user_id`. The first one brings the person online. Past the per-user
     /// cap, the oldest socket is told to close.
-    pub fn join(&self, user_id: &str, bot: bool) -> Joined {
+    pub fn join(&self, user_id: &str, bot: bool, features: HashSet<String>) -> Joined {
         let (kick, kicked) = oneshot::channel();
         let (direct, inbox) = mpsc::channel(DIRECT);
         let (proofs, asked) = mpsc::unbounded_channel();
@@ -276,6 +302,7 @@ impl Hub {
             kick,
             direct,
             proofs,
+            features,
         });
         if arrived && !bot {
             self.announce(user_id, true, None);
@@ -434,14 +461,43 @@ impl Hub {
         Ok(())
     }
 
-    /// How many people `room_id` takes for `user_id`: its own limit, else the server's, and
-    /// the server's for someone moved there. Never more than the server's.
-    fn room_limit(&self, calls: &Calls, user_id: &str, room_id: &str, user_limit: i32) -> usize {
+    /// How many people `room_id` takes for `user_id`: its own limit, else the optional
+    /// server ceiling, and the server ceiling for someone moved there. `None` means no cap.
+    fn room_limit(
+        &self,
+        calls: &Calls,
+        user_id: &str,
+        room_id: &str,
+        user_limit: i32,
+    ) -> Option<usize> {
         let max = self.limits.call_room_max;
         match usize::try_from(user_limit) {
-            Ok(limit) if limit > 0 && !calls.ticket(user_id, room_id) => limit.min(max),
+            Ok(limit) if limit > 0 && !calls.ticket(user_id, room_id) => {
+                Some(max.map_or(limit, |m| limit.min(m)))
+            }
             _ => max,
         }
+    }
+
+    /// Checks whether the server's measured capacity (media thread load and upload budget)
+    /// can carry one more seat for `user_id` in `room_id`.
+    fn capacity_check(&self, people: &People, user_id: &str, room_id: &str) -> Result<(), Refused> {
+        if people.calls.room_of(user_id).is_some() {
+            return Ok(());
+        }
+        if people.media_overloaded {
+            return Err(Refused::ServerFull);
+        }
+        if let Some(budget) = self.limits.call_egress_kbps {
+            let projected =
+                people
+                    .calls
+                    .projected_audio_kbps(user_id, room_id, self.limits.call_audio_slots);
+            if projected > u64::from(budget) {
+                return Err(Refused::ServerFull);
+            }
+        }
+        Ok(())
     }
 
     /// Whether `call_join` would seat `user_id` in `room_id` now. Checked before media is
@@ -454,7 +510,8 @@ impl Hub {
         let limit = self.room_limit(&people.calls, user_id, room_id, user_limit);
         people
             .calls
-            .check(user_id, room_id, limit, self.limits.call_server_max)
+            .check(user_id, room_id, limit, self.limits.call_server_max)?;
+        self.capacity_check(&people, user_id, room_id)
     }
 
     /// Seats `user_id` in `room_id` for socket `conn`, with the SFU's answer if the join had
@@ -494,6 +551,7 @@ impl Hub {
             }
         }
         let limit = self.room_limit(&people.calls, user_id, room_id, user_limit);
+        self.capacity_check(&people, user_id, room_id)?;
         let previous = people.calls.room_of(user_id).map(str::to_string);
         let again = previous.as_deref() == Some(room_id);
         let changes = people.calls.join(
@@ -1193,8 +1251,16 @@ impl Hub {
             sfu::Event::Load {
                 egress_kbps,
                 participants,
+                longest_turn_ms,
             } => {
-                tracing::debug!(egress_kbps, participants, "media load");
+                people.media_overloaded = longest_turn_ms >= 50;
+                tracing::debug!(
+                    egress_kbps,
+                    participants,
+                    longest_turn_ms,
+                    overloaded = people.media_overloaded,
+                    "media load"
+                );
             }
         }
     }
@@ -1489,6 +1555,7 @@ mod tests {
                 kick,
                 direct,
                 proofs,
+                features: HashSet::new(),
             });
             person.presence = Some(Setting {
                 state: State::Dnd,
@@ -1520,6 +1587,7 @@ mod tests {
                     kick,
                     direct: sent,
                     proofs,
+                    features: HashSet::new(),
                 }],
                 ..Person::default()
             },
@@ -1649,6 +1717,76 @@ mod tests {
             "removing either party ends the accepted call"
         );
         assert!(lock(&hub.people).rings.ready("caller").is_none());
+        hub.close();
+    }
+
+    #[tokio::test]
+    async fn socket_features_are_tracked_per_conn_and_per_seat() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/features_unit")
+            .expect("lazy pool");
+        let hub = Hub::start(pool, Limits::default(), None);
+
+        let first = hub.join("alice", false, HashSet::new());
+        {
+            let people = lock(&hub.people);
+            assert!(!people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
+
+        let mut with_gc = HashSet::new();
+        with_gc.insert("group_calls".to_string());
+        let second = hub.join("alice", false, with_gc);
+        {
+            let people = lock(&hub.people);
+            assert!(people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
+
+        // Put `first` (without group_calls) in a call seat.
+        hub.call_join(
+            "alice",
+            "room-1",
+            first.conn,
+            None,
+            12,
+            Access::default(),
+            false,
+            [1; 32],
+        )
+        .expect("join room");
+        {
+            let people = lock(&hub.people);
+            assert!(people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
+
+        // Move the seat to `second` (with group_calls).
+        hub.call_leave("alice", Reason::Left, true);
+        hub.call_join(
+            "alice",
+            "room-1",
+            second.conn,
+            None,
+            12,
+            Access::default(),
+            false,
+            [2; 32],
+        )
+        .expect("join room on second socket");
+        {
+            let people = lock(&hub.people);
+            assert!(people.has_feature("alice", "group_calls"));
+            assert!(people.seat_has_feature("alice", "group_calls"));
+        }
+
+        // Dropping `second` removes the feature from `alice`.
+        hub.leave("alice", second.conn);
+        {
+            let people = lock(&hub.people);
+            assert!(!people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
         hub.close();
     }
 }
