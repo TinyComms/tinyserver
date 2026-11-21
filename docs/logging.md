@@ -35,3 +35,16 @@ The external sender private key is not printed. It is written to `TINYSERVER_E2E
 Each HTTP request span carries `req_id` (32 hex characters) and the matched route template. The URI, the query string, and the headers are not on the span.
 
 A request that runs over a second logs one line when it ends: `slow send` at `warn` for a write to messages, reactions or uploads, `slow request` at `debug` for anything else. The fields are `route` (the template), `status`, `ms`, and `busy_ms` and `idle_ms` (time on the CPU and time waiting on the database, a lock or the network). The line has no `user_id`, no `req_id`, no URI and no query. A request under a second logs nothing.
+
+## SFU video state changes
+
+At `info`, the SFU logs one line per video state change (never per frame), using only `call_id`, `room_id`, and static enum values:
+
+| Line | Fields | When |
+| --- | --- | --- |
+| `video publish` | `call_id`, `room_id`, `source` (`camera` \| `share`), `on` | A publisher starts or stops camera or screen share |
+| `share refused` | `call_id`, `room_id`, `reason` (`share_taken`) | A join or renegotiation offer is refused because another participant holds the room's share |
+| `video slot` | `call_id`, `from` (publisher `call_id` or `none`), `layer` (`h` \| `l` \| `share` \| `none`), `why` | A listener's video slot changes what it carries |
+| `video slot empty` | `call_id`, `why` (`deafened` \| `quality_off` \| `link` \| `budget` \| `no_source` \| `waiting_keyframe`) | A connected listener's video slot has `wanted` empty or differing from `showing` for more than 3 s (logged once until the slot carries video again) |
+| `video layer broken` / `video layer back` | `call_id`, `layer` (`h` \| `l` \| `share`) | A publisher's inbound layer breaks over budget or recovers on a keyframe |
+| `keyframe asks` | `call_id`, `layer` (`h` \| `l` \| `share`), `count` | Per-layer keyframe request count, flushed at most once every 5 s while non-zero |
