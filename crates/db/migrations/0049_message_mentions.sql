@@ -17,6 +17,7 @@ ALTER TABLE roles DROP CONSTRAINT roles_permissions_check;
 ALTER TABLE roles
     ADD CONSTRAINT roles_permissions_check
     CHECK (permissions >= 0 AND permissions <= 8388607);
+ALTER TABLE roles ADD COLUMN mentionable boolean NOT NULL DEFAULT false;
 
 UPDATE roles SET permissions = permissions | 4194304
 WHERE NOT is_default AND permissions & 524288 <> 0;
@@ -222,9 +223,7 @@ BEGIN
 END;
 $$;
 
--- 2. Roles: optional mentionable flag, default false.
-
-ALTER TABLE roles ADD COLUMN mentionable boolean NOT NULL DEFAULT false;
+-- 2. Roles: optional mentionable flag (column added above before updating roles).
 
 DROP FUNCTION app_role_create(text, text, bigint, boolean);
 CREATE FUNCTION app_role_create(
