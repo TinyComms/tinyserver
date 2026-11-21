@@ -11,6 +11,7 @@ mod community;
 mod e2ee_link;
 mod e2ee_text;
 mod emoji;
+mod groups;
 mod health;
 mod limit;
 mod live;
@@ -76,6 +77,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(setup::routes(deployment, public_url))
         .merge(bot::routes())
         .merge(messages::routes())
+        .merge(groups::routes())
         .merge(emoji::routes())
         .merge(reports::routes())
         .merge(e2ee_text::routes())
