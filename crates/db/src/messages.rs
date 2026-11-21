@@ -300,6 +300,17 @@ pub async fn list_messages(
     before: Option<&str>,
     limit: i32,
 ) -> Result<Value, MessageError> {
+    list_messages_filtered(pool, caller, conversation, before, limit, false).await
+}
+
+pub async fn list_messages_filtered(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    before: Option<&str>,
+    limit: i32,
+    threads_only: bool,
+) -> Result<Value, MessageError> {
     let before = match before {
         Some(before) if !before.is_empty() => Some(before),
         _ => None,
@@ -307,10 +318,105 @@ pub async fn list_messages(
     let mut tx = scoped(pool, caller).await?;
     let value = json_in(
         &mut tx,
-        "SELECT app_list_messages($1::uuid, $2::uuid, $3)",
-        |query| query.bind(conversation).bind(before).bind(limit),
+        "SELECT app_list_messages_filtered($1::uuid, $2::uuid, $3, $4)",
+        |query| {
+            query
+                .bind(conversation)
+                .bind(before)
+                .bind(limit)
+                .bind(threads_only)
+        },
     )
     .await?;
+    commit(tx, value).await
+}
+
+pub async fn list_thread_messages(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+    before: Option<&str>,
+    limit: i32,
+) -> Result<Value, MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    let before = match before {
+        Some(before) if !before.is_empty() => Some(before),
+        _ => None,
+    };
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_list_thread_messages($1::uuid, $2::uuid, $3)",
+        |query| query.bind(root_id).bind(before).bind(limit),
+    )
+    .await?;
+    commit(tx, value).await
+}
+
+pub async fn mark_thread_read(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+    message_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    if !is_uuid(message_id) {
+        return Err(MessageError::Invalid);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_mark_thread_read($1::uuid, $2::uuid)")
+        .bind(root_id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+pub async fn follow_thread(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_follow_thread($1::uuid)")
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+pub async fn unfollow_thread(
+    pool: &PgPool,
+    caller: &Caller,
+    root_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(root_id) {
+        return Err(MessageError::NotFound);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_unfollow_thread($1::uuid)")
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+pub async fn list_followed_threads(pool: &PgPool, caller: &Caller) -> Result<Value, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(&mut tx, "SELECT app_list_followed_threads()", |query| query).await?;
     commit(tx, value).await
 }
 
@@ -361,6 +467,7 @@ pub async fn post_message_with(
     attachments: &[String],
     emoji: &[crate::EmojiSpan],
     sticker_id: Option<&str>,
+    thread_id: Option<&str>,
 ) -> Result<Value, MessageError> {
     let reply_to = blank_to_none(reply_to);
     if let Some(reply_to) = reply_to {
@@ -374,16 +481,22 @@ pub async fn post_message_with(
             return Err(MessageError::Invalid);
         }
     }
+    let thread_id = blank_to_none(thread_id);
+    if let Some(thread_id) = thread_id {
+        if !is_uuid(thread_id) {
+            return Err(MessageError::Invalid);
+        }
+    }
     let client_id = blank_to_none(client_id);
     let attachments = uuid_list(attachments)?;
     let emoji_json = serde_json::to_value(emoji).map_err(|_| MessageError::Invalid)?;
     let mut tx = scoped(pool, caller).await?;
     let value = json_in(
         &mut tx,
-        "SELECT app_post_message_ext($1::uuid, $2, $3::uuid, $4,
+        "SELECT app_post_message_thread($1::uuid, $2, $3::uuid, $4,
             CASE WHEN $5::text[] IS NULL THEN NULL
             ELSE (SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($5::text[]) AS item) END,
-            $6, $7::uuid)",
+            $6, $7::uuid, $8::uuid)",
         |query| {
             query
                 .bind(conversation)
@@ -393,6 +506,7 @@ pub async fn post_message_with(
                 .bind(attachments)
                 .bind(emoji_json)
                 .bind(sticker_id)
+                .bind(thread_id)
         },
     )
     .await?;

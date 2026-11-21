@@ -75,11 +75,12 @@ pub use link::{
 pub use media::{prepare_emoji, prepare_icon};
 pub use messages::{
     clear_custom_reaction, clear_reaction, create_channel, delete_channel, delete_message,
-    edit_message, list_channels, list_directs, list_messages, list_pins, mark_read,
+    edit_message, follow_thread, list_channels, list_directs, list_followed_threads, list_messages,
+    list_messages_filtered, list_pins, list_thread_messages, mark_read, mark_thread_read,
     open_attachment, open_direct, pin_message, post_message, post_message_with, save_attachment,
     save_sealed_attachment, scan_timeout, set_channel_override, toggle_custom_reaction,
-    toggle_reaction, typing_recipients, unpin_message, update_channel, upgrade_conversation,
-    AttachmentFile, MessageError, NewAttachment,
+    toggle_reaction, typing_recipients, unfollow_thread, unpin_message, update_channel,
+    upgrade_conversation, AttachmentFile, MessageError, NewAttachment,
 };
 pub use migrate::migrate;
 pub use moderation::{

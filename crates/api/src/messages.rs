@@ -12,11 +12,12 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use db::{
     clear_custom_reaction, clear_reaction, create_channel, delete_channel, delete_message,
-    edit_message, list_channels, list_directs, list_messages, list_pins, mark_read,
+    edit_message, follow_thread, list_channels, list_directs, list_followed_threads,
+    list_messages_filtered, list_pins, list_thread_messages, mark_read, mark_thread_read,
     open_attachment, open_direct, pin_message, post_message_with, save_attachment,
     save_sealed_attachment, set_channel_override, toggle_custom_reaction, toggle_reaction,
-    unpin_message, update_channel, upgrade_conversation, Caller, EmojiSpan, MessageError,
-    NewAttachment, PgPool, ScanEngine,
+    unfollow_thread, unpin_message, update_channel, upgrade_conversation, Caller, EmojiSpan,
+    MessageError, NewAttachment, PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -67,6 +68,16 @@ pub fn routes() -> Router<PgPool> {
             "/v1/messages/{id}/pin",
             axum::routing::put(pin).delete(unpin),
         )
+        .route("/v1/messages/{id}/thread", get(thread_messages))
+        .route(
+            "/v1/messages/{id}/thread/read",
+            axum::routing::post(read_thread),
+        )
+        .route(
+            "/v1/messages/{id}/thread/follow",
+            axum::routing::put(follow_thread_route).delete(unfollow_thread_route),
+        )
+        .route("/v1/threads", get(followed_threads))
         .route("/v1/conversations/{id}/pins", get(pins))
         .route("/v1/conversations/{id}/read", axum::routing::post(read))
         .route(
@@ -98,6 +109,7 @@ struct DirectBody {
 struct PageQuery {
     before: Option<String>,
     limit: Option<i32>,
+    threads: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +117,7 @@ struct PostBody {
     generation: Option<u64>,
     body: Option<String>,
     reply_to: Option<String>,
+    thread_id: Option<String>,
     client_id: Option<String>,
     attachment_ids: Option<Vec<String>>,
     emoji: Option<Vec<EmojiSpan>>,
@@ -467,12 +480,14 @@ async fn messages(
     Query(page): Query<PageQuery>,
 ) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
-    list_messages(
+    let threads_only = matches!(page.threads.as_deref(), Some("1" | "true"));
+    list_messages_filtered(
         &pool,
         &caller,
         &id,
         page.before.as_deref(),
         page.limit.unwrap_or(50),
+        threads_only,
     )
     .await
     .map(signed)
@@ -498,6 +513,14 @@ async fn add_message(
         || body.kind.is_some()
         || body.target_id.is_some()
     {
+        if body
+            .thread_id
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        {
+            // Encrypted conversations keep thread relations inside the sealed payload.
+            return Err(Error::Invalid);
+        }
         return crate::e2ee_text::post_ciphertext(
             &pool,
             &caller,
@@ -531,6 +554,7 @@ async fn add_message(
         &attachments,
         &emoji,
         body.sticker_id.as_deref(),
+        body.thread_id.as_deref(),
     )
     .await
     .map_err(|error| {
@@ -648,6 +672,91 @@ async fn pins(
         .map_err(|error| {
             let error = lift(error);
             message_failed(&caller.user_id, &id, &error);
+            error
+        })
+}
+
+async fn thread_messages(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(page): Query<PageQuery>,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    list_thread_messages(
+        &pool,
+        &caller,
+        &id,
+        page.before.as_deref(),
+        page.limit.unwrap_or(50),
+    )
+    .await
+    .map(signed)
+    .map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, &id, &error);
+        error
+    })
+}
+
+async fn read_thread(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ReadBody>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    mark_thread_read(&pool, &caller, &id, &body.message_id)
+        .await
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, &id, &error);
+            error
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn follow_thread_route(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    follow_thread(&pool, &caller, &id).await.map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, &id, &error);
+        error
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unfollow_thread_route(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    unfollow_thread(&pool, &caller, &id)
+        .await
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, &id, &error);
+            error
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn followed_threads(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    list_followed_threads(&pool, &caller)
+        .await
+        .map(signed)
+        .map_err(|error| {
+            let error = lift(error);
+            message_failed(&caller.user_id, "", &error);
             error
         })
 }
