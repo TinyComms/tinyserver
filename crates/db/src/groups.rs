@@ -82,11 +82,9 @@ pub async fn rename_group(
     }
     let name = validate_group_name(name)?;
     let mut tx = scoped(pool, caller).await?;
-    let value = json_in(
-        &mut tx,
-        "SELECT app_group_rename($1::uuid, $2)",
-        |query| query.bind(id).bind(&name),
-    )
+    let value = json_in(&mut tx, "SELECT app_group_rename($1::uuid, $2)", |query| {
+        query.bind(id).bind(&name)
+    })
     .await?;
     commit(tx, value).await
 }
@@ -141,9 +139,7 @@ pub async fn leave_group(
 /// Validates and trims a group name: 0 to 80 characters, no ASCII control characters.
 pub fn validate_group_name(name: &str) -> Result<String, MessageError> {
     let trimmed = name.trim();
-    if trimmed.chars().count() > GROUP_NAME_MAX
-        || trimmed.chars().any(|c| c.is_ascii_control())
-    {
+    if trimmed.chars().count() > GROUP_NAME_MAX || trimmed.chars().any(|c| c.is_ascii_control()) {
         return Err(MessageError::Invalid);
     }
     Ok(trimmed.to_string())
@@ -183,7 +179,10 @@ mod tests {
     fn group_name_allows_empty_up_to_80_and_rejects_controls() {
         assert_eq!(validate_group_name("").expect("empty"), "");
         assert_eq!(validate_group_name("   ").expect("blank"), "");
-        assert_eq!(validate_group_name("  Design Crew  ").expect("trim"), "Design Crew");
+        assert_eq!(
+            validate_group_name("  Design Crew  ").expect("trim"),
+            "Design Crew"
+        );
         assert_eq!(validate_group_name(&"a".repeat(80)).expect("80").len(), 80);
         assert!(matches!(
             validate_group_name(&"a".repeat(81)),

@@ -166,7 +166,12 @@ async fn group_find_or_create_concurrent_rename_isolation_and_capabilities() {
         assert_eq!(renamed["name"], "Beta");
 
         // Live isolation: owner O outside the group gets 404 on group, messages, media,
-        // and receives no group.* or message.* frame.
+        // and receives no group.* or message.* frame. B marks itself groups-capable first.
+        let (st, _) = Call::new(Method::GET, "/v1/groups")
+            .token(&b_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK);
         let server = serve(&db, api::Limits::default()).await;
         let (mut ws_o, _) = connect(&server, &owner_token, None).await;
         let (mut ws_b, _) = connect(&server, &b_token, None).await;
@@ -416,7 +421,10 @@ async fn group_add_convergence_tiebreak_leave_last_delete_and_audit_privacy() {
         assert_eq!(st, StatusCode::NO_CONTENT);
         let deleted_ev = next_type(&mut ws_a, "group.deleted").await;
         assert_eq!(deleted_ev["group_id"], gid_abcd);
-        assert!(!file_path.exists(), "attachment file must be removed on last leave");
+        assert!(
+            !file_path.exists(),
+            "attachment file must be removed on last leave"
+        );
 
         // Audit rows for group.* contain no user id other than actor_id (subject_user_id is NULL,
         // detail contains no member user ids).
@@ -520,6 +528,201 @@ async fn group_kick_ban_account_delete_emit_member_left_while_timeout_does_not()
         assert_eq!(ev["user_id"], d.user_id);
 
         assert_ne!(a.user_id, e.user_id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn older_client_member_is_unreachable_until_listing_groups_and_gated_from_live_messages() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (a, a_token) = join(&db, &owner, "a-g58@tinyserver.test", "member").await;
+        let (b, b_token) = join(&db, &owner, "b-g58@tinyserver.test", "member").await;
+        let (c, c_token) = join(&db, &owner, "c-g58@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+        let server = serve(&db, api::Limits::default()).await;
+
+        // Before anyone calls GET /v1/groups, all three are unreachable.
+        let (st, g) = Call::new(Method::POST, "/v1/groups")
+            .token(&a_token)
+            .json(json!({"user_ids": [b.user_id, c.user_id], "name": "Compat"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{g}");
+        let gid = g["id"].as_str().expect("gid").to_string();
+        for m in g["members"].as_array().expect("members") {
+            assert_eq!(m["reachable"], false, "before GET /v1/groups: {m}");
+        }
+
+        // Posting while nobody is reachable yet writes a nil-UUID audience (never NULL/empty).
+        let (st, m0) = Call::new(Method::POST, &format!("/v1/conversations/{gid}/messages"))
+            .token(&a_token)
+            .json(json!({"body": "nobody reachable yet"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{m0}");
+        let nil_audience: Vec<String> = sqlx::query_scalar(
+            "SELECT ARRAY(SELECT u::text FROM unnest(audience) AS u)
+             FROM outbox
+             WHERE topic = 'message.created' AND payload #>> '{message,id}' = $1",
+        )
+        .bind(m0["id"].as_str().expect("m0 id"))
+        .fetch_one(&db.owner)
+        .await
+        .expect("outbox row");
+        assert_eq!(nil_audience, vec!["00000000-0000-0000-0000-000000000000"]);
+
+        // A and C call GET /v1/groups (groups-capable clients). B stays on an older client.
+        let (st, _) = Call::new(Method::GET, "/v1/groups")
+            .token(&a_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = Call::new(Method::GET, "/v1/groups")
+            .token(&c_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK);
+
+        let (st, g_view) = Call::new(Method::GET, &format!("/v1/groups/{gid}"))
+            .token(&a_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{g_view}");
+        let reachable_of = |view: &Value, uid: &str| -> bool {
+            view["members"]
+                .as_array()
+                .expect("members")
+                .iter()
+                .find(|m| m["user_id"] == uid)
+                .and_then(|m| m["reachable"].as_bool())
+                .expect("reachable flag")
+        };
+        assert!(reachable_of(&g_view, &a.user_id));
+        assert!(!reachable_of(&g_view, &b.user_id));
+        assert!(reachable_of(&g_view, &c.user_id));
+
+        // Typing recipients for A exclude unreachable B and include reachable C.
+        let typing = db::typing_recipients(&db.runtime, &a, &gid)
+            .await
+            .expect("typing");
+        assert_eq!(typing, vec![c.user_id.clone()]);
+
+        // Connect live sockets for A, B (older client), and C.
+        let (mut ws_a, _) = connect(&server, &a_token, None).await;
+        let (mut ws_b, _) = connect(&server, &b_token, None).await;
+        let (mut ws_c, _) = connect(&server, &c_token, None).await;
+
+        // A posts a message: A and C receive message.created; B does NOT (gated).
+        let (st, m1) = Call::new(Method::POST, &format!("/v1/conversations/{gid}/messages"))
+            .token(&a_token)
+            .json(json!({"body": "hello reachable"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{m1}");
+        let ev_c = next_type(&mut ws_c, "message.created").await;
+        assert_eq!(ev_c["conversation_id"], gid);
+        let ev_a = next_type(&mut ws_a, "message.created").await;
+        assert_eq!(ev_a["conversation_id"], gid);
+        ping(&mut ws_b).await;
+
+        // B updates and calls GET /v1/groups: A and C receive group.member_reachable,
+        // and B is now reachable: true.
+        let (st, listed_b) = Call::new(Method::GET, "/v1/groups")
+            .token(&b_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{listed_b}");
+        assert!(reachable_of(&listed_b["groups"][0], &b.user_id));
+
+        let reach_a = next_type(&mut ws_a, "group.member_reachable").await;
+        assert_eq!(reach_a["group_id"], gid);
+        assert_eq!(reach_a["user_id"], b.user_id);
+        let reach_c = next_type(&mut ws_c, "group.member_reachable").await;
+        assert_eq!(reach_c["group_id"], gid);
+        assert_eq!(reach_c["user_id"], b.user_id);
+
+        // Second GET /v1/groups from B does not emit another group.member_reachable.
+        let before_second: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE topic = 'group.member_reachable'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("count");
+        let (st, _) = Call::new(Method::GET, "/v1/groups")
+            .token(&b_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK);
+        let after_second: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE topic = 'group.member_reachable'",
+        )
+        .fetch_one(&db.owner)
+        .await
+        .expect("count");
+        assert_eq!(before_second, after_second);
+
+        // Now B receives message.created and is included in typing_recipients.
+        let mut typing_after = db::typing_recipients(&db.runtime, &a, &gid)
+            .await
+            .expect("typing after");
+        typing_after.sort();
+        let mut expected = vec![b.user_id.clone(), c.user_id.clone()];
+        expected.sort();
+        assert_eq!(typing_after, expected);
+
+        let (st, _) = Call::new(Method::POST, &format!("/v1/conversations/{gid}/messages"))
+            .token(&a_token)
+            .json(json!({"body": "welcome B"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let ev_b = next_type(&mut ws_b, "message.created").await;
+        assert_eq!(ev_b["conversation_id"], gid);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn directs_list_excludes_groups_even_when_member_is_in_three_groups() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let (a, a_token) = join(&db, &owner, "a-dir@tinyserver.test", "member").await;
+        let (b, _) = join(&db, &owner, "b-dir@tinyserver.test", "member").await;
+        let (c, _) = join(&db, &owner, "c-dir@tinyserver.test", "member").await;
+        let (d, _) = join(&db, &owner, "d-dir@tinyserver.test", "member").await;
+        let (e, _) = join(&db, &owner, "e-dir@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        for others in [
+            vec![b.user_id.clone(), c.user_id.clone()],
+            vec![b.user_id.clone(), d.user_id.clone()],
+            vec![c.user_id.clone(), e.user_id.clone()],
+        ] {
+            let (st, g) = Call::new(Method::POST, "/v1/groups")
+                .token(&a_token)
+                .json(json!({"user_ids": others}))
+                .send(&app)
+                .await;
+            assert_eq!(st, StatusCode::CREATED, "{g}");
+        }
+        let (st, dm) = Call::new(Method::POST, "/v1/directs")
+            .token(&a_token)
+            .json(json!({"user_id": b.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{dm}");
+
+        let (st, directs) = Call::new(Method::GET, "/v1/directs")
+            .token(&a_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{directs}");
+        let list = directs.as_array().expect("directs");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"], dm["id"]);
+        assert_eq!(list[0]["peer"]["user_id"], b.user_id);
+        assert_ne!(a.user_id, b.user_id);
     })
     .await;
 }

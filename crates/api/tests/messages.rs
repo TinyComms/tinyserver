@@ -2200,12 +2200,19 @@ async fn insert_test_group(
     .await
     .expect("insert group_dms");
     for member in members {
-        sqlx::query("INSERT INTO group_dm_members (group_dm_id, user_id) VALUES ($1::uuid, $2::uuid)")
-            .bind(&group_id)
+        sqlx::query("UPDATE memberships SET groups_seen_at = now() WHERE user_id = $1::uuid")
             .bind(member)
             .execute(owner_pool)
             .await
-            .expect("insert group_dm_members");
+            .expect("mark test member groups-capable");
+        sqlx::query(
+            "INSERT INTO group_dm_members (group_dm_id, user_id) VALUES ($1::uuid, $2::uuid)",
+        )
+        .bind(&group_id)
+        .bind(member)
+        .execute(owner_pool)
+        .await
+        .expect("insert group_dm_members");
     }
     group_id
 }
@@ -2231,8 +2238,15 @@ async fn group_conversation_messages_audience_reads_typing_and_isolation() {
         .await;
 
         // Upload a clean attachment as Ada and attach it to a group message.
-        let (up_status, uploaded) =
-            upload(&app, &ada_token, "note.txt", "text/plain", b"hello group", &[]).await;
+        let (up_status, uploaded) = upload(
+            &app,
+            &ada_token,
+            "note.txt",
+            "text/plain",
+            b"hello group",
+            &[],
+        )
+        .await;
         assert_eq!(up_status, StatusCode::CREATED, "{uploaded}");
         let file_id = uploaded["id"].as_str().expect("attachment id").to_string();
 
@@ -2322,7 +2336,10 @@ async fn group_conversation_messages_audience_reads_typing_and_isolation() {
             .fetch_one(&db.owner)
             .await
             .expect("max outbox after read");
-        assert_eq!(before_read, after_read, "group read must emit no outbox row");
+        assert_eq!(
+            before_read, after_read,
+            "group read must emit no outbox row"
+        );
 
         // Typing recipients are the other group members only.
         let mut recipients = db::typing_recipients(&db.runtime, &ada, &group_id)
