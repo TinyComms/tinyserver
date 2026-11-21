@@ -175,6 +175,10 @@ async fn blocking_stops_directs_rings_and_unread_and_stays_private() {
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+        let ev = durable(&mut bob_ws).await;
+        assert_eq!(ev["type"], "block.updated");
+        assert_eq!(ev["user_id"], carol.user_id);
+        assert_eq!(ev["blocked"], true);
         let carol_token = session(&db, &carol.user_id).await;
         let (status, _) = Call::new(Method::POST, "/v1/directs")
             .token(&carol_token)
