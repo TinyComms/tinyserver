@@ -296,6 +296,7 @@ async fn serve(
     recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut bucket = Bucket::new(limits.messages_per_second, limits.message_burst);
     let mut moves = Moves::new(limits.call_move_burst, limits.call_move_every);
+    let mut watches = Moves::new(limits.call_watch_burst, limits.call_watch_every);
     let mut rekeys = Moves::new(limits.e2ee_rekey_burst, limits.e2ee_rekey_every);
     let mut rings = Moves::new(RING_BURST, RING_EVERY);
     let mut presence_sets = Moves::new(limits.presence_burst, limits.presence_every);
@@ -303,6 +304,7 @@ async fn serve(
         conn,
         bucket: &mut bucket,
         moves: &mut moves,
+        watches: &mut watches,
         rekeys: &mut rekeys,
         rings: &mut rings,
         presence: &mut presence_sets,
@@ -456,6 +458,8 @@ struct Asking<'a> {
     conn: u64,
     bucket: &'a mut Bucket,
     moves: &'a mut Moves,
+    /// `call.watch` updates. Separate and more generous than joins/offers.
+    watches: &'a mut Moves,
     /// End-to-end encryption key packages and `invalid`s.
     rekeys: &'a mut Moves,
     /// Ring, accept, decline, and cancel. Separate from joins and leaves.
@@ -552,7 +556,12 @@ async fn receive(
         "call.share_end" => call_share_end(hub, me, room_id).await?,
         "call.offer" => call_offer(hub, me, asking, sdp).await,
         "call.state" => call_state(hub, me, &incoming),
-        "call.quality" => call_quality(hub, me, incoming.video.as_deref()),
+        "call.quality" => call_quality(
+            hub,
+            me,
+            incoming.video.as_ref().and_then(serde_json::Value::as_str),
+        ),
+        "call.watch" => call_watch(hub, me, asking, incoming.video.as_ref()).await,
         "typing" => typing(hub, me, incoming.conversation_id.as_deref()).await,
         "presence.set" => presence_set(hub, me, asking, &incoming),
         _ => Err("unknown_type"),
@@ -998,6 +1007,7 @@ fn call_e2ee(
 fn media_code(refused: sfu::Refused) -> &'static str {
     match refused {
         sfu::Refused::BadSdp => "bad_sdp",
+        sfu::Refused::BadFrame => "bad_frame",
         sfu::Refused::NotFound => "not_found",
         sfu::Refused::ShareTaken => "share_taken",
         sfu::Refused::Unavailable => Refused::NoMedia.code(),
@@ -1029,8 +1039,7 @@ async fn call_offer(hub: &Hub, me: &Me, asking: &mut Asking<'_>, sdp: Option<&st
     Ok(Done::Answer(answer))
 }
 
-/// What the caller's one video slot may carry. Not being in a call with media is
-/// `not_found`.
+/// What the caller's video slots may carry. Not being in a call with media is `not_found`.
 fn call_quality(hub: &Hub, me: &Me, video: Option<&str>) -> Answer {
     let video = match video {
         Some("high") => sfu::Quality::High,
@@ -1042,6 +1051,94 @@ fn call_quality(hub: &Hub, me: &Me, video: Option<&str>) -> Answer {
         return Err("not_found");
     };
     media.quality(&call_id, video);
+    Ok(Done::Ok)
+}
+
+/// Parses a `call.watch` `video` array into SFU subscriptions.
+fn parse_watch(
+    video: Option<&serde_json::Value>,
+    max_slots: usize,
+) -> Result<Vec<sfu::Subscription>, &'static str> {
+    let Some(items) = video.and_then(serde_json::Value::as_array) else {
+        return Err("bad_frame");
+    };
+    if items.len() > max_slots {
+        return Err("bad_frame");
+    }
+    let mut subs = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err("bad_frame");
+        };
+        let Some(mid) = obj
+            .get("mid")
+            .and_then(serde_json::Value::as_str)
+            .filter(|mid| !mid.is_empty())
+        else {
+            return Err("bad_frame");
+        };
+        let Some(user_id) = obj
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return Err("bad_frame");
+        };
+        let target = if user_id == "auto" {
+            if let Some(kind) = obj.get("kind") {
+                match kind.as_str() {
+                    Some("camera" | "share") => {}
+                    _ => return Err("bad_frame"),
+                }
+            }
+            sfu::WatchTarget::Auto
+        } else {
+            let kind = match obj.get("kind").and_then(serde_json::Value::as_str) {
+                Some("camera") => sfu::VideoKind::Camera,
+                Some("share") => sfu::VideoKind::Share,
+                _ => return Err("bad_frame"),
+            };
+            sfu::WatchTarget::Source {
+                user_id: user_id.to_string(),
+                kind,
+            }
+        };
+        let max = match obj.get("max") {
+            None => sfu::Quality::High,
+            Some(value) => match value.as_str() {
+                Some("high") => sfu::Quality::High,
+                Some("low") => sfu::Quality::Low,
+                _ => return Err("bad_frame"),
+            },
+        };
+        subs.push(sfu::Subscription {
+            mid: mid.to_string(),
+            target,
+            max,
+        });
+    }
+    Ok(subs)
+}
+
+/// Replaces what each of the caller's receive video slots carries.
+async fn call_watch(
+    hub: &Hub,
+    me: &Me,
+    asking: &mut Asking<'_>,
+    video: Option<&serde_json::Value>,
+) -> Answer {
+    let max_slots = hub
+        .media
+        .as_ref()
+        .map_or(sfu::DEFAULT_VIDEO_SLOTS, sfu::Media::video_slots);
+    let subs = parse_watch(video, max_slots)?;
+    if !asking.watches.take() {
+        return Err("slow_down");
+    }
+    let (Some(media), Some(call_id)) = (&hub.media, hub.call_of(&me.user_id)) else {
+        return Err("not_found");
+    };
+    media.watch(&call_id, subs).await.map_err(media_code)?;
     Ok(Done::Ok)
 }
 
@@ -1379,6 +1476,65 @@ mod tests {
         assert!(super::changes_call("call.moderate"));
         assert!(super::changes_call("call.move"));
         assert!(super::changes_call("call.e2ee"));
+        assert!(super::changes_call("call.watch"));
         assert!(!super::changes_call("ping"));
+    }
+
+    #[test]
+    fn parse_watch_validates_entries_and_rejects_bad_frames() {
+        use serde_json::json;
+
+        let valid = json!([
+            {"mid": "vR1", "user_id": "u1", "kind": "share", "max": "high"},
+            {"mid": "vR2", "user_id": "u2", "kind": "camera", "max": "low"},
+            {"mid": "vR0", "user_id": "auto"}
+        ]);
+        let parsed = super::parse_watch(Some(&valid), 5).expect("valid watch list");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].mid, "vR1");
+        assert_eq!(
+            parsed[0].target,
+            sfu::WatchTarget::Source {
+                user_id: "u1".to_string(),
+                kind: sfu::VideoKind::Share,
+            }
+        );
+        assert_eq!(parsed[0].max, sfu::Quality::High);
+        assert_eq!(parsed[1].max, sfu::Quality::Low);
+        assert_eq!(parsed[2].target, sfu::WatchTarget::Auto);
+        assert_eq!(parsed[2].max, sfu::Quality::High);
+
+        assert_eq!(super::parse_watch(Some(&valid), 2), Err("bad_frame"));
+        assert_eq!(super::parse_watch(Some(&json!([])), 5), Ok(vec![]));
+        assert_eq!(super::parse_watch(None, 5), Err("bad_frame"));
+        assert_eq!(
+            super::parse_watch(Some(&json!("high")), 5),
+            Err("bad_frame")
+        );
+        assert_eq!(
+            super::parse_watch(
+                Some(&json!([{"mid": "", "user_id": "u1", "kind": "camera"}])),
+                5
+            ),
+            Err("bad_frame")
+        );
+        assert_eq!(
+            super::parse_watch(Some(&json!([{"mid": "v1", "user_id": "u1"}])), 5),
+            Err("bad_frame")
+        );
+        assert_eq!(
+            super::parse_watch(
+                Some(&json!([{"mid": "v1", "user_id": "u1", "kind": "screen"}])),
+                5
+            ),
+            Err("bad_frame")
+        );
+        assert_eq!(
+            super::parse_watch(
+                Some(&json!([{"mid": "v1", "user_id": "u1", "kind": "camera", "max": "off"}])),
+                5
+            ),
+            Err("bad_frame")
+        );
     }
 }

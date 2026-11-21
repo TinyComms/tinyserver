@@ -12,6 +12,10 @@ use serde_json::json;
 #[tokio::test]
 #[ignore = "owned disposable client/server fixture; explicitly provide DB URLs and output path"]
 async fn direct_calls_fixture_for_client() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .try_init();
     for name in [
         "TEST_DATABASE_URL_MIGRATE",
         "TEST_DATABASE_URL",
@@ -40,6 +44,14 @@ async fn direct_calls_fixture_for_client() {
         let owner = first_owner(&db).await;
         let owner_token = session(&db, &owner.user_id).await;
         let (peer, peer_token) = join(&db, &owner, "peer@tinyserver.test", "member").await;
+        let mut room_spec = db::NewRoom::named("video-gate");
+        room_spec.video_enabled = Some(true);
+        let room = match db::create_room(&db.runtime, &owner, &room_spec, None).await {
+            Ok(db::Wrote::Fresh(room)) => room,
+            Ok(db::Wrote::Replay(_)) => panic!("fixture room: unexpected replay"),
+            Err(error) => panic!("fixture video room: {error:?}"),
+        };
+        assert!(room.video_enabled, "fixture room must allow video");
         let config = sfu::Config::new(media_bind, Ipv4Addr::LOCALHOST.into());
         let (media, events) = sfu::start(config).expect("fixture SFU");
         let live = Live::with_media(db.runtime.clone(), Limits::default(), media, events);
@@ -49,6 +61,7 @@ async fn direct_calls_fixture_for_client() {
             .unwrap_or_else(|_| format!("http://{addr}"));
         let app = api::app(db.runtime.clone(), live.clone(), None);
         let serving = tokio::spawn(async move { axum::serve(listener, app).await });
+        let tmp_output = format!("{output}.tmp");
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -56,9 +69,10 @@ async fn direct_calls_fixture_for_client() {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&output).expect("private fixture output");
+        let mut file = options.open(&tmp_output).expect("private fixture output");
         let fixture = json!({
             "base_url": base_url,
+            "room_id": room.id,
             "direct_id": null,
             "owner": {"user_id": owner.user_id, "token": owner_token, "display_name": "Owner"},
             "peer": {"user_id": peer.user_id, "token": peer_token, "display_name": "Peer"},
@@ -66,11 +80,30 @@ async fn direct_calls_fixture_for_client() {
         });
         file.write_all(fixture.to_string().as_bytes()).expect("write fixture");
         file.sync_all().expect("flush fixture");
+        drop(file);
+        std::fs::rename(&tmp_output, &output).expect("publish fixture atomically");
         println!("Disposable two-member fixture ready; session values are only in the private output file.");
-        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
         live.close();
         serving.abort();
-        std::fs::remove_file(output).expect("remove expired fixture sessions");
+        let _ = std::fs::remove_file(&output);
     })
     .await;
 }

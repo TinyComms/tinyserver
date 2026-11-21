@@ -167,7 +167,7 @@ fn read_only_allows(method: &Method, path: &str) -> bool {
 pub(crate) fn read_only_frame_allowed(kind: &str) -> bool {
     matches!(
         kind,
-        "ping" | "call.leave" | "call.state" | "call.quality" | "call.e2ee"
+        "ping" | "call.leave" | "call.state" | "call.quality" | "call.watch" | "call.e2ee"
     )
 }
 
@@ -208,6 +208,7 @@ mod tests {
     fn read_only_live_frames() {
         assert!(read_only_frame_allowed("ping"));
         assert!(read_only_frame_allowed("call.leave"));
+        assert!(read_only_frame_allowed("call.watch"));
         assert!(!read_only_frame_allowed("call.join"));
         assert!(!read_only_frame_allowed("call.offer"));
         assert!(!read_only_frame_allowed("typing"));

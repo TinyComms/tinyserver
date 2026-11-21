@@ -68,6 +68,9 @@ pub struct Limits {
     /// Joins and leaves one socket may make at once, and how often it gets one more back.
     pub call_move_burst: u32,
     pub call_move_every: Duration,
+    /// `call.watch` updates one socket may send at once, and how often it gets one more back.
+    pub call_watch_burst: u32,
+    pub call_watch_every: Duration,
     /// How often who was connected is written to `last_seen_at`, in one batch.
     pub seen_every: Duration,
     /// End-to-end encryption key packages and `invalid`s one socket may send at once, and how
@@ -100,6 +103,8 @@ impl Default for Limits {
             call_audio_slots: 11,
             call_move_burst: 5,
             call_move_every: Duration::from_secs(3),
+            call_watch_burst: 20,
+            call_watch_every: Duration::from_millis(200),
             seen_every: Duration::from_secs(30),
             e2ee_rekey_burst: 5,
             e2ee_rekey_every: Duration::from_secs(2),
@@ -153,6 +158,11 @@ impl Live {
             .as_ref()
             .map(sfu::Media::transports)
             .unwrap_or_default()
+    }
+
+    /// Maximum receive video slots per listener when media is configured.
+    pub fn video_slots(&self) -> Option<usize> {
+        self.hub.media.as_ref().map(sfu::Media::video_slots)
     }
 
     /// Closes every socket with `1012 restart`, refuses new ones, and stops the dispatcher

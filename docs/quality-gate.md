@@ -22,10 +22,20 @@ runs that branch's client for that scenario.
   `docker-compose.yml` and `deploy/**` to `linux` only (the lab boots the image).
 - A migration (`crates/db/migrations/**`) also needs the PR's **Migrations** section: a restore of
   a production-shaped dump run forward, and the rollback written down.
-- The release gate is the **deploy** gate. `deploy/release-cut.sh` prints `e2e:` for the lab's run
-  of the release suite on the exact `origin/main` SHA being deployed, and blocks without it once
-  `e2e/gate.json` has `"release_proof": "enforce"`. A server deploy still does not wait for a
-  client release, and a client release does not wait for a server deploy.
+- The release gate is the **deploy** gate. `e2e/scenarios/video-received` is the first
+  `"release": true` scenario here (covering the desktop clients `windows`, `macos`, `linux`;
+  `android` and `ios` are `not_applicable` because the client probe is a desktop process pair).
+  `deploy/release-cut.sh` checks the `e2e-release` status on the exact `origin/main` SHA being
+  deployed and prints an `e2e:` line:
+  - `ok     e2e: the lab recorded the release suite green on <sha>: <url>` when `e2e-release` is
+    `success`.
+  - `note   e2e: no e2e-release status on <sha> (release_proof is report, so this does not block yet)`
+    (or the non-success state) while `e2e/gate.json` has `"release_proof": "report"`.
+  - `BLOCK  e2e: no e2e-release status on <sha>; the lab has not recorded the release suite green`
+    once `e2e/gate.json` has `"release_proof": "enforce"`, blocking the deploy until the lab records
+    the release suite green on that SHA.
+  A server deploy still does not wait for a client release, and a client release does not wait for
+  a server deploy.
 - `main` has no branch protection today and allows merge, squash and rebase. Target: squash only,
   required checks `check`, `pr-gate`, `e2e-proof`, no admin bypass. That is a settings change for
   Justin; nothing here applies it.
