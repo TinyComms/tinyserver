@@ -72,8 +72,8 @@ pub use messages::{
     list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
     post_message, save_attachment, save_sealed_attachment, scan_timeout, search_messages,
     set_channel_override, toggle_reaction, typing_recipients, unpin_message, update_channel,
-    upgrade_conversation, AttachmentFile, MentionInput, MessageError, NewAttachment, NewMessage,
-    SearchQuery,
+    upgrade_conversation, AttachmentFile, MentionInput, MessageEdit, MessageError, NewAttachment,
+    NewMessage, PreviewInput, SearchQuery,
 };
 pub use migrate::migrate;
 pub use moderation::{

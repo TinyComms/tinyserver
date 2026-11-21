@@ -15,7 +15,8 @@ use db::{
     list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
     post_message, save_attachment, save_sealed_attachment, search_messages, set_channel_override,
     toggle_reaction, unpin_message, update_channel, upgrade_conversation, Caller, MentionInput,
-    MessageError, NewAttachment, NewMessage, PgPool, ScanEngine, SearchQuery,
+    MessageEdit, MessageError, NewAttachment, NewMessage, PgPool, PreviewInput, ScanEngine,
+    SearchQuery,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -129,6 +130,27 @@ impl From<MentionBody> for MentionInput {
 }
 
 #[derive(Deserialize)]
+struct PreviewBody {
+    url: String,
+    site: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    image_attachment_id: Option<String>,
+}
+
+impl From<PreviewBody> for PreviewInput {
+    fn from(p: PreviewBody) -> Self {
+        Self {
+            url: p.url,
+            site: p.site,
+            title: p.title,
+            description: p.description,
+            image_attachment_id: p.image_attachment_id,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct PostBody {
     generation: Option<u64>,
     body: Option<String>,
@@ -136,6 +158,7 @@ struct PostBody {
     client_id: Option<String>,
     attachment_ids: Option<Vec<String>>,
     mentions: Option<Vec<MentionBody>>,
+    previews: Option<Vec<PreviewBody>>,
     // An encrypted conversation takes these and no body. See docs/e2ee-text.md.
     ciphertext: Option<String>,
     epoch: Option<u64>,
@@ -146,8 +169,9 @@ struct PostBody {
 
 #[derive(Deserialize)]
 struct EditBody {
-    body: String,
+    body: Option<String>,
     mentions: Option<Vec<MentionBody>>,
+    previews: Option<Vec<PreviewBody>>,
 }
 
 #[derive(Deserialize)]
@@ -531,7 +555,7 @@ async fn add_message(
                 client_id: body.client_id.as_deref(),
                 reply_to: body.reply_to.as_deref(),
                 attachments: &attachments,
-                has_body: body.body.is_some() || body.mentions.is_some(),
+                has_body: body.body.is_some() || body.mentions.is_some() || body.previews.is_some(),
             },
         )
         .await
@@ -542,6 +566,9 @@ async fn add_message(
     let mentions: Option<Vec<MentionInput>> = body
         .mentions
         .map(|list| list.into_iter().map(MentionInput::from).collect());
+    let previews: Option<Vec<PreviewInput>> = body
+        .previews
+        .map(|list| list.into_iter().map(PreviewInput::from).collect());
     let message = post_message(
         &pool,
         &caller,
@@ -552,6 +579,7 @@ async fn add_message(
             client_id: body.client_id.as_deref(),
             attachments: &attachments,
             mentions: mentions.as_deref(),
+            previews: previews.as_deref(),
         },
     )
     .await
@@ -573,14 +601,26 @@ async fn edit(
     let mentions: Option<Vec<MentionInput>> = body
         .mentions
         .map(|list| list.into_iter().map(MentionInput::from).collect());
-    edit_message(&pool, &caller, &id, &body.body, mentions.as_deref())
-        .await
-        .map(signed)
-        .map_err(|error| {
-            let error = lift(error);
-            message_failed(&caller.user_id, "", &error);
-            error
-        })
+    let previews: Option<Vec<PreviewInput>> = body
+        .previews
+        .map(|list| list.into_iter().map(PreviewInput::from).collect());
+    edit_message(
+        &pool,
+        &caller,
+        &id,
+        &MessageEdit {
+            body: body.body.as_deref(),
+            mentions: mentions.as_deref(),
+            previews: previews.as_deref(),
+        },
+    )
+    .await
+    .map(signed)
+    .map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, "", &error);
+        error
+    })
 }
 
 async fn remove_message(

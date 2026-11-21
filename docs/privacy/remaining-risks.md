@@ -92,7 +92,7 @@ What E2EE here does and does not do, for the product page and for support.
 | No history for new devices | By design |
 | Removal | A removed member stops receiving new ciphertext at once and loses future keys at the next commit; if no member is online the commit waits. They keep what they already have |
 | Moderation and abuse | No moderator delete in encrypted conversations in v1; the server cannot scan sealed files or read content. Handling depends on reports, whose evidence is whatever the reporter's client sends and cannot be verified ([`abuse-response.md`](abuse-response.md)) |
-| Search and previews | Encrypted conversations: client-side only. Plaintext conversations: server-side search (`GET /v1/search`, `0051`) indexes plaintext bodies only (`NOT e2ee`) and never logs queries; previews are client-side only |
+| Search and previews | Encrypted conversations: client-side only (previews travel inside the sealed payload). Plaintext conversations: server-side search (`GET /v1/search`, `0051`) indexes plaintext bodies only (`NOT e2ee`) and never logs queries; link previews (`0052`) are written by the sender's app and stored by the server, which never fetches linked URLs ([`link-previews.md`](link-previews.md)) |
 | Regulation | Pending proposals could reach E2EE services ([`compliance.md`](compliance.md) section 8.5) |
 | Review | Not independently reviewed (section 1) |
 

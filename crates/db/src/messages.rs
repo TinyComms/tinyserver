@@ -134,6 +134,16 @@ pub struct MentionInput {
     pub end: i32,
 }
 
+/// One sender-supplied link preview on a plaintext message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewInput {
+    pub url: String,
+    pub site: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image_attachment_id: Option<String>,
+}
+
 /// A plaintext message post.
 pub struct NewMessage<'a> {
     pub body: &'a str,
@@ -141,10 +151,24 @@ pub struct NewMessage<'a> {
     pub client_id: Option<&'a str>,
     pub attachments: &'a [String],
     pub mentions: Option<&'a [MentionInput]>,
+    pub previews: Option<&'a [PreviewInput]>,
+}
+
+/// A plaintext message edit. At least one of `body` or `previews` must be present.
+pub struct MessageEdit<'a> {
+    pub body: Option<&'a str>,
+    pub mentions: Option<&'a [MentionInput]>,
+    pub previews: Option<&'a [PreviewInput]>,
 }
 
 /// Maximum number of mention entries accepted on one message.
 pub const MENTIONS_MAX: usize = 50;
+/// Maximum number of link previews accepted on one message.
+pub const PREVIEWS_MAX: usize = 3;
+pub const PREVIEW_URL_MAX: usize = 2048;
+pub const PREVIEW_SITE_MAX: usize = 100;
+pub const PREVIEW_TITLE_MAX: usize = 200;
+pub const PREVIEW_DESCRIPTION_MAX: usize = 500;
 
 /// Parameters for `GET /v1/search`.
 pub struct SearchQuery<'a> {
@@ -428,8 +452,13 @@ pub async fn post_message(
     }
     let client_id = blank_to_none(input.client_id);
     let attachments = uuid_list(input.attachments)?;
+    let trimmed = input.body.trim();
     let mentions_json = match input.mentions {
-        Some(list) => Some(prepare_mentions(input.body.trim(), list)?),
+        Some(list) => Some(prepare_mentions(trimmed, list)?),
+        None => None,
+    };
+    let previews_json = match input.previews {
+        Some(list) => Some(prepare_previews(Some(trimmed), list)?),
         None => None,
     };
     let mut tx = scoped(pool, caller).await?;
@@ -438,7 +467,7 @@ pub async fn post_message(
         "SELECT app_post_message($1::uuid, $2, $3::uuid, $4,
             CASE WHEN $5::text[] IS NULL THEN NULL
             ELSE (SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($5::text[]) AS item) END,
-            $6)",
+            $6, $7)",
         |query| {
             query
                 .bind(conversation)
@@ -447,6 +476,7 @@ pub async fn post_message(
                 .bind(client_id)
                 .bind(attachments)
                 .bind(mentions_json)
+                .bind(previews_json)
         },
     )
     .await?;
@@ -457,21 +487,100 @@ pub async fn edit_message(
     pool: &PgPool,
     caller: &Caller,
     id: &str,
-    body: &str,
-    mentions: Option<&[MentionInput]>,
+    edit: &MessageEdit<'_>,
 ) -> Result<Value, MessageError> {
-    let mentions_json = match mentions {
-        Some(list) => Some(prepare_mentions(body.trim(), list)?),
+    if edit.body.is_none() && edit.previews.is_none() {
+        return Err(MessageError::Invalid);
+    }
+    let trimmed = edit.body.map(str::trim);
+    let mentions_json = match (trimmed, edit.mentions) {
+        (Some(body), Some(list)) => Some(prepare_mentions(body, list)?),
+        (None, Some(_)) => return Err(MessageError::Invalid),
+        (_, None) => None,
+    };
+    let previews_json = match edit.previews {
+        Some(list) => Some(prepare_previews(trimmed, list)?),
         None => None,
     };
     let mut tx = scoped(pool, caller).await?;
-    let value = json_in(
-        &mut tx,
-        "SELECT app_edit_message($1::uuid, $2, $3)",
-        |query| query.bind(id).bind(body).bind(mentions_json),
+    let (message, removed): (Value, Vec<String>) = sqlx::query_as(
+        "SELECT r_message, r_removed_files FROM app_edit_message($1::uuid, $2, $3, $4)",
     )
-    .await?;
-    commit(tx, value).await
+    .bind(id)
+    .bind(edit.body)
+    .bind(mentions_json)
+    .bind(previews_json)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    remove_files(&removed);
+    Ok(message)
+}
+
+/// Validates sender-supplied link previews. When `body` is known (`Some`), every preview's `url`
+/// must appear in `body`; SQL re-checks against the stored body on edits that omit `body`.
+fn prepare_previews(body: Option<&str>, previews: &[PreviewInput]) -> Result<Value, MessageError> {
+    if previews.len() > PREVIEWS_MAX {
+        return Err(MessageError::Invalid);
+    }
+    let mut out = Vec::with_capacity(previews.len());
+    for preview in previews {
+        let url = preview.url.as_str();
+        if url.is_empty()
+            || url.chars().count() > PREVIEW_URL_MAX
+            || url.chars().any(char::is_control)
+        {
+            return Err(MessageError::Invalid);
+        }
+        let parsed = url::Url::parse(url).map_err(|_| MessageError::Invalid)?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+            return Err(MessageError::Invalid);
+        }
+        if let Some(body) = body {
+            if !body.contains(url) {
+                return Err(MessageError::Invalid);
+            }
+        }
+        let mut obj = Map::new();
+        obj.insert("url".to_string(), Value::String(url.to_string()));
+        if let Some(site) = preview.site.as_deref() {
+            if site.chars().count() > PREVIEW_SITE_MAX || site.chars().any(char::is_control) {
+                return Err(MessageError::Invalid);
+            }
+            if !site.is_empty() {
+                obj.insert("site".to_string(), Value::String(site.to_string()));
+            }
+        }
+        if let Some(title) = preview.title.as_deref() {
+            if title.chars().count() > PREVIEW_TITLE_MAX || title.chars().any(char::is_control) {
+                return Err(MessageError::Invalid);
+            }
+            if !title.is_empty() {
+                obj.insert("title".to_string(), Value::String(title.to_string()));
+            }
+        }
+        if let Some(desc) = preview.description.as_deref() {
+            if desc.chars().count() > PREVIEW_DESCRIPTION_MAX || desc.chars().any(char::is_control)
+            {
+                return Err(MessageError::Invalid);
+            }
+            if !desc.is_empty() {
+                obj.insert("description".to_string(), Value::String(desc.to_string()));
+            }
+        }
+        if let Some(img) = blank_to_none(preview.image_attachment_id.as_deref()) {
+            if !is_uuid(img) {
+                return Err(MessageError::Invalid);
+            }
+            obj.insert(
+                "image_attachment_id".to_string(),
+                Value::String(img.to_string()),
+            );
+        }
+        out.push(Value::Object(obj));
+    }
+    Ok(Value::Array(out))
 }
 
 /// Validates mention entries and drops spans that fall outside `body` or split a UTF-8 code point.
@@ -1523,5 +1632,111 @@ mod tests {
                 Err(MessageError::Invalid)
             ));
         }
+    }
+
+    #[test]
+    fn previews_enforce_scheme_body_presence_caps_and_controls() {
+        let body = "see https://example.com/a and http://example.org/b";
+        let ok = super::prepare_previews(
+            Some(body),
+            &[super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: Some("Example".into()),
+                title: Some("Title".into()),
+                description: Some("Desc".into()),
+                image_attachment_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            }],
+        )
+        .expect("ok");
+        assert_eq!(ok.as_array().map(Vec::len), Some(1));
+
+        // URL not in body -> Invalid.
+        assert!(matches!(
+            super::prepare_previews(
+                Some(body),
+                &[super::PreviewInput {
+                    url: "https://other.example/c".into(),
+                    site: None,
+                    title: None,
+                    description: None,
+                    image_attachment_id: None,
+                }]
+            ),
+            Err(MessageError::Invalid)
+        ));
+
+        // Non-http(s) scheme -> Invalid.
+        assert!(matches!(
+            super::prepare_previews(
+                Some("javascript:alert(1)"),
+                &[super::PreviewInput {
+                    url: "javascript:alert(1)".into(),
+                    site: None,
+                    title: None,
+                    description: None,
+                    image_attachment_id: None,
+                }]
+            ),
+            Err(MessageError::Invalid)
+        ));
+
+        // Over-long fields & control characters -> Invalid.
+        for bad in [
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: Some("s".repeat(101)),
+                title: None,
+                description: None,
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: Some("t".repeat(201)),
+                description: None,
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: None,
+                description: Some("d".repeat(501)),
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: Some("bad\ntitle".into()),
+                description: None,
+                image_attachment_id: None,
+            },
+            super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: None,
+                description: None,
+                image_attachment_id: Some("not-a-uuid".into()),
+            },
+        ] {
+            assert!(matches!(
+                super::prepare_previews(Some(body), &[bad]),
+                Err(MessageError::Invalid)
+            ));
+        }
+
+        // More than 3 previews -> Invalid.
+        let four: Vec<_> = (0..4)
+            .map(|_| super::PreviewInput {
+                url: "https://example.com/a".into(),
+                site: None,
+                title: None,
+                description: None,
+                image_attachment_id: None,
+            })
+            .collect();
+        assert!(matches!(
+            super::prepare_previews(Some(body), &four),
+            Err(MessageError::Invalid)
+        ));
     }
 }
