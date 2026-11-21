@@ -153,6 +153,8 @@ AS $$
       );
 $$;
 
+DROP TRIGGER IF EXISTS users_forget_blocks ON users;
+DROP FUNCTION IF EXISTS app_blocks_forget_user();
 DROP FUNCTION app_unblock_user(uuid);
 DROP FUNCTION app_block_user(uuid);
 DROP FUNCTION app_list_blocks();

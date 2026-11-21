@@ -302,3 +302,23 @@ REVOKE EXECUTE ON FUNCTION app_block_user(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_block_user(uuid) TO app_runtime;
 REVOKE EXECUTE ON FUNCTION app_unblock_user(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_unblock_user(uuid) TO app_runtime;
+
+CREATE FUNCTION app_blocks_forget_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    DELETE FROM blocks WHERE blocker_id = NEW.id OR blocked_id = NEW.id;
+    RETURN NULL;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION app_blocks_forget_user() FROM PUBLIC;
+
+CREATE TRIGGER users_forget_blocks
+    AFTER UPDATE OF deleted_at ON users
+    FOR EACH ROW
+    WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL)
+    EXECUTE FUNCTION app_blocks_forget_user();

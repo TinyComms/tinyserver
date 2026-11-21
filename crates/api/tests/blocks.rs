@@ -250,6 +250,7 @@ async fn blocking_stops_directs_rings_and_unread_and_stays_private() {
         // Deleting Bob's account cascades his remaining block rows (Carol).
         let (status, _) = Call::new(Method::DELETE, "/v1/me")
             .token(&bob_token)
+            .json(json!({"confirm": "delete my account"}))
             .send(&app)
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
