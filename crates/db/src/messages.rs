@@ -1119,6 +1119,15 @@ pub(crate) async fn expire_orphans(pool: &PgPool) -> Result<Vec<String>, DbError
     Ok(ids)
 }
 
+/// Deletes memberless group conversations left behind by kick, ban, or account deletion and
+/// returns the attachment file ids to remove from disk.
+pub(crate) async fn sweep_empty_groups(pool: &PgPool) -> Result<Vec<String>, DbError> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT app_group_sweep()")
+        .fetch_one(pool)
+        .await?;
+    Ok(ids)
+}
+
 /// Deletes `{upload_dir}/{id}` for each uuid. A bad id or a missing file is ignored.
 pub(crate) fn remove_files(ids: &[String]) {
     for id in ids {

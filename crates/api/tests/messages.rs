@@ -2181,3 +2181,334 @@ async fn exchange(
         .to_vec();
     (status, headers, bytes)
 }
+
+async fn insert_test_group(
+    owner_pool: &db::PgPool,
+    creator: &str,
+    members: &[&str],
+    name: &str,
+) -> String {
+    let group_id: String = sqlx::query_scalar(
+        "INSERT INTO group_dms (name, created_by, member_key)
+         VALUES ($1, $2::uuid, app_group_member_key($3::uuid[]))
+         RETURNING id::text",
+    )
+    .bind(name)
+    .bind(creator)
+    .bind(members)
+    .fetch_one(owner_pool)
+    .await
+    .expect("insert group_dms");
+    for member in members {
+        sqlx::query("INSERT INTO group_dm_members (group_dm_id, user_id) VALUES ($1::uuid, $2::uuid)")
+            .bind(&group_id)
+            .bind(member)
+            .execute(owner_pool)
+            .await
+            .expect("insert group_dm_members");
+    }
+    group_id
+}
+
+#[tokio::test]
+async fn group_conversation_messages_audience_reads_typing_and_isolation() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (ada, ada_token) = join(&db, &owner, "ada-g61@tinyserver.test", "member").await;
+        let (bea, bea_token) = join(&db, &owner, "bea-g61@tinyserver.test", "member").await;
+        let (cy, cy_token) = join(&db, &owner, "cy-g61@tinyserver.test", "member").await;
+        let (outsider, outsider_token) =
+            join(&db, &owner, "out-g61@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let group_id = insert_test_group(
+            &db.owner,
+            &ada.user_id,
+            &[&ada.user_id, &bea.user_id, &cy.user_id],
+            "Crew",
+        )
+        .await;
+
+        // Upload a clean attachment as Ada and attach it to a group message.
+        let (up_status, uploaded) =
+            upload(&app, &ada_token, "note.txt", "text/plain", b"hello group", &[]).await;
+        assert_eq!(up_status, StatusCode::CREATED, "{uploaded}");
+        let file_id = uploaded["id"].as_str().expect("attachment id").to_string();
+
+        // Ada posts, lists, edits, reacts, and deletes in the group.
+        let (status, msg) = send_message(
+            &app,
+            &ada_token,
+            &group_id,
+            json!({"body": "hello crew", "attachment_ids": [file_id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{msg}");
+        let msg_id = msg["id"].as_str().expect("msg id").to_string();
+
+        let (status, listed) = get_messages(&app, &bea_token, &group_id).await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed.as_array().map(Vec::len), Some(1));
+        assert_eq!(listed[0]["id"], msg_id);
+
+        // Media is downloadable by group members, 404 for outsider and owner outside the group.
+        let (status, bytes) = download(&app, &cy_token, &file_id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, b"hello group");
+
+        for (label, tok) in [("outsider", &outsider_token), ("owner", &owner_token)] {
+            let (st, _) = get_messages(&app, tok, &group_id).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{label} list messages");
+            let (st, _) = send_message(&app, tok, &group_id, json!({"body": "hi"})).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{label} post message");
+            let (st, _) = Call::new(Method::PATCH, &format!("/v1/messages/{msg_id}"))
+                .token(tok)
+                .json(json!({"body": "tamper"}))
+                .send(&app)
+                .await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{label} edit message");
+            let (st, _) = Call::new(Method::PUT, &format!("/v1/messages/{msg_id}/reactions"))
+                .token(tok)
+                .json(json!({"emoji": "👍"}))
+                .send(&app)
+                .await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{label} react");
+            let (st, _) = Call::new(Method::DELETE, &format!("/v1/messages/{msg_id}"))
+                .token(tok)
+                .send(&app)
+                .await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{label} delete");
+            let (st, _) = download(&app, tok, &file_id).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{label} media");
+        }
+
+        // Edit and react as members; Bea cannot edit or delete Ada's message (author-only).
+        let (st, edited) = Call::new(Method::PATCH, &format!("/v1/messages/{msg_id}"))
+            .token(&ada_token)
+            .json(json!({"body": "hello crew edited"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{edited}");
+        let (st, denied) = Call::new(Method::DELETE, &format!("/v1/messages/{msg_id}"))
+            .token(&bea_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{denied}");
+
+        let (st, reaction) = Call::new(Method::PUT, &format!("/v1/messages/{msg_id}/reactions"))
+            .token(&bea_token)
+            .json(json!({"emoji": "🎉"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{reaction}");
+
+        // Mark read writes `kind = 'group'` and emits NO outbox row.
+        let before_read: i64 = sqlx::query_scalar("SELECT coalesce(max(id), 0) FROM outbox")
+            .fetch_one(&db.owner)
+            .await
+            .expect("max outbox");
+        mark_read(&app, &bea_token, &group_id, &msg_id).await;
+        let read_kind: String = sqlx::query_scalar(
+            "SELECT kind FROM reads WHERE user_id = $1::uuid AND conversation_id = $2::uuid",
+        )
+        .bind(&bea.user_id)
+        .bind(&group_id)
+        .fetch_one(&db.owner)
+        .await
+        .expect("read row");
+        assert_eq!(read_kind, "group");
+        let after_read: i64 = sqlx::query_scalar("SELECT coalesce(max(id), 0) FROM outbox")
+            .fetch_one(&db.owner)
+            .await
+            .expect("max outbox after read");
+        assert_eq!(before_read, after_read, "group read must emit no outbox row");
+
+        // Typing recipients are the other group members only.
+        let mut recipients = db::typing_recipients(&db.runtime, &ada, &group_id)
+            .await
+            .expect("typing recipients");
+        recipients.sort();
+        let mut expected_others = vec![bea.user_id.clone(), cy.user_id.clone()];
+        expected_others.sort();
+        assert_eq!(recipients, expected_others);
+
+        // Delete the message as Ada and verify every group outbox row has the exact member audience.
+        let (st, _) = Call::new(Method::DELETE, &format!("/v1/messages/{msg_id}"))
+            .token(&ada_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        let rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT topic, ARRAY(SELECT u::text FROM unnest(audience) AS u ORDER BY u::text)
+             FROM outbox
+             WHERE payload ->> 'conversation_id' = $1",
+        )
+        .bind(&group_id)
+        .fetch_all(&db.owner)
+        .await
+        .expect("outbox rows");
+        assert!(!rows.is_empty());
+        let mut expected_all = vec![ada.user_id.clone(), bea.user_id.clone(), cy.user_id.clone()];
+        expected_all.sort();
+        for (topic, audience) in rows {
+            let audience = audience.unwrap_or_default();
+            assert!(!audience.is_empty(), "{topic} had empty/null audience");
+            assert_eq!(audience, expected_all, "{topic} audience mismatch");
+        }
+
+        // Guard: app_outbox_append refuses a group payload with NULL or empty audience.
+        let null_err = sqlx::query(
+            "SELECT app_outbox_append('group.updated', jsonb_build_object('group_id', $1), NULL)",
+        )
+        .bind(&group_id)
+        .execute(&db.owner)
+        .await;
+        assert!(null_err.is_err(), "NULL audience on group event must fail");
+
+        // Channel id does not open as group and group id does not open as channel.
+        let (st, ch) = Call::new(Method::POST, "/v1/channels")
+            .token(&owner_token)
+            .json(json!({"name": "not-a-group"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{ch}");
+        let channel_id = ch["id"].as_str().expect("channel id").to_string();
+        let (st, _) = Call::new(Method::PATCH, &format!("/v1/channels/{group_id}"))
+            .token(&owner_token)
+            .json(json!({"name": "nope"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let is_group_member: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM group_dms WHERE id = $1::uuid)")
+                .bind(&channel_id)
+                .fetch_one(&db.owner)
+                .await
+                .expect("check");
+        assert!(!is_group_member);
+
+        // Suppress unused variable warning for outsider.
+        assert_ne!(outsider.user_id, ada.user_id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn group_membership_follows_kick_ban_account_delete_timeout_and_sweep() {
+    run(|db| async move {
+        let owner = first_owner(&db).await;
+        let owner_token = session(&db, &owner.user_id).await;
+        let (ada, ada_token) = join(&db, &owner, "ada-g61b@tinyserver.test", "member").await;
+        let (bea, bea_token) = join(&db, &owner, "bea-g61b@tinyserver.test", "member").await;
+        let (cy, cy_token) = join(&db, &owner, "cy-g61b@tinyserver.test", "member").await;
+        let (dee, dee_token) = join(&db, &owner, "dee-g61b@tinyserver.test", "member").await;
+        let app = api::router(db.runtime.clone(), None);
+
+        let group_id = insert_test_group(
+            &db.owner,
+            &ada.user_id,
+            &[&ada.user_id, &bea.user_id, &cy.user_id, &dee.user_id],
+            "Squad",
+        )
+        .await;
+
+        let (st, msg) = send_message(&app, &ada_token, &group_id, json!({"body": "first"})).await;
+        assert_eq!(st, StatusCode::CREATED, "{msg}");
+        let msg_id = msg["id"].as_str().expect("msg id").to_string();
+        mark_read(&app, &bea_token, &group_id, &msg_id).await;
+        mark_read(&app, &cy_token, &group_id, &msg_id).await;
+
+        let key_before: Vec<u8> =
+            sqlx::query_scalar("SELECT member_key FROM group_dms WHERE id = $1::uuid")
+                .bind(&group_id)
+                .fetch_one(&db.owner)
+                .await
+                .expect("member_key");
+
+        // Timeout keeps membership, blocks post, allows read.
+        sqlx::query(
+            "UPDATE memberships SET timeout_until = now() + interval '1 day' WHERE user_id = $1::uuid",
+        )
+        .bind(&dee.user_id)
+        .execute(&db.owner)
+        .await
+        .expect("timeout");
+        let (st, _) = get_messages(&app, &dee_token, &group_id).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = send_message(&app, &dee_token, &group_id, json!({"body": "muted"})).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let key_after_timeout: Vec<u8> =
+            sqlx::query_scalar("SELECT member_key FROM group_dms WHERE id = $1::uuid")
+                .bind(&group_id)
+                .fetch_one(&db.owner)
+                .await
+                .expect("member_key");
+        assert_eq!(key_before, key_after_timeout);
+
+        // Kick Bea: removes group_dm_members row, removes reads row, updates member_key.
+        let (st, _) = Call::new(Method::DELETE, &format!("/v1/members/{}", bea.user_id))
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let bea_read_left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM reads WHERE user_id = $1::uuid AND kind = 'group' AND conversation_id = $2::uuid",
+        )
+        .bind(&bea.user_id)
+        .bind(&group_id)
+        .fetch_one(&db.owner)
+        .await
+        .expect("reads count");
+        assert_eq!(bea_read_left, 0);
+        let key_after_kick: Vec<u8> =
+            sqlx::query_scalar("SELECT member_key FROM group_dms WHERE id = $1::uuid")
+                .bind(&group_id)
+                .fetch_one(&db.owner)
+                .await
+                .expect("member_key");
+        assert_ne!(key_before, key_after_kick);
+
+        // Ban Cy: removes membership & reads.
+        let (st, _) = Call::new(Method::POST, "/v1/bans")
+            .token(&owner_token)
+            .json(json!({"user_id": cy.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let cy_in: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM group_dm_members WHERE group_dm_id = $1::uuid AND user_id = $2::uuid)",
+        )
+        .bind(&group_id)
+        .bind(&cy.user_id)
+        .fetch_one(&db.owner)
+        .await
+        .expect("cy membership");
+        assert!(!cy_in);
+
+        // Account deletion of Dee: removes membership.
+        let (st, _) = Call::new(Method::DELETE, "/v1/me")
+            .token(&dee_token)
+            .json(json!({"confirm": "delete my account"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        // Kick Ada (last member): group is now memberless and cleaned up by sweep.
+        let (st, _) = Call::new(Method::DELETE, &format!("/v1/members/{}", ada.user_id))
+            .token(&owner_token)
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        db::sweep(&db.runtime).await.expect("sweep");
+        let group_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM group_dms WHERE id = $1::uuid)")
+                .bind(&group_id)
+                .fetch_one(&db.owner)
+                .await
+                .expect("group exists");
+        assert!(!group_exists, "memberless group should be removed by sweep");
+    })
+    .await;
+}
