@@ -67,13 +67,17 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
     let public_url = sign_in
         .as_ref()
         .map_or_else(String::new, |sign_in| sign_in.public_url().to_string());
+    let max_video_slots = live
+        .as_ref()
+        .and_then(Live::video_slots)
+        .unwrap_or(sfu::DEFAULT_VIDEO_SLOTS);
     let mut routes = Router::new()
         .merge(health::routes(live.clone()))
         .merge(operator::routes())
         .merge(session::routes())
         .merge(account::routes())
         .merge(community::routes())
-        .merge(admin::routes())
+        .merge(admin::routes(max_video_slots))
         .merge(setup::routes(deployment, public_url))
         .merge(bot::routes())
         .merge(messages::routes())

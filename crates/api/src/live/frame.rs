@@ -161,8 +161,8 @@ pub(crate) struct Incoming {
     /// `call.moderate`.
     pub server_muted: Option<bool>,
     pub server_deafened: Option<bool>,
-    /// `call.quality`: `high`, `low`, or `off`.
-    pub video: Option<String>,
+    /// `call.quality`: `"high"`, `"low"`, or `"off"`. `call.watch`: subscription array.
+    pub video: Option<Value>,
     /// `call.join`: the highest end-to-end encryption version the client speaks. Read
     /// leniently: a number of 1 or more, anything else is none.
     pub e2ee: Option<Value>,
@@ -222,6 +222,14 @@ pub(crate) struct VideoSlotFrame<'a> {
     pub mid: &'a str,
     pub user_id: &'a str,
     pub kind: &'static str,
+}
+
+#[derive(Serialize)]
+pub(crate) struct VideoEntryFrame<'a> {
+    pub mid: &'a str,
+    pub user_id: &'a str,
+    pub kind: &'static str,
+    pub layer: &'static str,
 }
 
 #[derive(Serialize)]
@@ -291,12 +299,14 @@ pub(crate) enum Out<'a> {
         call_id: &'a str,
         sdp: &'a str,
     },
-    /// Which receive slot carries whom. `video` is null while the video slot carries nobody.
+    /// Which receive slot carries whom. `video` mirrors slot 0 (null while empty) for older
+    /// clients; `videos` lists every active receive video slot with its forwarded layer.
     #[serde(rename = "call.slots")]
     CallSlots {
         call_id: &'a str,
         audio: &'a [SlotFrame<'a>],
         video: Option<VideoSlotFrame<'a>>,
+        videos: &'a [VideoEntryFrame<'a>],
     },
     #[serde(rename = "call.speaking")]
     CallSpeaking {
@@ -411,7 +421,7 @@ impl Out<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Audience, Event, Me, Out, SlotFrame, VideoSlotFrame};
+    use super::{Audience, Event, Me, Out, SlotFrame, VideoEntryFrame, VideoSlotFrame};
     use crate::live::call::{Occupancy, Participant};
     use db::OutboxRow;
     use serde_json::{json, Value};
@@ -526,10 +536,11 @@ mod tests {
                 user_id: "u",
             }],
             video: None,
+            videos: &[],
         };
         assert_eq!(
             slots.text(),
-            r#"{"type":"call.slots","call_id":"c-1","audio":[{"mid":"1","user_id":"u"}],"video":null}"#
+            r#"{"type":"call.slots","call_id":"c-1","audio":[{"mid":"1","user_id":"u"}],"video":null,"videos":[]}"#
         );
         let slots = Out::CallSlots {
             call_id: "c-1",
@@ -539,10 +550,16 @@ mod tests {
                 user_id: "u",
                 kind: "camera",
             }),
+            videos: &[VideoEntryFrame {
+                mid: "2",
+                user_id: "u",
+                kind: "camera",
+                layer: "h",
+            }],
         };
         assert_eq!(
             slots.text(),
-            r#"{"type":"call.slots","call_id":"c-1","audio":[],"video":{"mid":"2","user_id":"u","kind":"camera"}}"#
+            r#"{"type":"call.slots","call_id":"c-1","audio":[],"video":{"mid":"2","user_id":"u","kind":"camera"},"videos":[{"mid":"2","user_id":"u","kind":"camera","layer":"h"}]}"#
         );
         let speaking = Out::CallSpeaking {
             room_id: "r",
@@ -594,10 +611,24 @@ mod tests {
                 user_id: "u",
                 kind: sfu::VideoKind::Share.as_str(),
             }),
+            videos: &[
+                VideoEntryFrame {
+                    mid: "2",
+                    user_id: "u",
+                    kind: sfu::VideoKind::Share.as_str(),
+                    layer: sfu::Layer::Share.as_str(),
+                },
+                VideoEntryFrame {
+                    mid: "3",
+                    user_id: "v",
+                    kind: sfu::VideoKind::Camera.as_str(),
+                    layer: sfu::Layer::Low.as_str(),
+                },
+            ],
         };
         assert_eq!(
             slots.text(),
-            r#"{"type":"call.slots","call_id":"c-1","audio":[],"video":{"mid":"2","user_id":"u","kind":"share"}}"#
+            r#"{"type":"call.slots","call_id":"c-1","audio":[],"video":{"mid":"2","user_id":"u","kind":"share"},"videos":[{"mid":"2","user_id":"u","kind":"share","layer":"share"},{"mid":"3","user_id":"v","kind":"camera","layer":"l"}]}"#
         );
     }
 

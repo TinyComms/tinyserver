@@ -1,0 +1,11 @@
+{
+  "id": "video-received",
+  "title": "A released client's share and camera reach another released client through this server, in a room and in a direct call",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {"android": "the client probe is a desktop process pair", "ios": "the same"},
+  "needs": ["server", "isolated-postgres", "two-people"],
+  "release": true,
+  "driver": "run.sh",
+  "client": "the last released tinyclient tag",
+  "proof_scope": "released desktop client media core against this server build; not GUI"
+}
