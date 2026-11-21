@@ -548,7 +548,9 @@ async fn receive(
         "call.accept" => call_accept(hub, me, asking, direct_id).await?,
         "call.decline" => call_decline(hub, me, asking, direct_id).await?,
         "call.cancel" => call_cancel(hub, me, asking, direct_id).await?,
-        "call.group.start" => call_group_start(hub, me, asking, group_id).await?,
+        "call.group.start" => {
+            call_group_start(hub, me, asking, group_id, incoming.from_direct.clone()).await?
+        }
         "call.group.ring" => {
             call_group_ring(
                 hub,
@@ -883,6 +885,7 @@ async fn call_group_start(
     me: &mut Me,
     asking: &mut Asking<'_>,
     group_id: Option<&str>,
+    from_direct: Option<super::group_call::FromDirect>,
 ) -> Result<Answer, End> {
     let Some(group_id) = group_id else {
         return Ok(Err("bad_frame"));
@@ -897,7 +900,7 @@ async fn call_group_start(
         Ok(members) => members,
         Err(code) => return Ok(Err(code)),
     };
-    match hub.start_group_call(group_id, &me.user_id, members) {
+    match hub.start_group_call(group_id, &me.user_id, members, from_direct) {
         Ok(()) => Ok(Ok(Done::Ok)),
         Err(refused) => Ok(Err(refused.code())),
     }

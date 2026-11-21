@@ -513,3 +513,401 @@ async fn old_client_sees_only_safe_frame_types_and_mid_call_removal_ends_seat() 
     })
     .await;
 }
+
+/// Joins a direct call with real media + DAVE MLS.
+async fn dial_direct(mut ws: Ws, user_id: &str, direct_id: &str, room_id: &str) -> GroupApp {
+    let mut client = Client::new(SocketAddr::from((LOOPBACK, 0)), SLOTS).expect("client");
+    send(
+        &mut ws,
+        json!({
+            "type": "call.join",
+            "ref": "jd",
+            "direct_id": direct_id,
+            "sdp": client.offer(),
+            "e2ee": 1,
+        }),
+    )
+    .await;
+    let answer = until(&mut ws, |v| {
+        (v["type"] == "call.answer" || v["type"] == "error").then(|| v.clone())
+    })
+    .await;
+    assert_eq!(answer["type"], "call.answer", "{answer}");
+    client
+        .accept(answer["sdp"].as_str().expect("sdp"))
+        .expect("accept answer");
+    let running = client.start(b'd').expect("client thread");
+    let deadline = Instant::now() + WAIT;
+    while !running.connected() {
+        assert!(Instant::now() < deadline, "media did not connect");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    GroupApp {
+        ws,
+        user_id: user_id.to_string(),
+        room_id: room_id.to_string(),
+        _running: running,
+        session: None,
+        welcomes: 0,
+        commits: Vec::new(),
+        seen_types: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn direct_call_moves_into_group_call_with_real_media_and_mls() {
+    run(|db| async move {
+        let server = serve_media(&db).await;
+        let app = api::app(db.runtime.clone(), server.live.clone(), None);
+        let owner = first_owner(&db).await;
+        let (a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
+        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
+        let (c, c_tok) = join(&db, &owner, "C", "c@example.com").await;
+
+        let (st, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&a_tok)
+            .json(json!({"user_id": b.user_id}))
+            .send(&app)
+            .await;
+        assert!(
+            st == StatusCode::CREATED || st == StatusCode::OK,
+            "{direct}"
+        );
+        let direct_id = direct["id"].as_str().expect("direct_id").to_string();
+
+        let (mut ws_a, _) = connect(&server, &a_tok, None).await;
+        let (mut ws_b, _) = connect(&server, &b_tok, None).await;
+        let (mut ws_c, _) = connect(&server, &c_tok, None).await;
+
+        // A rings B, B accepts, both join direct call with real media + MLS.
+        assert_eq!(
+            answer(
+                &mut ws_a,
+                json!({"type": "call.ring", "ref": "r1", "direct_id": direct_id})
+            )
+            .await,
+            json!({"type": "ok", "ref": "r1"})
+        );
+        let ringing = until(&mut ws_b, |v| {
+            (v["type"] == "call.ringing").then(|| v.clone())
+        })
+        .await;
+        let ring_id = ringing["ring_id"].as_str().expect("ring_id").to_string();
+        assert_eq!(
+            answer(
+                &mut ws_b,
+                json!({"type": "call.accept", "ref": "ac", "direct_id": direct_id})
+            )
+            .await,
+            json!({"type": "ok", "ref": "ac"})
+        );
+        let direct_room = format!("d:{ring_id}");
+        let mut dir_a = dial_direct(ws_a, &a.user_id, &direct_id, &direct_room).await;
+        let mut dir_b = dial_direct(ws_b, &b.user_id, &direct_id, &direct_room).await;
+        let roster_ab = [mls_user(&a.user_id), mls_user(&b.user_id)];
+        pump(&mut [&mut dir_a, &mut dir_b], &roster_ab, |xs| {
+            xs.iter().all(|x| x.ready()) && xs[0].code() == xs[1].code()
+        })
+        .await;
+        let direct_code = dir_a.code().expect("direct code");
+
+        // A creates group {A, B, C} and starts group call from the live direct call.
+        let (st, created) = Call::new(Method::POST, "/v1/groups")
+            .token(&a_tok)
+            .json(json!({"user_ids": [b.user_id, c.user_id], "name": "Escalated"}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{created}");
+        let gid = created["id"].as_str().expect("gid").to_string();
+
+        assert_eq!(
+            answer(
+                &mut dir_a.ws,
+                json!({
+                    "type": "call.group.start",
+                    "ref": "mv",
+                    "group_id": gid,
+                    "from_direct": {"direct_id": direct_id, "ring_id": ring_id},
+                }),
+            )
+            .await,
+            json!({"type": "ok", "ref": "mv"})
+        );
+        let started = until(&mut dir_a.ws, |v| {
+            (v["type"] == "call.group.started").then(|| v.clone())
+        })
+        .await;
+        assert_eq!(started["moved_from"]["direct_id"], direct_id);
+        assert_eq!(started["moved_from"]["ring_id"], ring_id);
+        let call_id = started["call_id"].as_str().expect("call_id").to_string();
+        let group_room = format!("g:{call_id}");
+
+        let started_c = until(&mut ws_c, |v| {
+            (v["type"] == "call.group.started").then(|| v.clone())
+        })
+        .await;
+        assert_eq!(started_c["call_id"], call_id);
+
+        // Both A and B move into g:{call_id}, and C answers and joins -> fresh MLS group & privacy code!
+        let mut grp_a = dial_group(dir_a.ws, &a.user_id, &gid, &group_room).await;
+        let mut grp_b = dial_group(dir_b.ws, &b.user_id, &gid, &group_room).await;
+        let mut grp_c = dial_group(ws_c, &c.user_id, &gid, &group_room).await;
+        let roster_abc = [
+            mls_user(&a.user_id),
+            mls_user(&b.user_id),
+            mls_user(&c.user_id),
+        ];
+        pump(
+            &mut [&mut grp_a, &mut grp_b, &mut grp_c],
+            &roster_abc,
+            |xs| {
+                xs.iter().all(|x| x.ready())
+                    && xs[0].code() == xs[1].code()
+                    && xs[1].code() == xs[2].code()
+            },
+        )
+        .await;
+        assert_ne!(grp_a.code().expect("group code"), direct_code);
+
+        // End the group call and verify one `ended` row in direct_call_log and one in group_call_log.
+        for ws in [&mut grp_a.ws, &mut grp_b.ws, &mut grp_c.ws] {
+            send(
+                ws,
+                json!({"type": "call.leave", "ref": "lv", "group_id": gid, "call_id": call_id}),
+            )
+            .await;
+        }
+        let _ = until(&mut grp_c.ws, |v| {
+            (v["type"] == "call.group.ended").then(|| v.clone())
+        })
+        .await;
+        let _ = until(&mut grp_c.ws, |v| {
+            (v["type"] == "group.call").then(|| v.clone())
+        })
+        .await;
+
+        let direct_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM direct_call_log WHERE id = $1::uuid AND outcome = 'ended'",
+        )
+        .bind(&ring_id)
+        .fetch_one(&db.owner)
+        .await
+        .expect("direct_call_log");
+        assert_eq!(direct_rows, 1);
+
+        let group_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM group_call_log WHERE id = $1::uuid AND outcome = 'ended'",
+        )
+        .bind(&call_id)
+        .fetch_one(&db.owner)
+        .await
+        .expect("group_call_log");
+        assert_eq!(group_rows, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn old_client_peer_ends_with_peer_left_when_direct_moves_to_group() {
+    run(|db| async move {
+        let server = serve_media(&db).await;
+        let app = api::app(db.runtime.clone(), server.live.clone(), None);
+        let owner = first_owner(&db).await;
+        let (a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
+        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
+        let (c, _c_tok) = join(&db, &owner, "C", "c@example.com").await;
+
+        let (st, direct) = Call::new(Method::POST, "/v1/directs")
+            .token(&a_tok)
+            .json(json!({"user_id": b.user_id}))
+            .send(&app)
+            .await;
+        assert!(
+            st == StatusCode::CREATED || st == StatusCode::OK,
+            "{direct}"
+        );
+        let direct_id = direct["id"].as_str().expect("direct_id").to_string();
+
+        let (mut ws_a, _) = connect(&server, &a_tok, None).await;
+        let (mut ws_b, _) = connect(&server, &b_tok, None).await;
+
+        assert_eq!(
+            answer(
+                &mut ws_a,
+                json!({"type": "call.ring", "ref": "r", "direct_id": direct_id})
+            )
+            .await,
+            json!({"type": "ok", "ref": "r"})
+        );
+        let ringing = until(&mut ws_b, |v| {
+            (v["type"] == "call.ringing").then(|| v.clone())
+        })
+        .await;
+        let ring_id = ringing["ring_id"].as_str().expect("ring_id").to_string();
+        assert_eq!(
+            answer(
+                &mut ws_b,
+                json!({"type": "call.accept", "ref": "ac", "direct_id": direct_id})
+            )
+            .await,
+            json!({"type": "ok", "ref": "ac"})
+        );
+        let direct_room = format!("d:{ring_id}");
+        let mut dir_a = dial_direct(ws_a, &a.user_id, &direct_id, &direct_room).await;
+        let mut dir_b = dial_direct(ws_b, &b.user_id, &direct_id, &direct_room).await;
+
+        let (st, created) = Call::new(Method::POST, "/v1/groups")
+            .token(&a_tok)
+            .json(json!({"user_ids": [b.user_id, c.user_id]}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{created}");
+        let gid = created["id"].as_str().expect("gid").to_string();
+
+        // A starts group call from direct and moves; old-client B ignores call.group.*.
+        assert_eq!(
+            answer(
+                &mut dir_a.ws,
+                json!({
+                    "type": "call.group.start",
+                    "ref": "mv",
+                    "group_id": gid,
+                    "from_direct": {"direct_id": direct_id, "ring_id": ring_id},
+                }),
+            )
+            .await,
+            json!({"type": "ok", "ref": "mv"})
+        );
+        let started = until(&mut dir_a.ws, |v| {
+            (v["type"] == "call.group.started").then(|| v.clone())
+        })
+        .await;
+        let call_id = started["call_id"].as_str().expect("call_id").to_string();
+        let group_room = format!("g:{call_id}");
+        let _grp_a = dial_group(dir_a.ws, &a.user_id, &gid, &group_room).await;
+
+        // Wait up to 20s for B to see A leave as `moved` and B's own seat end with `peer_left`.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut saw_a_moved = false;
+        let mut saw_b_peer_left = false;
+        while !saw_b_peer_left {
+            let msg = tokio::time::timeout_at(deadline, dir_b.ws.next())
+                .await
+                .expect("B's direct seat did not end with peer_left in time")
+                .expect("socket open")
+                .expect("frame");
+            let Message::Text(text) = msg else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(text.as_str()).expect("json");
+            if v["type"] == "call.left" && v["user_id"] == a.user_id {
+                assert_eq!(v["reason"], "moved");
+                saw_a_moved = true;
+            }
+            if v["type"] == "call.left" && v["user_id"] == b.user_id {
+                assert_eq!(v["reason"], "peer_left");
+                saw_b_peer_left = true;
+            }
+        }
+        assert!(saw_a_moved);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn adding_member_to_running_group_call_sends_started_ring_and_welcome() {
+    run(|db| async move {
+        let server = serve_media(&db).await;
+        let app = api::app(db.runtime.clone(), server.live.clone(), None);
+        let owner = first_owner(&db).await;
+        let (a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
+        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
+        let (c, _c_tok) = join(&db, &owner, "C", "c@example.com").await;
+        let (d, d_tok) = join(&db, &owner, "D", "d@example.com").await;
+
+        let (st, created) = Call::new(Method::POST, "/v1/groups")
+            .token(&a_tok)
+            .json(json!({"user_ids": [b.user_id, c.user_id]}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{created}");
+        let gid = created["id"].as_str().expect("gid").to_string();
+
+        let (mut ws_a, _) = connect(&server, &a_tok, None).await;
+        let (ws_b, _) = connect(&server, &b_tok, None).await;
+        let (mut ws_d, _) = connect(&server, &d_tok, None).await;
+
+        assert_eq!(
+            answer(
+                &mut ws_a,
+                json!({"type": "call.group.start", "ref": "s", "group_id": gid})
+            )
+            .await,
+            json!({"type": "ok", "ref": "s"})
+        );
+        let started = until(&mut ws_a, |v| {
+            (v["type"] == "call.group.started").then(|| v.clone())
+        })
+        .await;
+        let call_id = started["call_id"].as_str().expect("call_id").to_string();
+        let room_id = format!("g:{call_id}");
+
+        let mut app_a = dial_group(ws_a, &a.user_id, &gid, &room_id).await;
+        let mut app_b = dial_group(ws_b, &b.user_id, &gid, &room_id).await;
+        let roster_ab = [mls_user(&a.user_id), mls_user(&b.user_id)];
+        pump(&mut [&mut app_a, &mut app_b], &roster_ab, |xs| {
+            xs.iter().all(|x| x.ready()) && xs[0].code() == xs[1].code()
+        })
+        .await;
+
+        // Add D to the group mid-call: D immediately receives call.group.started.
+        let (st, _) = Call::new(Method::POST, &format!("/v1/groups/{gid}/members"))
+            .token(&a_tok)
+            .json(json!({"user_id": d.user_id}))
+            .send(&app)
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        let started_d = until(&mut ws_d, |v| {
+            (v["type"] == "call.group.started").then(|| v.clone())
+        })
+        .await;
+        assert_eq!(started_d["call_id"], call_id);
+
+        // Seated A rings D via call.group.ring.
+        send(
+            &mut app_a.ws,
+            json!({
+                "type": "call.group.ring",
+                "ref": "rd",
+                "group_id": gid,
+                "call_id": call_id,
+                "user_ids": [d.user_id],
+            }),
+        )
+        .await;
+        let ring_d = until(&mut ws_d, |v| {
+            (v["type"] == "call.group.ring" && v["user_id"] == d.user_id).then(|| v.clone())
+        })
+        .await;
+        assert_eq!(ring_d["state"], "ringing");
+        assert_eq!(ring_d["by"], a.user_id);
+
+        // D joins and receives a Welcome, converging on the same privacy code as A and B.
+        let mut app_d = dial_group(ws_d, &d.user_id, &gid, &room_id).await;
+        let roster_abd = [
+            mls_user(&a.user_id),
+            mls_user(&b.user_id),
+            mls_user(&d.user_id),
+        ];
+        pump(
+            &mut [&mut app_a, &mut app_b, &mut app_d],
+            &roster_abd,
+            |xs| {
+                xs.iter().all(|x| x.ready()) && xs[0].code() == xs[2].code() && xs[2].welcomes >= 1
+            },
+        )
+        .await;
+    })
+    .await;
+}

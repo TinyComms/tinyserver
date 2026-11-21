@@ -148,6 +148,8 @@ pub(crate) struct Incoming {
     pub call_id: Option<String>,
     /// `call.group.ring` and `call.group.unring`: the members to ring or stop ringing.
     pub user_ids: Option<Vec<String>>,
+    /// `call.group.start`: move a live 1:1 direct call into this group call (#62).
+    pub from_direct: Option<super::group_call::FromDirect>,
     /// `typing`: the channel or direct conversation.
     pub conversation_id: Option<String>,
     pub user_id: Option<String>,
@@ -338,6 +340,8 @@ pub(crate) enum Out<'a> {
         started_at: &'a str,
         rings: &'a [super::group_call::RingEntry],
         participants: &'a [Participant],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        moved_from: Option<&'a super::group_call::FromDirect>,
     },
     #[serde(rename = "call.group.ring")]
     CallGroupRing {
@@ -706,10 +710,28 @@ mod tests {
             started_at: "2026-11-16T10:00:00Z",
             rings: &rings,
             participants: &[],
+            moved_from: None,
         };
         assert_eq!(
             started.text(),
             r#"{"type":"call.group.started","group_id":"g1","call_id":"c1","started_by":"a","started_at":"2026-11-16T10:00:00Z","rings":[{"user_id":"b","state":"ringing"}],"participants":[]}"#
+        );
+        let from_direct = crate::live::group_call::FromDirect {
+            direct_id: "d1".to_string(),
+            ring_id: "r1".to_string(),
+        };
+        let moved = Out::CallGroupStarted {
+            group_id: "g1",
+            call_id: "c1",
+            started_by: "a",
+            started_at: "2026-11-16T10:00:00Z",
+            rings: &rings,
+            participants: &[],
+            moved_from: Some(&from_direct),
+        };
+        assert_eq!(
+            moved.text(),
+            r#"{"type":"call.group.started","group_id":"g1","call_id":"c1","started_by":"a","started_at":"2026-11-16T10:00:00Z","rings":[{"user_id":"b","state":"ringing"}],"participants":[],"moved_from":{"direct_id":"d1","ring_id":"r1"}}"#
         );
         assert_eq!(
             Out::CallGroupRing {

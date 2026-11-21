@@ -54,6 +54,10 @@ struct Ring {
     phase: Phase,
     until: Instant,
     accepted_at: Option<SystemTime>,
+    /// Set when a live 1:1 call is moving into a group call (#62). Until this deadline,
+    /// joining `moving_to` leaves `d:{id}` as `moved` without cascading `peer_left`.
+    moving_until: Option<Instant>,
+    moving_to: Option<String>,
 }
 
 /// What `ready` says about a ring this person is in.
@@ -83,6 +87,7 @@ pub(crate) struct Due {
     pub caller_id: String,
     pub callee_id: String,
     pub accepted: bool,
+    pub moving: bool,
 }
 
 /// `call.ring` placed a ring, or the caller is told the other side is busy.
@@ -162,6 +167,8 @@ impl Rings {
             phase: Phase::Ringing,
             until: Instant::now() + RING_FOR,
             accepted_at: None,
+            moving_until: None,
+            moving_to: None,
         };
         let card = ring.card();
         self.by_user.insert(caller_id.to_string(), id.clone());
@@ -284,6 +291,56 @@ impl Rings {
         self.by_user.contains_key(user_id)
     }
 
+    /// Validates that `ring_id` is a `Live` direct call on `direct_id` involving `user_id` and
+    /// returns the other party's user id without mutating state.
+    pub fn validate_move(
+        &self,
+        direct_id: &str,
+        ring_id: &str,
+        user_id: &str,
+    ) -> Result<String, &'static str> {
+        let ring = self.by_id.get(ring_id).ok_or("not_found")?;
+        if ring.direct_id != direct_id || ring.phase != Phase::Live {
+            return Err("not_found");
+        }
+        if ring.caller_id == user_id {
+            Ok(ring.callee_id.clone())
+        } else if ring.callee_id == user_id {
+            Ok(ring.caller_id.clone())
+        } else {
+            Err("not_found")
+        }
+    }
+
+    /// Marks a `Live` direct call as moving into `target_room_id` (`g:{call_id}`) with a
+    /// `SEAT_FOR` deadline. Returns the other party's user id.
+    pub fn begin_move(
+        &mut self,
+        direct_id: &str,
+        ring_id: &str,
+        user_id: &str,
+        target_room_id: &str,
+        now: Instant,
+    ) -> Result<String, &'static str> {
+        let peer = self.validate_move(direct_id, ring_id, user_id)?;
+        let ring = self.by_id.get_mut(ring_id).expect("validated ring");
+        ring.moving_until = Some(now + SEAT_FOR);
+        ring.moving_to = Some(target_room_id.to_string());
+        Ok(peer)
+    }
+
+    /// True while `direct_room_id` is a live direct call actively moving into `target_room_id`.
+    pub fn is_moving_to(&self, direct_room_id: &str, target_room_id: &str) -> bool {
+        let Some(id) = ring_of_room(direct_room_id) else {
+            return false;
+        };
+        self.by_id.get(id).is_some_and(|ring| {
+            ring.phase == Phase::Live
+                && ring.moving_until.is_some()
+                && ring.moving_to.as_deref() == Some(target_room_id)
+        })
+    }
+
     pub fn direct_of_room(&self, room_id: &str) -> Option<&str> {
         Some(&self.by_id.get(ring_of_room(room_id)?)?.direct_id)
     }
@@ -302,11 +359,15 @@ impl Rings {
         })
     }
 
-    /// Rings whose wait is over. A live call is not one of them.
+    /// Rings whose wait is over, plus live calls whose move-to-group deadline elapsed.
     pub fn due(&self, now: Instant) -> Vec<Due> {
         self.by_id
             .values()
-            .filter(|ring| ring.phase != Phase::Live && ring.until <= now)
+            .filter(|ring| {
+                (ring.phase != Phase::Live && ring.until <= now)
+                    || (ring.phase == Phase::Live
+                        && ring.moving_until.is_some_and(|until| until <= now))
+            })
             .map(|ring| Due {
                 id: ring.id.clone(),
                 room_id: room_key(&ring.id),
@@ -314,6 +375,8 @@ impl Rings {
                 caller_id: ring.caller_id.clone(),
                 callee_id: ring.callee_id.clone(),
                 accepted: ring.phase == Phase::Accepted,
+                moving: ring.phase == Phase::Live
+                    && ring.moving_until.is_some_and(|until| until <= now),
             })
             .collect()
     }
@@ -325,13 +388,26 @@ impl Rings {
             .is_some_and(|ring| ring.phase == Phase::Accepted && ring.until <= now)
     }
 
-    /// Ends one due ring. A live call, or one whose window moved, stays.
+    /// Live, moving to a group call, and the move deadline has elapsed.
+    pub fn moving_due(&self, id: &str, now: Instant) -> bool {
+        self.by_id.get(id).is_some_and(|ring| {
+            ring.phase == Phase::Live && ring.moving_until.is_some_and(|until| until <= now)
+        })
+    }
+
+    /// Ends one due ring. A live call without an elapsed move deadline stays.
     pub fn take_due(&mut self, id: &str, now: Instant) -> Option<Notice> {
-        let (phase, until) = {
+        let (phase, until, moving_until) = {
             let ring = self.by_id.get(id)?;
-            (ring.phase, ring.until)
+            (ring.phase, ring.until, ring.moving_until)
         };
-        if phase == Phase::Live || until > now {
+        if phase == Phase::Live {
+            if moving_until.is_some_and(|u| u <= now) {
+                return Some(self.remove(id, Kind::Ended, "ended"));
+            }
+            return None;
+        }
+        if until > now {
             return None;
         }
         if phase == Phase::Ringing {
@@ -341,13 +417,17 @@ impl Rings {
         }
     }
 
-    /// Rings whose wait is over. A live call is not one of them.
+    /// Rings whose wait is over, including live calls past their move deadline.
     #[cfg(test)]
     pub fn expire_due(&mut self, now: Instant) -> Vec<Notice> {
         let due: Vec<String> = self
             .by_id
             .iter()
-            .filter(|(_, ring)| ring.phase != Phase::Live && ring.until <= now)
+            .filter(|(_, ring)| {
+                (ring.phase != Phase::Live && ring.until <= now)
+                    || (ring.phase == Phase::Live
+                        && ring.moving_until.is_some_and(|until| until <= now))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         due.into_iter()
@@ -359,7 +439,8 @@ impl Rings {
                     .unwrap_or(Phase::Ringing);
                 match phase {
                     Phase::Ringing => self.remove(&id, Kind::Missed, "missed"),
-                    Phase::Accepted | Phase::Live => self.remove(&id, Kind::MediaTimeout, "ended"),
+                    Phase::Accepted => self.remove(&id, Kind::MediaTimeout, "ended"),
+                    Phase::Live => self.remove(&id, Kind::Ended, "ended"),
                 }
             })
             .collect()
@@ -485,5 +566,43 @@ mod tests {
         let ended = rings.on_room_empty(&key).expect("ended");
         assert_eq!(ended.record.expect("record").outcome, "ended");
         assert!(rings.parties(&key).is_none());
+    }
+
+    #[test]
+    fn moving_direct_expires_at_deadline_as_ended() {
+        let mut rings = Rings::default();
+        let started = pair(&mut rings);
+        let Kind::Ringing(card) = started.kind else {
+            panic!("ring");
+        };
+        rings.accept("direct", "callee").expect("accept");
+        let key = room_key(&card.ring_id);
+        rings.mark_live(&key);
+
+        let now = Instant::now();
+        let peer = rings
+            .begin_move("direct", &card.ring_id, "caller", "g:grp1", now)
+            .expect("begin move");
+        assert_eq!(peer, "callee");
+        assert!(rings.is_moving_to(&key, "g:grp1"));
+        assert!(!rings.is_moving_to(&key, "g:other"));
+
+        // Before SEAT_FOR: not due.
+        assert!(rings
+            .due(now + SEAT_FOR - Duration::from_secs(1))
+            .is_empty());
+
+        // At SEAT_FOR: due with moving = true, take_due ends it with outcome "ended".
+        let due = rings.due(now + SEAT_FOR);
+        assert_eq!(due.len(), 1);
+        assert!(due[0].moving);
+        assert!(rings.moving_due(&card.ring_id, now + SEAT_FOR));
+        let notice = rings
+            .take_due(&card.ring_id, now + SEAT_FOR)
+            .expect("ended");
+        assert!(matches!(notice.kind, Kind::Ended(_)));
+        assert_eq!(notice.record.expect("record").outcome, "ended");
+        assert!(!rings.has_user("caller"));
+        assert!(!rings.has_user("callee"));
     }
 }

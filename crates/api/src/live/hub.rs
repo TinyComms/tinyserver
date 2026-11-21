@@ -585,7 +585,10 @@ impl Hub {
         }
         let previous = people.calls.room_of(user_id).map(str::to_string);
         let again = previous.as_deref() == Some(room_id);
-        let changes = match people.calls.join(
+        let moving_direct = previous
+            .as_deref()
+            .is_some_and(|prev| people.rings.is_moving_to(prev, room_id));
+        let changes = match people.calls.join_with_move(
             user_id,
             room_id,
             conn,
@@ -594,6 +597,7 @@ impl Hub {
             self.limits.call_server_max,
             access,
             e2ee,
+            moving_direct,
         ) {
             Ok(changes) => changes,
             Err(refused) => {
@@ -1242,29 +1246,115 @@ impl Hub {
     }
 
     /// Starts a group call if none is running (checking capacity for the starter first), or
-    /// resends `call.group.started` to the asker alone if one is already live.
+    /// resends `call.group.started` to the asker alone if one is already live. When `from_direct`
+    /// is set (#62), validates that the sender holds a seat in that live 1:1 call and its peer is
+    /// in `members`, marks both parties `moving`, starts the 15 s direct move deadline, and rings
+    /// newcomers within server capacity (reporting overflow newcomers `busy` while the pair moves).
     pub fn start_group_call(
         &self,
         group_id: &str,
         started_by: &str,
         members: Vec<String>,
+        from_direct: Option<super::group_call::FromDirect>,
     ) -> Result<(), Refused> {
         let mut people = lock(&self.people);
         if self.closing() {
             return Err(Refused::Closing);
         }
-        if people.group_calls.active_room(group_id).is_none() {
-            // Check capacity for the starter before starting or ringing anyone.
-            const PENDING_ROOM: &str = "g:pending";
-            people.calls.check(
-                started_by,
-                PENDING_ROOM,
-                self.limits.call_room_max,
-                self.limits.call_server_max,
-            )?;
-            self.capacity_check(&people, started_by, PENDING_ROOM)?;
-        }
         let now = std::time::Instant::now();
+        let move_info = if let Some(fd) = from_direct {
+            let direct_room = super::ring::room_key(&fd.ring_id);
+            if people.calls.room_of(started_by) != Some(direct_room.as_str()) {
+                return Err(Refused::NotFound);
+            }
+            let peer_id = people
+                .rings
+                .validate_move(&fd.direct_id, &fd.ring_id, started_by)
+                .map_err(|_| Refused::NotFound)?;
+            if !members.iter().any(|m| m == &peer_id) {
+                return Err(Refused::NotFound);
+            }
+
+            // Moving does not count twice against server capacity: both parties typically already
+            // hold seats in `d:{ring_id}`. The group room still needs two seats for them.
+            let existing_others = people
+                .group_calls
+                .active_room(group_id)
+                .map_or(0, |room_id| {
+                    people
+                        .calls
+                        .people(&room_id)
+                        .iter()
+                        .filter(|u| u.as_str() != started_by && u.as_str() != peer_id.as_str())
+                        .count()
+                });
+            if self
+                .limits
+                .call_room_max
+                .is_some_and(|max| existing_others + 2 > max)
+            {
+                return Err(Refused::Full);
+            }
+            let room_slots = self
+                .limits
+                .call_room_max
+                .map_or(usize::MAX, |max| max.saturating_sub(existing_others + 2));
+
+            let extra_for_pair = usize::from(people.calls.room_of(started_by).is_none())
+                + usize::from(people.calls.room_of(&peer_id).is_none());
+            if self
+                .limits
+                .call_server_max
+                .is_some_and(|max| people.calls.seats_len() + extra_for_pair > max)
+            {
+                return Err(Refused::ServerFull);
+            }
+            let server_slots = self.limits.call_server_max.map_or(usize::MAX, |max| {
+                max.saturating_sub(people.calls.seats_len() + extra_for_pair)
+            });
+
+            let mut newcomer_slots = if people.media_overloaded {
+                0
+            } else {
+                room_slots.min(server_slots)
+            };
+            if let Some(budget) = self.limits.call_egress_kbps {
+                let base_count = existing_others + 2;
+                let max_extra = newcomer_slots.min(members.len());
+                let mut allowed = 0usize;
+                for extra in 1..=max_extra {
+                    let count = base_count + extra;
+                    let per_listener = (count - 1).min(self.limits.call_audio_slots) as u64;
+                    let streams = (count as u64).saturating_mul(per_listener);
+                    if streams.saturating_mul(50) <= u64::from(budget) {
+                        allowed = extra;
+                    } else {
+                        break;
+                    }
+                }
+                newcomer_slots = allowed;
+            }
+            Some(super::group_call::MoveInfo {
+                from_direct: fd,
+                parties: [started_by.to_string(), peer_id],
+                newcomer_slots,
+            })
+        } else {
+            if people.group_calls.active_room(group_id).is_none() {
+                // Check capacity for the starter before starting or ringing anyone.
+                const PENDING_ROOM: &str = "g:pending";
+                people.calls.check(
+                    started_by,
+                    PENDING_ROOM,
+                    self.limits.call_room_max,
+                    self.limits.call_server_max,
+                )?;
+                self.capacity_check(&people, started_by, PENDING_ROOM)?;
+            }
+            None
+        };
+
+        let moving_fd = move_info.as_ref().map(|m| m.from_direct.clone());
         let People {
             users,
             calls,
@@ -1276,6 +1366,7 @@ impl Hub {
             group_id,
             started_by,
             members,
+            move_info,
             |uid| rings.has_user(uid) || calls.room_of(uid).is_some_and(super::call::is_group_room),
             |uid| {
                 users
@@ -1285,6 +1376,14 @@ impl Hub {
             |room_id| calls.participants_of(room_id),
             now,
         );
+        if let Some(fd) = moving_fd {
+            let target_call_id = match &outcome {
+                super::group_call::StartOutcome::Created { card, .. }
+                | super::group_call::StartOutcome::Existing { card } => card.call_id.as_str(),
+            };
+            let target_room = super::group_call::room_key(target_call_id);
+            let _ = rings.begin_move(&fd.direct_id, &fd.ring_id, started_by, &target_room, now);
+        }
         match outcome {
             super::group_call::StartOutcome::Created { card, recipients } => {
                 send_group_started(&people, &card, &recipients);
@@ -1679,6 +1778,9 @@ impl Hub {
                     people.fanout(&item.caller_id, Arc::clone(&frame));
                     people.fanout(&item.callee_id, frame);
                 }
+            } else if people.rings.moving_due(&item.id, now) {
+                let changes = people.calls.end_room(&item.room_id, Reason::PeerLeft);
+                self.tell(&mut people, changes);
             }
             let notice = people.rings.take_due(&item.id, now);
             self.announce_rings(people, notice);
@@ -2020,6 +2122,7 @@ fn send_group_started(
             started_at: &card.started_at,
             rings: &card.rings,
             participants: &card.participants,
+            moved_from: card.moved_from.as_ref(),
         }
         .text(),
     );
@@ -2462,7 +2565,7 @@ mod tests {
             "c".to_string(),
             "d".to_string(),
         ];
-        hub.start_group_call("g1", "a", members.clone())
+        hub.start_group_call("g1", "a", members.clone(), None)
             .expect("start group call");
 
         // All four members get call.group.started; B is busy, C (in voice room) and D are rung.
@@ -2568,6 +2671,155 @@ mod tests {
         hub.unring_group_call("g1", &call_id, "a", &["d".to_string()])
             .expect("unring on non-ringing is ok");
         drop(outsider);
+        hub.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_call_move_lifecycle_and_refusal_leaves_direct_untouched() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/group_move_unit")
+            .expect("lazy pool");
+        let limits = Limits {
+            // Room for the two moving parties, zero room for newcomers -> C is reported busy while A and B still move.
+            call_room_max: Some(2),
+            ..Limits::default()
+        };
+        let hub = Hub::start(pool, limits, None);
+        let mut a = hub.join("a", false, HashSet::new());
+        let mut b = hub.join("b", false, HashSet::new());
+        let mut c = hub.join("c", false, HashSet::new());
+
+        // Set up live 1:1 call between A and B.
+        hub.start_ring("d1", "a", "b").expect("ring");
+        hub.accept_ring("d1", "b").expect("accept");
+        let direct_room = hub.direct_join_key("d1", "a").expect("key");
+        let ring_id = direct_room
+            .strip_prefix("d:")
+            .expect("d: prefix")
+            .to_string();
+        hub.call_join(
+            "a",
+            &direct_room,
+            a.conn,
+            None,
+            2,
+            Access::default(),
+            false,
+            [1; 32],
+        )
+        .expect("a direct");
+        hub.call_join(
+            "b",
+            &direct_room,
+            b.conn,
+            None,
+            2,
+            Access::default(),
+            false,
+            [2; 32],
+        )
+        .expect("b direct");
+        lock(&hub.people).rings.mark_live(&direct_room);
+        while a.direct.try_recv().is_ok() {}
+        while b.direct.try_recv().is_ok() {}
+        while c.direct.try_recv().is_ok() {}
+
+        let fd = super::super::group_call::FromDirect {
+            direct_id: "d1".to_string(),
+            ring_id: ring_id.clone(),
+        };
+
+        // Refused when peer B is not a member of the group: direct call stays untouched.
+        assert_eq!(
+            hub.start_group_call(
+                "g-no-b",
+                "a",
+                vec!["a".into(), "c".into(), "d".into()],
+                Some(fd.clone()),
+            ),
+            Err(Refused::NotFound)
+        );
+        assert_eq!(hub.room_of("a").as_deref(), Some(direct_room.as_str()));
+        assert_eq!(hub.room_of("b").as_deref(), Some(direct_room.as_str()));
+
+        // Valid start from direct with {a, b, c} under call_room_max=2:
+        // A and B are `moving` (not busy, not rung); C is `busy` because no 3rd seat fits.
+        hub.start_group_call(
+            "g-abc",
+            "a",
+            vec!["a".into(), "b".into(), "c".into()],
+            Some(fd.clone()),
+        )
+        .expect("start from direct");
+
+        let started_a: Value =
+            serde_json::from_str(&a.direct.try_recv().expect("started a")).expect("json");
+        assert_eq!(started_a["type"], "call.group.started");
+        assert_eq!(started_a["moved_from"]["direct_id"], "d1");
+        assert_eq!(started_a["moved_from"]["ring_id"], ring_id);
+        let state_of = |uid: &str| {
+            started_a["rings"]
+                .as_array()
+                .expect("rings")
+                .iter()
+                .find(|r| r["user_id"] == uid)
+                .and_then(|r| r["state"].as_str())
+        };
+        assert_eq!(state_of("a"), Some("moving"));
+        assert_eq!(state_of("b"), Some("moving"));
+        assert_eq!(state_of("c"), Some("busy"));
+
+        let call_id = started_a["call_id"].as_str().expect("call_id").to_string();
+        let group_room = super::super::group_call::room_key(&call_id);
+        while b.direct.try_recv().is_ok() {}
+
+        // A joins the group call -> leaves direct with `moved`, B keeps their direct seat!
+        hub.call_join(
+            "a",
+            &group_room,
+            a.conn,
+            None,
+            0,
+            Access::default(),
+            false,
+            [1; 32],
+        )
+        .expect("a moves to group");
+        assert_eq!(hub.room_of("a").as_deref(), Some(group_room.as_str()));
+        assert_eq!(
+            hub.room_of("b").as_deref(),
+            Some(direct_room.as_str()),
+            "B keeps their direct seat while moving"
+        );
+        let mut saw_a_moved = false;
+        while let Ok(raw) = b.direct.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("json");
+            if v["type"] == "call.left" && v["user_id"] == "a" {
+                assert_eq!(v["reason"], "moved");
+                saw_a_moved = true;
+            }
+            assert!(
+                !(v["type"] == "call.left" && v["user_id"] == "b"),
+                "B must not be ended when A moves"
+            );
+        }
+        assert!(saw_a_moved);
+
+        // B joins the group call -> leaves direct with `moved`, direct room empties and ring clears!
+        hub.call_join(
+            "b",
+            &group_room,
+            b.conn,
+            None,
+            0,
+            Access::default(),
+            false,
+            [2; 32],
+        )
+        .expect("b moves to group");
+        assert_eq!(hub.room_of("b").as_deref(), Some(group_room.as_str()));
+        assert!(!lock(&hub.people).rings.has_user("a"));
+        assert!(!lock(&hub.people).rings.has_user("b"));
         hub.close();
     }
 }

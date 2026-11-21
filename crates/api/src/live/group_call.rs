@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::call::Participant;
 use super::ring::{new_id, RING_FOR, SEAT_FOR};
@@ -23,10 +23,29 @@ pub(crate) fn call_of_room(room_id: &str) -> Option<&str> {
     room_id.strip_prefix(PREFIX)
 }
 
+/// Source 1:1 direct call carried on `call.group.start` (`from_direct`) and
+/// `call.group.started` (`moved_from`) when moving a live 1:1 call into a group call (#62).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FromDirect {
+    pub direct_id: String,
+    pub ring_id: String,
+}
+
+/// Parameters for starting (or joining an existing) group call from a live 1:1 direct call.
+#[derive(Debug, Clone)]
+pub(crate) struct MoveInfo {
+    pub from_direct: FromDirect,
+    pub parties: [String; 2],
+    /// Maximum newcomers (beyond the two moving parties) that can be rung given server capacity.
+    /// Any further reachable newcomers are reported `busy` while the two parties still move.
+    pub newcomer_slots: usize,
+}
+
 /// Per-member ring state on a group call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RingStatus {
     Ringing,
+    Moving,
     Answered,
     Declined,
     Missed,
@@ -39,6 +58,7 @@ impl RingStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ringing => "ringing",
+            Self::Moving => "moving",
             Self::Answered => "answered",
             Self::Declined => "declined",
             Self::Missed => "missed",
@@ -76,6 +96,7 @@ pub(crate) struct StartedCard {
     pub started_at: String,
     pub rings: Vec<RingEntry>,
     pub participants: Vec<Participant>,
+    pub moved_from: Option<FromDirect>,
 }
 
 /// Result of `GroupCalls::start`.
@@ -185,7 +206,7 @@ impl GroupCall {
             .iter()
             .filter(|(uid, _)| !seen.contains(uid.as_str()))
             .collect();
-        extras.sort_by(|(a, _), (b, _)| a.cmp(b));
+        extras.sort_by_key(|(a, _)| *a);
         for (uid, slot) in extras {
             entries.push(RingEntry {
                 user_id: uid.clone(),
@@ -195,7 +216,11 @@ impl GroupCall {
         entries
     }
 
-    fn started_card(&self, participants: Vec<Participant>) -> StartedCard {
+    fn started_card(
+        &self,
+        participants: Vec<Participant>,
+        moved_from: Option<FromDirect>,
+    ) -> StartedCard {
         StartedCard {
             group_id: self.group_id.clone(),
             call_id: self.id.clone(),
@@ -203,6 +228,7 @@ impl GroupCall {
             started_at: self.started_at_iso.clone(),
             rings: self.ring_entries(),
             participants,
+            moved_from,
         }
     }
 
@@ -246,6 +272,7 @@ impl GroupCall {
                         Some(
                             RingStatus::Missed
                             | RingStatus::Ringing
+                            | RingStatus::Moving
                             | RingStatus::Cancelled
                             | RingStatus::Answered,
                         ) => "missed",
@@ -287,6 +314,7 @@ impl GroupCalls {
         group_id: &str,
         started_by: &str,
         members: Vec<String>,
+        moving: Option<MoveInfo>,
         mut is_busy: impl FnMut(&str) -> bool,
         mut is_online: impl FnMut(&str) -> bool,
         participants_of: impl FnOnce(&str) -> Vec<Participant>,
@@ -297,8 +325,28 @@ impl GroupCalls {
             let participants = participants_of(&room_id);
             let call = self.by_id.get_mut(&call_id).expect("group call");
             call.members = members;
+            if let Some(info) = moving {
+                for party in &info.parties {
+                    if !participants.iter().any(|p| p.user_id == *party) {
+                        call.rings.insert(
+                            party.clone(),
+                            RingSlot {
+                                status: RingStatus::Moving,
+                                until: None,
+                                last_rung_at: None,
+                                by: started_by.to_string(),
+                            },
+                        );
+                    }
+                }
+                let recipients = call.members.clone();
+                return StartOutcome::Created {
+                    card: call.started_card(participants, Some(info.from_direct)),
+                    recipients,
+                };
+            }
             return StartOutcome::Existing {
-                card: call.started_card(participants),
+                card: call.started_card(participants, None),
             };
         }
 
@@ -318,8 +366,25 @@ impl GroupCalls {
         let started_at = SystemTime::now();
         let started_at_iso = format_utc(started_at);
         let mut rings = HashMap::new();
+        let mut rung_newcomers = 0usize;
+        let moving_parties = moving.as_ref().map(|m| &m.parties);
+        let newcomer_cap = moving.as_ref().map_or(usize::MAX, |m| m.newcomer_slots);
+
         for member in &members {
-            if member == started_by {
+            if let Some(parties) = moving_parties {
+                if parties.iter().any(|p| p == member) {
+                    rings.insert(
+                        member.clone(),
+                        RingSlot {
+                            status: RingStatus::Moving,
+                            until: None,
+                            last_rung_at: None,
+                            by: started_by.to_string(),
+                        },
+                    );
+                    continue;
+                }
+            } else if member == started_by {
                 continue;
             }
             let slot = if ringing_elsewhere.contains(member) || is_busy(member) {
@@ -336,7 +401,15 @@ impl GroupCalls {
                     last_rung_at: None,
                     by: started_by.to_string(),
                 }
+            } else if rung_newcomers >= newcomer_cap {
+                RingSlot {
+                    status: RingStatus::Busy,
+                    until: None,
+                    last_rung_at: None,
+                    by: started_by.to_string(),
+                }
             } else {
+                rung_newcomers += 1;
                 RingSlot {
                     status: RingStatus::Ringing,
                     until: Some(now + RING_FOR),
@@ -347,6 +420,7 @@ impl GroupCalls {
             rings.insert(member.clone(), slot);
         }
         let recipients = members.clone();
+        let moved_from = moving.map(|m| m.from_direct);
         let call = GroupCall {
             id: id.clone(),
             group_id: group_id.to_string(),
@@ -359,7 +433,7 @@ impl GroupCalls {
             first_seat_by: Some(now + SEAT_FOR),
             alone_since: None,
         };
-        let card = call.started_card(Vec::new());
+        let card = call.started_card(Vec::new(), moved_from);
         self.by_group.insert(group_id.to_string(), id.clone());
         self.by_id.insert(id, call);
         StartOutcome::Created { card, recipients }
@@ -562,7 +636,7 @@ impl GroupCalls {
         let call_id = self.by_group.get(group_id)?.clone();
         let call = self.by_id.get_mut(&call_id)?;
         let slot = call.rings.get_mut(user_id)?;
-        if slot.status != RingStatus::Ringing {
+        if !matches!(slot.status, RingStatus::Ringing | RingStatus::Moving) {
             return None;
         }
         slot.status = RingStatus::Answered;
@@ -730,7 +804,7 @@ impl GroupCalls {
         if !call.members.iter().any(|m| m == user_id) {
             call.members.push(user_id.to_string());
         }
-        Some(call.started_card(participants))
+        Some(call.started_card(participants, None))
     }
 
     /// Community removal, ban, or timeout: drops any pending group rings for `user_id` across all
@@ -972,6 +1046,7 @@ mod tests {
             "g4",
             "a",
             members(&["a", "b", "c", "d"]),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -989,6 +1064,7 @@ mod tests {
             "g20",
             "u0",
             big.clone(),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -1004,6 +1080,7 @@ mod tests {
             "g4",
             "b",
             members(&["a", "b", "c", "d"]),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -1021,6 +1098,7 @@ mod tests {
             "g1",
             "a",
             members(&["a", "b", "c", "d"]),
+            None,
             |u| u == "b",
             |u| u != "c",
             |_| vec![],
@@ -1043,6 +1121,7 @@ mod tests {
             "g1",
             "a",
             members(&["a", "b", "c", "d"]),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -1092,6 +1171,7 @@ mod tests {
             "g1",
             "a",
             members(&["a", "b", "c"]),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -1118,6 +1198,7 @@ mod tests {
             "g1",
             "a",
             members(&["a", "b"]),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -1137,6 +1218,7 @@ mod tests {
             "g1",
             "a",
             members(&["a", "b", "c"]),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -1164,6 +1246,7 @@ mod tests {
             "g1",
             "a",
             members(&["a", "b"]),
+            None,
             |_| false,
             |_| true,
             |_| vec![],
@@ -1201,6 +1284,7 @@ mod tests {
             "g1",
             "a",
             members(&["a", "b", "c"]),
+            None,
             |_| false,
             |u| u != "c",
             |_| vec![],
@@ -1248,5 +1332,43 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].user_id, "b");
         assert_eq!(events[0].state, "ringing");
+    }
+
+    #[test]
+    fn move_from_direct_marks_pair_moving_and_caps_newcomers_as_busy() {
+        let mut calls = GroupCalls::default();
+        let now = Instant::now();
+        let move_info = MoveInfo {
+            from_direct: FromDirect {
+                direct_id: "d1".into(),
+                ring_id: "r1".into(),
+            },
+            parties: ["a".into(), "b".into()],
+            newcomer_slots: 1,
+        };
+        let StartOutcome::Created { card, .. } = calls.start(
+            "g1",
+            "a",
+            members(&["a", "b", "c", "d"]),
+            Some(move_info),
+            |_| false,
+            |_| true,
+            |_| vec![],
+            now,
+        ) else {
+            panic!("created");
+        };
+        assert_eq!(
+            card.moved_from,
+            Some(FromDirect {
+                direct_id: "d1".into(),
+                ring_id: "r1".into(),
+            })
+        );
+        let state_of = |u: &str| card.rings.iter().find(|r| r.user_id == u).map(|r| r.state);
+        assert_eq!(state_of("a"), Some("moving"));
+        assert_eq!(state_of("b"), Some("moving"));
+        assert_eq!(state_of("c"), Some("ringing"));
+        assert_eq!(state_of("d"), Some("busy"));
     }
 }
