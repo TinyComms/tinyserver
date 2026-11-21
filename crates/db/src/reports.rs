@@ -132,6 +132,7 @@ pub struct ReportSummary {
     pub message_id: Option<String>,
     pub channel_id: Option<String>,
     pub direct_id: Option<String>,
+    pub group_id: Option<String>,
     pub has_evidence: bool,
     pub evidence_unverified: bool,
     pub linked_audit_ids: Vec<i64>,
@@ -232,7 +233,7 @@ pub async fn file_report(
 
 const SUMMARY_COLUMNS: &str = "r.id::text, r.kind, r.category, r.status, r.preserve,
         r.reported_user_id::text, ru.display_name, r.reporter_id::text, rp.display_name,
-        r.message_id::text, r.channel_id::text, r.direct_id::text,
+        r.message_id::text, r.channel_id::text, r.direct_id::text, r.group_dm_id::text,
         r.evidence IS NOT NULL, r.evidence_unverified, r.linked_audit_ids";
 
 fn stamps(column: &str) -> String {
@@ -259,12 +260,13 @@ fn summary_from(row: &PgRow) -> Result<ReportSummary, CommunityError> {
         message_id: row.try_get(9).map_err(get)?,
         channel_id: row.try_get(10).map_err(get)?,
         direct_id: row.try_get(11).map_err(get)?,
-        has_evidence: row.try_get(12).map_err(get)?,
-        evidence_unverified: row.try_get(13).map_err(get)?,
-        linked_audit_ids: row.try_get(14).map_err(get)?,
-        created_at: row.try_get(15).map_err(get)?,
-        updated_at: row.try_get(16).map_err(get)?,
-        resolved_at: row.try_get(17).map_err(get)?,
+        group_id: row.try_get(12).map_err(get)?,
+        has_evidence: row.try_get(13).map_err(get)?,
+        evidence_unverified: row.try_get(14).map_err(get)?,
+        linked_audit_ids: row.try_get(15).map_err(get)?,
+        created_at: row.try_get(16).map_err(get)?,
+        updated_at: row.try_get(17).map_err(get)?,
+        resolved_at: row.try_get(18).map_err(get)?,
     })
 }
 
@@ -351,10 +353,10 @@ async fn detail(
         .ok_or(CommunityError::NotFound)?;
     let summary = summary_from(&row)?;
     let get = from_sql;
-    let note = row.try_get(18).map_err(get)?;
-    let evidence = row.try_get(19).map_err(get)?;
-    let preserved_by = person(row.try_get(20).map_err(get)?, row.try_get(21).map_err(get)?);
-    let preserved_at = row.try_get(22).map_err(get)?;
+    let note = row.try_get(19).map_err(get)?;
+    let evidence = row.try_get(20).map_err(get)?;
+    let preserved_by = person(row.try_get(21).map_err(get)?, row.try_get(22).map_err(get)?);
+    let preserved_at = row.try_get(23).map_err(get)?;
     let rows = sqlx::query(&format!(
         "SELECT n.id::text, n.author_id::text, u.display_name, n.body,
                 to_char(n.created_at AT TIME ZONE 'UTC', '{STAMP}')
@@ -477,5 +479,32 @@ mod tests {
         assert!(check_note(Some(&"x".repeat(NOTE_MAX))).is_ok());
         assert!(check_note(Some("nul\u{0}")).is_err());
         assert!(check_note(Some("bell\u{7}")).is_err());
+    }
+
+    #[test]
+    fn report_summary_exposes_group_id_only() {
+        let summary = ReportSummary {
+            id: "r1".into(),
+            kind: "message".into(),
+            category: "harassment".into(),
+            status: "open".into(),
+            preserve: false,
+            reported: None,
+            reporter: None,
+            message_id: Some("m1".into()),
+            channel_id: None,
+            direct_id: None,
+            group_id: Some("g1".into()),
+            has_evidence: true,
+            evidence_unverified: true,
+            linked_audit_ids: Vec::new(),
+            created_at: "2026-11-21T00:00:00Z".into(),
+            updated_at: "2026-11-21T00:00:00Z".into(),
+            resolved_at: None,
+        };
+        let json = serde_json::to_value(&summary).expect("serialize");
+        assert_eq!(json["group_id"], "g1");
+        assert!(json.get("group_dm_id").is_none());
+        assert!(json.get("members").is_none());
     }
 }

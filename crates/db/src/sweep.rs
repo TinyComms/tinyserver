@@ -53,6 +53,8 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept, DbError> {
         .await?;
     let orphans = crate::messages::expire_orphans(pool).await?;
     crate::messages::remove_files(&orphans);
+    let group_files = crate::messages::sweep_empty_groups(pool).await?;
+    crate::messages::remove_files(&group_files);
     let attachments = i64::try_from(orphans.len()).unwrap_or(i64::MAX);
     let reports = crate::reports::expire_reports(pool).await?;
     // Expired key packages, old welcomes and old sealed-upload ledger rows. Not counted above:

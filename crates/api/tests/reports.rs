@@ -488,6 +488,183 @@ async fn what_can_and_cannot_be_reported() {
 }
 
 #[tokio::test]
+async fn a_member_can_report_a_group_message_without_exposing_members_or_granting_access() {
+    run(|db| async move {
+        let w = world(&db).await;
+        let (outsider, outsider_token) = join(
+            &db,
+            &db::Caller {
+                user_id: w.owner.user_id.clone(),
+                role: "owner".to_string(),
+                scopes: Vec::new(),
+            },
+            "outsider-rep@tinyserver.test",
+            "member",
+        )
+        .await;
+
+        // Ada creates a group with Bea and Cy (owner, moderator, and outsider are NOT in it).
+        let (status, group) = call(
+            &w.app,
+            &w.ada.token,
+            Method::POST,
+            "/v1/groups",
+            Some(json!({"user_ids": [w.bea.user_id, w.cy.user_id], "name": "Private Trio"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{group}");
+        let group_id = group["id"].as_str().expect("group id").to_string();
+
+        // Bea posts a message in the group.
+        let (status, msg) = call(
+            &w.app,
+            &w.bea.token,
+            Method::POST,
+            &format!("/v1/conversations/{group_id}/messages"),
+            Some(json!({"body": "a private group line"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{msg}");
+        let msg_id = msg["id"].as_str().expect("message id").to_string();
+
+        // There is no kind = "group".
+        let (status, err) = report(
+            &w,
+            &w.ada.token,
+            json!({"kind": "group", "target_id": group_id, "category": "spam"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+
+        // Non-member, moderator, and owner outside the group all get 404.
+        for (label, tok) in [
+            ("outsider", outsider_token.as_str()),
+            ("moderator", w.moderator.token.as_str()),
+            ("owner", w.owner.token.as_str()),
+        ] {
+            let (status, answer) = report(
+                &w,
+                tok,
+                json!({"kind": "message", "target_id": msg_id, "category": "harassment"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {answer}");
+        }
+
+        // Ada (member of the group) reports Bea's message with unverified evidence.
+        let (status, filed) = report(
+            &w,
+            &w.ada.token,
+            json!({
+                "kind": "message",
+                "target_id": msg_id,
+                "category": "harassment",
+                "evidence": "quoted by reporter"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{filed}");
+        assert_eq!(filed["evidence_unverified"], true);
+        assert_eq!(filed["duplicate"], false);
+        let report_id = filed["id"].as_str().expect("report id").to_string();
+
+        // Duplicate while open returns 200 with the same report id.
+        let (status, dup) = report(
+            &w,
+            &w.ada.token,
+            json!({"kind": "message", "target_id": msg_id, "category": "harassment"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dup}");
+        assert_eq!(dup["id"], report_id);
+        assert_eq!(dup["duplicate"], true);
+
+        // Database row has message_id and group_dm_id.
+        let (db_msg, db_group): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT message_id::text, group_dm_id::text FROM reports WHERE id = $1::uuid",
+        )
+        .bind(&report_id)
+        .fetch_one(&db.owner)
+        .await
+        .expect("report row");
+        assert_eq!(db_msg.as_deref(), Some(msg_id.as_str()));
+        assert_eq!(db_group.as_deref(), Some(group_id.as_str()));
+
+        // Moderator reads the report: sees group_id, never Cy's id or the stored message body,
+        // and still gets 404 on the group and its messages.
+        let (status, detail) = call(
+            &w.app,
+            &w.moderator.token,
+            Method::GET,
+            &format!("/v1/reports/{report_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["message_id"], msg_id);
+        assert_eq!(detail["group_id"], group_id);
+        assert!(detail["channel_id"].is_null());
+        assert!(detail["direct_id"].is_null());
+        assert_eq!(detail["reported"]["user_id"], w.bea.user_id);
+        assert_eq!(detail["evidence_unverified"], true);
+        let serialized = detail.to_string();
+        assert!(
+            !serialized.contains(&w.cy.user_id),
+            "report leaked bystander group member id: {serialized}"
+        );
+        assert!(!serialized.contains("a private group line"));
+        assert!(!serialized.contains("group_dm_id"));
+
+        let (status, _) = call(
+            &w.app,
+            &w.moderator.token,
+            Method::GET,
+            &format!("/v1/groups/{group_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(
+            &w.app,
+            &w.moderator.token,
+            Method::GET,
+            &format!("/v1/conversations/{group_id}/messages"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // All three members leave -> group is deleted, report stays readable with group_id NULL.
+        for tok in [&w.ada.token, &w.bea.token, &w.cy.token] {
+            let (status, _) = call(
+                &w.app,
+                tok,
+                Method::DELETE,
+                &format!("/v1/groups/{group_id}/members/me"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let (status, after_delete) = call(
+            &w.app,
+            &w.moderator.token,
+            Method::GET,
+            &format!("/v1/reports/{report_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{after_delete}");
+        assert!(after_delete["group_id"].is_null());
+        assert!(after_delete["message_id"].is_null());
+        assert_eq!(after_delete["reported"]["user_id"], w.bea.user_id);
+
+        assert_ne!(outsider.user_id, w.ada.user_id);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn the_reported_member_cannot_see_or_infer_the_reporter() {
     run(|db| async move {
         let w = world(&db).await;

@@ -43,6 +43,7 @@ pub const FEATURES: &[&str] = &[
     "custom_emoji",
     "stickers",
     "threads",
+    "groups",
 ];
 
 pub fn routes() -> Router<PgPool> {
