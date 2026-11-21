@@ -67,7 +67,7 @@ CREATE OR REPLACE FUNCTION app_create_channel(
     p_category uuid,
     p_topic text,
     p_position integer,
-    p_e2ee boolean
+    p_e2ee boolean DEFAULT false
 )
 RETURNS jsonb
 LANGUAGE plpgsql

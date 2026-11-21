@@ -1,0 +1,10 @@
+{
+  "id": "wave-3-server",
+  "title": "Wave 3A core server enhancements (layout, blocks, mentions, search, previews, emoji, threads, call capacity, video logs, live features)",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "pending matching tinyclient support for the new server capabilities"
+}
