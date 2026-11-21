@@ -14,8 +14,9 @@ use db::{
     block_user, clear_reaction, create_channel, delete_channel, delete_message, edit_message,
     list_blocks, list_channels, list_directs, list_messages, list_pins, mark_read, open_attachment,
     open_direct, pin_message, post_message, save_attachment, save_sealed_attachment,
-    set_channel_override, toggle_reaction, unblock_user, unpin_message, update_channel,
-    upgrade_conversation, Caller, MessageError, NewAttachment, PgPool, ScanEngine,
+    search_messages, set_channel_override, toggle_reaction, unblock_user, unpin_message,
+    update_channel, upgrade_conversation, Caller, MentionInput, MessageEdit, MessageError,
+    NewAttachment, NewMessage, PgPool, PreviewInput, ScanEngine, SearchQuery,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -73,6 +74,7 @@ pub fn routes() -> Router<PgPool> {
         )
         .route("/v1/conversations/{id}/pins", get(pins))
         .route("/v1/conversations/{id}/read", axum::routing::post(read))
+        .route("/v1/search", get(search))
         .route(
             "/v1/conversations/{id}/e2ee",
             axum::routing::post(upgrade_e2ee),
@@ -105,12 +107,63 @@ struct PageQuery {
 }
 
 #[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    conversation_id: Option<String>,
+    author_id: Option<String>,
+    before: Option<String>,
+    limit: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct MentionBody {
+    kind: String,
+    id: Option<String>,
+    start: i32,
+    end: i32,
+}
+
+impl From<MentionBody> for MentionInput {
+    fn from(m: MentionBody) -> Self {
+        Self {
+            kind: m.kind,
+            id: m.id,
+            start: m.start,
+            end: m.end,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    url: String,
+    site: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    image_attachment_id: Option<String>,
+}
+
+impl From<PreviewBody> for PreviewInput {
+    fn from(p: PreviewBody) -> Self {
+        Self {
+            url: p.url,
+            site: p.site,
+            title: p.title,
+            description: p.description,
+            image_attachment_id: p.image_attachment_id,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct PostBody {
     generation: Option<u64>,
     body: Option<String>,
     reply_to: Option<String>,
     client_id: Option<String>,
     attachment_ids: Option<Vec<String>>,
+    mentions: Option<Vec<MentionBody>>,
+    previews: Option<Vec<PreviewBody>>,
     // An encrypted conversation takes these and no body. See docs/e2ee-text.md.
     ciphertext: Option<String>,
     epoch: Option<u64>,
@@ -121,7 +174,9 @@ struct PostBody {
 
 #[derive(Deserialize)]
 struct EditBody {
-    body: String,
+    body: Option<String>,
+    mentions: Option<Vec<MentionBody>>,
+    previews: Option<Vec<PreviewBody>>,
 }
 
 #[derive(Deserialize)]
@@ -534,7 +589,7 @@ async fn add_message(
                 client_id: body.client_id.as_deref(),
                 reply_to: body.reply_to.as_deref(),
                 attachments: &attachments,
-                has_body: body.body.is_some(),
+                has_body: body.body.is_some() || body.mentions.is_some() || body.previews.is_some(),
             },
         )
         .await
@@ -542,14 +597,24 @@ async fn add_message(
             message_failed(&caller.user_id, &id, error);
         });
     }
+    let mentions: Option<Vec<MentionInput>> = body
+        .mentions
+        .map(|list| list.into_iter().map(MentionInput::from).collect());
+    let previews: Option<Vec<PreviewInput>> = body
+        .previews
+        .map(|list| list.into_iter().map(PreviewInput::from).collect());
     let message = post_message(
         &pool,
         &caller,
         &id,
-        body.body.as_deref().unwrap_or(""),
-        body.reply_to.as_deref(),
-        body.client_id.as_deref(),
-        &attachments,
+        &NewMessage {
+            body: body.body.as_deref().unwrap_or(""),
+            reply_to: body.reply_to.as_deref(),
+            client_id: body.client_id.as_deref(),
+            attachments: &attachments,
+            mentions: mentions.as_deref(),
+            previews: previews.as_deref(),
+        },
     )
     .await
     .map_err(|error| {
@@ -567,14 +632,29 @@ async fn edit(
     Json(body): Json<EditBody>,
 ) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
-    edit_message(&pool, &caller, &id, &body.body)
-        .await
-        .map(signed)
-        .map_err(|error| {
-            let error = lift(error);
-            message_failed(&caller.user_id, "", &error);
-            error
-        })
+    let mentions: Option<Vec<MentionInput>> = body
+        .mentions
+        .map(|list| list.into_iter().map(MentionInput::from).collect());
+    let previews: Option<Vec<PreviewInput>> = body
+        .previews
+        .map(|list| list.into_iter().map(PreviewInput::from).collect());
+    edit_message(
+        &pool,
+        &caller,
+        &id,
+        &MessageEdit {
+            body: body.body.as_deref(),
+            mentions: mentions.as_deref(),
+            previews: previews.as_deref(),
+        },
+    )
+    .await
+    .map(signed)
+    .map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, "", &error);
+        error
+    })
 }
 
 async fn remove_message(
@@ -681,6 +761,35 @@ async fn read(
             error
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Searches plaintext messages the caller may read. Never logs `params.q`.
+async fn search(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    let q = params.q.as_deref().unwrap_or("");
+    let result = search_messages(
+        &pool,
+        &caller,
+        &SearchQuery {
+            q,
+            conversation_id: params.conversation_id.as_deref(),
+            author_id: params.author_id.as_deref(),
+            before: params.before.as_deref(),
+            limit: params.limit,
+        },
+    )
+    .await
+    .map_err(|error| {
+        let error = lift(error);
+        let reason = message_reason(&error);
+        tracing::warn!(user_id = %caller.user_id, reason, "search failed");
+        error
+    })?;
+    Ok(signed(result))
 }
 
 /// One-way: a plaintext conversation becomes end-to-end encrypted. What was already stored stays

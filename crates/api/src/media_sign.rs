@@ -70,7 +70,7 @@ fn overlay_with(value: &mut Value, secret: &[u8], now: i64) {
                     );
                 }
             }
-            for key in ["attachments", "last_message", "message"] {
+            for key in ["attachments", "last_message", "message", "hits"] {
                 if let Some(child) = map.get_mut(key) {
                     overlay_with(child, secret, now);
                 }
