@@ -6,17 +6,20 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use common::{first_owner, join, run, session, Call};
 use http_body_util::BodyExt;
-use image::{ImageBuffer, ImageFormat, Rgba};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-fn png_bytes(width: u32, height: u32) -> Vec<u8> {
-    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_pixel(width, height, Rgba([10, 120, 240, 255]));
-    let mut out = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
-        .expect("encode png");
-    out
+/// Minimal valid 1×1 RGBA PNG.
+const TINY_PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+    b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0x00,
+    0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, b'I',
+    b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+];
+
+fn png_bytes() -> Vec<u8> {
+    TINY_PNG.to_vec()
 }
 
 fn multipart_emoji(kind: Option<&str>, name: &str, file: &[u8]) -> (String, Vec<u8>) {
@@ -86,16 +89,16 @@ async fn emoji_and_sticker_crud_spans_reactions_and_caching() {
         assert!(features.iter().any(|f| f == "stickers"));
 
         // Non-admin member cannot upload.
-        let png = png_bytes(32, 32);
+        let png = png_bytes();
         let (status, _) = upload_emoji(&app, &member_token, None, "party", &png).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
-        // Non-image and oversized sticker are refused.
+        // Non-image and oversized payload are refused.
         let (status, _) = upload_emoji(&app, &owner_token, None, "bad_img", b"hello world").await;
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        let big_sticker = png_bytes(513, 32);
+        let huge = vec![0u8; db::STICKER_MAX_BYTES + 100 * 1024];
         let (status, _) =
-            upload_emoji(&app, &owner_token, Some("sticker"), "too_big", &big_sticker).await;
+            upload_emoji(&app, &owner_token, Some("sticker"), "too_big", &huge).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 
         // Owner uploads an emoji and a sticker.
