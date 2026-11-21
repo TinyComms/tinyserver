@@ -214,7 +214,14 @@ pub fn video(data: &[u8]) {
             _ => {
                 let quality = [Quality::Off, Quality::Low, Quality::High][usize::from(b % 3)];
                 let budget = (value & 1 == 1).then_some((value >> 1) as u32);
-                let most = ceiling(budget, value >> 40, value >> 56, value >> 52, value >> 48);
+                let most = ceiling(
+                    budget,
+                    value >> 40,
+                    value >> 56,
+                    value >> 52,
+                    value >> 48,
+                    value >> 44,
+                );
                 if budget.is_none() {
                     assert!(most.share && most.camera == Quality::High && most.tiles);
                 }
