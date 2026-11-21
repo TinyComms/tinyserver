@@ -44,6 +44,7 @@ pub const FEATURES: &[&str] = &[
     "custom_emoji",
     "stickers",
     "threads",
+    "groups",
 ];
 
 #[derive(Clone, Copy)]

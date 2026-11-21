@@ -22,14 +22,14 @@ A member can report a message, a member, or a channel. Moderators with the `mana
 | kind, category | reporter | `message`, `member` or `channel`; `spam`, `harassment`, `hate`, `violence`, `sexual`, `illegal`, `impersonation`, `other` |
 | reporter | the session | a link to the reporter's account, removed when they delete it |
 | reported person | the server | the member reported, or the author of the message reported. This is the author id the server already has, with or without encryption |
-| message, channel, direct ids | the server | where it was. Ids only |
+| message, channel, direct, group ids | the server | where it was. Ids only; a group message report stores `group_id` and never the group's member list |
 | note | reporter | up to 2000 characters, optional |
 | evidence | reporter's client | up to 32 KiB, optional, **unverified** |
 | status, resolution time, linked audit ids | moderators | |
 | moderator notes | moderators | separate rows, up to 2000 characters each |
 | preserve | an owner | the legal hold |
 
-Reporting a message never copies the message. The server checks that the reporter can already read it, so a report is not a way to find out that a message exists, and then stores its id. If the reporter wants a moderator to see what was said, the reporter's client sends it as `evidence`.
+Reporting a message never copies the message. The server checks that the reporter can already read it, so a report is not a way to find out that a message exists, and then stores its id. A member of a group conversation reports one of its messages with `kind = message`; the report stores `message_id` and `group_id` only (no member list), evidence stays unverified, and handling the report does not add the moderator to the group or give them access to its messages. If the reporter wants a moderator to see what was said, the reporter's client sends it as `evidence`.
 
 ### Evidence is voluntary and cannot be verified
 

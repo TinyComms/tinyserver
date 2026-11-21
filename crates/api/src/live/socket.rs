@@ -1507,7 +1507,10 @@ mod tests {
         assert_eq!(super::parse_watch(Some(&valid), 2), Err("bad_frame"));
         assert_eq!(super::parse_watch(Some(&json!([])), 5), Ok(vec![]));
         assert_eq!(super::parse_watch(None, 5), Err("bad_frame"));
-        assert_eq!(super::parse_watch(Some(&json!("high")), 5), Err("bad_frame"));
+        assert_eq!(
+            super::parse_watch(Some(&json!("high")), 5),
+            Err("bad_frame")
+        );
         assert_eq!(
             super::parse_watch(
                 Some(&json!([{"mid": "", "user_id": "u1", "kind": "camera"}])),

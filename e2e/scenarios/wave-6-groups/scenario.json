@@ -1,0 +1,10 @@
+{
+  "id": "wave-6-groups",
+  "title": "Wave 6A group conversations foundation (storage, /v1/groups API, older-client reachability gating, group message reports)",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "pending matching tinyclient group-conversation adapter (#287/#288)"
+}
