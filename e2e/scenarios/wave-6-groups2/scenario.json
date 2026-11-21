@@ -1,0 +1,10 @@
+{
+  "id": "wave-6-groups2",
+  "title": "Wave 6D E2EE MLS group conversations, group calls, and 1:1-to-group call escalation (#57, #63, #62)",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "pending matching tinyclient group-call & E2EE group UI"
+}

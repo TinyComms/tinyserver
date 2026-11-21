@@ -291,8 +291,8 @@ impl Rings {
         self.by_user.contains_key(user_id)
     }
 
-    /// Validates that `ring_id` is a `Live` direct call on `direct_id` involving `user_id` and
-    /// returns the other party's user id without mutating state.
+    /// Validates that `ring_id` is a `Live` direct call on `direct_id` involving `user_id` that
+    /// is not already moving to another group call, returning the other party's user id.
     pub fn validate_move(
         &self,
         direct_id: &str,
@@ -300,7 +300,7 @@ impl Rings {
         user_id: &str,
     ) -> Result<String, &'static str> {
         let ring = self.by_id.get(ring_id).ok_or("not_found")?;
-        if ring.direct_id != direct_id || ring.phase != Phase::Live {
+        if ring.direct_id != direct_id || ring.phase != Phase::Live || ring.moving_to.is_some() {
             return Err("not_found");
         }
         if ring.caller_id == user_id {
@@ -309,6 +309,39 @@ impl Rings {
             Ok(ring.caller_id.clone())
         } else {
             Err("not_found")
+        }
+    }
+
+    /// Target group media room (`g:{call_id}`) if `ring_id` is actively moving, plus whether
+    /// `user_id` is one of its two parties.
+    pub fn existing_move_target(
+        &self,
+        direct_id: &str,
+        ring_id: &str,
+        user_id: &str,
+    ) -> Option<&str> {
+        let ring = self.by_id.get(ring_id)?;
+        if ring.direct_id != direct_id || ring.phase != Phase::Live {
+            return None;
+        }
+        if ring.caller_id != user_id && ring.callee_id != user_id {
+            return None;
+        }
+        ring.moving_to.as_deref()
+    }
+
+    /// Target group media room (`g:{call_id}`) if `ring_id` is moving.
+    pub fn moving_to(&self, ring_id: &str) -> Option<&str> {
+        self.by_id
+            .get(ring_id)
+            .and_then(|ring| ring.moving_to.as_deref())
+    }
+
+    /// Clears a pending escalation move on `ring_id` when neither party left the 1:1 call.
+    pub fn clear_move(&mut self, ring_id: &str) {
+        if let Some(ring) = self.by_id.get_mut(ring_id) {
+            ring.moving_until = None;
+            ring.moving_to = None;
         }
     }
 

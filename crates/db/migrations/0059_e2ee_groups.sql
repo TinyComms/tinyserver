@@ -17,7 +17,7 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_channel uuid;
@@ -101,7 +101,7 @@ RETURNS TABLE (d_user uuid, d_device uuid)
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_low uuid;
@@ -156,7 +156,7 @@ RETURNS bytea
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_kind text;
@@ -194,7 +194,7 @@ CREATE OR REPLACE FUNCTION app_e2ee_create_group(p_conv uuid, p_device uuid, p_c
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_hash bytea;
@@ -273,7 +273,7 @@ CREATE TRIGGER group_dms_e2ee_forget
 
 -- 5. Include `group_dms` in `app_e2ee_repair` UUID collision check.
 CREATE OR REPLACE FUNCTION app_e2ee_repair(p_conv uuid, p_binding jsonb, p_hash bytea)
-RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
     h e2ee_generation_heads;
     g e2ee_groups;
@@ -389,7 +389,7 @@ CREATE OR REPLACE FUNCTION app_group_open(
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_me uuid := app_uid();
@@ -491,7 +491,7 @@ CREATE OR REPLACE FUNCTION app_group_add(
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_e2ee boolean;
@@ -566,7 +566,7 @@ CREATE OR REPLACE FUNCTION app_e2ee_upgrade(p_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_kind text;
@@ -592,6 +592,9 @@ BEGIN
     IF v_kind = 'group' THEN
         PERFORM 1 FROM group_dms WHERE id = p_id FOR UPDATE;
         UPDATE group_dms SET e2ee = true WHERE id = p_id AND NOT e2ee;
+        IF NOT FOUND THEN
+            RETURN app_group_json(p_id);
+        END IF;
         IF (SELECT count(*) FROM app_e2ee_desired(p_id)) > app_e2ee_group_devices_max() THEN
             RAISE EXCEPTION 'group too large' USING ERRCODE = 'P0E16';
         END IF;
@@ -670,7 +673,7 @@ RETURNS jsonb
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
     SELECT jsonb_build_object(
         'id', m.id::text,

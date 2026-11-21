@@ -44,7 +44,7 @@ RETURNS TABLE (
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
     SELECT gm.user_id,
            coalesce(m.timeout_until > now(), false)
@@ -81,7 +81,7 @@ CREATE FUNCTION app_record_group_call(
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_started timestamptz;
@@ -95,7 +95,8 @@ BEGIN
     IF coalesce(cardinality(p_people), 0) <> coalesce(cardinality(p_people_outcomes), 0) THEN
         RAISE EXCEPTION 'invalid people outcomes' USING ERRCODE = '22023';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM group_dms WHERE id = p_group) THEN
+    PERFORM 1 FROM group_dms WHERE id = p_group FOR KEY SHARE;
+    IF NOT FOUND THEN
         RETURN;
     END IF;
 
@@ -154,7 +155,7 @@ RETURNS jsonb
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
     SELECT jsonb_build_object(
         'id', g.id::text,

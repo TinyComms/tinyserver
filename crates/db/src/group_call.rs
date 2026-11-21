@@ -5,10 +5,11 @@ use sqlx::PgPool;
 use crate::error::DbError;
 use crate::messages::is_uuid;
 
-/// The current unbanned members of a group conversation, plus whether the caller is timed out.
+/// The current unbanned members of a group conversation, plus which members are timed out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupCallMembers {
     pub members: Vec<String>,
+    pub timed_out: Vec<String>,
     pub caller_timed_out: bool,
 }
 
@@ -49,9 +50,15 @@ pub async fn group_call_access(
         .iter()
         .find(|(uid, _)| uid == user_id)
         .is_some_and(|(_, timed_out)| *timed_out);
+    let timed_out = rows
+        .iter()
+        .filter(|(_, is_timed_out)| *is_timed_out)
+        .map(|(uid, _)| uid.clone())
+        .collect();
     let members = rows.into_iter().map(|(uid, _)| uid).collect();
     Ok(Some(GroupCallMembers {
         members,
+        timed_out,
         caller_timed_out,
     }))
 }
@@ -95,12 +102,14 @@ mod tests {
     fn check_caller_refuses_timed_out_and_allows_active() {
         let active = GroupCallMembers {
             members: vec!["a".into(), "b".into()],
+            timed_out: vec![],
             caller_timed_out: false,
         };
         assert_eq!(active.check_caller(), Ok(()));
 
         let timed_out = GroupCallMembers {
             members: vec!["a".into(), "b".into()],
+            timed_out: vec!["a".into()],
             caller_timed_out: true,
         };
         assert_eq!(timed_out.check_caller(), Err("timed_out"));

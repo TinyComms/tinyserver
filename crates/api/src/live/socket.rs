@@ -759,11 +759,15 @@ fn private_media(room_id: &str) -> bool {
 
 /// The caller is a current unbanned, non-timed-out member of `group_id`. Returns the group's
 /// current unbanned member ids in join order.
-async fn group_open(hub: &Hub, group_id: &str, user_id: &str) -> Result<Vec<String>, &'static str> {
+async fn group_open(
+    hub: &Hub,
+    group_id: &str,
+    user_id: &str,
+) -> Result<db::GroupCallMembers, &'static str> {
     match db::group_call_access(&hub.pool, group_id, user_id).await {
         Ok(Some(group)) => {
             group.check_caller()?;
-            Ok(group.members)
+            Ok(group)
         }
         Ok(None) => Err("not_found"),
         Err(error) => {
@@ -896,11 +900,17 @@ async fn call_group_start(
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }
-    let members = match group_open(hub, group_id, &me.user_id).await {
-        Ok(members) => members,
+    let group = match group_open(hub, group_id, &me.user_id).await {
+        Ok(group) => group,
         Err(code) => return Ok(Err(code)),
     };
-    match hub.start_group_call(group_id, &me.user_id, members, from_direct) {
+    match hub.start_group_call(
+        group_id,
+        &me.user_id,
+        group.members,
+        &group.timed_out,
+        from_direct,
+    ) {
         Ok(()) => Ok(Ok(Done::Ok)),
         Err(refused) => Ok(Err(refused.code())),
     }
@@ -917,7 +927,7 @@ async fn call_group_ring(
     let (Some(group_id), Some(call_id), Some(user_ids)) = (group_id, call_id, user_ids) else {
         return Ok(Err("bad_frame"));
     };
-    if user_ids.is_empty() {
+    if user_ids.is_empty() || user_ids.len() > 101 {
         return Ok(Err("bad_frame"));
     }
     if !asking.rings.take() {
@@ -926,11 +936,11 @@ async fn call_group_ring(
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }
-    let members = match group_open(hub, group_id, &me.user_id).await {
-        Ok(members) => members,
+    let group = match group_open(hub, group_id, &me.user_id).await {
+        Ok(group) => group,
         Err(code) => return Ok(Err(code)),
     };
-    match hub.ring_group_call(group_id, call_id, &me.user_id, user_ids, members) {
+    match hub.ring_group_call(group_id, call_id, &me.user_id, user_ids, &group.timed_out) {
         Ok(()) => Ok(Ok(Done::Ok)),
         Err(code) => Ok(Err(code)),
     }
@@ -947,7 +957,7 @@ async fn call_group_unring(
     let (Some(group_id), Some(call_id), Some(user_ids)) = (group_id, call_id, user_ids) else {
         return Ok(Err("bad_frame"));
     };
-    if user_ids.is_empty() {
+    if user_ids.is_empty() || user_ids.len() > 101 {
         return Ok(Err("bad_frame"));
     }
     if !asking.rings.take() {
@@ -979,9 +989,6 @@ async fn call_group_decline(
         return Ok(Err("slow_down"));
     }
     if let Err(code) = fresh(hub, me).await? {
-        return Ok(Err(code));
-    }
-    if let Err(code) = group_open(hub, group_id, &me.user_id).await {
         return Ok(Err(code));
     }
     match hub.decline_group_call(group_id, call_id, &me.user_id) {
@@ -1172,11 +1179,10 @@ async fn call_join_group(
     if let Err(code) = fresh(hub, me).await? {
         return Ok(Err(code));
     }
-    let members = match group_open(hub, group_id, &me.user_id).await {
-        Ok(members) => members,
-        Err(code) => return Ok(Err(code)),
-    };
-    let room_id = match hub.group_join_key(group_id, members) {
+    if let Err(code) = group_open(hub, group_id, &me.user_id).await {
+        return Ok(Err(code));
+    }
+    let room_id = match hub.group_join_key(group_id) {
         Ok(room_id) => room_id,
         Err(code) => return Ok(Err(code)),
     };
@@ -1189,7 +1195,10 @@ async fn call_join_group(
         None => None,
         Some((media, sdp)) => match media.join(&room_id, &me.user_id, sdp).await {
             Ok(answer) => Some(answer),
-            Err(refused) => return Ok(Err(media_code(refused))),
+            Err(refused) => {
+                hub.cancel_group_ring(&room_id, &me.user_id);
+                return Ok(Err(media_code(refused)));
+            }
         },
     };
     let joined = hub.call_join(
@@ -1210,6 +1219,12 @@ async fn call_join_group(
             hub.forget(&answer.call_id);
         }
         return Ok(Err(refused.code()));
+    }
+    // Re-check membership after seating, matching `room_exists` in `call_join`, so a member
+    // removed/kicked/banned while `media.join` was in flight cannot stay seated.
+    if let Ok(None) = db::group_call_access(&hub.pool, group_id, &me.user_id).await {
+        hub.kick_seat(&room_id, &me.user_id, Reason::Removed);
+        return Ok(Err("not_found"));
     }
     Ok(Ok(answer.map_or(Done::Ok, Done::Answer)))
 }

@@ -1255,6 +1255,7 @@ impl Hub {
         group_id: &str,
         started_by: &str,
         members: Vec<String>,
+        timed_out: &[String],
         from_direct: Option<super::group_call::FromDirect>,
     ) -> Result<(), Refused> {
         let mut people = lock(&self.people);
@@ -1263,6 +1264,21 @@ impl Hub {
         }
         let now = std::time::Instant::now();
         let move_info = if let Some(fd) = from_direct {
+            let active_group_room = people.group_calls.active_room(group_id);
+            if let Some(target_room) =
+                people
+                    .rings
+                    .existing_move_target(&fd.direct_id, &fd.ring_id, started_by)
+            {
+                if active_group_room.as_deref() == Some(target_room) {
+                    let participants = people.calls.participants_of(target_room);
+                    if let Some(card) = people.group_calls.started_card(group_id, participants) {
+                        send_group_started(&people, &card, &[started_by.to_string()]);
+                        return Ok(());
+                    }
+                }
+                return Err(Refused::NotFound);
+            }
             let direct_room = super::ring::room_key(&fd.ring_id);
             if people.calls.room_of(started_by) != Some(direct_room.as_str()) {
                 return Err(Refused::NotFound);
@@ -1271,23 +1287,23 @@ impl Hub {
                 .rings
                 .validate_move(&fd.direct_id, &fd.ring_id, started_by)
                 .map_err(|_| Refused::NotFound)?;
+            if people.calls.room_of(&peer_id) != Some(direct_room.as_str()) {
+                return Err(Refused::NotFound);
+            }
             if !members.iter().any(|m| m == &peer_id) {
                 return Err(Refused::NotFound);
             }
 
             // Moving does not count twice against server capacity: both parties typically already
             // hold seats in `d:{ring_id}`. The group room still needs two seats for them.
-            let existing_others = people
-                .group_calls
-                .active_room(group_id)
-                .map_or(0, |room_id| {
-                    people
-                        .calls
-                        .people(&room_id)
-                        .iter()
-                        .filter(|u| u.as_str() != started_by && u.as_str() != peer_id.as_str())
-                        .count()
-                });
+            let existing_others = active_group_room.as_deref().map_or(0, |room_id| {
+                people
+                    .calls
+                    .people(room_id)
+                    .iter()
+                    .filter(|u| u.as_str() != started_by && u.as_str() != peer_id.as_str())
+                    .count()
+            });
             if self
                 .limits
                 .call_room_max
@@ -1319,13 +1335,19 @@ impl Hub {
                 room_slots.min(server_slots)
             };
             if let Some(budget) = self.limits.call_egress_kbps {
+                let other_streams = people.calls.other_rooms_audio_streams(
+                    &direct_room,
+                    active_group_room.as_deref(),
+                    self.limits.call_audio_slots,
+                );
                 let base_count = existing_others + 2;
                 let max_extra = newcomer_slots.min(members.len());
                 let mut allowed = 0usize;
                 for extra in 1..=max_extra {
                     let count = base_count + extra;
                     let per_listener = (count - 1).min(self.limits.call_audio_slots) as u64;
-                    let streams = (count as u64).saturating_mul(per_listener);
+                    let streams =
+                        other_streams.saturating_add((count as u64).saturating_mul(per_listener));
                     if streams.saturating_mul(50) <= u64::from(budget) {
                         allowed = extra;
                     } else {
@@ -1369,9 +1391,10 @@ impl Hub {
             move_info,
             |uid| rings.has_user(uid) || calls.room_of(uid).is_some_and(super::call::is_group_room),
             |uid| {
-                users
-                    .get(uid)
-                    .is_some_and(|p| !p.bot && !p.conns.is_empty())
+                !timed_out.iter().any(|t| t == uid)
+                    && users
+                        .get(uid)
+                        .is_some_and(|p| !p.bot && !p.conns.is_empty())
             },
             |room_id| calls.participants_of(room_id),
             now,
@@ -1402,7 +1425,7 @@ impl Hub {
         call_id: &str,
         by: &str,
         user_ids: &[String],
-        members: Vec<String>,
+        timed_out: &[String],
     ) -> Result<(), &'static str> {
         let mut people = lock(&self.people);
         let room_id = people
@@ -1412,7 +1435,6 @@ impl Hub {
         if people.calls.room_of(by) != Some(room_id.as_str()) {
             return Err("not_found");
         }
-        let _ = people.group_calls.join_key(group_id, Some(members));
         let seated = people.calls.people(&room_id).to_vec();
         let now = std::time::Instant::now();
         let People {
@@ -1430,9 +1452,10 @@ impl Hub {
             &seated,
             |uid| rings.has_user(uid) || calls.room_of(uid).is_some_and(super::call::is_group_room),
             |uid| {
-                users
-                    .get(uid)
-                    .is_some_and(|p| !p.bot && !p.conns.is_empty())
+                !timed_out.iter().any(|t| t == uid)
+                    && users
+                        .get(uid)
+                        .is_some_and(|p| !p.bot && !p.conns.is_empty())
             },
             now,
         )?;
@@ -1498,14 +1521,10 @@ impl Hub {
     }
 
     /// The media room `g:{call_id}` for `group_id`'s live call, or `not_found`.
-    pub fn group_join_key(
-        &self,
-        group_id: &str,
-        members: Vec<String>,
-    ) -> Result<String, &'static str> {
+    pub fn group_join_key(&self, group_id: &str) -> Result<String, &'static str> {
         lock(&self.people)
             .group_calls
-            .join_key(group_id, Some(members))
+            .join_key(group_id)
             .ok_or("not_found")
     }
 
@@ -1540,6 +1559,26 @@ impl Hub {
         }
     }
 
+    /// Removes `user_id` if they are currently seated in `room_id` (used for post-join
+    /// membership re-checks so a removed member cannot remain seated).
+    pub fn kick_seat(&self, room_id: &str, user_id: &str, reason: Reason) {
+        let mut people = lock(&self.people);
+        if people.calls.room_of(user_id) != Some(room_id) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let changes = people.calls.leave(user_id, reason);
+        self.tell(&mut people, changes);
+        let mut group_ended = Vec::new();
+        if super::call::is_group_room(room_id) {
+            let remaining = people.calls.people(room_id).len();
+            if let Some(ended) = people.group_calls.on_left(room_id, remaining, now) {
+                group_ended.push(ended);
+            }
+        }
+        self.announce_settled(people, Vec::new(), group_ended);
+    }
+
     /// Leaves only `(group_id, call_id)`, leaving any unrelated seat untouched.
     pub fn leave_group(
         &self,
@@ -1552,6 +1591,11 @@ impl Hub {
             .group_calls
             .room_for(group_id, call_id)
             .ok_or("not_found")?;
+        if !people.group_calls.can_seat(&room_id, user_id)
+            && people.calls.room_of(user_id) != Some(room_id.as_str())
+        {
+            return Err("not_found");
+        }
         let now = std::time::Instant::now();
         let mut group_ended = Vec::new();
         if people.calls.room_of(user_id) == Some(room_id.as_str()) {
@@ -1779,8 +1823,48 @@ impl Hub {
                     people.fanout(&item.callee_id, frame);
                 }
             } else if people.rings.moving_due(&item.id, now) {
+                let target_room = people.rings.moving_to(&item.id).map(str::to_owned);
+                let seated_direct = people.calls.people(&item.room_id).len();
+                if seated_direct >= 2 {
+                    // Neither party left the 1:1 call before the move deadline: keep their live
+                    // direct call intact and cancel any unseated `moving` slots in the target group.
+                    people.rings.clear_move(&item.id);
+                    if let Some(target_room) = target_room.as_deref() {
+                        let seated_target = people.calls.people(target_room).len();
+                        for uid in [&item.caller_id, &item.callee_id] {
+                            if people.calls.room_of(uid) != Some(target_room) {
+                                if let Some(event) = people.group_calls.cancel_ring_for_room(
+                                    target_room,
+                                    uid,
+                                    uid,
+                                    seated_target,
+                                    now,
+                                ) {
+                                    send_group_ring(&people, &event);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let changes = people.calls.end_room(&item.room_id, Reason::PeerLeft);
                 self.tell(&mut people, changes);
+                if let Some(target_room) = target_room.as_deref() {
+                    let seated_target = people.calls.people(target_room).len();
+                    for uid in [&item.caller_id, &item.callee_id] {
+                        if people.calls.room_of(uid) != Some(target_room) {
+                            if let Some(event) = people.group_calls.cancel_ring_for_room(
+                                target_room,
+                                uid,
+                                uid,
+                                seated_target,
+                                now,
+                            ) {
+                                send_group_ring(&people, &event);
+                            }
+                        }
+                    }
+                }
             }
             let notice = people.rings.take_due(&item.id, now);
             self.announce_rings(people, notice);
@@ -2565,7 +2649,7 @@ mod tests {
             "c".to_string(),
             "d".to_string(),
         ];
-        hub.start_group_call("g1", "a", members.clone(), None)
+        hub.start_group_call("g1", "a", members.clone(), &[], None)
             .expect("start group call");
 
         // All four members get call.group.started; B is busy, C (in voice room) and D are rung.
@@ -2667,6 +2751,11 @@ mod tests {
             .iter()
             .all(|o| !o.room_id.starts_with("g:")));
 
+        // Non-member scoped call.leave returns not_found (no existence oracle).
+        assert_eq!(
+            hub.leave_group("g1", &call_id, "outsider2"),
+            Err("not_found")
+        );
         // Seated A can unring a ringing member (re-add E? check unring ok on non-ringing D).
         hub.unring_group_call("g1", &call_id, "a", &["d".to_string()])
             .expect("unring on non-ringing is ok");
@@ -2735,6 +2824,7 @@ mod tests {
                 "g-no-b",
                 "a",
                 vec!["a".into(), "c".into(), "d".into()],
+                &[],
                 Some(fd.clone()),
             ),
             Err(Refused::NotFound)
@@ -2748,9 +2838,22 @@ mod tests {
             "g-abc",
             "a",
             vec!["a".into(), "b".into(), "c".into()],
+            &[],
             Some(fd.clone()),
         )
         .expect("start from direct");
+
+        // Concurrent/second escalation of the same direct call to a different group is refused.
+        assert_eq!(
+            hub.start_group_call(
+                "g-other",
+                "b",
+                vec!["a".into(), "b".into(), "c".into()],
+                &[],
+                Some(fd.clone()),
+            ),
+            Err(Refused::NotFound)
+        );
 
         let started_a: Value =
             serde_json::from_str(&a.direct.try_recv().expect("started a")).expect("json");

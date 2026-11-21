@@ -273,6 +273,27 @@ impl Calls {
         total_streams.saturating_mul(AUDIO_STREAM_KBPS)
     }
 
+    /// Active audio streams across all live rooms other than `exclude_a` and `exclude_b`.
+    pub fn other_rooms_audio_streams(
+        &self,
+        exclude_a: &str,
+        exclude_b: Option<&str>,
+        audio_slots: usize,
+    ) -> u64 {
+        let mut total: u64 = 0;
+        for (room, members) in &self.rooms {
+            if room == exclude_a || exclude_b == Some(room.as_str()) {
+                continue;
+            }
+            let count = members.len();
+            if count > 1 {
+                let per_listener = (count - 1).min(audio_slots) as u64;
+                total = total.saturating_add((count as u64).saturating_mul(per_listener));
+            }
+        }
+        total
+    }
+
     /// Whether `user_id` was moved to `room_id` and may still join it past its limit.
     pub fn ticket(&self, user_id: &str, room_id: &str) -> bool {
         self.tickets
@@ -354,6 +375,9 @@ impl Calls {
             Reason::JoinedElsewhere
         };
         changes.extend(self.leave_inner(user_id, reason, !moving_direct));
+        if is_private_room(room_id) {
+            self.moderated.remove(user_id);
+        }
         self.epoch += 1;
         self.seats.insert(
             user_id.to_string(),
@@ -410,6 +434,7 @@ impl Calls {
             people.retain(|person| person != user_id);
             if people.is_empty() {
                 self.rooms.remove(&room_id);
+                self.live_direct.remove(&room_id);
             }
         }
         let mut changes = vec![Change::Left {

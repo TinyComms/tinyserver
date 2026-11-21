@@ -324,7 +324,6 @@ impl GroupCalls {
             let room_id = room_key(&call_id);
             let participants = participants_of(&room_id);
             let call = self.by_id.get_mut(&call_id).expect("group call");
-            call.members = members;
             if let Some(info) = moving {
                 for party in &info.parties {
                     if !participants.iter().any(|p| p.user_id == *party) {
@@ -473,16 +472,14 @@ impl GroupCalls {
             .collect();
 
         let call = self.by_id.get_mut(call_id).ok_or("not_found")?;
+        let member_set: HashSet<&str> = call.members.iter().map(String::as_str).collect();
         let mut events = Vec::new();
         let mut seen = HashSet::new();
         for uid in user_ids {
             if !seen.insert(uid.as_str()) {
                 continue;
             }
-            if uid == by
-                || !call.members.iter().any(|m| m == uid)
-                || seated.iter().any(|s| s == uid)
-            {
+            if uid == by || !member_set.contains(uid.as_str()) || seated.iter().any(|s| s == uid) {
                 continue;
             }
             if let Some(existing) = call.rings.get(uid) {
@@ -604,14 +601,21 @@ impl GroupCalls {
         Ok(event)
     }
 
-    /// Looks up the media room `g:{call_id}` for `group_id`'s live call, updating the cached
-    /// member list if supplied.
-    pub fn join_key(&mut self, group_id: &str, members: Option<Vec<String>>) -> Option<String> {
-        let call_id = self.by_group.get(group_id)?.clone();
-        if let (Some(call), Some(members)) = (self.by_id.get_mut(&call_id), members) {
-            call.members = members;
-        }
-        Some(room_key(&call_id))
+    /// Looks up the media room `g:{call_id}` for `group_id`'s live call.
+    pub fn join_key(&self, group_id: &str) -> Option<String> {
+        let call_id = self.by_group.get(group_id)?;
+        Some(room_key(call_id))
+    }
+
+    /// Snapshot card for `group_id`'s live call (used for idempotent `call.group.start` retries).
+    pub fn started_card(
+        &self,
+        group_id: &str,
+        participants: Vec<Participant>,
+    ) -> Option<StartedCard> {
+        let call_id = self.by_group.get(group_id)?;
+        let call = self.by_id.get(call_id)?;
+        Some(call.started_card(participants, None))
     }
 
     /// Whether `room_id` is a live group call and `user_id` is a current member.
@@ -654,8 +658,9 @@ impl GroupCalls {
         Some(event)
     }
 
-    /// Cancels `user_id`'s pending `Ringing` ring on `room_id` (e.g. when a join is refused by
-    /// capacity or scoped `call.leave` arrives before seating).
+    /// Cancels `user_id`'s pending `Ringing`, `Answered`, or `Moving` slot on `room_id` (e.g.
+    /// when a join fails during media/capacity checks, a scoped `call.leave` arrives before
+    /// seating, or a 1:1 escalation deadline expires without them moving).
     pub fn cancel_ring_for_room(
         &mut self,
         room_id: &str,
@@ -667,7 +672,10 @@ impl GroupCalls {
         let call_id = call_of_room(room_id)?;
         let call = self.by_id.get_mut(call_id)?;
         let slot = call.rings.get_mut(user_id)?;
-        if slot.status != RingStatus::Ringing {
+        if !matches!(
+            slot.status,
+            RingStatus::Ringing | RingStatus::Answered | RingStatus::Moving
+        ) {
             return None;
         }
         slot.status = RingStatus::Cancelled;
