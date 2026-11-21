@@ -1,4 +1,4 @@
--- Rollback of 0050_message_mentions.sql.
+-- Rollback of 0049_message_mentions.sql.
 
 DROP TRIGGER IF EXISTS roles_forget_message_mentions ON roles;
 DROP FUNCTION IF EXISTS app_mentions_forget_role();

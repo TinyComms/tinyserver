@@ -632,14 +632,15 @@ pub async fn set_layout(
                     }
                 }
                 LayoutKind::Channel => {
-                    let _: bool =
-                        sqlx::query_scalar("SELECT app_layout_move_channel($1::uuid, $2::uuid, $3)")
-                            .bind(&item_id)
-                            .bind(category.as_deref())
-                            .bind(item_pos)
-                            .fetch_one(&mut *tx)
-                            .await
-                            .map_err(from_sql)?;
+                    let _: bool = sqlx::query_scalar(
+                        "SELECT app_layout_move_channel($1::uuid, $2::uuid, $3)",
+                    )
+                    .bind(&item_id)
+                    .bind(category.as_deref())
+                    .bind(item_pos)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(from_sql)?;
                 }
             }
         }

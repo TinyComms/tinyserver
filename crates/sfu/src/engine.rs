@@ -266,6 +266,8 @@ struct Peer {
     /// The payload type audio goes to them on, for putting it first on a TCP stream.
     audio_pt: Option<Pt>,
     slots: Slots<Mid, PeerId>,
+    /// Per-slot 48 kHz RTP timestamp rebasing so switching speakers mid-call stays monotonic.
+    audio_rebase: HashMap<Mid, Rebase<PeerId>>,
     /// The last slot map sent for this listener.
     told: Vec<Slot>,
     connected: bool,
@@ -581,6 +583,7 @@ pub(crate) struct Engine {
     ids: RandomState,
     egress: u64,
     counts: Counts,
+    load_longest_turn: Duration,
     load_at: Instant,
     reported_at: Instant,
     swept_at: Instant,
@@ -685,6 +688,7 @@ impl Engine {
             ids: RandomState::new(),
             egress: 0,
             counts: Counts::default(),
+            load_longest_turn: Duration::ZERO,
             load_at: now,
             reported_at: now,
             swept_at: now,
@@ -751,6 +755,7 @@ impl Engine {
             self.tick(Instant::now());
             let turn = woke.elapsed();
             self.counts.longest_turn = self.counts.longest_turn.max(turn);
+            self.load_longest_turn = self.load_longest_turn.max(turn);
         }
     }
 
@@ -1016,6 +1021,7 @@ impl Engine {
             publish: None,
             audio_pt: None,
             slots: Slots::new(),
+            audio_rebase: HashMap::new(),
             told: Vec::new(),
             connected: false,
             joined_at: now,
@@ -1230,22 +1236,35 @@ impl Engine {
         self.peers.get(&sharer)
     }
 
-    /// Gives `id` a slot with every other member of its room, and them one with it.
+    /// Reconciles audio slots for every member in `room_id`. In small calls (<= slot count)
+    /// everyone gets a slot for everyone else; in large calls each listener gets the loudest
+    /// current speakers, with hold time so slots do not flap.
     fn seat(&mut self, id: PeerId) {
         let Some(room_id) = self.peers.get(&id).map(|peer| peer.room_id.clone()) else {
             return;
         };
-        let members = self.members(&room_id);
-        for other in members.iter().copied().filter(|other| *other != id) {
-            if let Some(peer) = self.peers.get_mut(&other) {
-                peer.slots.assign(id);
-            }
-            if let Some(peer) = self.peers.get_mut(&id) {
-                peer.slots.assign(other);
-            }
-        }
+        self.reconcile_room(&room_id, Instant::now());
+    }
+
+    fn reconcile_room(&mut self, room_id: &str, now: Instant) {
+        let members = self.members(room_id);
+        let roster: Vec<(PeerId, bool, f32)> = members
+            .iter()
+            .filter_map(|id| {
+                self.peers.get(id).map(|peer| {
+                    let speaking = peer.audible() && peer.speech.speaking(now);
+                    (*id, speaking, peer.speech.level())
+                })
+            })
+            .collect();
         for member in members {
-            self.tell_slots(member);
+            let changed = self
+                .peers
+                .get_mut(&member)
+                .is_some_and(|peer| peer.slots.reconcile(member, &roster, now));
+            if changed {
+                self.tell_slots(member);
+            }
         }
     }
 
@@ -1622,9 +1641,9 @@ impl Engine {
             if peer.connected {
                 if let Some(screen) = &mut peer.screen {
                     if !screen.empty_logged
-                        && screen
-                            .empty_since
-                            .is_some_and(|since| now.saturating_duration_since(since) >= EMPTY_LOG_AFTER)
+                        && screen.empty_since.is_some_and(|since| {
+                            now.saturating_duration_since(since) >= EMPTY_LOG_AFTER
+                        })
                     {
                         screen.empty_logged = true;
                         tracing::info!(
@@ -1638,9 +1657,9 @@ impl Engine {
             for layer in [Layer::High, Layer::Low, Layer::Share] {
                 let inbound = &mut peer.layers[layer.index()];
                 if inbound.asks > 0
-                    && inbound.asks_logged_at.is_none_or(|at| {
-                        now.saturating_duration_since(at) >= KEYFRAME_ASKS_EVERY
-                    })
+                    && inbound
+                        .asks_logged_at
+                        .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_ASKS_EVERY)
                 {
                     let count = std::mem::take(&mut inbound.asks);
                     inbound.asks_logged_at = Some(now);
@@ -1705,11 +1724,13 @@ impl Engine {
         let since = now.saturating_duration_since(self.load_at);
         if since >= LOAD_EVERY {
             let egress_kbps = self.egress.saturating_mul(8) / since.as_millis().max(1) as u64;
+            let longest_turn_ms = std::mem::take(&mut self.load_longest_turn).as_millis() as u64;
             self.egress = 0;
             self.load_at = now;
             self.events.hint(Event::Load {
                 egress_kbps,
                 participants: self.peers.len(),
+                longest_turn_ms,
             });
         }
     }
@@ -1756,6 +1777,7 @@ impl Engine {
     }
 
     fn speaking(&mut self, now: Instant) {
+        let mut large_rooms = Vec::new();
         for (room_id, room) in &mut self.rooms {
             let loud: Vec<(PeerId, f32)> = room
                 .members
@@ -1780,6 +1802,19 @@ impl Engine {
                     user_ids,
                 });
             }
+            let count = room.members.len();
+            if count > 1
+                && room.members.iter().any(|id| {
+                    self.peers
+                        .get(id)
+                        .is_some_and(|peer| peer.slots.capacity() + 1 < count)
+                })
+            {
+                large_rooms.push(room_id.clone());
+            }
+        }
+        for room_id in large_rooms {
+            self.reconcile_room(&room_id, now);
         }
     }
 
@@ -1849,13 +1884,20 @@ impl Engine {
                 let Some(mid) = peer.slots.mid_of(&origin).copied() else {
                     continue;
                 };
+                let time = data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer();
+                let out = peer
+                    .audio_rebase
+                    .entry(mid)
+                    .or_default()
+                    .map_hz(origin, time, 48_000, now);
+                let at = MediaTime::new(out, Frequency::FORTY_EIGHT_KHZ);
                 let Some(writer) = peer.rtc.writer(mid) else {
                     continue;
                 };
                 let Some(pt) = writer.match_params(data.params) else {
                     continue;
                 };
-                let written = writer.write(pt, data.network_time, data.time, data.data.clone());
+                let written = writer.write(pt, data.network_time, at, data.data.clone());
                 peer.audio_pt = Some(pt);
                 peer.audio_sent += u64::from(size) + AUDIO_HEADERS;
                 if let Err(error) = written {

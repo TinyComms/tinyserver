@@ -548,5 +548,5 @@ CREATE TRIGGER users_forget_message_previews
     WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL)
     EXECUTE FUNCTION app_previews_forget_user();
 
--- Rollback: crates/db/rollback/0052_message_previews.down.sql drops the trigger,
--- message_previews table, attachments.is_preview, and restores the 0050 message functions.
+-- Rollback: crates/db/rollback/0051_message_previews.down.sql drops the trigger,
+-- message_previews table, attachments.is_preview, and restores the 0049 message functions.

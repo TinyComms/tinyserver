@@ -40,6 +40,9 @@ pub const FEATURES: &[&str] = &[
     "mentions",
     "message_search",
     "link_previews",
+    "custom_emoji",
+    "stickers",
+    "threads",
 ];
 
 pub fn routes() -> Router<PgPool> {
@@ -84,6 +87,12 @@ struct Capabilities {
     e2ee_self: bool,
     /// How long a message in a self conversation is kept, in seconds.
     e2ee_self_ttl_secs: i64,
+    /// Custom community emoji and sticker limits.
+    emoji_max_count: usize,
+    emoji_max_bytes: usize,
+    sticker_max_count: usize,
+    sticker_max_bytes: usize,
+    sticker_max_px: i32,
 }
 
 async fn capabilities(
@@ -106,6 +115,11 @@ async fn capabilities(
         e2ee_link_archive_max: archive_max,
         e2ee_self: true,
         e2ee_self_ttl_secs: self_ttl,
+        emoji_max_count: db::EMOJI_MAX_COUNT,
+        emoji_max_bytes: db::EMOJI_MAX_BYTES,
+        sticker_max_count: db::STICKER_MAX_COUNT,
+        sticker_max_bytes: db::STICKER_MAX_BYTES,
+        sticker_max_px: db::STICKER_MAX_PX,
     }))
 }
 
@@ -523,10 +537,9 @@ mod tests {
 
     #[test]
     fn layout_body_accepts_room_ids_or_mixed_items_and_rejects_both() {
-        let legacy: LayoutBody = serde_json::from_str(
-            r#"{"categories":[{"id":null,"room_ids":["r1","r2"]}]}"#,
-        )
-        .expect("legacy");
+        let legacy: LayoutBody =
+            serde_json::from_str(r#"{"categories":[{"id":null,"room_ids":["r1","r2"]}]}"#)
+                .expect("legacy");
         let buckets = parse_buckets(legacy).ok().expect("parse legacy");
         assert_eq!(buckets.len(), 1);
         assert_eq!(

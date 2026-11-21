@@ -10,6 +10,7 @@ mod bot;
 mod community;
 mod direct_call;
 mod e2ee;
+mod emoji;
 mod error;
 mod link;
 mod media;
@@ -59,6 +60,11 @@ pub use e2ee::{
     user_devices, CommitSnapshot, HandshakeRow, Issued, IssuedProposal, MlsTarget, NewE2eeMessage,
     ServerKeyRow, Unissued, WelcomeFor,
 };
+pub use emoji::{
+    create_emoji, delete_emoji, get_emoji, list_emoji, rename_emoji, validate_emoji_kind,
+    validate_emoji_name, EmojiImage, EmojiSpan, EMOJI_MAX_BYTES, EMOJI_MAX_COUNT,
+    STICKER_MAX_BYTES, STICKER_MAX_COUNT, STICKER_MAX_PX,
+};
 pub use error::DbError;
 pub use link::{
     abort_link_archive, begin_link_archive, create_link, delete_link, finish_link_archive,
@@ -66,12 +72,14 @@ pub use link::{
     post_link_message, remove_link_archive, LinkArchive, LinkMessage, LINK_ID_LEN,
     LINK_MESSAGE_MAX,
 };
-pub use media::prepare_icon;
+pub use media::{prepare_emoji, prepare_icon};
 pub use messages::{
-    block_user, clear_reaction, create_channel, delete_channel, delete_message, edit_message,
-    list_blocks, list_channels, list_directs, list_messages, list_pins, mark_read, open_attachment,
-    open_direct, pin_message, post_message, save_attachment, save_sealed_attachment, scan_timeout,
-    search_messages, set_channel_override, toggle_reaction, typing_recipients, unblock_user,
+    block_user, clear_custom_reaction, clear_reaction, create_channel, delete_channel,
+    delete_message, edit_message, follow_thread, list_blocks, list_channels, list_directs,
+    list_followed_threads, list_messages, list_messages_filtered, list_pins, list_thread_messages,
+    mark_read, mark_thread_read, open_attachment, open_direct, pin_message, post_message,
+    save_attachment, save_sealed_attachment, scan_timeout, search_messages, set_channel_override,
+    toggle_custom_reaction, toggle_reaction, typing_recipients, unblock_user, unfollow_thread,
     unpin_message, update_channel, upgrade_conversation, AttachmentFile, MentionInput, MessageEdit,
     MessageError, NewAttachment, NewMessage, PreviewInput, SearchQuery,
 };

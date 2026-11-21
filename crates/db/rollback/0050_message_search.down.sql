@@ -1,4 +1,4 @@
--- Rollback of 0051_message_search.sql.
+-- Rollback of 0050_message_search.sql.
 
 DROP FUNCTION IF EXISTS app_search_messages(text, uuid, uuid, uuid, integer);
 DROP TRIGGER IF EXISTS users_forget_search_rate_log ON users;

@@ -10,6 +10,7 @@ mod bot;
 mod community;
 mod e2ee_link;
 mod e2ee_text;
+mod emoji;
 mod health;
 mod limit;
 mod live;
@@ -75,6 +76,7 @@ fn build(pool: PgPool, live: Option<Live>, sign_in: Option<SignIn>) -> Router {
         .merge(setup::routes(deployment, public_url))
         .merge(bot::routes())
         .merge(messages::routes())
+        .merge(emoji::routes())
         .merge(reports::routes())
         .merge(e2ee_text::routes())
         .merge(e2ee_link::routes());
@@ -118,7 +120,9 @@ async fn harden(request: Request, next: Next) -> Response {
         HeaderValue::from_static("no-referrer"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(
         header::STRICT_TRANSPORT_SECURITY,
         HeaderValue::from_static("max-age=31536000"),

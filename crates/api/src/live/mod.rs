@@ -54,10 +54,17 @@ pub struct Limits {
     /// Client messages a second, and the burst above that.
     pub messages_per_second: u32,
     pub message_burst: u32,
-    /// People in one room's call. A join past it gets `full`.
-    pub call_room_max: usize,
-    /// People in calls on the server. A join past it gets `server_full`.
-    pub call_server_max: usize,
+    /// Optional operator ceiling on people in one room's call. `None` means no fixed room
+    /// cap (a room's own `user_limit` still applies). A join past it gets `room_full`.
+    pub call_room_max: Option<usize>,
+    /// Optional operator ceiling on people in calls on the server. `None` means admission is
+    /// bounded by measured capacity (egress budget and media thread load). A join past it
+    /// gets `server_full`.
+    pub call_server_max: Option<usize>,
+    /// Server upload budget for calls, in kb/s. `None` means no upload budget.
+    pub call_egress_kbps: Option<u32>,
+    /// Receive audio slots per listener (default 11), used to project audio egress.
+    pub call_audio_slots: usize,
     /// Joins and leaves one socket may make at once, and how often it gets one more back.
     pub call_move_burst: u32,
     pub call_move_every: Duration,
@@ -87,8 +94,10 @@ impl Default for Limits {
             poll: Duration::from_secs(5),
             messages_per_second: 20,
             message_burst: 40,
-            call_room_max: 12,
-            call_server_max: 32,
+            call_room_max: None,
+            call_server_max: None,
+            call_egress_kbps: None,
+            call_audio_slots: 11,
             call_move_burst: 5,
             call_move_every: Duration::from_secs(3),
             seen_every: Duration::from_secs(30),
@@ -353,7 +362,9 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert!(one.contains("group_calls"));
 
-        let with_since = parse_features(Some("since=99&features=unknown_one,group_calls,GROUP_CALLS"));
+        let with_since = parse_features(Some(
+            "since=99&features=unknown_one,group_calls,GROUP_CALLS",
+        ));
         assert_eq!(with_since.len(), 1);
         assert!(with_since.contains("group_calls"));
 

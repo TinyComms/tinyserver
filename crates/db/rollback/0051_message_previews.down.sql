@@ -1,4 +1,4 @@
--- Rollback of 0052_message_previews.sql.
+-- Rollback of 0051_message_previews.sql.
 
 DROP TRIGGER IF EXISTS users_forget_message_previews ON users;
 DROP FUNCTION IF EXISTS app_previews_forget_user();

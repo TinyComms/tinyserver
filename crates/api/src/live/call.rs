@@ -216,25 +216,58 @@ pub(crate) struct Calls {
 }
 
 impl Calls {
-    /// Whether `join` would seat `user_id` in `room_id` now, with `limit` people in a room.
+    /// Whether `join` would seat `user_id` in `room_id` now, with optional room `limit` and
+    /// optional `server_max` ceiling.
     pub fn check(
         &self,
         user_id: &str,
         room_id: &str,
-        limit: usize,
-        server_max: usize,
+        limit: Option<usize>,
+        server_max: Option<usize>,
     ) -> Result<(), Refused> {
         if self.room_of(user_id) == Some(room_id) {
             return Ok(());
         }
         let here = self.rooms.get(room_id).map_or(0, Vec::len);
-        if here >= limit {
+        if limit.is_some_and(|max| here >= max) {
             return Err(Refused::Full);
         }
-        if !self.seats.contains_key(user_id) && self.seats.len() >= server_max {
+        if !self.seats.contains_key(user_id)
+            && server_max.is_some_and(|max| self.seats.len() >= max)
+        {
             return Err(Refused::ServerFull);
         }
         Ok(())
+    }
+
+    /// Projected server audio upload in kb/s if `user_id` is seated in `room_id`, assuming
+    /// each listener receives at most `audio_slots` streams at 50 kb/s each.
+    pub fn projected_audio_kbps(&self, user_id: &str, room_id: &str, audio_slots: usize) -> u64 {
+        const AUDIO_STREAM_KBPS: u64 = 50;
+        let current_room = self.room_of(user_id);
+        let mut total_streams: u64 = 0;
+        let mut saw_target = false;
+        for (room, members) in &self.rooms {
+            let mut count = members.len();
+            if current_room == Some(room.as_str()) && room.as_str() != room_id {
+                count = count.saturating_sub(1);
+            }
+            if room.as_str() == room_id {
+                saw_target = true;
+                if current_room != Some(room_id) {
+                    count += 1;
+                }
+            }
+            if count > 1 {
+                let per_listener = (count - 1).min(audio_slots) as u64;
+                total_streams =
+                    total_streams.saturating_add((count as u64).saturating_mul(per_listener));
+            }
+        }
+        if !saw_target {
+            // Single person in a new room sends 0 streams to others.
+        }
+        total_streams.saturating_mul(AUDIO_STREAM_KBPS)
     }
 
     /// Whether `user_id` was moved to `room_id` and may still join it past its limit.
@@ -267,8 +300,8 @@ impl Calls {
         room_id: &str,
         conn: u64,
         call_id: Option<String>,
-        limit: usize,
-        server_max: usize,
+        limit: Option<usize>,
+        server_max: Option<usize>,
         access: Access,
         e2ee: bool,
     ) -> Result<Vec<Change>, Refused> {
@@ -789,7 +822,7 @@ mod tests {
     }
 
     fn join(calls: &mut Calls, user: &str, room: &str, conn: u64) -> Result<Vec<Change>, Refused> {
-        calls.join(user, room, conn, None, 12, 32, FREE, false)
+        calls.join(user, room, conn, None, None, None, FREE, false)
     }
 
     #[test]
@@ -973,7 +1006,7 @@ mod tests {
     fn caps_count_people_not_moves() {
         let mut calls = Calls::default();
         let go = |calls: &mut Calls, user: &str, room: &str, conn: u64| {
-            calls.join(user, room, conn, None, 2, 3, FREE, false)
+            calls.join(user, room, conn, None, Some(2), Some(3), FREE, false)
         };
         assert!(go(&mut calls, "u", "a", 1).is_ok());
         assert!(go(&mut calls, "v", "a", 2).is_ok());
@@ -985,10 +1018,10 @@ mod tests {
     }
 
     #[test]
-    fn the_default_room_cap_refuses_the_thirteenth() {
+    fn default_limits_allow_more_than_twelve_in_a_room() {
         let limits = crate::live::Limits::default();
         let mut calls = Calls::default();
-        for n in 0..12 {
+        for n in 0..50 {
             let user_id = format!("u{n}");
             let joined = calls.join(
                 &user_id,
@@ -1002,19 +1035,19 @@ mod tests {
             );
             assert!(joined.is_ok(), "{user_id}");
         }
-        assert_eq!(
-            calls.join(
-                "u12",
-                "a",
-                12,
-                None,
-                limits.call_room_max,
-                limits.call_server_max,
-                FREE,
-                false
-            ),
-            Err(Refused::Full)
-        );
+        assert_eq!(calls.people("a").len(), 50);
+    }
+
+    #[test]
+    fn projected_audio_kbps_is_linear_above_slot_count() {
+        let mut calls = Calls::default();
+        for n in 0..20 {
+            assert!(join(&mut calls, &format!("u{n}"), "a", n).is_ok());
+        }
+        // Adding a 21st person: 21 listeners * 11 slots * 50 kbps = 11550 kbps.
+        assert_eq!(calls.projected_audio_kbps("u20", "a", 11), 21 * 11 * 50);
+        // Adding a 1st person to an empty room b does not add streams to b.
+        assert_eq!(calls.projected_audio_kbps("u20", "b", 11), 20 * 11 * 50);
     }
 
     #[test]
@@ -1054,8 +1087,8 @@ mod tests {
                 "a",
                 1,
                 Some("c-1".to_string()),
-                12,
-                32,
+                None,
+                None,
                 suppressed,
                 false,
             )
@@ -1138,12 +1171,30 @@ mod tests {
     #[test]
     fn a_seat_keeps_its_call_id_and_state_until_it_leaves() {
         let mut calls = Calls::default();
-        let joined = calls.join("u", "a", 1, Some("c-1".to_string()), 12, 32, FREE, false);
+        let joined = calls.join(
+            "u",
+            "a",
+            1,
+            Some("c-1".to_string()),
+            None,
+            None,
+            FREE,
+            false,
+        );
         assert!(joined.is_ok());
         assert_eq!(calls.call_of("u"), Some("c-1"));
         assert_eq!(calls.holder("c-1"), Some("u"));
         assert_eq!(
-            calls.join("u", "a", 2, Some("c-2".to_string()), 12, 32, FREE, false),
+            calls.join(
+                "u",
+                "a",
+                2,
+                Some("c-2".to_string()),
+                None,
+                None,
+                FREE,
+                false
+            ),
             Ok(Vec::new())
         );
         assert_eq!(calls.holder("c-1"), None);
@@ -1194,10 +1245,28 @@ mod tests {
         let mut calls = Calls::default();
         let key = "d:11111111-1111-4111-8111-111111111111";
         calls
-            .join("a", key, 1, Some("c-a".to_string()), 2, 32, FREE, true)
+            .join(
+                "a",
+                key,
+                1,
+                Some("c-a".to_string()),
+                Some(2),
+                Some(32),
+                FREE,
+                true,
+            )
             .expect("a");
         calls
-            .join("b", key, 2, Some("c-b".to_string()), 2, 32, FREE, true)
+            .join(
+                "b",
+                key,
+                2,
+                Some("c-b".to_string()),
+                Some(2),
+                Some(32),
+                FREE,
+                true,
+            )
             .expect("b");
         assert!(calls.snapshot().is_empty(), "a direct call is not a room");
         assert!(calls.note_direct_pair(key));
@@ -1222,10 +1291,10 @@ mod tests {
         let mut calls = Calls::default();
         let key = "d:22222222-2222-4222-8222-222222222222";
         calls
-            .join("a", key, 1, None, 2, 32, FREE, false)
+            .join("a", key, 1, None, Some(2), Some(32), FREE, false)
             .expect("a");
         calls
-            .join("b", key, 2, None, 2, 32, FREE, false)
+            .join("b", key, 2, None, Some(2), Some(32), FREE, false)
             .expect("b");
         let changes = calls.leave("a", Reason::Left);
         assert_eq!(changes.len(), 2);

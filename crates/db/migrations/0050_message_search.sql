@@ -195,5 +195,5 @@ $$;
 REVOKE EXECUTE ON FUNCTION app_search_messages(text, uuid, uuid, uuid, integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_search_messages(text, uuid, uuid, uuid, integer) TO app_runtime;
 
--- Rollback: crates/db/rollback/0051_message_search.down.sql drops app_search_messages,
+-- Rollback: crates/db/rollback/0050_message_search.down.sql drops app_search_messages,
 -- the trigger, search_rate_log, and the messages_body_search index.

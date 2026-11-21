@@ -114,7 +114,7 @@ For an encrypted conversation, `POST /v1/conversations/{id}/messages` takes exac
   "kind": "message" | "edit", "target_id": "<message id, for an edit>", "attachment_ids": ["…"] }
 ```
 
-and refuses with `400 e2ee_required` any request that has a `body`, plaintext `mentions`, or plaintext `previews`.
+and refuses with `400 e2ee_required` any request that has a `body`, plaintext `mentions`, or plaintext `previews`, and with `400 invalid` any ciphertext request that carries plaintext `reply_to` or `thread_id` (encrypted conversations keep reply and thread relations inside the sealed payload so the server learns no conversation structure).
 
 **Authenticated data.** The MLS authenticated data of every application message is `"tiny-e2ee-v1 msg" 0x00 kind 0x00 target_id`, with `target_id` the lowercase hyphenated uuid of the target for an edit and empty for a message. It is in the clear in a `PrivateMessage` and covered by its AEAD and the sender's signature. The server refuses (`400 bad_e2ee`) a post whose `kind` and `target_id` are not the ones the authenticated data names, and a receiver refuses a row whose stored `kind` and `target_id` disagree with it. So a server, or anyone who can write its database, cannot turn an edit into a message or point it at another message without the receivers noticing. `client_id` is unique per sender device and conversation (`409` replays, idempotent: the original is returned). A plaintext post to an encrypted conversation is never accepted, and a `ciphertext` post to a plaintext conversation is `400 not_e2ee`. There is no fallback.
 

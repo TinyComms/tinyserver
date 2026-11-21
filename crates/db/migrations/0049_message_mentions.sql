@@ -477,6 +477,10 @@ AS $$
       AND NOT m.e2ee
       AND m.msg_kind = 'message'
       AND m.author_id <> app_uid()
+      AND NOT EXISTS (
+          SELECT 1 FROM blocks b
+          WHERE b.blocker_id = app_uid() AND b.blocked_id = m.author_id
+      )
       AND ((p_kind = 'channel' AND m.channel_id = p_conversation)
            OR (p_kind = 'direct' AND m.direct_id = p_conversation))
       AND NOT EXISTS (
@@ -954,6 +958,6 @@ CREATE TRIGGER roles_forget_message_mentions
     FOR EACH ROW
     EXECUTE FUNCTION app_mentions_forget_role();
 
--- Rollback: crates/db/rollback/0050_message_mentions.down.sql drops the triggers,
+-- Rollback: crates/db/rollback/0049_message_mentions.down.sql drops the triggers,
 -- message_mentions table, unread-mentions helper, roles.mentionable, and restores bit masks
 -- to 4194303 / 2343551 and the 0045/0046 functions.

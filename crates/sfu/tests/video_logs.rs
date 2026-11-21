@@ -74,7 +74,8 @@ async fn video_state_changes_are_logged_at_info() {
         .filter(|line| line.contains("video slot") || line.contains("video publish"))
         .count();
     assert_eq!(
-        steady_slot_lines, 0,
+        steady_slot_lines,
+        0,
         "unexpected repeated state-change lines while video is steady: {:?}",
         &steady_lines[before_steady..]
     );

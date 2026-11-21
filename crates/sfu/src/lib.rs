@@ -128,8 +128,9 @@ pub struct Config {
     pub tcp_idle: Duration,
     /// The largest offer, in bytes.
     pub offer_bytes: usize,
-    /// Audio and video m-lines an offer may have. Audio is the room cap: one microphone and
-    /// a slot for everyone else. Other kinds are refused.
+    /// Audio and video m-lines an offer may have. Audio is one microphone plus receive slots
+    /// per listener (default 12 = 1 send + 11 loudest-speaker receive slots), independent of
+    /// how many people are in the room. Other kinds are refused.
     pub offer_audio: usize,
     pub offer_video: usize,
 }
@@ -252,6 +253,7 @@ pub enum Event {
     Load {
         egress_kbps: u64,
         participants: usize,
+        longest_turn_ms: u64,
     },
 }
 
