@@ -84,6 +84,29 @@ impl People {
         }
     }
 
+    /// Whether `user_id` has at least one connected socket that declared `name`.
+    #[allow(dead_code)]
+    fn has_feature(&self, user_id: &str, name: &str) -> bool {
+        self.users
+            .get(user_id)
+            .is_some_and(|person| person.conns.iter().any(|conn| conn.features.contains(name)))
+    }
+
+    /// Whether the socket currently holding `user_id`'s call seat declared `name`.
+    #[allow(dead_code)]
+    fn seat_has_feature(&self, user_id: &str, name: &str) -> bool {
+        let Some(conn_id) = self.calls.conn_of(user_id) else {
+            return false;
+        };
+        self.users.get(user_id).is_some_and(|person| {
+            person
+                .conns
+                .iter()
+                .find(|conn| conn.id == conn_id)
+                .is_some_and(|conn| conn.features.contains(name))
+        })
+    }
+
     /// Sends `call.e2ee` frames, each to the socket holding its person's seat, or keeps them
     /// for the next one while that seat has none.
     fn e2ee(&mut self, frames: Vec<e2ee::Outgoing>) {
@@ -111,6 +134,7 @@ struct Conn {
     kick: oneshot::Sender<Close>,
     direct: mpsc::Sender<Arc<str>>,
     proofs: mpsc::UnboundedSender<Proof>,
+    features: HashSet<String>,
 }
 
 /// Answered once a socket has shown it is alive. Dropped if it closes first.
@@ -257,7 +281,7 @@ impl Hub {
 
     /// Adds a socket for `user_id`. The first one brings the person online. Past the per-user
     /// cap, the oldest socket is told to close.
-    pub fn join(&self, user_id: &str, bot: bool) -> Joined {
+    pub fn join(&self, user_id: &str, bot: bool, features: HashSet<String>) -> Joined {
         let (kick, kicked) = oneshot::channel();
         let (direct, inbox) = mpsc::channel(DIRECT);
         let (proofs, asked) = mpsc::unbounded_channel();
@@ -276,6 +300,7 @@ impl Hub {
             kick,
             direct,
             proofs,
+            features,
         });
         if arrived && !bot {
             self.announce(user_id, true, None);
@@ -1489,6 +1514,7 @@ mod tests {
                 kick,
                 direct,
                 proofs,
+                features: HashSet::new(),
             });
             person.presence = Some(Setting {
                 state: State::Dnd,
@@ -1520,6 +1546,7 @@ mod tests {
                     kick,
                     direct: sent,
                     proofs,
+                    features: HashSet::new(),
                 }],
                 ..Person::default()
             },
@@ -1649,6 +1676,76 @@ mod tests {
             "removing either party ends the accepted call"
         );
         assert!(lock(&hub.people).rings.ready("caller").is_none());
+        hub.close();
+    }
+
+    #[tokio::test]
+    async fn socket_features_are_tracked_per_conn_and_per_seat() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/features_unit")
+            .expect("lazy pool");
+        let hub = Hub::start(pool, Limits::default(), None);
+
+        let first = hub.join("alice", false, HashSet::new());
+        {
+            let people = lock(&hub.people);
+            assert!(!people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
+
+        let mut with_gc = HashSet::new();
+        with_gc.insert("group_calls".to_string());
+        let second = hub.join("alice", false, with_gc);
+        {
+            let people = lock(&hub.people);
+            assert!(people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
+
+        // Put `first` (without group_calls) in a call seat.
+        hub.call_join(
+            "alice",
+            "room-1",
+            first.conn,
+            None,
+            12,
+            Access::default(),
+            false,
+            [1; 32],
+        )
+        .expect("join room");
+        {
+            let people = lock(&hub.people);
+            assert!(people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
+
+        // Move the seat to `second` (with group_calls).
+        hub.call_leave("alice", Reason::Left, true);
+        hub.call_join(
+            "alice",
+            "room-1",
+            second.conn,
+            None,
+            12,
+            Access::default(),
+            false,
+            [2; 32],
+        )
+        .expect("join room on second socket");
+        {
+            let people = lock(&hub.people);
+            assert!(people.has_feature("alice", "group_calls"));
+            assert!(people.seat_has_feature("alice", "group_calls"));
+        }
+
+        // Dropping `second` removes the feature from `alice`.
+        hub.leave("alice", second.conn);
+        {
+            let people = lock(&hub.people);
+            assert!(!people.has_feature("alice", "group_calls"));
+            assert!(!people.seat_has_feature("alice", "group_calls"));
+        }
         hub.close();
     }
 }

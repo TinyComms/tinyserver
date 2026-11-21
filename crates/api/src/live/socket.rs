@@ -1,6 +1,7 @@
 //! One live socket: `ready`, the replay, then events, presence, and calls until something
 //! closes it.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -176,8 +177,9 @@ pub(crate) async fn run(
     slot: Slot,
     mut me: Me,
     since: Option<i64>,
+    features: HashSet<String>,
 ) {
-    let joined = hub.join(&me.user_id, me.is_bot());
+    let joined = hub.join(&me.user_id, me.is_bot(), features);
     let conn = joined.conn;
     tracing::info!(user_id = %me.user_id, conn, "live socket opened");
     if !me.is_bot() {

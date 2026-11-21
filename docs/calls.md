@@ -41,7 +41,7 @@ Signaling needs both directions on one ordered stream. SSE would need a second H
 ### Connect
 
 ```
-GET /v1/live?since=<seq>
+GET /v1/live?since=<seq>&features=<name,...>
 Authorization: Bearer <session token>
 Authorization: Bot <bot token>
 Upgrade: websocket
@@ -52,7 +52,7 @@ Upgrade: websocket
 | Auth | `Authorization: Bearer <session token>` or `Authorization: Bot <bot token>`. No query-string token. Checked before the upgrade. No token, a bad token, or an unknown scheme is `401 {"error":"unauthorized"}`. A database error on that check is `500 {"error":"unavailable"}`. The socket re-reads the session every 60 s (a bot token is re-read with `authenticate_bot`). It also re-reads at once on `session.ended`, on `member.role` or `member.roles` for itself, and on any `role.updated` or `role.deleted`. `call.join`, `call.kick`, `call.moderate`, `call.move`, and `call.share_end` re-read before they act. An ended session closes with `4001 session_ended`. A database error on a later re-read keeps the socket; the next re-read tries again. A database error on one of those five call requests returns `error` `unavailable` and does not close the socket. |
 | Membership | A kick emits `member.removed` to every member socket. That person's sockets close with `4003 removed`, and their call ends at once with `call.left` `removed`. Their sessions are deleted, and `session.ended` is not emitted. A ban emits `member.banned` (ban_members only) and then `member.removed` if they were a member. The banned person's sockets close on `member.banned` with `4003` even when they do not receive that frame. The call ends as `banned`. |
 | Session end | Sign-out of one session, sign-out everywhere, and a provider back-channel logout emit `session.ended` with `user_id`. The frame is not sent to clients. Every socket of that user re-checks its own token. A socket whose token is gone closes with `4001`. A socket whose token is still valid stays. Sign-out everywhere deletes every session, so every socket of that user closes. |
-| Query | `since=<seq>`, a non-negative integer. Anything else is `400 {"error":"invalid"}`. Other parameters are ignored. |
+| Query | `since=<seq>`, a non-negative integer; anything else is `400 {"error":"invalid"}`. Optional `features=<name,...>`, a comma-separated list of lower-case live feature names the app understands (such as `group_calls`; at most 16 names of at most 32 bytes; unknown or malformed values are ignored, never a refusal). The declared set stays server-side on that socket and is never included on participant frames. Other parameters are ignored. |
 | Frame size | 64 KiB, for one frame and one message. SDP with simulcast fits. Bigger closes the socket with `1009 too_big`. Binary frames close it with `1003 text_only`. |
 | Client message rate | 20 a second, burst 40. A message over that is dropped, and the first one dropped gets `error {code: "slow_down"}`. 40 dropped in a row closes with `4029 slow_down`. |
 | Sockets per user | 3. A fourth closes the oldest with `4008 replaced`. |
