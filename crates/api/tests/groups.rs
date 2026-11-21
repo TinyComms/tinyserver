@@ -176,6 +176,7 @@ async fn group_find_or_create_concurrent_rename_isolation_and_capabilities() {
         let (mut ws_o, _) = connect(&server, &owner_token, None).await;
         let (mut ws_b, _) = connect(&server, &b_token, None).await;
 
+        let _uploads = UploadDirGuard::new("find-create");
         let file_id = upload_text(&app, &a_token, "secret.txt", b"group-only").await;
         let (st, msg) = Call::new(Method::POST, &format!("/v1/conversations/{gid}/messages"))
             .token(&a_token)
@@ -250,18 +251,42 @@ async fn group_find_or_create_concurrent_rename_isolation_and_capabilities() {
     .await;
 }
 
-#[tokio::test]
-async fn group_add_convergence_tiebreak_leave_last_delete_and_audit_privacy() {
-    run(|db| async move {
-        let upload_dir = std::env::temp_dir().join(format!(
-            "tinyserver-groups-test-{}",
+struct UploadDirGuard {
+    dir: std::path::PathBuf,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl UploadDirGuard {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyserver-groups-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&upload_dir).expect("upload dir");
-        std::env::set_var("TINYSERVER_UPLOAD_DIR", &upload_dir);
+        std::fs::create_dir_all(&dir).expect("upload dir");
+        let prev = std::env::var_os("TINYSERVER_UPLOAD_DIR");
+        std::env::set_var("TINYSERVER_UPLOAD_DIR", &dir);
+        Self { dir, prev }
+    }
+}
+
+impl Drop for UploadDirGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("TINYSERVER_UPLOAD_DIR", v),
+            None => std::env::remove_var("TINYSERVER_UPLOAD_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[tokio::test]
+async fn group_add_convergence_tiebreak_leave_last_delete_and_audit_privacy() {
+    run(|db| async move {
+        let _uploads = UploadDirGuard::new("add-leave");
+        let upload_dir = _uploads.dir.clone();
 
         let owner = first_owner(&db).await;
         let owner_token = session(&db, &owner.user_id).await;
@@ -446,7 +471,7 @@ async fn group_add_convergence_tiebreak_leave_last_delete_and_audit_privacy() {
             }
         }
 
-        let _ = std::fs::remove_dir_all(&upload_dir);
+        drop(_uploads);
     })
     .await;
 }

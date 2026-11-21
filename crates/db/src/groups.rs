@@ -26,6 +26,9 @@ pub async fn list_groups(pool: &PgPool, caller: &Caller) -> Result<Value, Messag
 
 /// Fetches one group conversation the caller is currently in, else `NotFound`.
 pub async fn get_group(pool: &PgPool, caller: &Caller, id: &str) -> Result<Value, MessageError> {
+    if caller.role == "bot" {
+        return Err(MessageError::Forbidden);
+    }
     if !is_uuid(id) {
         return Err(MessageError::NotFound);
     }
@@ -46,8 +49,8 @@ pub async fn open_group(
     name: Option<&str>,
     e2ee: bool,
 ) -> Result<(Value, bool), MessageError> {
-    if e2ee {
-        return Err(MessageError::E2eeOff);
+    if caller.role == "bot" {
+        return Err(MessageError::Forbidden);
     }
     let users = validate_group_create_users(&caller.user_id, user_ids)?;
     let name = validate_group_name(name.unwrap_or(""))?;
@@ -77,6 +80,9 @@ pub async fn rename_group(
     id: &str,
     name: &str,
 ) -> Result<Value, MessageError> {
+    if caller.role == "bot" {
+        return Err(MessageError::Forbidden);
+    }
     if !is_uuid(id) {
         return Err(MessageError::NotFound);
     }
@@ -97,6 +103,9 @@ pub async fn add_group_member(
     id: &str,
     user_id: &str,
 ) -> Result<(Value, bool), MessageError> {
+    if caller.role == "bot" {
+        return Err(MessageError::Forbidden);
+    }
     if !is_uuid(id) {
         return Err(MessageError::NotFound);
     }
@@ -122,6 +131,9 @@ pub async fn leave_group(
     caller: &Caller,
     id: &str,
 ) -> Result<Vec<String>, MessageError> {
+    if caller.role == "bot" {
+        return Err(MessageError::Forbidden);
+    }
     if !is_uuid(id) {
         return Err(MessageError::NotFound);
     }
