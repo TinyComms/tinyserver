@@ -1,14 +1,18 @@
-//! Video routing without the network: the speaker who holds the floor, which simulcast layer
-//! a listener gets, what the upload budget allows, and the RTP time a listener's one video
-//! slot carries across switches.
+//! Video routing without the network: the speaker who holds the floor, which simulcast layers
+//! a listener's video slots get, what the upload budget allows, and the RTP time each video slot
+//! carries across switches.
 
 use std::time::{Duration, Instant};
+
+use crate::VideoKind;
 
 /// Nominal camera bitrates from `docs/calls.md`, in kb/s. The upload budget plans with them.
 pub(crate) const HIGH_KBPS: u64 = 1200;
 pub(crate) const LOW_KBPS: u64 = 350;
 /// The nominal screen share bitrate, in kb/s: a desktop's share at its best, 1440p at 60 fps.
 pub(crate) const SHARE_KBPS: u64 = 8000;
+/// Cap on a listener's combined probe target across multiple subscribed video slots.
+pub(crate) const MAX_PROBE_KBPS: u64 = 12_000;
 /// One forwarded audio stream with its headers, in kb/s, for the upload budget.
 pub(crate) const AUDIO_KBPS: u64 = 50;
 /// A listener on `l` moves up to `h` at this much room for video, and back down below
@@ -64,21 +68,21 @@ pub(crate) fn resume_probe_kbps(audio_kbps: u64) -> u64 {
 /// One simulcast layer of a camera, or a share's one layer. `h` is high, `l` is low; a
 /// camera without rids is high.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Layer {
+pub enum Layer {
     High,
     Low,
     Share,
 }
 
 impl Layer {
-    pub fn of_rid(rid: Option<&str>) -> Self {
+    pub(crate) fn of_rid(rid: Option<&str>) -> Self {
         match rid {
             Some("l") => Self::Low,
             _ => Self::High,
         }
     }
 
-    pub fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Self::High => 0,
             Self::Low => 1,
@@ -95,7 +99,7 @@ impl Layer {
     }
 
     /// The camera's other layer. A share has only one.
-    pub fn other(self) -> Self {
+    pub(crate) fn other(self) -> Self {
         match self {
             Self::High => Self::Low,
             Self::Low => Self::High,
@@ -104,8 +108,8 @@ impl Layer {
     }
 }
 
-/// What video a listener can use: theirs from `call.quality`, or the server's from its
-/// upload budget. `Off` is audio only.
+/// What video a listener can use: theirs from `call.quality`, a subscription's `max`, or the
+/// server's from its upload budget. `Off` is audio only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Quality {
     Off,
@@ -113,43 +117,97 @@ pub enum Quality {
     High,
 }
 
-/// What a listener's link has room for beside its audio, lowest first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Fit {
-    /// No video at all.
-    Audio,
-    /// `l`.
-    Low,
-    /// `l`, or a share.
-    Share,
-    /// Anything.
-    High,
+/// One video slot's demand for [`allocate`]: stream kind and maximum layer allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Want {
+    pub kind: VideoKind,
+    pub max: Quality,
 }
 
-impl Fit {
-    /// Each step above audio, highest first: the kb/s that reaches it, and what keeps it.
-    const STEPS: [(Self, u64, u64); 3] = [
-        (Self::High, UP_KBPS, DOWN_KBPS),
-        (Self::Share, SHARE_UP_KBPS, SHARE_DOWN_KBPS),
-        (Self::Low, RESUME_KBPS, PAUSE_KBPS),
-    ];
-
-    /// The most `kbps` carries for a listener at `from`.
-    fn of(kbps: u64, from: Self) -> Self {
-        Self::STEPS
-            .iter()
-            .find(|(step, up, down)| kbps >= if from >= *step { *down } else { *up })
-            .map_or(Self::Audio, |(step, _, _)| *step)
-    }
-
-    /// The camera layers this leaves room for.
-    pub fn quality(self) -> Quality {
-        match self {
-            Self::Audio => Quality::Off,
-            Self::Low | Self::Share => Quality::Low,
-            Self::High => Quality::High,
+/// Allocates a listener's available video room (`room_kbps`, after audio) across subscribed slots
+/// in priority order: slot 0 first, then tile slots in the order subscribed. Under congestion the
+/// last tile is dropped first and slot 0 last. Uses per-step up/down hysteresis so streams do not
+/// flap around a threshold.
+pub(crate) fn allocate(
+    room_kbps: u64,
+    wants: &[Want],
+    held: &[Option<Layer>],
+) -> Vec<Option<Layer>> {
+    let mut left = room_kbps;
+    let mut starved = false;
+    let mut out = Vec::with_capacity(wants.len());
+    for (idx, want) in wants.iter().enumerate() {
+        let prev = held.get(idx).copied().flatten();
+        if want.max == Quality::Off {
+            out.push(None);
+            continue;
+        }
+        if starved {
+            out.push(None);
+            continue;
+        }
+        match want.kind {
+            VideoKind::Share => {
+                let need = if prev == Some(Layer::Share) {
+                    SHARE_DOWN_KBPS
+                } else {
+                    SHARE_UP_KBPS
+                };
+                if left >= need {
+                    left = left.saturating_sub(SHARE_UP_KBPS);
+                    out.push(Some(Layer::Share));
+                } else {
+                    starved = true;
+                    out.push(None);
+                }
+            }
+            VideoKind::Camera => {
+                if want.max == Quality::High {
+                    let high_need = if prev == Some(Layer::High) {
+                        DOWN_KBPS
+                    } else {
+                        UP_KBPS
+                    };
+                    if left >= high_need {
+                        left = left.saturating_sub(HIGH_KBPS);
+                        out.push(Some(Layer::High));
+                        continue;
+                    }
+                }
+                let low_need = if prev.is_some() {
+                    PAUSE_KBPS
+                } else {
+                    RESUME_KBPS
+                };
+                if left >= low_need {
+                    left = left.saturating_sub(LOW_KBPS);
+                    out.push(Some(Layer::Low));
+                } else {
+                    starved = true;
+                    out.push(None);
+                }
+            }
         }
     }
+    out
+}
+
+/// Allocation before any estimate or REMB has arrived: shares are always tried, cameras start on
+/// `l`, and `Quality::Off` gets nothing.
+pub(crate) fn allocate_unproven(wants: &[Want]) -> Vec<Option<Layer>> {
+    wants
+        .iter()
+        .map(|want| {
+            if want.max == Quality::Off {
+                None
+            } else {
+                match want.kind {
+                    VideoKind::Share => Some(Layer::Share),
+                    VideoKind::Camera => Some(Layer::Low),
+                }
+            }
+        })
+        .collect()
 }
 
 /// Whether a link is really full. An estimate alone cannot say: it follows what is sent, so a
@@ -186,20 +244,19 @@ pub(crate) struct Reading {
 /// What was taken from a listener, and when it is tried again.
 #[derive(Debug, Clone, Copy)]
 struct Withdrawn {
-    from: Option<Fit>,
+    from: Option<u64>,
     retry: Instant,
 }
 
-/// Follows what one listener's link can carry. Down at once on evidence, because a full link is
-/// losing audio now, and never on an estimate alone. Up as soon as an estimate has held for a
-/// hold, so the video does not flap on a link that only looks better for a moment. Whatever was
-/// taken comes back to be tried again after a wait that grows while it keeps failing, so no
-/// listener is left without video because of how a link once looked.
+/// Follows how much video room, in kb/s beside audio, one listener's link can carry. Down at once
+/// on evidence, because a full link is losing audio now, and never on an estimate alone. Up as
+/// soon as an estimate has held for a hold, so video does not flap on a link that only looks
+/// better for a moment. Whatever was taken comes back to be tried again after a wait that grows
+/// while it keeps failing, so no listener is left without video because of how a link once looked.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Link {
-    /// What the link is known to have room for. `None` until there is word of that: `l`, and
-    /// any share.
-    fit: Option<Fit>,
+    /// Proven room for video in kb/s. `None` until there is word of that: `l`, and any share.
+    room: Option<u64>,
     rising: Option<Instant>,
     withdrawn: Option<Withdrawn>,
     /// The wait after the last withdrawal, and when what it took was last tried again.
@@ -208,7 +265,7 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    pub fn update(&mut self, reading: Reading, hold: Duration, now: Instant) -> Option<Fit> {
+    pub fn update(&mut self, reading: Reading, hold: Duration, now: Instant) -> Option<u64> {
         let room = match (reading.told, reading.estimate) {
             (Some(told), Some(estimate)) => Some(told.min(estimate)),
             (told, estimate) => told.or(estimate),
@@ -216,44 +273,54 @@ impl Link {
         let Some(room) = room else {
             return self.retry(reading, now);
         };
-        let held = self.fit.unwrap_or(Fit::High);
         let limit = if reading.congested {
             Some(room)
         } else {
             reading.told
         };
-        match limit.map(|limit| Fit::of(limit, held)) {
-            Some(target) if target < held => {
-                self.withdraw(target, hold, now);
-                return self.fit;
+        if let Some(limit) = limit {
+            match self.room {
+                Some(held) if limit < held => {
+                    self.withdraw(limit, hold, now);
+                    return self.room;
+                }
+                None if reading.congested => {
+                    self.withdraw(limit, hold, now);
+                    return self.room;
+                }
+                None => {
+                    self.room = Some(limit);
+                }
+                _ => {}
             }
-            Some(target) if self.fit.is_none() => self.fit = Some(target),
-            _ => {}
         }
-        let Some(fit) = self.fit else {
+        let Some(cur) = self.room else {
             // Good news needs no wait the first time. Anything less says nothing yet.
-            let target = Fit::of(room, Fit::High);
-            self.fit = (target >= Fit::Share).then_some(target);
-            return self.fit;
+            if room >= SHARE_DOWN_KBPS {
+                self.room = Some(room);
+            }
+            return self.room;
         };
-        let target = Fit::of(room, fit);
-        if target <= fit {
+        if room <= cur {
             self.rising = None;
             return self.retry(reading, now);
         }
         let since = *self.rising.get_or_insert(now);
         if now.saturating_duration_since(since) >= hold {
-            self.fit = Some(target);
+            self.room = Some(room);
             self.rising = None;
-            if self.withdrawn.is_some_and(|gone| gone.from <= Some(target)) {
+            if self
+                .withdrawn
+                .is_some_and(|gone| gone.from.is_none_or(|from| from <= room))
+            {
                 self.withdrawn = None;
             }
         }
-        self.fit
+        self.room
     }
 
-    /// Takes the link down to `fit`, to be tried again later, sooner if it held for a while.
-    fn withdraw(&mut self, fit: Fit, hold: Duration, now: Instant) {
+    /// Takes the link down to `room`, to be tried again later, sooner if it held for a while.
+    fn withdraw(&mut self, room: u64, hold: Duration, now: Instant) {
         let failing = self
             .tried
             .is_some_and(|at| now.saturating_duration_since(at) < self.wait * 2);
@@ -262,87 +329,92 @@ impl Link {
         } else {
             hold
         };
-        let from = self.withdrawn.map_or(self.fit, |gone| gone.from);
+        let from = self.withdrawn.map_or(self.room, |gone| gone.from);
         self.withdrawn = Some(Withdrawn {
             from,
             retry: now + self.wait,
         });
-        self.fit = Some(fit);
+        self.room = Some(room);
         self.rising = None;
     }
 
     /// Puts back what was taken, if its wait is over and the receiver has not said otherwise.
-    fn retry(&mut self, reading: Reading, now: Instant) -> Option<Fit> {
+    fn retry(&mut self, reading: Reading, now: Instant) -> Option<u64> {
         if let Some(gone) = self.withdrawn {
             let forbidden = reading
                 .told
-                .is_some_and(|told| Fit::of(told, Fit::Audio) < gone.from.unwrap_or(Fit::High));
+                .is_some_and(|told| gone.from.is_none_or(|from| told < from));
             if now >= gone.retry && !forbidden && !reading.congested {
-                self.fit = gone.from;
+                self.room = gone.from;
                 self.withdrawn = None;
                 self.tried = Some(now);
             }
         }
-        self.fit
+        self.room
     }
 
-    pub fn fit(&self) -> Option<Fit> {
-        self.fit
-    }
-}
-
-/// The layer a listener should get. `fit` is what its link has room for; with no estimate yet
-/// it starts on `l`.
-pub(crate) fn pick_layer(fit: Option<Fit>, quality: Quality, ceiling: Quality) -> Option<Layer> {
-    match (quality.min(ceiling), fit) {
-        (Quality::Off, _) | (_, Some(Fit::Audio)) => None,
-        (Quality::High, Some(Fit::High)) => Some(Layer::High),
-        _ => Some(Layer::Low),
+    pub fn room(&self) -> Option<u64> {
+        self.room
     }
 }
 
-/// What the server's upload budget lets every listener have.
+/// What the server's upload budget lets streams have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ceiling {
-    /// Listeners in a room with a share get it.
+    /// Share streams fit in the upload budget.
     pub share: bool,
-    /// The most a camera listener may get.
+    /// The most a main camera stream may get.
     pub camera: Quality,
+    /// Tile (`l`-only) camera streams fit alongside main cameras.
+    pub tiles: bool,
 }
 
-/// The plan under the server's upload budget. Shares come first, because text on a screen
-/// matters more than a face: they fit after audio, or nobody gets one. Then cameras, with
-/// what is left: `h` if every camera listener fits on `h`, `l` if they fit on `l`, else
-/// audio only. `audio_streams` is the number of audio streams forwarded, `share_viewers` the
-/// listeners with a share to watch, and `camera_viewers` those with only a camera.
+/// The plan under the server's upload budget, counted over streams rather than listeners.
+/// Shares come first, because text on a screen matters more than a face: they fit after audio, or
+/// nobody gets one. Then cameras, with what is left: main (`high_streams`) and tiles
+/// (`low_streams`) at full rate if they fit, else all cameras on `l` if that fits, else main only
+/// on `h` or `l`, else audio only.
 pub(crate) fn ceiling(
     budget_kbps: Option<u32>,
     audio_streams: u64,
-    share_viewers: u64,
-    camera_viewers: u64,
+    share_streams: u64,
+    high_streams: u64,
+    low_streams: u64,
 ) -> Ceiling {
     let Some(budget) = budget_kbps else {
         return Ceiling {
             share: true,
             camera: Quality::High,
+            tiles: true,
         };
     };
     let budget = u64::from(budget);
     let audio = audio_streams.saturating_mul(AUDIO_KBPS);
-    let shares = audio.saturating_add(share_viewers.saturating_mul(SHARE_KBPS));
+    let shares = audio.saturating_add(share_streams.saturating_mul(SHARE_KBPS));
     let share = shares <= budget;
     let planned = if share { shares } else { audio };
-    let fits = |layer_kbps: u64| {
-        planned.saturating_add(camera_viewers.saturating_mul(layer_kbps)) <= budget
+    let fits = |high_kbps: u64, low_kbps: u64| {
+        planned
+            .saturating_add(high_streams.saturating_mul(high_kbps))
+            .saturating_add(low_streams.saturating_mul(low_kbps))
+            <= budget
     };
-    let camera = if fits(HIGH_KBPS) {
-        Quality::High
-    } else if fits(LOW_KBPS) {
-        Quality::Low
+    let (camera, tiles) = if fits(HIGH_KBPS, LOW_KBPS) {
+        (Quality::High, true)
+    } else if low_streams > 0 && fits(LOW_KBPS, LOW_KBPS) {
+        (Quality::Low, true)
+    } else if fits(HIGH_KBPS, 0) {
+        (Quality::High, false)
+    } else if fits(LOW_KBPS, 0) {
+        (Quality::Low, false)
     } else {
-        Quality::Off
+        (Quality::Off, false)
     };
-    Ceiling { share, camera }
+    Ceiling {
+        share,
+        camera,
+        tiles,
+    }
 }
 
 /// Maps each source's RTP time onto one continuous timeline for a listener's video slot.
@@ -482,20 +554,158 @@ mod tests {
 
     const HOLD: Duration = Duration::from_secs(5);
 
+    fn cam(max: Quality) -> Want {
+        Want {
+            kind: VideoKind::Camera,
+            max,
+        }
+    }
+
+    fn share(max: Quality) -> Want {
+        Want {
+            kind: VideoKind::Share,
+            max,
+        }
+    }
+
     #[test]
-    fn what_fits_follows_the_room_for_video_with_hysteresis() {
-        assert_eq!(Fit::of(5000, Fit::Audio), Fit::High);
-        assert_eq!(Fit::of(UP_KBPS - 1, Fit::Low), Fit::Share);
-        assert_eq!(Fit::of(UP_KBPS - 1, Fit::High), Fit::High);
-        assert_eq!(Fit::of(DOWN_KBPS, Fit::High), Fit::High);
-        assert_eq!(Fit::of(DOWN_KBPS - 1, Fit::High), Fit::Share);
-        assert_eq!(Fit::of(SHARE_UP_KBPS - 1, Fit::Low), Fit::Low);
-        assert_eq!(Fit::of(SHARE_DOWN_KBPS, Fit::Share), Fit::Share);
-        assert_eq!(Fit::of(SHARE_DOWN_KBPS - 1, Fit::Share), Fit::Low);
-        assert_eq!(Fit::of(RESUME_KBPS - 1, Fit::Audio), Fit::Audio);
-        assert_eq!(Fit::of(RESUME_KBPS, Fit::Audio), Fit::Low);
-        assert_eq!(Fit::of(PAUSE_KBPS, Fit::Low), Fit::Low);
-        assert_eq!(Fit::of(PAUSE_KBPS - 1, Fit::Low), Fit::Audio);
+    fn allocate_single_stream_matches_hysteresis_thresholds() {
+        let high = [cam(Quality::High)];
+        assert_eq!(allocate(5000, &high, &[None]), vec![Some(Layer::High)]);
+        assert_eq!(
+            allocate(UP_KBPS - 1, &high, &[Some(Layer::Low)]),
+            vec![Some(Layer::Low)]
+        );
+        assert_eq!(
+            allocate(UP_KBPS - 1, &high, &[Some(Layer::High)]),
+            vec![Some(Layer::High)]
+        );
+        assert_eq!(
+            allocate(DOWN_KBPS, &high, &[Some(Layer::High)]),
+            vec![Some(Layer::High)]
+        );
+        assert_eq!(
+            allocate(DOWN_KBPS - 1, &high, &[Some(Layer::High)]),
+            vec![Some(Layer::Low)]
+        );
+        assert_eq!(allocate(RESUME_KBPS - 1, &high, &[None]), vec![None]);
+        assert_eq!(
+            allocate(RESUME_KBPS, &high, &[None]),
+            vec![Some(Layer::Low)]
+        );
+        assert_eq!(
+            allocate(PAUSE_KBPS, &high, &[Some(Layer::Low)]),
+            vec![Some(Layer::Low)]
+        );
+        assert_eq!(
+            allocate(PAUSE_KBPS - 1, &high, &[Some(Layer::Low)]),
+            vec![None]
+        );
+
+        let s = [share(Quality::High)];
+        assert_eq!(allocate(SHARE_UP_KBPS - 1, &s, &[None]), vec![None]);
+        assert_eq!(
+            allocate(SHARE_UP_KBPS, &s, &[None]),
+            vec![Some(Layer::Share)]
+        );
+        assert_eq!(
+            allocate(SHARE_DOWN_KBPS, &s, &[Some(Layer::Share)]),
+            vec![Some(Layer::Share)]
+        );
+        assert_eq!(
+            allocate(SHARE_DOWN_KBPS - 1, &s, &[Some(Layer::Share)]),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn allocate_fits_share_when_tiles_do_not_and_drops_tiles_last_first() {
+        let wants = [
+            share(Quality::High),
+            cam(Quality::Low),
+            cam(Quality::Low),
+            cam(Quality::Low),
+            cam(Quality::Low),
+        ];
+        // Share fits at 1,000 kb/s, tiles do not.
+        assert_eq!(
+            allocate(1000, &wants, &[None; 5]),
+            vec![Some(Layer::Share), None, None, None, None]
+        );
+        // 2,500 kb/s brings up the share (1,000) and all four tiles (3*350 + 450 = 1,500).
+        let full = allocate(2500, &wants, &[None; 5]);
+        assert_eq!(
+            full,
+            vec![
+                Some(Layer::Share),
+                Some(Layer::Low),
+                Some(Layer::Low),
+                Some(Layer::Low),
+                Some(Layer::Low),
+            ]
+        );
+        // Congestion drops the last tile first, then earlier tiles, then the share last.
+        assert_eq!(
+            allocate(2100, &wants, &full),
+            vec![
+                Some(Layer::Share),
+                Some(Layer::Low),
+                Some(Layer::Low),
+                Some(Layer::Low),
+                None,
+            ]
+        );
+        assert_eq!(
+            allocate(1700, &wants, &full),
+            vec![
+                Some(Layer::Share),
+                Some(Layer::Low),
+                Some(Layer::Low),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            allocate(1300, &wants, &full),
+            vec![Some(Layer::Share), Some(Layer::Low), None, None, None]
+        );
+        assert_eq!(
+            allocate(900, &wants, &full),
+            vec![Some(Layer::Share), None, None, None, None]
+        );
+        assert_eq!(allocate(700, &wants, &full), vec![None; 5]);
+    }
+
+    #[test]
+    fn allocate_hysteresis_prevents_tile_flapping_and_respects_quality_caps() {
+        let wants = [cam(Quality::Low), cam(Quality::Low)];
+        // Needs 350 + 450 = 800 to add the second tile.
+        assert_eq!(
+            allocate(799, &wants, &[Some(Layer::Low), None]),
+            vec![Some(Layer::Low), None]
+        );
+        assert_eq!(
+            allocate(800, &wants, &[Some(Layer::Low), None]),
+            vec![Some(Layer::Low), Some(Layer::Low)]
+        );
+        // Once held, 350 + 250 = 600 keeps both; 599 drops the second.
+        assert_eq!(
+            allocate(600, &wants, &[Some(Layer::Low), Some(Layer::Low)]),
+            vec![Some(Layer::Low), Some(Layer::Low)]
+        );
+        assert_eq!(
+            allocate(599, &wants, &[Some(Layer::Low), Some(Layer::Low)]),
+            vec![Some(Layer::Low), None]
+        );
+        // Quality::Low caps camera to Low; Quality::Off empties everything.
+        assert_eq!(
+            allocate(5000, &[cam(Quality::Low), cam(Quality::Off)], &[None, None]),
+            vec![Some(Layer::Low), None]
+        );
+        assert_eq!(
+            allocate_unproven(&[share(Quality::High), cam(Quality::High), cam(Quality::Off)]),
+            vec![Some(Layer::Share), Some(Layer::Low), None]
+        );
     }
 
     fn told(kbps: u64) -> Reading {
@@ -527,12 +737,12 @@ mod tests {
         let mut link = Link::default();
         let none = Reading::default();
         assert_eq!(link.update(none, HOLD, start), None);
-        assert_eq!(link.update(told(5000), HOLD, start), Some(Fit::High));
-        assert_eq!(link.update(told(200), HOLD, start), Some(Fit::Audio));
-        assert_eq!(link.update(told(5000), HOLD, start), Some(Fit::Audio));
+        assert_eq!(link.update(told(5000), HOLD, start), Some(5000));
+        assert_eq!(link.update(told(200), HOLD, start), Some(200));
+        assert_eq!(link.update(told(5000), HOLD, start), Some(200));
         let almost = start + HOLD - Duration::from_millis(1);
-        assert_eq!(link.update(told(5000), HOLD, almost), Some(Fit::Audio));
-        assert_eq!(link.update(told(5000), HOLD, start + HOLD), Some(Fit::High));
+        assert_eq!(link.update(told(5000), HOLD, almost), Some(200));
+        assert_eq!(link.update(told(5000), HOLD, start + HOLD), Some(5000));
     }
 
     #[test]
@@ -540,22 +750,19 @@ mod tests {
         let start = Instant::now();
         let mut link = Link::default();
         link.update(told(500), HOLD, start);
-        assert_eq!(link.update(told(5000), HOLD, start), Some(Fit::Low));
+        assert_eq!(link.update(told(5000), HOLD, start), Some(500));
         let dip = start + HOLD / 2;
-        assert_eq!(link.update(told(500), HOLD, dip), Some(Fit::Low));
-        assert_eq!(link.update(told(5000), HOLD, dip), Some(Fit::Low));
-        assert_eq!(link.update(told(5000), HOLD, start + HOLD), Some(Fit::Low));
-        assert_eq!(link.update(told(5000), HOLD, dip + HOLD), Some(Fit::High));
+        assert_eq!(link.update(told(500), HOLD, dip), Some(500));
+        assert_eq!(link.update(told(5000), HOLD, dip), Some(500));
+        assert_eq!(link.update(told(5000), HOLD, start + HOLD), Some(500));
+        assert_eq!(link.update(told(5000), HOLD, dip + HOLD), Some(5000));
     }
 
     #[test]
     fn good_news_is_taken_at_once_and_a_low_first_estimate_means_nothing() {
         let start = Instant::now();
         // A little audio off the estimator's 1,000 kb/s start.
-        assert_eq!(
-            Link::default().update(idle(950), HOLD, start),
-            Some(Fit::Share)
-        );
+        assert_eq!(Link::default().update(idle(950), HOLD, start), Some(950));
         assert_eq!(Link::default().update(idle(150), HOLD, start), None);
         assert_eq!(Link::default().update(idle(500), HOLD, start), None);
     }
@@ -568,7 +775,7 @@ mod tests {
         link.update(idle(5000), HOLD, start);
         for second in 1..120 {
             let at = start + Duration::from_secs(second);
-            assert_eq!(link.update(idle(150), HOLD, at), Some(Fit::High));
+            assert_eq!(link.update(idle(150), HOLD, at), Some(5000));
         }
     }
 
@@ -579,13 +786,13 @@ mod tests {
         link.update(idle(5000), HOLD, start);
         let mut at = start;
         for wait in [1, 2, 4, 8, 12, 12] {
-            assert_eq!(link.update(full(200), HOLD, at), Some(Fit::Audio));
+            assert_eq!(link.update(full(200), HOLD, at), Some(200));
             let due = at + HOLD * wait;
             let before = due - Duration::from_millis(1);
-            assert_eq!(link.update(idle(200), HOLD, before), Some(Fit::Audio));
+            assert_eq!(link.update(idle(200), HOLD, before), Some(200));
             assert_eq!(
                 link.update(idle(200), HOLD, due),
-                Some(Fit::High),
+                Some(5000),
                 "after {wait} holds"
             );
             at = due + Duration::from_secs(1);
@@ -593,7 +800,7 @@ mod tests {
         // One that holds starts the wait over.
         at += HOLD * RETRY_MOST * 3;
         link.update(full(200), HOLD, at);
-        assert_eq!(link.update(idle(200), HOLD, at + HOLD), Some(Fit::High));
+        assert_eq!(link.update(idle(200), HOLD, at + HOLD), Some(5000));
     }
 
     #[test]
@@ -603,12 +810,12 @@ mod tests {
         let mut link = Link::default();
         link.update(told(5000), HOLD, start);
         link.update(told(200), HOLD, start);
-        assert_eq!(link.update(told(200), HOLD, later), Some(Fit::Audio));
+        assert_eq!(link.update(told(200), HOLD, later), Some(200));
         let mut link = Link::default();
         link.update(idle(5000), HOLD, start);
         link.update(full(200), HOLD, start);
-        assert_eq!(link.update(full(200), HOLD, later), Some(Fit::Audio));
-        assert_eq!(link.update(idle(200), HOLD, later), Some(Fit::High));
+        assert_eq!(link.update(full(200), HOLD, later), Some(200));
+        assert_eq!(link.update(idle(200), HOLD, later), Some(5000));
     }
 
     #[test]
@@ -644,8 +851,8 @@ mod tests {
         for audio in [0, 49, 50, 128, 304, 1000] {
             let spare = resume_probe_kbps(audio) - audio;
             assert_eq!(
-                Fit::of(spare, Fit::Audio),
-                Fit::Low,
+                allocate(spare, &[cam(Quality::Low)], &[None]),
+                vec![Some(Layer::Low)],
                 "{audio} kb/s of audio"
             );
         }
@@ -653,33 +860,8 @@ mod tests {
         assert_eq!(resume_probe_kbps(301), resume_probe_kbps(304));
     }
 
-    #[test]
-    fn the_layer_follows_what_fits() {
-        let high = Quality::High;
-        assert_eq!(pick_layer(None, high, high), Some(Layer::Low));
-        assert_eq!(pick_layer(Some(Fit::Audio), high, high), None);
-        assert_eq!(pick_layer(Some(Fit::Low), high, high), Some(Layer::Low));
-        assert_eq!(pick_layer(Some(Fit::Share), high, high), Some(Layer::Low));
-        assert_eq!(pick_layer(Some(Fit::High), high, high), Some(Layer::High));
-    }
-
-    #[test]
-    fn quality_and_the_budget_cap_the_layer() {
-        let lots = Some(Fit::High);
-        assert_eq!(
-            pick_layer(lots, Quality::Low, Quality::High),
-            Some(Layer::Low)
-        );
-        assert_eq!(pick_layer(lots, Quality::Off, Quality::High), None);
-        assert_eq!(
-            pick_layer(lots, Quality::High, Quality::Low),
-            Some(Layer::Low)
-        );
-        assert_eq!(pick_layer(lots, Quality::High, Quality::Off), None);
-    }
-
     fn camera(budget: Option<u32>, audio: u64, viewers: u64) -> Quality {
-        ceiling(budget, audio, 0, viewers).camera
+        ceiling(budget, audio, 0, viewers, 0).camera
     }
 
     #[test]
@@ -694,23 +876,93 @@ mod tests {
 
     #[test]
     fn shares_are_planned_before_cameras() {
-        let all = ceiling(None, 100, 100, 100);
+        let all = ceiling(None, 100, 100, 100, 100);
         assert!(all.share);
         assert_eq!(all.camera, Quality::High);
-        // Two share viewers (8,000 each) and one camera viewer, the sharer, with three audio
-        // streams (150): the cameras fit above 16,150.
-        let roomy = ceiling(Some(17_400), 3, 2, 1);
+        assert!(all.tiles);
+        // Two share streams (8,000 each) and one camera stream, with three audio
+        // streams (150): the camera fits above 16,150.
+        let roomy = ceiling(Some(17_400), 3, 2, 1, 0);
         assert_eq!((roomy.share, roomy.camera), (true, Quality::High));
-        let tight = ceiling(Some(16_600), 3, 2, 1);
+        let tight = ceiling(Some(16_600), 3, 2, 1, 0);
         assert_eq!((tight.share, tight.camera), (true, Quality::Low));
-        let shares_only = ceiling(Some(16_200), 3, 2, 1);
+        let shares_only = ceiling(Some(16_200), 3, 2, 1, 0);
         assert_eq!(
             (shares_only.share, shares_only.camera),
             (true, Quality::Off)
         );
         // No room for the shares: cameras get the budget instead.
-        let cameras = ceiling(Some(2000), 3, 2, 1);
+        let cameras = ceiling(Some(2000), 3, 2, 1, 0);
         assert_eq!((cameras.share, cameras.camera), (false, Quality::High));
+    }
+
+    #[test]
+    fn ceiling_counts_tile_streams_separately_from_main_and_shares() {
+        // 2 audio (100) + 1 share (8,000) + 4 low tiles (1,400) = 9,500.
+        let fits_all = ceiling(Some(9_500), 2, 1, 0, 4);
+        assert_eq!(
+            fits_all,
+            Ceiling {
+                share: true,
+                camera: Quality::High,
+                tiles: true,
+            }
+        );
+        // Below 9,500: share still fits, tiles drop.
+        let share_no_tiles = ceiling(Some(8_500), 2, 1, 0, 4);
+        assert_eq!(
+            share_no_tiles,
+            Ceiling {
+                share: true,
+                camera: Quality::High,
+                tiles: false,
+            }
+        );
+        // 2 audio (100) + 1 main (1,200) + 4 tiles (1,400) = 2,700.
+        assert_eq!(
+            ceiling(Some(2_700), 2, 0, 1, 4),
+            Ceiling {
+                share: true,
+                camera: Quality::High,
+                tiles: true,
+            }
+        );
+        // 1,900 fits main on Low (350) + 4 tiles (1,400) + audio (100) = 1,850.
+        assert_eq!(
+            ceiling(Some(1_900), 2, 0, 1, 4),
+            Ceiling {
+                share: true,
+                camera: Quality::Low,
+                tiles: true,
+            }
+        );
+        // 1,400 fits main on High (1,200) + audio (100) = 1,300 without tiles.
+        assert_eq!(
+            ceiling(Some(1_400), 2, 0, 1, 4),
+            Ceiling {
+                share: true,
+                camera: Quality::High,
+                tiles: false,
+            }
+        );
+        // 500 fits main on Low (350) + audio (100) = 450 without tiles.
+        assert_eq!(
+            ceiling(Some(500), 2, 0, 1, 4),
+            Ceiling {
+                share: true,
+                camera: Quality::Low,
+                tiles: false,
+            }
+        );
+        // 300 fits audio only.
+        assert_eq!(
+            ceiling(Some(300), 2, 0, 1, 4),
+            Ceiling {
+                share: true,
+                camera: Quality::Off,
+                tiles: false,
+            }
+        );
     }
 
     #[test]

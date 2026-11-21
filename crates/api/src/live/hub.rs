@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use super::call::{Access, Calls, Change, Moderation, Occupancy, Reason, Refused, Session};
 use super::e2ee;
-use super::frame::{Event, Out, SlotFrame, VideoSlotFrame};
+use super::frame::{Event, Out, SlotFrame, VideoEntryFrame, VideoSlotFrame};
 use super::presence::{Setting, State};
 use super::socket::Close;
 use super::Limits;
@@ -1193,6 +1193,7 @@ impl Hub {
                 call_id,
                 audio,
                 video,
+                videos,
             } => {
                 let slots: Vec<SlotFrame<'_>> = audio
                     .iter()
@@ -1206,11 +1207,21 @@ impl Hub {
                     user_id: &slot.user_id,
                     kind: slot.kind.as_str(),
                 });
+                let video_entries: Vec<VideoEntryFrame<'_>> = videos
+                    .iter()
+                    .map(|slot| VideoEntryFrame {
+                        mid: &slot.mid,
+                        user_id: &slot.user_id,
+                        kind: slot.kind.as_str(),
+                        layer: slot.layer.as_str(),
+                    })
+                    .collect();
                 let frame: Arc<str> = Arc::from(
                     Out::CallSlots {
                         call_id: &call_id,
                         audio: &slots,
                         video,
+                        videos: &video_entries,
                     }
                     .text(),
                 );

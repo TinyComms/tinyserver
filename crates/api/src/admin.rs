@@ -6,7 +6,7 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use db::{LayoutBucket, LayoutItem, LayoutKind, NewRole, PgPool, RolePatch, ServerPatch};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +25,7 @@ pub const FEATURES: &[&str] = &[
     "voice_moderation",
     "e2ee_calls",
     "direct_calls",
+    "multi_video",
     "e2ee_text",
     "upload_limits",
     "file_scan",
@@ -45,7 +46,10 @@ pub const FEATURES: &[&str] = &[
     "threads",
 ];
 
-pub fn routes() -> Router<PgPool> {
+#[derive(Clone, Copy)]
+struct MaxVideoSlots(usize);
+
+pub fn routes(max_video_slots: usize) -> Router<PgPool> {
     Router::new()
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/server", get(server).patch(edit_server))
@@ -68,6 +72,12 @@ pub fn routes() -> Router<PgPool> {
             patch(rename_category).delete(remove_category),
         )
         .route("/v1/layout", put(layout))
+        .layer(Extension(MaxVideoSlots(max_video_slots)))
+}
+
+#[derive(Serialize)]
+struct MultiVideo {
+    max_slots: usize,
 }
 
 #[derive(Serialize)]
@@ -93,10 +103,13 @@ struct Capabilities {
     sticker_max_count: usize,
     sticker_max_bytes: usize,
     sticker_max_px: i32,
+    /// Multi-stream video receive capability: how many recvonly video lines a client may offer.
+    multi_video: MultiVideo,
 }
 
 async fn capabilities(
     State(pool): State<PgPool>,
+    Extension(MaxVideoSlots(max_slots)): Extension<MaxVideoSlots>,
     headers: HeaderMap,
 ) -> Result<Json<Capabilities>, ApiError> {
     caller(&pool, &headers).await?;
@@ -120,6 +133,7 @@ async fn capabilities(
         sticker_max_count: db::STICKER_MAX_COUNT,
         sticker_max_bytes: db::STICKER_MAX_BYTES,
         sticker_max_px: db::STICKER_MAX_PX,
+        multi_video: MultiVideo { max_slots },
     }))
 }
 

@@ -158,6 +158,8 @@ enum Request {
     /// The SFU refused the last offer.
     Reject(SyncSender<()>),
     Answer(String, SyncSender<Result<(), String>>),
+    /// Send a PLI keyframe request on a specific receive video mid.
+    Keyframe(String),
 }
 
 /// A client with an offer out and no answer yet.
@@ -169,28 +171,54 @@ pub struct Client {
     microphone: Mid,
     camera: Mid,
     share: Mid,
-    screen: Mid,
+    screens: Vec<Mid>,
     pending: Option<SdpPendingOffer>,
     offer: String,
     /// The m-line and direction the pending offer changed from, to undo it if refused.
     flipped: Option<(Mid, Direction)>,
-    /// A frame on the video slot was lost. Frames are dropped until a keyframe, as a decoder
-    /// would, and asked for with PLI.
-    lost: bool,
-    asked: Option<Instant>,
+    /// A frame on a video slot was lost. Frames on that mid are dropped until a keyframe, as a
+    /// decoder would, and asked for with PLI.
+    lost: HashSet<Mid>,
+    asked: HashMap<Mid, Instant>,
 }
 
 impl Client {
-    /// Binds `bind` and builds an offer with `slots` receive slots. Use the room cap less one.
+    /// Binds `bind` and builds an offer with `slots` receive audio slots and one receive video
+    /// slot (the single-video shape of released clients). Use the room cap less one.
     pub fn new(bind: SocketAddr, slots: usize) -> io::Result<Self> {
+        Self::with_video_slots(bind, slots, 1)
+    }
+
+    /// Binds `bind` and builds an offer with `audio_slots` receive audio slots and `video_slots`
+    /// receive video slots (slot 0 main, slots 1..N tiles).
+    pub fn with_video_slots(
+        bind: SocketAddr,
+        audio_slots: usize,
+        video_slots: usize,
+    ) -> io::Result<Self> {
         let socket = UdpSocket::bind(bind)?;
         let local = socket.local_addr()?;
         let candidate = Candidate::host(local, "udp");
-        Self::build(Link::Udp(socket), local, candidate, slots)
+        Self::build(
+            Link::Udp(socket),
+            local,
+            candidate,
+            audio_slots,
+            video_slots,
+        )
     }
 
     /// Like [`Client::new`], with one active TCP candidate on `ip` and no UDP.
     pub fn tcp(ip: IpAddr, slots: usize) -> io::Result<Self> {
+        Self::tcp_with_video_slots(ip, slots, 1)
+    }
+
+    /// Like [`Client::with_video_slots`], over ICE-TCP only.
+    pub fn tcp_with_video_slots(
+        ip: IpAddr,
+        audio_slots: usize,
+        video_slots: usize,
+    ) -> io::Result<Self> {
         let local = SocketAddr::new(ip, ACTIVE_PORT);
         let candidate = Candidate::builder()
             .tcp()
@@ -201,7 +229,7 @@ impl Client {
             streams: HashMap::new(),
             next: FIRST_STREAM,
         };
-        Self::build(link, local, candidate, slots)
+        Self::build(link, local, candidate, audio_slots, video_slots)
     }
 
     fn build(
@@ -209,6 +237,7 @@ impl Client {
         local: SocketAddr,
         candidate: Result<Candidate, str0m::error::IceError>,
         slots: usize,
+        video_slots: usize,
     ) -> io::Result<Self> {
         let mut config = crate::engine::release_audio_promptly(
             RtcConfig::new().clear_codecs().enable_opus(true, false),
@@ -227,7 +256,7 @@ impl Client {
         // str0m checks a new mid against the session's, not the others in this change. Fifteen
         // random mids of three characters collide about once in 2,000 offers, and two m-lines
         // on one mid break the next offer. An unapplied change leaves `rtc` as it was.
-        let (change, microphone, camera, share, screen) = loop {
+        let (change, microphone, camera, share, screens) = loop {
             let mut change = rtc.sdp_api();
             let mut mids = HashSet::new();
             let mut add = |direction, kind, layers| {
@@ -245,9 +274,12 @@ impl Client {
             }
             let camera = add(Direction::Inactive, MediaKind::Video, Some(layers));
             let share = add(Direction::Inactive, MediaKind::Video, None);
-            let screen = add(Direction::RecvOnly, MediaKind::Video, None);
-            if mids.len() == slots + 4 {
-                break (change, microphone, camera, share, screen);
+            let mut screens = Vec::with_capacity(video_slots);
+            for _ in 0..video_slots {
+                screens.push(add(Direction::RecvOnly, MediaKind::Video, None));
+            }
+            if mids.len() == slots + 3 + video_slots {
+                break (change, microphone, camera, share, screens);
             }
         };
         let (offer, pending) = change
@@ -260,13 +292,18 @@ impl Client {
             microphone,
             camera,
             share,
-            screen,
+            screens,
             pending: Some(pending),
             offer: offer.to_sdp_string(),
             flipped: None,
-            lost: false,
-            asked: None,
+            lost: HashSet::new(),
+            asked: HashMap::new(),
         })
+    }
+
+    /// Receive video m-line mids, in offer order (slot 0 first, then tile slots).
+    pub fn video_mids(&self) -> Vec<String> {
+        self.screens.iter().map(ToString::to_string).collect()
     }
 
     /// The SDP for `call.join`.
@@ -390,8 +427,10 @@ impl Client {
             }
             let remb = shared.remb.load(Ordering::Acquire);
             if connected && remb > 0 && now >= next_remb {
-                if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(self.screen, None) {
-                    stream.request_remb(Bitrate::kbps(remb));
+                if let Some(&first) = self.screens.first() {
+                    if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(first, None) {
+                        stream.request_remb(Bitrate::kbps(remb));
+                    }
                 }
                 next_remb = now + REMB_EVERY;
                 continue;
@@ -462,6 +501,13 @@ impl Client {
                 }
                 self.pending = None;
                 let _ = reply.send(());
+            }
+            Request::Keyframe(mid_str) => {
+                if let Some(&mid) = self.screens.iter().find(|mid| mid.to_string() == mid_str) {
+                    if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(mid, None) {
+                        stream.request_keyframe(KeyframeRequestKind::Pli);
+                    }
+                }
             }
         }
     }
@@ -558,13 +604,16 @@ impl Client {
                     self.transmit(poll, proto, to, &transmit.contents);
                 }
                 Output::Event(Event::Connected) => shared.connected.store(true, Ordering::Release),
-                Output::Event(Event::MediaData(data)) if data.mid == self.screen => {
+                Output::Event(Event::MediaData(data)) if self.screens.contains(&data.mid) => {
                     let keyframe = data.is_keyframe();
-                    self.lost = !keyframe && (self.lost || !data.contiguous);
-                    if self.lost {
-                        self.ask_keyframe();
+                    let was_lost = self.lost.contains(&data.mid);
+                    let is_lost = !keyframe && (was_lost || !data.contiguous);
+                    if is_lost {
+                        self.lost.insert(data.mid);
+                        self.ask_keyframe(data.mid);
                         continue;
                     }
+                    self.lost.remove(&data.mid);
                     let (marker, layer) = tag(&data.data).unwrap_or_default();
                     let frame = VideoFrame {
                         mid: data.mid.to_string(),
@@ -592,6 +641,11 @@ impl Client {
                 Output::Event(Event::KeyframeRequest(request)) if request.mid == self.camera => {
                     shared.keyframes_asked.fetch_add(1, Ordering::AcqRel);
                     let rid = request.rid.as_deref();
+                    if rid == Some("h") {
+                        shared.keyframes_asked_high.fetch_add(1, Ordering::AcqRel);
+                    } else if rid == Some("l") {
+                        shared.keyframes_asked_low.fetch_add(1, Ordering::AcqRel);
+                    }
                     for (at, layer) in LAYERS.iter().enumerate() {
                         if rid.is_none() || rid == Some(layer.rid) {
                             camera.restart[at] = true;
@@ -607,17 +661,18 @@ impl Client {
         }
     }
 
-    /// Asks the SFU for a keyframe on the video slot, at most every `PLI_EVERY`.
-    fn ask_keyframe(&mut self) {
+    /// Asks the SFU for a keyframe on `mid`, at most every `PLI_EVERY`.
+    fn ask_keyframe(&mut self, mid: Mid) {
         let now = Instant::now();
         if self
             .asked
-            .is_some_and(|at| now.saturating_duration_since(at) < PLI_EVERY)
+            .get(&mid)
+            .is_some_and(|at| now.saturating_duration_since(*at) < PLI_EVERY)
         {
             return;
         }
-        self.asked = Some(now);
-        if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(self.screen, None) {
+        self.asked.insert(mid, now);
+        if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(mid, None) {
             stream.request_keyframe(KeyframeRequestKind::Pli);
         }
     }
@@ -864,6 +919,8 @@ struct Shared {
     /// The REMB to send on the video slot, in kb/s. 0 sends none.
     remb: AtomicU64,
     keyframes_asked: AtomicU64,
+    keyframes_asked_high: AtomicU64,
+    keyframes_asked_low: AtomicU64,
     share_keyframes_asked: AtomicU64,
     share_kbps: AtomicU64,
     /// The camera sends `h` alone, as a publisher without simulcast does.
@@ -909,6 +966,8 @@ impl Default for Shared {
             sending: AtomicBool::default(),
             remb: AtomicU64::default(),
             keyframes_asked: AtomicU64::default(),
+            keyframes_asked_high: AtomicU64::default(),
+            keyframes_asked_low: AtomicU64::default(),
             share_keyframes_asked: AtomicU64::default(),
             share_kbps: AtomicU64::new(SHARE_KBPS),
             single_layer: AtomicBool::default(),
@@ -987,9 +1046,24 @@ impl Running {
         self.shared.keyframes_asked.load(Ordering::Acquire)
     }
 
+    /// Keyframe requests the SFU has sent specifically for the camera's `h` layer.
+    pub fn keyframes_asked_high(&self) -> u64 {
+        self.shared.keyframes_asked_high.load(Ordering::Acquire)
+    }
+
+    /// Keyframe requests the SFU has sent specifically for the camera's `l` layer.
+    pub fn keyframes_asked_low(&self) -> u64 {
+        self.shared.keyframes_asked_low.load(Ordering::Acquire)
+    }
+
     /// Keyframe requests the SFU has sent for the share.
     pub fn share_keyframes_asked(&self) -> u64 {
         self.shared.share_keyframes_asked.load(Ordering::Acquire)
+    }
+
+    /// Sends a PLI keyframe request on one of this client's receive video mids.
+    pub fn request_keyframe(&self, mid: &str) -> Result<(), String> {
+        self.ask(Request::Keyframe(mid.to_string()))
     }
 
     /// The offer for `call.offer` that turns the camera on or off. The camera sends once

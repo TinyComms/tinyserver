@@ -147,6 +147,7 @@ async fn capabilities_and_me_describe_what_the_caller_may_do() {
             "upload_limits",
             "file_scan",
             "first_run_setup",
+            "multi_video",
         ] {
             assert!(
                 body["features"]
@@ -156,6 +157,7 @@ async fn capabilities_and_me_describe_what_the_caller_may_do() {
                 "{feature}"
             );
         }
+        assert_eq!(body["multi_video"]["max_slots"], sfu::DEFAULT_VIDEO_SLOTS);
 
         let (_, me) = get(&app, &owner_token, "/v1/me").await;
         assert_eq!(me["role"], "owner");

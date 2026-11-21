@@ -1,7 +1,8 @@
 //! Media plane. One OS thread owns one UDP socket, an ICE-TCP listener on the same port
 //! number, and one `str0m::Rtc` per participant. It forwards Opus audio and H.264 video to
-//! each listener's one video slot: the room's screen share while there is one, else one
-//! simulcast layer of one camera.
+//! each listener's receive video slots: slot 0 carries the room's screen share or active speaker
+//! camera by default (preserving older single-slot clients unchanged), and multi-video clients
+//! can subscribe additional tile slots via `call.watch`.
 //!
 //! The API sends [`Media`] commands and reads [`Event`]s. str0m types stay in this crate.
 //! RTP stays in memory. Postgres never stores it.
@@ -30,7 +31,10 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
-pub use video::Quality;
+pub use video::{Layer, Quality};
+
+/// Default maximum receive video slots per listener: one main slot plus four camera tiles.
+pub const DEFAULT_VIDEO_SLOTS: usize = 5;
 
 static PEER_IPS: AtomicBool = AtomicBool::new(false);
 
@@ -130,8 +134,11 @@ pub struct Config {
     pub offer_bytes: usize,
     /// Audio and video m-lines an offer may have. Audio is one microphone plus receive slots
     /// per listener (default 12 = 1 send + 11 loudest-speaker receive slots), independent of
-    /// how many people are in the room. Other kinds are refused.
+    /// how many people are in the room. Video is two send lines (camera + share) plus up to
+    /// `video_slots` receive lines. Other kinds are refused.
     pub offer_audio: usize,
+    /// Maximum receive video slots a listener may offer (default 5: one main plus four tiles).
+    pub video_slots: usize,
     pub offer_video: usize,
 }
 
@@ -160,7 +167,8 @@ impl Config {
             tcp_idle: Duration::from_secs(30),
             offer_bytes: 32 * 1024,
             offer_audio: 12,
-            offer_video: 3,
+            video_slots: DEFAULT_VIDEO_SLOTS,
+            offer_video: 2 + DEFAULT_VIDEO_SLOTS,
         }
     }
 }
@@ -177,12 +185,14 @@ pub struct Answer {
     pub share: bool,
 }
 
-/// Why the SFU refused a join or an offer.
+/// Why the SFU refused a join, an offer, or a watch subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
     /// Not an SDP offer str0m accepts, or over the offer caps.
     BadSdp,
-    /// No such participant. For an offer only.
+    /// Invalid subscription list (unknown mid, user not in room, self, or duplicate source).
+    BadFrame,
+    /// No such participant. For an offer or watch only.
     NotFound,
     /// The offer starts a share, and someone else in the room holds it.
     ShareTaken,
@@ -206,7 +216,7 @@ pub struct Slot {
     pub user_id: String,
 }
 
-/// What a listener's one video slot carries.
+/// What a listener's video slot carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoKind {
     Camera,
@@ -222,12 +232,31 @@ impl VideoKind {
     }
 }
 
-/// The video receive m-line `mid` carries `user_id`'s `kind`.
+/// The video receive m-line `mid` carries `user_id`'s `kind` on `layer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoSlot {
     pub mid: String,
     pub user_id: String,
     pub kind: VideoKind,
+    pub layer: Layer,
+}
+
+/// What one receive video slot subscribes to in `call.watch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchTarget {
+    /// Automatic selection on slot 0: the room's share, else active speaker.
+    Auto,
+    /// A specific publisher's camera or share.
+    Source { user_id: String, kind: VideoKind },
+}
+
+/// One entry in a viewer's `call.watch` subscription list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscription {
+    pub mid: String,
+    pub target: WatchTarget,
+    /// Highest layer requested (`High` or `Low`). Tile slots are capped at `Low`.
+    pub max: Quality,
 }
 
 /// What the media thread tells the API.
@@ -235,12 +264,14 @@ pub struct VideoSlot {
 pub enum Event {
     /// ICE and DTLS are up.
     Connected { call_id: String },
-    /// The whole slot map for one listener. Sent on every change. `video` changes on the
+    /// The whole slot map for one listener. Sent on every change. Each slot changes on the
     /// keyframe that starts a new source, so frames after it decode on their own.
+    /// `video` mirrors slot 0 for older clients; `videos` lists every active video slot.
     Slots {
         call_id: String,
         audio: Vec<Slot>,
         video: Option<VideoSlot>,
+        videos: Vec<VideoSlot>,
     },
     /// Who is speaking in a room. Sent when it changes, at most 4 times a second.
     Speaking {
@@ -285,6 +316,11 @@ pub(crate) enum Command {
         call_id: String,
         video: Quality,
     },
+    Watch {
+        call_id: String,
+        video: Vec<Subscription>,
+        reply: oneshot::Sender<Result<(), Refused>>,
+    },
     EndShare {
         call_id: String,
     },
@@ -302,6 +338,7 @@ pub struct Media {
     alive: Arc<AtomicBool>,
     addr: SocketAddr,
     lan: bool,
+    video_slots: usize,
     offers: sdp::Caps,
 }
 
@@ -313,6 +350,7 @@ pub fn start(config: Config) -> io::Result<(Media, async_mpsc::Receiver<Event>)>
     let (engine, waker) = engine::Engine::bind(config.clone(), inbox, events, alive.clone())?;
     let addr = engine.advertised();
     let lan = config.lan_ip.is_some();
+    let video_slots = config.video_slots;
     let offers = sdp::Caps::from(&config);
     std::thread::Builder::new()
         .name("sfu".to_string())
@@ -323,6 +361,7 @@ pub fn start(config: Config) -> io::Result<(Media, async_mpsc::Receiver<Event>)>
         alive,
         addr,
         lan,
+        video_slots,
         offers,
     };
     Ok((media, outbox))
@@ -332,6 +371,11 @@ impl Media {
     /// The public address and port in every answer's candidates, UDP and TCP.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Maximum receive video slots a listener may offer.
+    pub fn video_slots(&self) -> usize {
+        self.video_slots
     }
 
     /// The transports members can reach while the thread runs: `udp`, `tcp`, and `lan` when
@@ -405,12 +449,25 @@ impl Media {
         });
     }
 
-    /// What a listener's video slot may carry, from `call.quality`. It starts at `High`.
+    /// What a listener's video slots may carry, from `call.quality`. It starts at `High`.
     pub fn quality(&self, call_id: &str, video: Quality) {
         let _ = self.send(Command::Quality {
             call_id: call_id.to_string(),
             video,
         });
+    }
+
+    /// Replaces a listener's video slot subscriptions, from `call.watch`. Unlisted mids become
+    /// empty. Returns `Refused::BadFrame` on an unknown mid, a user not in the room, self, a
+    /// duplicate mid or source, or `auto` on a non-main slot.
+    pub async fn watch(&self, call_id: &str, video: Vec<Subscription>) -> Result<(), Refused> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Watch {
+            call_id: call_id.to_string(),
+            video,
+            reply,
+        })?;
+        answer.await.unwrap_or(Err(Refused::Unavailable))
     }
 
     /// Stops forwarding a participant's share. It stays stopped until an offer sets the

@@ -36,6 +36,7 @@ pub struct Sfu {
     /// The latest slot map for each call id, kept while waiting for other events.
     pub slots: HashMap<String, Vec<Slot>>,
     pub video: HashMap<String, Option<VideoSlot>>,
+    pub videos: HashMap<String, Vec<VideoSlot>>,
 }
 
 impl Drop for Sfu {
@@ -51,6 +52,7 @@ pub fn start(config: Config) -> Sfu {
         events,
         slots: HashMap::new(),
         video: HashMap::new(),
+        videos: HashMap::new(),
     }
 }
 
@@ -70,15 +72,37 @@ impl Sfu {
                 call_id,
                 audio,
                 video,
+                videos,
             } = &event
             {
                 self.slots.insert(call_id.clone(), audio.clone());
                 self.video.insert(call_id.clone(), video.clone());
+                self.videos.insert(call_id.clone(), videos.clone());
             }
             if let Some(found) = pick(&event) {
                 return found;
             }
         }
+    }
+
+    /// Waits until `call_id`'s `videos` list matches `predicate`.
+    pub async fn videos_matching(
+        &mut self,
+        call_id: &str,
+        mut predicate: impl FnMut(&[VideoSlot]) -> bool,
+    ) -> Vec<VideoSlot> {
+        if let Some(videos) = self.videos.get(call_id).filter(|v| predicate(v)) {
+            return videos.clone();
+        }
+        self.wait_for(|event| match event {
+            Event::Slots {
+                call_id: id,
+                videos,
+                ..
+            } if id == call_id && predicate(videos) => Some(videos.clone()),
+            _ => None,
+        })
+        .await
     }
 
     /// Waits until `call_id`'s slot map has `want` entries.

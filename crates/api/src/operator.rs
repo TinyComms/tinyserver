@@ -167,7 +167,7 @@ fn read_only_allows(method: &Method, path: &str) -> bool {
 pub(crate) fn read_only_frame_allowed(kind: &str) -> bool {
     matches!(
         kind,
-        "ping" | "call.leave" | "call.state" | "call.quality" | "call.e2ee"
+        "ping" | "call.leave" | "call.state" | "call.quality" | "call.watch" | "call.e2ee"
     )
 }
 

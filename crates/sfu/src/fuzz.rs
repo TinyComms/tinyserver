@@ -14,8 +14,10 @@ use str0m::{Input, Output, Rtc, RtcConfig};
 use crate::engine::{candidates, rtc_config, H264_PROFILE};
 use crate::sdp::{share_sending, Caps};
 use crate::tcp::{encode, BadFrame, Framer, FRAME_MAX};
-use crate::video::{ceiling, pick_layer, Floor, Layer, Link, Quality, Reading, Rebase};
-use crate::Config;
+use crate::video::{
+    allocate, allocate_unproven, ceiling, Floor, Layer, Link, Quality, Reading, Rebase, Want,
+};
+use crate::{Config, VideoKind};
 
 const PUBLIC: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 50000);
@@ -212,23 +214,41 @@ pub fn video(data: &[u8]) {
             _ => {
                 let quality = [Quality::Off, Quality::Low, Quality::High][usize::from(b % 3)];
                 let budget = (value & 1 == 1).then_some((value >> 1) as u32);
-                let most = ceiling(budget, value >> 40, value >> 56, value >> 52);
+                let most = ceiling(budget, value >> 40, value >> 56, value >> 52, value >> 48);
                 if budget.is_none() {
-                    assert!(most.share && most.camera == Quality::High);
+                    assert!(most.share && most.camera == Quality::High && most.tiles);
                 }
                 let reading = Reading {
                     told: (a & 2 == 2).then_some(value >> 24),
                     estimate: (a % 2 == 1).then_some(value >> 8),
                     congested: a & 4 == 4,
                 };
-                let fit = link.update(reading, Duration::from_millis(u64::from(*b)), at);
-                let layer = pick_layer(fit, quality, most.camera);
+                let room = link.update(reading, Duration::from_millis(u64::from(*b)), at);
+                let wants = [
+                    Want {
+                        kind: VideoKind::Camera,
+                        max: quality.min(most.camera),
+                    },
+                    Want {
+                        kind: VideoKind::Camera,
+                        max: if most.tiles {
+                            Quality::Low.min(quality)
+                        } else {
+                            Quality::Off
+                        },
+                    },
+                ];
+                let layers = match room {
+                    Some(kbps) => allocate(kbps, &wants, &[None, None]),
+                    None => allocate_unproven(&wants),
+                };
                 if most.camera == Quality::Off || quality == Quality::Off {
-                    assert_eq!(layer, None);
+                    assert_eq!(layers[0], None);
                 }
                 if quality.min(most.camera) == Quality::Low {
-                    assert_ne!(layer, Some(Layer::High));
+                    assert_ne!(layers[0], Some(Layer::High));
                 }
+                assert_ne!(layers[1], Some(Layer::High));
             }
         }
     }
