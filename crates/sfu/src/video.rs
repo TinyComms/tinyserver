@@ -359,11 +359,16 @@ impl<S> Default for Rebase<S> {
 impl<S: PartialEq + Copy> Rebase<S> {
     /// The output time, at 90 kHz, of a frame from `source` at `time`.
     pub fn map(&mut self, source: S, time: u64, now: Instant) -> u64 {
+        self.map_hz(source, time, VIDEO_HZ, now)
+    }
+
+    /// The output time, at `hz`, of a frame from `source` at `time`.
+    pub fn map_hz(&mut self, source: S, time: u64, hz: u64, now: Instant) -> u64 {
         if self.source != Some(source) {
             let start = match self.last {
                 Some((at, then)) => {
                     let gap = now.saturating_duration_since(then).as_micros();
-                    let ticks = u64::try_from(gap.saturating_mul(u128::from(VIDEO_HZ)) / 1_000_000)
+                    let ticks = u64::try_from(gap.saturating_mul(u128::from(hz)) / 1_000_000)
                         .unwrap_or(u64::MAX);
                     at.wrapping_add(ticks.max(1))
                 }

@@ -408,15 +408,21 @@ async fn serve() -> anyhow::Result<()> {
     api::seal_external_sender(&pool)
         .await
         .map_err(|reason| anyhow::anyhow!(reason))?;
-    let defaults = api::Limits::default();
-    let limits = api::Limits {
-        call_room_max: env_count("TINYSERVER_CALL_ROOM_MAX", defaults.call_room_max)?,
-        call_server_max: env_count("TINYSERVER_CALL_SERVER_MAX", defaults.call_server_max)?,
-        ..defaults
-    };
     let sign_in = sign_in().await?;
     sign_in_warnings(&pool, &sign_in).await;
-    let media = media_config(limits.call_room_max)?;
+    let media = media_config()?;
+    let defaults = api::Limits::default();
+    let limits = api::Limits {
+        call_room_max: env_optional_count("TINYSERVER_CALL_ROOM_MAX")?,
+        call_server_max: env_optional_count("TINYSERVER_CALL_SERVER_MAX")?,
+        call_egress_kbps: media.as_ref().and_then(|config| config.egress_kbps),
+        call_audio_slots: media
+            .as_ref()
+            .map_or(defaults.call_audio_slots, |config| {
+                config.offer_audio.saturating_sub(1)
+            }),
+        ..defaults
+    };
     let live = match media {
         Some(config) => {
             let (media, events) = sfu::start(config).context("start media")?;
@@ -705,7 +711,7 @@ fn secret_from_env(name: &str) -> anyhow::Result<Option<String>> {
 /// `TINYSERVER_PUBLIC_IP` with the same port, and `TINYSERVER_LAN_IP` too when set. No public
 /// address means no media. An offer may have one audio m-line per seat in a room.
 /// `TINYSERVER_MEDIA_EGRESS_KBPS` caps what media uploads to everyone, in kb/s.
-fn media_config(room_max: usize) -> anyhow::Result<Option<sfu::Config>> {
+fn media_config() -> anyhow::Result<Option<sfu::Config>> {
     let Ok(public) = env_var("TINYSERVER_PUBLIC_IP") else {
         return Ok(None);
     };
@@ -738,7 +744,9 @@ fn media_config(room_max: usize) -> anyhow::Result<Option<sfu::Config>> {
     let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
     let mut config = sfu::Config::new(bind, public_ip);
     config.lan_ip = lan_ip;
-    config.offer_audio = room_max;
+    if let Some(offer_audio) = env_optional_count("TINYSERVER_OFFER_AUDIO")? {
+        config.offer_audio = offer_audio;
+    }
     config.egress_kbps = match env_var("TINYSERVER_MEDIA_EGRESS_KBPS") {
         Err(_) => None,
         Ok(value) => Some(
@@ -858,6 +866,18 @@ fn env_count(name: &str, default: usize) -> anyhow::Result<usize> {
             .parse::<usize>()
             .ok()
             .filter(|count| *count > 0)
+            .with_context(|| format!("{name} is not a positive whole number")),
+    }
+}
+
+fn env_optional_count(name: &str) -> anyhow::Result<Option<usize>> {
+    match env_var(name) {
+        Err(_) => Ok(None),
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|count| *count > 0)
+            .map(Some)
             .with_context(|| format!("{name} is not a positive whole number")),
     }
 }

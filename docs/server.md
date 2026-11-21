@@ -192,7 +192,7 @@ The server keeps `TINYSERVER_DB_POOL` Postgres connections (default 16, at least
 
 ### Rooms
 
-`GET /v1/rooms` rows add `category_id`, `position`, `topic`, `user_limit` (0 to 99; 0 means the server cap, `TINYSERVER_CALL_ROOM_MAX`, default 12), `bitrate_kbps` (16 to 128, default 64), `ptt_only`, `video_enabled`, `e2ee_required` (default false), `overrides [{role_id, allow, deny}]`, and `my_permissions`. A positive `user_limit` is also clamped to that cap. A move uses the server cap for 30 seconds even when the room limit is lower. Rooms the caller cannot view are left out; owners see all. Rooms come uncategorized first, then by category, each by `position`.
+`GET /v1/rooms` rows add `category_id`, `position`, `topic`, `user_limit` (0 or any positive integer; 0 means unlimited unless `TINYSERVER_CALL_ROOM_MAX` is set), `bitrate_kbps` (16 to 128, default 64), `ptt_only`, `video_enabled`, `e2ee_required` (default false), `overrides [{role_id, allow, deny}]`, and `my_permissions`. A positive `user_limit` is clamped to `TINYSERVER_CALL_ROOM_MAX` when set. A move bypasses `user_limit` for 30 seconds. Rooms the caller cannot view are left out; owners see all. Rooms come uncategorized first, then by category, each by `position`.
 
 `POST /v1/rooms` takes `{name, category_id?, topic?, user_limit?, bitrate_kbps?, ptt_only?, video_enabled?, e2ee_required?}` (manage_channels); `PATCH /v1/rooms/{id}` any of those and `position` (manage_channels in that room). `DELETE /v1/rooms/{id}` (manage_channels in that room) is 204. Audited `room.delete`.
 

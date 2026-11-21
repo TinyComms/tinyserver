@@ -1039,8 +1039,8 @@ async fn caps_refuse_a_full_room_and_a_full_server() {
             people.push(join(&db, &owner, &format!("p{n}@tinyserver.test"), "member").await);
         }
         let limits = Limits {
-            call_room_max: 2,
-            call_server_max: 3,
+            call_room_max: Some(2),
+            call_server_max: Some(3),
             ..Limits::default()
         };
         let server = serve(&db, limits).await;
