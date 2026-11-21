@@ -166,6 +166,47 @@ pub async fn prepare_icon(bytes: &[u8]) -> Result<Rewritten, MessageError> {
     Ok(rewritten)
 }
 
+/// Custom community emoji or sticker. Supports PNG, JPEG, WebP, and GIF (animated).
+/// Re-encodes via `rewrite_raster_in_turn`. Emoji are capped at 256 KiB after rewrite;
+/// stickers are capped at 512 KiB and 512×512 px.
+pub async fn prepare_emoji(bytes: &[u8], kind: &str) -> Result<(Rewritten, bool), MessageError> {
+    let mime = match crate::server::sniff_image(bytes) {
+        Some(m) => m,
+        None if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => "image/gif",
+        None => return Err(MessageError::UnsupportedMedia),
+    };
+    let name = match mime {
+        "image/png" => "emoji.png",
+        "image/jpeg" => "emoji.jpg",
+        "image/webp" => "emoji.webp",
+        "image/gif" => "emoji.gif",
+        _ => return Err(MessageError::UnsupportedMedia),
+    };
+    let classified = classify(name, mime, bytes, Archives::Denied)?;
+    if classified.mime != "image/gif" {
+        reject_icon_caps(bytes, &classified.mime)?;
+    }
+    let rewritten = rewrite_raster_in_turn(bytes, &classified.mime).await?;
+    if rewritten.bytes.is_empty() {
+        return Err(MessageError::UnsupportedMedia);
+    }
+    let (max_bytes, max_edge) = if kind == "sticker" {
+        (crate::emoji::STICKER_MAX_BYTES, Some(crate::emoji::STICKER_MAX_PX))
+    } else {
+        (crate::emoji::EMOJI_MAX_BYTES, None)
+    };
+    if let Some(edge) = max_edge {
+        if rewritten.width > edge || rewritten.height > edge {
+            return Err(MessageError::TooLarge);
+        }
+    }
+    if rewritten.bytes.len() > max_bytes {
+        return Err(MessageError::TooLarge);
+    }
+    let animated = rewritten.mime == "image/gif";
+    Ok((rewritten, animated))
+}
+
 /// Re-encode a classified raster. Header caps run before a full decode.
 /// Post-rewrite byte size is checked by `save_attachment` against `image_max_bytes`.
 pub fn rewrite_raster(bytes: &[u8], mime: &str) -> Result<Rewritten, MessageError> {
@@ -1457,5 +1498,49 @@ mod tests {
         let got = allow("doc.docx", mime, &bytes).expect("docx stays a document");
         assert_eq!(got.kind, "file");
         assert_eq!(got.mime, mime);
+    }
+
+    #[tokio::test]
+    async fn prepare_emoji_accepts_png_and_gif_and_rejects_oversized_stickers_and_non_images() {
+        let png = solid_png(32, 32);
+        let (out, animated) = super::prepare_emoji(&png, "emoji")
+            .await
+            .expect("png emoji");
+        assert_eq!(out.mime, "image/png");
+        assert!(!animated);
+
+        // Minimal valid 2-frame 4x4 GIF.
+        let mut gif = Vec::new();
+        {
+            let mut enc = super::GifEncoder::new(&mut gif);
+            enc.set_repeat(super::Repeat::Infinite).expect("repeat");
+            for c in [0u8, 255u8] {
+                let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([c, c, c, 255]));
+                enc.encode_frame(image::Frame::new(img)).expect("frame");
+            }
+        }
+        let (out, animated) = super::prepare_emoji(&gif, "emoji")
+            .await
+            .expect("gif emoji");
+        assert_eq!(out.mime, "image/gif");
+        assert!(animated);
+
+        assert!(matches!(
+            super::prepare_emoji(b"not an image", "emoji").await,
+            Err(MessageError::UnsupportedMedia)
+        ));
+
+        let big_sticker = solid_png(513, 64);
+        assert!(matches!(
+            super::prepare_emoji(&big_sticker, "sticker").await,
+            Err(MessageError::TooLarge)
+        ));
+
+        let ok_sticker = solid_png(512, 512);
+        let (out, animated) = super::prepare_emoji(&ok_sticker, "sticker")
+            .await
+            .expect("512px sticker");
+        assert_eq!((out.width, out.height), (512, 512));
+        assert!(!animated);
     }
 }

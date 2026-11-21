@@ -288,6 +288,7 @@ Durable topics:
 | `message.created`, `message.edited`, `message.deleted` | Every member socket for a channel. The two people for a direct | `conversation_id`, `kind` (`channel` or `direct`), `message` |
 | `reaction.updated` | Same split as messages | `message_id`, `conversation_id`, `kind`, `emoji`, `on`, `user_id`, `count` |
 | `pin.added`, `pin.removed` | Same split as messages | `conversation_id`, `kind` (`channel` or `direct`), `message_id`, `pinned_by` |
+| `emoji.updated` | Every member | `emoji` (`[{id, kind, name, animated, sha256}]`) |
 | `read.updated` | The two people in a direct; in a channel, the reader alone | `conversation_id`, `kind` (`channel` or `direct`), `user_id`, `message_id` |
 
 A channel read is stored and emits `read.updated` to the reader's own sessions only, so their other devices clear the count; nobody else hears it, and the emit happens only when the cursor moves forward. Channel message, reaction, pin and channel events go to every member socket when every member can view the channel, and only to the members who can view it when it can be restricted (`0013_private_channel_events.sql`). The audience is fixed when the event is emitted. `channel.deleted` carries only the id and goes to every member. Direct events set the audience to those two user ids, a channel read to the reader's one user id. Bots do not receive these topics.

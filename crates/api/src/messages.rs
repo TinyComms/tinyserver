@@ -11,11 +11,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use db::{
-    clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
-    list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
-    post_message, save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction,
-    unpin_message, update_channel, upgrade_conversation, Caller, MessageError, NewAttachment,
-    PgPool, ScanEngine,
+    clear_custom_reaction, clear_reaction, create_channel, delete_channel, delete_message,
+    edit_message, list_channels, list_directs, list_messages, list_pins, mark_read,
+    open_attachment, open_direct, pin_message, post_message_with, save_attachment,
+    save_sealed_attachment, set_channel_override, toggle_custom_reaction, toggle_reaction,
+    unpin_message, update_channel, upgrade_conversation, Caller, EmojiSpan, MessageError,
+    NewAttachment, PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -106,6 +107,8 @@ struct PostBody {
     reply_to: Option<String>,
     client_id: Option<String>,
     attachment_ids: Option<Vec<String>>,
+    emoji: Option<Vec<EmojiSpan>>,
+    sticker_id: Option<String>,
     // An encrypted conversation takes these and no body. See docs/e2ee-text.md.
     ciphertext: Option<String>,
     epoch: Option<u64>,
@@ -121,7 +124,8 @@ struct EditBody {
 
 #[derive(Deserialize)]
 struct EmojiBody {
-    emoji: String,
+    emoji: Option<String>,
+    emoji_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -184,6 +188,8 @@ pub(crate) enum Error {
     GenerationChanged,
     RepairUnavailable,
     PinLimit,
+    EmojiLimit,
+    NameTaken,
 }
 
 impl IntoResponse for Error {
@@ -224,6 +230,8 @@ impl IntoResponse for Error {
             Self::GenerationChanged => (StatusCode::CONFLICT, "generation_changed"),
             Self::RepairUnavailable => (StatusCode::CONFLICT, "repair_unavailable"),
             Self::PinLimit => (StatusCode::CONFLICT, "pin_limit"),
+            Self::EmojiLimit => (StatusCode::CONFLICT, "emoji_limit"),
+            Self::NameTaken => (StatusCode::CONFLICT, "name_taken"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -265,6 +273,8 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::GenerationChanged => "generation_changed",
         Error::RepairUnavailable => "repair_unavailable",
         Error::PinLimit => "pin_limit",
+        Error::EmojiLimit => "emoji_limit",
+        Error::NameTaken => "name_taken",
     }
 }
 
@@ -313,6 +323,8 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::GenerationChanged => Error::GenerationChanged,
         MessageError::RepairUnavailable => Error::RepairUnavailable,
         MessageError::PinLimit => Error::PinLimit,
+        MessageError::EmojiLimit => Error::EmojiLimit,
+        MessageError::NameTaken => Error::NameTaken,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -508,7 +520,8 @@ async fn add_message(
             message_failed(&caller.user_id, &id, error);
         });
     }
-    let message = post_message(
+    let emoji = body.emoji.unwrap_or_default();
+    let message = post_message_with(
         &pool,
         &caller,
         &id,
@@ -516,6 +529,8 @@ async fn add_message(
         body.reply_to.as_deref(),
         body.client_id.as_deref(),
         &attachments,
+        &emoji,
+        body.sticker_id.as_deref(),
     )
     .await
     .map_err(|error| {
@@ -560,14 +575,16 @@ async fn react(
     Json(body): Json<EmojiBody>,
 ) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
-    toggle_reaction(&pool, &caller, &id, &body.emoji)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            let error = lift(error);
-            message_failed(&caller.user_id, "", &error);
-            error
-        })
+    let result = match (body.emoji.as_deref(), body.emoji_id.as_deref()) {
+        (Some(emoji), None) => toggle_reaction(&pool, &caller, &id, emoji).await,
+        (None, Some(emoji_id)) => toggle_custom_reaction(&pool, &caller, &id, emoji_id).await,
+        _ => return Err(Error::Invalid),
+    };
+    result.map(Json).map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, "", &error);
+        error
+    })
 }
 
 async fn unreact(
@@ -577,13 +594,16 @@ async fn unreact(
     Json(body): Json<EmojiBody>,
 ) -> Result<StatusCode, Error> {
     let caller = member(&pool, &headers).await?;
-    clear_reaction(&pool, &caller, &id, &body.emoji)
-        .await
-        .map_err(|error| {
-            let error = lift(error);
-            message_failed(&caller.user_id, "", &error);
-            error
-        })?;
+    let result = match (body.emoji.as_deref(), body.emoji_id.as_deref()) {
+        (Some(emoji), None) => clear_reaction(&pool, &caller, &id, emoji).await,
+        (None, Some(emoji_id)) => clear_custom_reaction(&pool, &caller, &id, emoji_id).await,
+        _ => return Err(Error::Invalid),
+    };
+    result.map_err(|error| {
+        let error = lift(error);
+        message_failed(&caller.user_id, "", &error);
+        error
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -910,11 +930,26 @@ fn field_i32(body: &[u8]) -> Result<i32, MessageError> {
     text.parse::<i32>().map_err(|_| MessageError::Invalid)
 }
 
-struct Part {
-    name: String,
-    filename: Option<String>,
-    mime: Option<String>,
-    body: Vec<u8>,
+pub(crate) struct Part {
+    pub(crate) name: String,
+    pub(crate) filename: Option<String>,
+    pub(crate) mime: Option<String>,
+    pub(crate) body: Vec<u8>,
+}
+
+pub(crate) fn parse_multipart_parts(
+    content_type: &str,
+    body: &[u8],
+) -> Result<Vec<Part>, MessageError> {
+    let boundary = boundary(content_type).ok_or(MessageError::Invalid)?;
+    let parts = split_parts(body, &boundary).ok_or(MessageError::Invalid)?;
+    if parts.is_empty() || parts.len() > 8 {
+        return Err(MessageError::Invalid);
+    }
+    parts
+        .into_iter()
+        .map(|part| parse_part(part).ok_or(MessageError::Invalid))
+        .collect()
 }
 
 fn boundary(content_type: &str) -> Option<String> {

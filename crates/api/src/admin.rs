@@ -35,6 +35,8 @@ pub const FEATURES: &[&str] = &[
     "e2ee_group_generations",
     "presence_status",
     "pins",
+    "custom_emoji",
+    "stickers",
 ];
 
 pub fn routes() -> Router<PgPool> {
@@ -79,6 +81,12 @@ struct Capabilities {
     e2ee_self: bool,
     /// How long a message in a self conversation is kept, in seconds.
     e2ee_self_ttl_secs: i64,
+    /// Custom community emoji and sticker limits.
+    emoji_max_count: usize,
+    emoji_max_bytes: usize,
+    sticker_max_count: usize,
+    sticker_max_bytes: usize,
+    sticker_max_px: i32,
 }
 
 async fn capabilities(
@@ -101,6 +109,11 @@ async fn capabilities(
         e2ee_link_archive_max: archive_max,
         e2ee_self: true,
         e2ee_self_ttl_secs: self_ttl,
+        emoji_max_count: db::EMOJI_MAX_COUNT,
+        emoji_max_bytes: db::EMOJI_MAX_BYTES,
+        sticker_max_count: db::STICKER_MAX_COUNT,
+        sticker_max_bytes: db::STICKER_MAX_BYTES,
+        sticker_max_px: db::STICKER_MAX_PX,
     }))
 }
 

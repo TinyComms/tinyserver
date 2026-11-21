@@ -71,6 +71,8 @@ Upgrading from the three fixed roles: `owner` became the owner flag, `admin` the
 | `idempotency_conflict` | 409 | `Idempotency-Key` reused with a different body |
 | `slow_down` | 429 | Filing a report past 10 in an hour or 50 in a day; a device link past its caps (5 open links, 16 messages, one archive per person) or rate |
 | `archive_exists` | 409 | `PUT /v1/e2ee/links/{id}/archive` on a link that already has its archive |
+| `emoji_limit` | 409 | The community already holds 200 custom emoji or 200 stickers |
+| `name_taken` | 409 | Another custom emoji or sticker already uses that name |
 | `length_required` | 411 | `PUT /v1/e2ee/links/{id}/archive` without `Content-Length` |
 | `read_only` | 503 | The operator suspended the community read-only, and this route writes. The body has `mode` and `notice`. |
 | `suspended` | 503 | The operator took the community offline. Every route but `/health` and `/v1/status` answers this, with `mode` and `notice`. |
@@ -267,8 +269,13 @@ Live frames for these objects are in [`calls.md`](calls.md#messages): `channel.c
 | `POST /v1/conversations/{id}/messages` | speak in the channel, or either member of the direct, and not timed out | `{body?, reply_to?, client_id?, attachment_ids?}`. Body is trimmed, at most 4000 characters. Empty body needs at least one attachment. `reply_to` must be a message in that conversation. `client_id` is 1 to 64 characters with no ASCII controls; a retry returns the same message and the status is still `201`. → `201` message. |
 | `PATCH /v1/messages/{id}` | the author, with speak, not timed out | `{body}`. A deleted message is `400 invalid`. Empty body is allowed when attachments remain. |
 | `DELETE /v1/messages/{id}` | the author, with speak; or manage_messages in the channel | `204`. Soft delete: body cleared, reactions and attachment rows removed, files deleted, `deleted_at` set. A second delete is `204`. A moderator's delete is audited `message.delete` (ids only, never the text) and the frame and the stored message name `deleted_by`. |
-| `PUT /v1/messages/{id}/reactions` | speak, not timed out | `{emoji}` toggles. One grapheme, 1 to 16 scalars, no ASCII control. → `{emoji, count, me}`. |
-| `DELETE /v1/messages/{id}/reactions` | the member who reacted | `{emoji}` → `204`. Missing reaction is `404`. |
+| `PUT /v1/messages/{id}/reactions` | speak, not timed out | `{emoji}` (one Unicode grapheme, 1 to 16 scalars) or `{emoji_id}` (a community custom emoji) toggles. → `{emoji, emoji_id?, name?, count, me}`. For custom emoji, `emoji` is `:name:`. |
+| `DELETE /v1/messages/{id}/reactions` | the member who reacted | `{emoji}` or `{emoji_id}` → `204`. Missing reaction is `404`. |
+| `GET /v1/emoji?kind=` | any member | Lists custom emoji and stickers (`[{id, kind, name, animated, sha256}]`), optionally filtered by `kind` (`emoji` or `sticker`). |
+| `GET /v1/emoji/{id}` | any member | The re-encoded image bytes with `ETag`, `If-None-Match` (`304`), and `Cache-Control: private, max-age=31536000, immutable`. |
+| `POST /v1/emoji` | manage_server, not timed out | Multipart form: `name` (2 to 32 lowercase ASCII alphanumerics or `_`), `file` (PNG, JPEG, WebP, or GIF; re-encoded; emoji ≤ 256 KiB, sticker ≤ 512 KiB and ≤ 512 px), optional `kind` (`emoji` or `sticker`, default `emoji`). Cap 200 per kind (`409 emoji_limit`). Audited `emoji.create`, emits `emoji.updated`. → `201`. |
+| `PATCH /v1/emoji/{id}` | manage_server, not timed out | `{name}` renames the emoji or sticker. Audited `emoji.update`, emits `emoji.updated`. |
+| `DELETE /v1/emoji/{id}` | manage_server, not timed out | `204`. Removes custom reactions via cascade and leaves message text intact. Audited `emoji.delete`, emits `emoji.updated`. |
 | `PUT /v1/messages/{id}/pin` | manage_channels in the channel, or either person in the direct; not timed out | `204`, idempotent. Pins are ids only, so the same routes serve plaintext and encrypted conversations. At most 50 pins per conversation; the next is `409 pin_limit`. Audited `message.pin` for a channel; directs are not audited. |
 | `DELETE /v1/messages/{id}/pin` | same | `204`, idempotent, also when the message is not pinned. Audited `message.unpin` for a channel. |
 | `GET /v1/conversations/{id}/pins` | view_channel, or either person in the direct | The pinned messages, the usual message JSON, newest pin first, at most 50. In an encrypted conversation these are the ciphertext rows; a device shows a pin only if it can still open it. |
@@ -280,7 +287,7 @@ A timeout may still read. Posting, reacting, uploading, typing, and pinning whil
 
 Channel JSON: `id`, `category_id`, `name`, `topic`, `position`, `created_by`, `created_at`, `overrides [{role_id, allow, deny}]`, `unread`, `last_message`. Direct JSON: `id`, `created_at`, `peer {user_id, display_name}`, `unread`, `last_read`, `peer_read`, `last_message`. `last_message` is `{id, author_id, body, created_at}` with `body` cut at 200 characters, or `null`. `unread` skips the caller's own messages and deleted ones. The rows of `GET /v1/channels` add `my_permissions`, the caller's bits in that channel; events do not carry it. Peer pictures are not on the direct object; use the member list.
 
-Message JSON: `id`, `author_id`, `body`, `reply_to`, `client_id`, `created_at`, `edited_at`, `deleted_at`, `deleted_by`, `attachments`, `reactions [{emoji, count, me}]`. `deleted_by` is the user id of whoever removed the message when that was not the author, and `null` otherwise. An attachment on a message is `{id, name, mime, kind, bytes, width, height, duration}`. `kind` is `image`, `gif`, `video`, or `file`. `scan_status` is on the upload response, not on a message's attachments.
+Message JSON: `id`, `author_id`, `body`, `reply_to`, `client_id`, `created_at`, `edited_at`, `deleted_at`, `deleted_by`, `emoji [{id, start, end}]`, `sticker_id`, `attachments`, `reactions [{emoji, emoji_id?, name?, count, me}]`. `deleted_by` is the user id of whoever removed the message when that was not the author, and `null` otherwise. An attachment on a message is `{id, name, mime, kind, bytes, width, height, duration}`. `kind` is `image`, `gif`, `video`, or `file`. `scan_status` is on the upload response, not on a message's attachments.
 
 ### Type policy
 

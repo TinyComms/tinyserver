@@ -119,6 +119,12 @@ pub enum MessageError {
     /// The conversation already holds the most pins it may (50).
     #[error("pin limit")]
     PinLimit,
+    /// The community already holds the most emoji or stickers it may (200 per kind).
+    #[error("emoji limit")]
+    EmojiLimit,
+    /// An emoji or sticker with this name already exists.
+    #[error("name taken")]
+    NameTaken,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -344,6 +350,55 @@ pub async fn post_message(
     commit(tx, value).await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn post_message_with(
+    pool: &PgPool,
+    caller: &Caller,
+    conversation: &str,
+    body: &str,
+    reply_to: Option<&str>,
+    client_id: Option<&str>,
+    attachments: &[String],
+    emoji: &[crate::EmojiSpan],
+    sticker_id: Option<&str>,
+) -> Result<Value, MessageError> {
+    let reply_to = blank_to_none(reply_to);
+    if let Some(reply_to) = reply_to {
+        if !is_uuid(reply_to) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let sticker_id = blank_to_none(sticker_id);
+    if let Some(sticker_id) = sticker_id {
+        if !is_uuid(sticker_id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let client_id = blank_to_none(client_id);
+    let attachments = uuid_list(attachments)?;
+    let emoji_json = serde_json::to_value(emoji).map_err(|_| MessageError::Invalid)?;
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_post_message_ext($1::uuid, $2, $3::uuid, $4,
+            CASE WHEN $5::text[] IS NULL THEN NULL
+            ELSE (SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($5::text[]) AS item) END,
+            $6, $7::uuid)",
+        |query| {
+            query
+                .bind(conversation)
+                .bind(body)
+                .bind(reply_to)
+                .bind(client_id)
+                .bind(attachments)
+                .bind(emoji_json)
+                .bind(sticker_id)
+        },
+    )
+    .await?;
+    commit(tx, value).await
+}
+
 pub async fn edit_message(
     pool: &PgPool,
     caller: &Caller,
@@ -402,6 +457,45 @@ pub async fn clear_reaction(
     sqlx::query("SELECT app_clear_reaction($1::uuid, $2)")
         .bind(id)
         .bind(emoji)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+pub async fn toggle_custom_reaction(
+    pool: &PgPool,
+    caller: &Caller,
+    id: &str,
+    emoji_id: &str,
+) -> Result<Value, MessageError> {
+    if !is_uuid(emoji_id) {
+        return Err(MessageError::Invalid);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_toggle_custom_reaction($1::uuid, $2::uuid)",
+        |query| query.bind(id).bind(emoji_id),
+    )
+    .await?;
+    commit(tx, value).await
+}
+
+pub async fn clear_custom_reaction(
+    pool: &PgPool,
+    caller: &Caller,
+    id: &str,
+    emoji_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(emoji_id) {
+        return Err(MessageError::Invalid);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_clear_custom_reaction($1::uuid, $2::uuid)")
+        .bind(id)
+        .bind(emoji_id)
         .execute(&mut *tx)
         .await
         .map_err(message_sql)?;
@@ -747,6 +841,8 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E21" => MessageError::GenerationChanged,
         "P0E22" => MessageError::RepairUnavailable,
         "P0E23" => MessageError::PinLimit,
+        "P0E24" => MessageError::EmojiLimit,
+        "23505" => MessageError::NameTaken,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),
