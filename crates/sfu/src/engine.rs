@@ -1169,7 +1169,7 @@ impl Engine {
         call_id: &str,
         subs: Vec<Subscription>,
         reply: tokio::sync::oneshot::Sender<Result<(), Refused>>,
-        now: Instant,
+        _now: Instant,
     ) {
         let Some(id) = self.by_call.get(call_id).copied() else {
             let _ = reply.send(Err(Refused::NotFound));
