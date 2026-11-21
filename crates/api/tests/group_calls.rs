@@ -254,10 +254,10 @@ async fn group_call_lifecycle_mls_late_join_and_log() {
             None,
         );
         let owner = first_owner(&db).await;
-        let (a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
-        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
-        let (c, c_tok) = join(&db, &owner, "C", "c@example.com").await;
-        let (d, d_tok) = join(&db, &owner, "D", "d@example.com").await;
+        let (a, a_tok) = join(&db, &owner, "a@example.com", "member").await;
+        let (b, b_tok) = join(&db, &owner, "b@example.com", "member").await;
+        let (c, c_tok) = join(&db, &owner, "c@example.com", "member").await;
+        let (d, d_tok) = join(&db, &owner, "d@example.com", "member").await;
 
         let (st, created) = Call::new(Method::POST, "/v1/groups")
             .token(&a_tok)
@@ -411,9 +411,9 @@ async fn old_client_sees_only_safe_frame_types_and_mid_call_removal_ends_seat() 
         let server = serve(&db, Limits::default()).await;
         let app = api::app(db.runtime.clone(), server.live.clone(), None);
         let owner = first_owner(&db).await;
-        let (_a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
-        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
-        let (c, c_tok) = join(&db, &owner, "C", "c@example.com").await;
+        let (_a, a_tok) = join(&db, &owner, "a@example.com", "member").await;
+        let (b, b_tok) = join(&db, &owner, "b@example.com", "member").await;
+        let (c, c_tok) = join(&db, &owner, "c@example.com", "member").await;
 
         let (st, created) = Call::new(Method::POST, "/v1/groups")
             .token(&a_tok)
@@ -560,9 +560,9 @@ async fn direct_call_moves_into_group_call_with_real_media_and_mls() {
         let server = serve_media(&db).await;
         let app = api::app(db.runtime.clone(), server.live.clone(), None);
         let owner = first_owner(&db).await;
-        let (a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
-        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
-        let (c, c_tok) = join(&db, &owner, "C", "c@example.com").await;
+        let (a, a_tok) = join(&db, &owner, "a@example.com", "member").await;
+        let (b, b_tok) = join(&db, &owner, "b@example.com", "member").await;
+        let (c, c_tok) = join(&db, &owner, "c@example.com", "member").await;
 
         let (st, direct) = Call::new(Method::POST, "/v1/directs")
             .token(&a_tok)
@@ -713,9 +713,9 @@ async fn old_client_peer_ends_with_peer_left_when_direct_moves_to_group() {
         let server = serve_media(&db).await;
         let app = api::app(db.runtime.clone(), server.live.clone(), None);
         let owner = first_owner(&db).await;
-        let (a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
-        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
-        let (c, _c_tok) = join(&db, &owner, "C", "c@example.com").await;
+        let (a, a_tok) = join(&db, &owner, "a@example.com", "member").await;
+        let (b, b_tok) = join(&db, &owner, "b@example.com", "member").await;
+        let (c, _c_tok) = join(&db, &owner, "c@example.com", "member").await;
 
         let (st, direct) = Call::new(Method::POST, "/v1/directs")
             .token(&a_tok)
@@ -820,10 +820,10 @@ async fn adding_member_to_running_group_call_sends_started_ring_and_welcome() {
         let server = serve_media(&db).await;
         let app = api::app(db.runtime.clone(), server.live.clone(), None);
         let owner = first_owner(&db).await;
-        let (a, a_tok) = join(&db, &owner, "A", "a@example.com").await;
-        let (b, b_tok) = join(&db, &owner, "B", "b@example.com").await;
-        let (c, _c_tok) = join(&db, &owner, "C", "c@example.com").await;
-        let (d, d_tok) = join(&db, &owner, "D", "d@example.com").await;
+        let (a, a_tok) = join(&db, &owner, "a@example.com", "member").await;
+        let (b, b_tok) = join(&db, &owner, "b@example.com", "member").await;
+        let (c, _c_tok) = join(&db, &owner, "c@example.com", "member").await;
+        let (d, d_tok) = join(&db, &owner, "d@example.com", "member").await;
 
         let (st, created) = Call::new(Method::POST, "/v1/groups")
             .token(&a_tok)
