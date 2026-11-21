@@ -78,14 +78,15 @@ async fn group_find_or_create_concurrent_rename_isolation_and_capabilities() {
         let features = caps["features"].as_array().expect("features");
         assert!(features.iter().any(|f| f == "groups"), "{caps}");
 
-        // e2ee: true is refused with 400 e2ee_off until #57 lands.
-        let (st, err) = Call::new(Method::POST, "/v1/groups")
+        // e2ee: true follows server e2ee_text policy: succeeds under optional (default),
+        // refused with 400 e2ee_off only when e2ee_text = 'off'.
+        let (st, enc) = Call::new(Method::POST, "/v1/groups")
             .token(&a_token)
             .json(json!({"user_ids": [b.user_id, c.user_id], "e2ee": true}))
             .send(&app)
             .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
-        assert_eq!(err["error"], "e2ee_off");
+        assert_eq!(st, StatusCode::CREATED, "{enc}");
+        assert_eq!(enc["e2ee"], true);
 
         // Fewer than two others, self, or duplicate -> 400 invalid.
         for bad in [
@@ -116,7 +117,7 @@ async fn group_find_or_create_concurrent_rename_isolation_and_capabilities() {
         assert_eq!(g1["unread"], 0);
         assert!(g1.get("peer").is_none());
         assert!(g1.get("peer_read").is_none());
-        assert!(g1.get("last_call").is_none());
+        assert!(g1["last_call"].is_null());
 
         // A creates {A,B,C} again: 200, same id, name unchanged.
         let (st, g2) = Call::new(Method::POST, "/v1/groups")

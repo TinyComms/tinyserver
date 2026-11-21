@@ -43,6 +43,8 @@ pub(crate) struct Event {
     pub subject: Option<String>,
     /// The room, for `room.deleted`.
     pub room: Option<String>,
+    /// The group conversation, for `group.member_added`, `group.member_left`, and `group.deleted`.
+    pub group: Option<String>,
     /// For `member.timeout`: a timeout was set, not ended.
     pub timed_out: bool,
     /// Set when `audience` is `Users`.
@@ -83,6 +85,11 @@ impl Event {
             .get("room_id")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let group = row
+            .payload
+            .get("group_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let timed_out = row.topic == "member.timeout"
             && row
                 .payload
@@ -111,6 +118,7 @@ impl Event {
             audience,
             subject,
             room,
+            group,
             timed_out,
             users: row.users,
             frame,
@@ -134,6 +142,14 @@ pub(crate) struct Incoming {
     pub direct_id: Option<String>,
     /// Scoped `call.leave`: the accepted/live attempt, so stale cleanup cannot end a new ring.
     pub ring_id: Option<String>,
+    /// `call.group.*`, `call.join`, and scoped `call.leave` of a group call.
+    pub group_id: Option<String>,
+    /// `call.group.ring`, `call.group.unring`, `call.group.decline`, and scoped `call.leave`.
+    pub call_id: Option<String>,
+    /// `call.group.ring` and `call.group.unring`: the members to ring or stop ringing.
+    pub user_ids: Option<Vec<String>>,
+    /// `call.group.start`: move a live 1:1 direct call into this group call (#62).
+    pub from_direct: Option<super::group_call::FromDirect>,
     /// `typing`: the channel or direct conversation.
     pub conversation_id: Option<String>,
     pub user_id: Option<String>,
@@ -231,6 +247,9 @@ pub(crate) enum Out<'a> {
         /// The direct call this person is seated in. Kept out of `calls`.
         #[serde(skip_serializing_if = "Option::is_none")]
         direct_call: Option<DirectReady<'a>>,
+        /// Live calls in groups this person belongs to. Omitted when empty.
+        #[serde(skip_serializing_if = "<[super::group_call::ReadyGroupCall]>::is_empty")]
+        group_calls: &'a [super::group_call::ReadyGroupCall],
     },
     #[serde(rename = "presence")]
     Presence {
@@ -323,6 +342,58 @@ pub(crate) enum Out<'a> {
     },
     #[serde(rename = "call.busy")]
     CallBusy { direct_id: &'a str },
+    #[serde(rename = "call.group.started")]
+    CallGroupStarted {
+        group_id: &'a str,
+        call_id: &'a str,
+        started_by: &'a str,
+        started_at: &'a str,
+        rings: &'a [super::group_call::RingEntry],
+        participants: &'a [Participant],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        moved_from: Option<&'a super::group_call::FromDirect>,
+    },
+    #[serde(rename = "call.group.ring")]
+    CallGroupRing {
+        group_id: &'a str,
+        call_id: &'a str,
+        user_id: &'a str,
+        state: &'static str,
+        by: &'a str,
+    },
+    #[serde(rename = "call.group.joined")]
+    CallGroupJoined {
+        group_id: &'a str,
+        call_id: &'a str,
+        #[serde(flatten)]
+        participant: &'a Participant,
+    },
+    #[serde(rename = "call.group.left")]
+    CallGroupLeft {
+        group_id: &'a str,
+        call_id: &'a str,
+        user_id: &'a str,
+        reason: &'static str,
+    },
+    #[serde(rename = "call.group.state")]
+    CallGroupState {
+        group_id: &'a str,
+        call_id: &'a str,
+        #[serde(flatten)]
+        participant: &'a Participant,
+    },
+    #[serde(rename = "call.group.speaking")]
+    CallGroupSpeaking {
+        group_id: &'a str,
+        call_id: &'a str,
+        user_ids: &'a [String],
+    },
+    #[serde(rename = "call.group.ended")]
+    CallGroupEnded {
+        group_id: &'a str,
+        call_id: &'a str,
+        outcome: &'static str,
+    },
     /// A client request succeeded.
     #[serde(rename = "ok")]
     Ok {
@@ -622,6 +693,7 @@ mod tests {
             }],
             ring: None,
             direct_call: None,
+            group_calls: &[],
         };
         assert_eq!(
             ready.text(),
@@ -653,6 +725,83 @@ mod tests {
             }
             .text(),
             r#"{"type":"call.left","room_id":"r","user_id":"u","reason":"kicked"}"#
+        );
+    }
+
+    #[test]
+    fn group_call_frames_have_their_documented_shape() {
+        let rings = [crate::live::group_call::RingEntry {
+            user_id: "b".to_string(),
+            state: "ringing",
+        }];
+        let started = Out::CallGroupStarted {
+            group_id: "g1",
+            call_id: "c1",
+            started_by: "a",
+            started_at: "2026-11-16T10:00:00Z",
+            rings: &rings,
+            participants: &[],
+            moved_from: None,
+        };
+        assert_eq!(
+            started.text(),
+            r#"{"type":"call.group.started","group_id":"g1","call_id":"c1","started_by":"a","started_at":"2026-11-16T10:00:00Z","rings":[{"user_id":"b","state":"ringing"}],"participants":[]}"#
+        );
+        let from_direct = crate::live::group_call::FromDirect {
+            direct_id: "d1".to_string(),
+            ring_id: "r1".to_string(),
+        };
+        let moved = Out::CallGroupStarted {
+            group_id: "g1",
+            call_id: "c1",
+            started_by: "a",
+            started_at: "2026-11-16T10:00:00Z",
+            rings: &rings,
+            participants: &[],
+            moved_from: Some(&from_direct),
+        };
+        assert_eq!(
+            moved.text(),
+            r#"{"type":"call.group.started","group_id":"g1","call_id":"c1","started_by":"a","started_at":"2026-11-16T10:00:00Z","rings":[{"user_id":"b","state":"ringing"}],"participants":[],"moved_from":{"direct_id":"d1","ring_id":"r1"}}"#
+        );
+        assert_eq!(
+            Out::CallGroupRing {
+                group_id: "g1",
+                call_id: "c1",
+                user_id: "b",
+                state: "cancelled",
+                by: "a",
+            }
+            .text(),
+            r#"{"type":"call.group.ring","group_id":"g1","call_id":"c1","user_id":"b","state":"cancelled","by":"a"}"#
+        );
+        assert_eq!(
+            Out::CallGroupLeft {
+                group_id: "g1",
+                call_id: "c1",
+                user_id: "b",
+                reason: "alone",
+            }
+            .text(),
+            r#"{"type":"call.group.left","group_id":"g1","call_id":"c1","user_id":"b","reason":"alone"}"#
+        );
+        assert_eq!(
+            Out::CallGroupSpeaking {
+                group_id: "g1",
+                call_id: "c1",
+                user_ids: &["a".to_string()],
+            }
+            .text(),
+            r#"{"type":"call.group.speaking","group_id":"g1","call_id":"c1","user_ids":["a"]}"#
+        );
+        assert_eq!(
+            Out::CallGroupEnded {
+                group_id: "g1",
+                call_id: "c1",
+                outcome: "ended",
+            }
+            .text(),
+            r#"{"type":"call.group.ended","group_id":"g1","call_id":"c1","outcome":"ended"}"#
         );
     }
 }

@@ -39,6 +39,8 @@ pub(crate) enum Reason {
     Moved,
     /// The other person of a direct call left, so this call ends too.
     PeerLeft,
+    /// Left alone in a group call with no ring pending past the alone timeout.
+    Alone,
 }
 
 impl Reason {
@@ -57,6 +59,7 @@ impl Reason {
             Self::TimedOut => "timed_out",
             Self::Moved => "moved",
             Self::PeerLeft => "peer_left",
+            Self::Alone => "alone",
         }
     }
 
@@ -270,6 +273,27 @@ impl Calls {
         total_streams.saturating_mul(AUDIO_STREAM_KBPS)
     }
 
+    /// Active audio streams across all live rooms other than `exclude_a` and `exclude_b`.
+    pub fn other_rooms_audio_streams(
+        &self,
+        exclude_a: &str,
+        exclude_b: Option<&str>,
+        audio_slots: usize,
+    ) -> u64 {
+        let mut total: u64 = 0;
+        for (room, members) in &self.rooms {
+            if room == exclude_a || exclude_b == Some(room.as_str()) {
+                continue;
+            }
+            let count = members.len();
+            if count > 1 {
+                let per_listener = (count - 1).min(audio_slots) as u64;
+                total = total.saturating_add((count as u64).saturating_mul(per_listener));
+            }
+        }
+        total
+    }
+
     /// Whether `user_id` was moved to `room_id` and may still join it past its limit.
     pub fn ticket(&self, user_id: &str, room_id: &str) -> bool {
         self.tickets
@@ -293,6 +317,7 @@ impl Calls {
     /// Seats `user_id` in `room_id` for socket `conn` with SFU participant `call_id`, leaving
     /// any other call first. Joining the room they are already in only moves the seat to
     /// `conn` and `call_id`. A join on a move ticket leaves the other call as `moved`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn join(
         &mut self,
@@ -305,8 +330,29 @@ impl Calls {
         access: Access,
         e2ee: bool,
     ) -> Result<Vec<Change>, Refused> {
+        self.join_with_move(
+            user_id, room_id, conn, call_id, limit, server_max, access, e2ee, false,
+        )
+    }
+
+    /// Same as [`Self::join`], except when `moving_direct` is true: leaving the person's moving
+    /// direct call emits `Reason::Moved` and does NOT cascade `Reason::PeerLeft` to the other
+    /// party (#62).
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_with_move(
+        &mut self,
+        user_id: &str,
+        room_id: &str,
+        conn: u64,
+        call_id: Option<String>,
+        limit: Option<usize>,
+        server_max: Option<usize>,
+        access: Access,
+        e2ee: bool,
+        moving_direct: bool,
+    ) -> Result<Vec<Change>, Refused> {
         self.check(user_id, room_id, limit, server_max)?;
-        let moved = self.ticket(user_id, room_id);
+        let moved = moving_direct || self.ticket(user_id, room_id);
         self.tickets.remove(user_id);
         if let Some(seat) = self.seats.get_mut(user_id) {
             if seat.room_id == room_id {
@@ -328,7 +374,10 @@ impl Calls {
         } else {
             Reason::JoinedElsewhere
         };
-        changes.extend(self.leave(user_id, reason));
+        changes.extend(self.leave_inner(user_id, reason, !moving_direct));
+        if is_private_room(room_id) {
+            self.moderated.remove(user_id);
+        }
         self.epoch += 1;
         self.seats.insert(
             user_id.to_string(),
@@ -364,6 +413,10 @@ impl Calls {
     /// leave as `peer_left`. The first person can sit alone until the other joins. A room
     /// call leaves only this person.
     pub fn leave(&mut self, user_id: &str, reason: Reason) -> Vec<Change> {
+        self.leave_inner(user_id, reason, true)
+    }
+
+    fn leave_inner(&mut self, user_id: &str, reason: Reason, cascade_direct: bool) -> Vec<Change> {
         let Some(seat) = self.seats.remove(user_id) else {
             return Vec::new();
         };
@@ -381,6 +434,7 @@ impl Calls {
             people.retain(|person| person != user_id);
             if people.is_empty() {
                 self.rooms.remove(&room_id);
+                self.live_direct.remove(&room_id);
             }
         }
         let mut changes = vec![Change::Left {
@@ -389,10 +443,10 @@ impl Calls {
             reason,
             call_id: seat.call_id,
         }];
-        if is_direct_room(&room_id) && reason != Reason::PeerLeft {
+        if cascade_direct && is_direct_room(&room_id) && reason != Reason::PeerLeft {
             self.live_direct.remove(&room_id);
             if let Some(peer) = peer {
-                changes.extend(self.leave(&peer, Reason::PeerLeft));
+                changes.extend(self.leave_inner(&peer, Reason::PeerLeft, true));
             }
         }
         changes
@@ -418,6 +472,11 @@ impl Calls {
             self.live_direct.insert(room_id.to_string());
         }
         ready
+    }
+
+    /// Total active call seats across the server.
+    pub fn seats_len(&self) -> usize {
+        self.seats.len()
     }
 
     /// The room `user_id` is in.
@@ -703,7 +762,7 @@ impl Calls {
     pub fn snapshot(&self) -> Vec<Occupancy> {
         self.rooms
             .iter()
-            .filter(|(room_id, _)| !is_direct_room(room_id))
+            .filter(|(room_id, _)| !is_private_room(room_id))
             .map(|(room_id, people)| Occupancy {
                 room_id: room_id.clone(),
                 participants: people
@@ -740,8 +799,36 @@ impl Calls {
     }
 }
 
+/// What kind of media room a `room_id` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoomKind {
+    Room,
+    Direct,
+    Group,
+}
+
+pub(crate) fn room_kind(room_id: &str) -> RoomKind {
+    if room_id.starts_with("d:") {
+        RoomKind::Direct
+    } else if room_id.starts_with("g:") {
+        RoomKind::Group
+    } else {
+        RoomKind::Room
+    }
+}
+
 pub(crate) fn is_direct_room(room_id: &str) -> bool {
-    room_id.starts_with("d:")
+    room_kind(room_id) == RoomKind::Direct
+}
+
+pub(crate) fn is_group_room(room_id: &str) -> bool {
+    room_kind(room_id) == RoomKind::Group
+}
+
+/// Private calls (direct or group): omitted from `ready.calls`, never broadcast to the whole
+/// server, skipped by room permission refreshes, and refused by voice-room moderation.
+pub(crate) fn is_private_room(room_id: &str) -> bool {
+    room_kind(room_id) != RoomKind::Room
 }
 
 /// Joins and leaves one socket may make: a burst, then one more every `every`.
@@ -1300,6 +1387,72 @@ mod tests {
         assert_eq!(changes.len(), 2);
         assert!(calls.room_of("a").is_none());
         assert!(calls.room_of("b").is_none());
+    }
+
+    #[test]
+    fn a_group_call_is_private_and_leaving_never_cascades_peer_left() {
+        let mut calls = Calls::default();
+        let key = "g:33333333-3333-4333-8333-333333333333";
+        for (i, u) in ["a", "b", "c"].into_iter().enumerate() {
+            calls
+                .join(u, key, i as u64 + 1, None, None, None, FREE, true)
+                .expect(u);
+        }
+        assert!(
+            calls.snapshot().is_empty(),
+            "a group call is not in ready.calls"
+        );
+        let changes = calls.leave("a", Reason::Left);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            &changes[0],
+            Change::Left { user_id, reason: Reason::Left, .. } if user_id == "a"
+        ));
+        assert_eq!(calls.people(key), &["b".to_string(), "c".to_string()]);
+        assert_eq!(calls.room_of("b"), Some(key));
+        assert_eq!(calls.room_of("c"), Some(key));
+    }
+
+    #[test]
+    fn moving_direct_join_emits_moved_without_cascading_peer_left() {
+        let mut calls = Calls::default();
+        let direct = "d:44444444-4444-4444-8444-444444444444";
+        let group = "g:55555555-5555-4555-8555-555555555555";
+        calls
+            .join("a", direct, 1, None, Some(2), None, FREE, true)
+            .expect("a");
+        calls
+            .join("b", direct, 2, None, Some(2), None, FREE, true)
+            .expect("b");
+
+        // A moves from direct to group: Reason::Moved, B stays in direct!
+        let changes_a = calls
+            .join_with_move("a", group, 1, None, None, None, FREE, true, true)
+            .expect("a moves");
+        assert_eq!(changes_a.len(), 2);
+        assert!(matches!(
+            &changes_a[0],
+            Change::Left { room_id, user_id, reason: Reason::Moved, .. }
+                if room_id == direct && user_id == "a"
+        ));
+        assert!(matches!(
+            &changes_a[1],
+            Change::Joined { room_id, participant }
+                if room_id == group && participant.user_id == "a"
+        ));
+        assert_eq!(calls.room_of("b"), Some(direct));
+
+        // B moves from direct to group: Reason::Moved, direct room is now empty.
+        let changes_b = calls
+            .join_with_move("b", group, 2, None, None, None, FREE, true, true)
+            .expect("b moves");
+        assert!(matches!(
+            &changes_b[0],
+            Change::Left { room_id, user_id, reason: Reason::Moved, .. }
+                if room_id == direct && user_id == "b"
+        ));
+        assert!(calls.people(direct).is_empty());
+        assert_eq!(calls.people(group), &["a".to_string(), "b".to_string()]);
     }
 
     #[test]
