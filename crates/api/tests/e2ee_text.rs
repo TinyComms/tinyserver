@@ -6961,3 +6961,568 @@ async fn repair_cannot_reuse_a_genesis_created_before_the_first_info_read() {
     })
     .await;
 }
+
+// ---- #57: end-to-end encrypted group conversations -------------------------------------------
+
+#[tokio::test]
+async fn encrypted_group_lifecycle_and_owner_isolation() {
+    run(|db| async move {
+        let w = world(db).await;
+        let (a, a_tok) = w.member("eg-a").await;
+        let (b, b_tok) = w.member("eg-b").await;
+        let (c, c_tok) = w.member("eg-c").await;
+        let (d, d_tok) = w.member("eg-d").await;
+
+        let owner_dev = ready(&w.app, &w.owner.user_id, &w.owner_token).await;
+        let mut dev_a = ready(&w.app, &a.user_id, &a_tok).await;
+        let dev_b = ready(&w.app, &b.user_id, &b_tok).await;
+        let dev_c = ready(&w.app, &c.user_id, &c_tok).await;
+        let mut dev_d = ready(&w.app, &d.user_id, &d_tok).await;
+
+        // Create encrypted group {A, B, C} (owner is NOT a member).
+        let (st, grp) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &a_tok,
+                Some(json!({"user_ids": [b.user_id, c.user_id], "name": "Secret", "e2ee": true})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{grp}");
+        assert_eq!(grp["e2ee"], true);
+        let gid = grp["id"].as_str().expect("gid").to_string();
+
+        // Owner outside the group gets 404 on every E2EE conversation route and is never in members.
+        for (method, path, body) in [
+            (Method::GET, format!("/v1/e2ee/conversations/{gid}"), None),
+            (
+                Method::POST,
+                format!("/v1/e2ee/conversations/{gid}/group"),
+                Some(json!({"device_id": owner_dev.id()})),
+            ),
+            (
+                Method::GET,
+                format!(
+                    "/v1/e2ee/conversations/{gid}/handshake?after=0&device_id={}",
+                    owner_dev.id()
+                ),
+                None,
+            ),
+            (
+                Method::GET,
+                format!(
+                    "/v1/e2ee/conversations/{gid}/tree?device_id={}&epoch=1",
+                    owner_dev.id()
+                ),
+                None,
+            ),
+            (
+                Method::GET,
+                format!("/v1/e2ee/conversations/{gid}/generations"),
+                None,
+            ),
+            (
+                Method::GET,
+                format!("/v1/e2ee/conversations/{gid}/reactions"),
+                None,
+            ),
+        ] {
+            let (st, err) = w.send(method, &path, &w.owner_token, body).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{path}: {err}");
+        }
+
+        // Start MLS group and settle all three devices; owner's device is absent.
+        start(&w.app, &mut dev_a, &gid).await;
+        let mut devs = [dev_a, dev_b, dev_c];
+        settle(&w.app, &mut devs, 0, &gid).await;
+
+        let (st, gi) = info(&w.app, &a_tok, &gid).await;
+        assert_eq!(st, StatusCode::OK, "{gi}");
+        let members = gi["members"].as_array().expect("members");
+        assert_eq!(members.len(), 3, "{gi}");
+        assert!(
+            !members.iter().any(|m| m["user_id"] == w.owner.user_id),
+            "owner must not be in MLS group: {gi}"
+        );
+
+        // Plaintext post into encrypted group is refused with 400 e2ee_required.
+        let (st, err) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{gid}/messages"),
+                &a_tok,
+                Some(json!({"body": "plaintext refused"})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["error"], "e2ee_required");
+
+        // Ciphertext post succeeds, all three decrypt it, and last_message.body is empty.
+        let (st, m1) = say(&w.app, &mut devs[0], &gid, "epoch1-secret", json!({})).await;
+        assert_eq!(st, StatusCode::CREATED, "{m1}");
+        for dev in devs.iter_mut().skip(1) {
+            let texts = read(&w.app, dev, &gid).await;
+            assert_eq!(texts, vec!["epoch1-secret".to_string()]);
+        }
+        let (st, gview) = w
+            .send(Method::GET, &format!("/v1/groups/{gid}"), &b_tok, None)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{gview}");
+        assert_eq!(gview["last_message"]["body"], "");
+
+        // Add fourth member D: Add is pending, sends are held (409 proposals_changed) until committed.
+        let (st, added) = w
+            .send(
+                Method::POST,
+                &format!("/v1/groups/{gid}/members"),
+                &a_tok,
+                Some(json!({"user_id": d.user_id})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{added}");
+
+        // Trigger immediate issuance by setting commit batch delay to 0.
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 0")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch 0");
+
+        let (st, blocked) = say(&w.app, &mut devs[0], &gid, "held-until-add", json!({})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{blocked}");
+        assert_eq!(blocked["error"], "proposals_changed");
+
+        let (st, gi2) = info(&w.app, &a_tok, &gid).await;
+        assert_eq!(st, StatusCode::OK, "{gi2}");
+        assert!(gi2["pending"]
+            .as_array()
+            .expect("pending")
+            .iter()
+            .any(|p| p["op"] == "add" && p["device_id"] == dev_d.id()));
+
+        // Commit D's Add, D joins by Welcome, unread is 0, D cannot decrypt epoch 1 but decrypts epoch 2.
+        let [dev_a, dev_b, dev_c] = devs;
+        let mut all = [dev_a, dev_b, dev_c, dev_d];
+        settle(&w.app, &mut all, 0, &gid).await;
+
+        let (st, d_view) = w
+            .send(Method::GET, &format!("/v1/groups/{gid}"), &d_tok, None)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{d_view}");
+        assert_eq!(d_view["unread"], 0);
+
+        let (st, m2) = say(&w.app, &mut all[0], &gid, "epoch2-for-d", json!({})).await;
+        assert_eq!(st, StatusCode::CREATED, "{m2}");
+        let d_texts = read(&w.app, &mut all[3], &gid).await;
+        assert_eq!(
+            d_texts,
+            vec!["epoch2-for-d".to_string()],
+            "late joiner must not decrypt pre-join epoch"
+        );
+        dev_d = all.into_iter().nth(3).expect("d");
+        let _ = dev_d;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn encrypted_group_leave_kick_ban_delete_remove_and_timeout_does_not() {
+    run(|db| async move {
+        let w = world(db).await;
+        sqlx::query("UPDATE server_settings SET e2ee_commit_batch_secs = 0")
+            .execute(&w.db.owner)
+            .await
+            .expect("batch 0");
+
+        let (a, a_tok) = w.member("egr-a").await;
+        let (b, b_tok) = w.member("egr-b").await;
+        let (c, c_tok) = w.member("egr-c").await;
+        let (d, d_tok) = w.member("egr-d").await;
+        let (e, e_tok) = w.member("egr-e").await;
+        let (f, f_tok) = w.member("egr-f").await;
+
+        let mut dev_a = ready(&w.app, &a.user_id, &a_tok).await;
+        let dev_b = ready(&w.app, &b.user_id, &b_tok).await;
+        let dev_c = ready(&w.app, &c.user_id, &c_tok).await;
+        let dev_d = ready(&w.app, &d.user_id, &d_tok).await;
+        let dev_e = ready(&w.app, &e.user_id, &e_tok).await;
+        let dev_f = ready(&w.app, &f.user_id, &f_tok).await;
+
+        let (st, grp) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &a_tok,
+                Some(json!({
+                    "user_ids": [b.user_id, c.user_id, d.user_id, e.user_id, f.user_id],
+                    "e2ee": true
+                })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{grp}");
+        let gid = grp["id"].as_str().expect("gid").to_string();
+
+        start(&w.app, &mut dev_a, &gid).await;
+        let mut devs = [dev_a, dev_b, dev_c, dev_d, dev_e, dev_f];
+        settle(&w.app, &mut devs, 0, &gid).await;
+
+        // Timeout F: NO Remove queued, group keeps sending.
+        sqlx::query(
+            "UPDATE memberships SET timeout_until = now() + interval '1 day' WHERE user_id = $1::uuid",
+        )
+        .bind(&f.user_id)
+        .execute(&w.db.owner)
+        .await
+        .expect("timeout");
+        let (st, gi) = info(&w.app, &a_tok, &gid).await;
+        assert_eq!(st, StatusCode::OK, "{gi}");
+        assert!(gi["pending"].as_array().expect("pending").is_empty());
+        let (st, ok_msg) = say(&w.app, &mut devs[0], &gid, "still sends", json!({})).await;
+        assert_eq!(st, StatusCode::CREATED, "{ok_msg}");
+
+        // 1) Leave B -> Remove pending, sends refused until committed, B gets 404 on handshake.
+        let (st, _) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/groups/{gid}/members/me"),
+                &b_tok,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, held) = say(&w.app, &mut devs[0], &gid, "blocked-leave", json!({})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{held}");
+        assert_eq!(held["error"], "proposals_changed");
+        let (st, _) = w
+            .send(
+                Method::GET,
+                &format!(
+                    "/v1/e2ee/conversations/{gid}/handshake?after=0&device_id={}",
+                    devs[1].id()
+                ),
+                &b_tok,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = commit(&w.app, &mut devs[0], &gid).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        // 2) Kick C -> Remove pending, sends refused until committed.
+        let (st, _) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/members/{}", c.user_id),
+                &w.owner_token,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, held) = say(&w.app, &mut devs[0], &gid, "blocked-kick", json!({})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{held}");
+        assert_eq!(held["error"], "proposals_changed");
+        let (st, _) = commit(&w.app, &mut devs[0], &gid).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        // 3) Ban D -> Remove pending, sends refused until committed.
+        let (st, _) = w
+            .send(
+                Method::POST,
+                "/v1/bans",
+                &w.owner_token,
+                Some(json!({"user_id": d.user_id})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, held) = say(&w.app, &mut devs[0], &gid, "blocked-ban", json!({})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{held}");
+        assert_eq!(held["error"], "proposals_changed");
+        let (st, _) = commit(&w.app, &mut devs[0], &gid).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        // 4) Account deletion E -> Remove pending, sends refused until committed.
+        let (st, _) = w
+            .send(
+                Method::DELETE,
+                "/v1/me",
+                &e_tok,
+                Some(json!({"confirm": "delete my account"})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, held) = say(&w.app, &mut devs[0], &gid, "blocked-del", json!({})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{held}");
+        assert_eq!(held["error"], "proposals_changed");
+        let (st, _) = commit(&w.app, &mut devs[0], &gid).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        // Remaining members (A, F) can send again.
+        let (st, after) = say(&w.app, &mut devs[0], &gid, "after-removals", json!({})).await;
+        assert_eq!(st, StatusCode::CREATED, "{after}");
+
+        // Last members leave -> group and MLS rows are forgotten.
+        let (st, _) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/groups/{gid}/members/me"),
+                &f_tok,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, _) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/groups/{gid}/members/me"),
+                &a_tok,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let left_mls: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM e2ee_groups WHERE conversation_id = $1::uuid",
+        )
+        .bind(&gid)
+        .fetch_one(&w.db.owner)
+        .await
+        .expect("mls count");
+        assert_eq!(left_mls, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn encrypted_group_device_ceiling_policy_isolation_and_upgrade() {
+    run(|db| async move {
+        let w = world(db).await;
+        sqlx::query(
+            "UPDATE server_settings SET e2ee_group_devices_max = 4, e2ee_commit_batch_secs = 0",
+        )
+        .execute(&w.db.owner)
+        .await
+        .expect("cap 4");
+
+        let (a, a_tok) = w.member("egc-a").await;
+        let (b, b_tok) = w.member("egc-b").await;
+        let (c, c_tok) = w.member("egc-c").await;
+        let (d, d_tok) = w.member("egc-d").await;
+
+        let mut dev_a = ready(&w.app, &a.user_id, &a_tok).await;
+        let dev_a2 = Dev::new(&a.user_id, &a_tok);
+        let (st, r) = register_vouched(&w.app, &dev_a2, &dev_a).await;
+        assert_eq!(st, StatusCode::CREATED, "{r}");
+        let (st, _) = upload_packages(&w.app, &dev_a2, 5).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        let dev_b = ready(&w.app, &b.user_id, &b_tok).await;
+        let dev_c = ready(&w.app, &c.user_id, &c_tok).await;
+        let dev_d = ready(&w.app, &d.user_id, &d_tok).await;
+        let _ = (&dev_b, &dev_c, &dev_d);
+
+        // 5 devices across {A (2), B (1), C (1), D (1)} > cap 4 -> create refused with 400 e2ee_group_too_large.
+        let (st, err) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &a_tok,
+                Some(json!({"user_ids": [b.user_id, c.user_id, d.user_id], "e2ee": true})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["error"], "e2ee_group_too_large");
+
+        // Plaintext group of the same 4 people has NO size check.
+        let (st, plain4) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &a_tok,
+                Some(json!({"user_ids": [b.user_id, c.user_id, d.user_id], "e2ee": false})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{plain4}");
+        let plain4_id = plain4["id"].as_str().expect("plain4").to_string();
+
+        // Upgrading plain4 (5 devices > 4) is also refused with 400 e2ee_group_too_large.
+        let (st, err) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{plain4_id}/e2ee"),
+                &a_tok,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["error"], "e2ee_group_too_large");
+
+        // Create encrypted group {A (2), B (1), C (1)} == 4 devices (at ceiling): succeeds!
+        let (st, enc3) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &a_tok,
+                Some(json!({"user_ids": [b.user_id, c.user_id], "e2ee": true})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{enc3}");
+        let enc3_id = enc3["id"].as_str().expect("enc3").to_string();
+
+        start(&w.app, &mut dev_a, &enc3_id).await;
+        let mut devs = [dev_a, dev_a2, dev_b, dev_c];
+        settle(&w.app, &mut devs, 0, &enc3_id).await;
+
+        // Adding D (would be 5 devices > 4) is refused and the group STILL sends.
+        let (st, err) = w
+            .send(
+                Method::POST,
+                &format!("/v1/groups/{enc3_id}/members"),
+                &a_tok,
+                Some(json!({"user_id": d.user_id})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["error"], "e2ee_group_too_large");
+        let (st, still_ok) = say(&w.app, &mut devs[0], &enc3_id, "still sends", json!({})).await;
+        assert_eq!(st, StatusCode::CREATED, "{still_ok}");
+
+        // Policy enforcement on POST /v1/groups: off / new_required / required.
+        sqlx::query("UPDATE server_settings SET e2ee_group_devices_max = 2000")
+            .execute(&w.db.owner)
+            .await
+            .expect("raise cap");
+        for (mode, req_e2ee, expect_status, expect_err) in [
+            ("off", true, StatusCode::BAD_REQUEST, "e2ee_off"),
+            (
+                "new_required",
+                false,
+                StatusCode::BAD_REQUEST,
+                "e2ee_required",
+            ),
+            ("required", false, StatusCode::BAD_REQUEST, "e2ee_required"),
+        ] {
+            sqlx::query("UPDATE server_settings SET e2ee_text = $1")
+                .bind(mode)
+                .execute(&w.db.owner)
+                .await
+                .expect("mode");
+            let (st, err) = w
+                .send(
+                    Method::POST,
+                    "/v1/groups",
+                    &b_tok,
+                    Some(json!({"user_ids": [c.user_id, d.user_id], "e2ee": req_e2ee})),
+                )
+                .await;
+            assert_eq!(st, expect_status, "mode={mode}: {err}");
+            assert_eq!(err["error"], expect_err, "mode={mode}: {err}");
+        }
+        sqlx::query("UPDATE server_settings SET e2ee_text = 'optional'")
+            .execute(&w.db.owner)
+            .await
+            .expect("optional");
+
+        // Two encrypted groups with the SAME three members {A, B, C} (via D leaving a 4-person group)
+        // have TWO distinct MLS groups even when `e2ee_audience_groups = true`.
+        sqlx::query("UPDATE server_settings SET e2ee_audience_groups = true")
+            .execute(&w.db.owner)
+            .await
+            .expect("audience groups on");
+        let (st, g_second) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &a_tok,
+                Some(json!({"user_ids": [b.user_id, c.user_id, d.user_id], "e2ee": true})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{g_second}");
+        let g2_id = g_second["id"].as_str().expect("g2").to_string();
+        let (st, _) = w
+            .send(
+                Method::DELETE,
+                &format!("/v1/groups/{g2_id}/members/me"),
+                &d_tok,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+
+        start(&w.app, &mut devs[0], &g2_id).await;
+        let (_, i1) = info(&w.app, &a_tok, &enc3_id).await;
+        let (_, i2) = info(&w.app, &a_tok, &g2_id).await;
+        assert_eq!(i1["group_id"], enc3_id);
+        assert_eq!(i2["group_id"], g2_id);
+        assert_ne!(i1["group_id"], i2["group_id"]);
+
+        sqlx::query("UPDATE server_settings SET e2ee_audience_groups = false")
+            .execute(&w.db.owner)
+            .await
+            .expect("audience groups off");
+
+        // Upgrade a plaintext group: old rows stay plaintext, plaintext_history is true,
+        // last_message.body is empty, and a later create with e2ee: false makes a fresh plaintext group.
+        let (st, pg) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &b_tok,
+                Some(json!({"user_ids": [c.user_id, d.user_id], "name": "Upgradable"})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{pg}");
+        let pg_id = pg["id"].as_str().expect("pg_id").to_string();
+        let (st, old_msg) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{pg_id}/messages"),
+                &b_tok,
+                Some(json!({"body": "before upgrade"})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{old_msg}");
+
+        let (st, upgraded) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{pg_id}/e2ee"),
+                &b_tok,
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{upgraded}");
+        assert_eq!(upgraded["id"], pg_id);
+        assert_eq!(upgraded["e2ee"], true);
+        assert_eq!(upgraded["plaintext_history"], true);
+        assert_eq!(upgraded["last_message"]["body"], "");
+
+        // Old plaintext message is still readable.
+        let (st, hist) = messages(&w.app, &c_tok, &pg_id).await;
+        assert_eq!(st, StatusCode::OK, "{hist}");
+        assert_eq!(hist[0]["body"], "before upgrade");
+        assert_eq!(hist[0]["e2ee"], false);
+
+        // Plaintext post after upgrade is refused.
+        let (st, err) = w
+            .send(
+                Method::POST,
+                &format!("/v1/conversations/{pg_id}/messages"),
+                &b_tok,
+                Some(json!({"body": "no longer plain"})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["error"], "e2ee_required");
+
+        // Create for {B, C, D} with e2ee: false creates a new plaintext group.
+        let (st, pg_new) = w
+            .send(
+                Method::POST,
+                "/v1/groups",
+                &b_tok,
+                Some(json!({"user_ids": [c.user_id, d.user_id], "e2ee": false})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{pg_new}");
+        assert_ne!(pg_new["id"], pg_id);
+    })
+    .await;
+}
