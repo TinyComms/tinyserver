@@ -13,9 +13,9 @@ use axum::{Extension, Json, Router};
 use db::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
     list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
-    post_message, save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction,
-    unpin_message, update_channel, upgrade_conversation, Caller, MentionInput, MessageError,
-    NewAttachment, NewMessage, PgPool, ScanEngine,
+    post_message, save_attachment, save_sealed_attachment, search_messages, set_channel_override,
+    toggle_reaction, unpin_message, update_channel, upgrade_conversation, Caller, MentionInput,
+    MessageError, NewAttachment, NewMessage, PgPool, ScanEngine, SearchQuery,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -68,6 +68,7 @@ pub fn routes() -> Router<PgPool> {
         )
         .route("/v1/conversations/{id}/pins", get(pins))
         .route("/v1/conversations/{id}/read", axum::routing::post(read))
+        .route("/v1/search", get(search))
         .route(
             "/v1/conversations/{id}/e2ee",
             axum::routing::post(upgrade_e2ee),
@@ -95,6 +96,15 @@ struct DirectBody {
 
 #[derive(Deserialize)]
 struct PageQuery {
+    before: Option<String>,
+    limit: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    conversation_id: Option<String>,
+    author_id: Option<String>,
     before: Option<String>,
     limit: Option<i32>,
 }
@@ -677,6 +687,35 @@ async fn read(
             error
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Searches plaintext messages the caller may read. Never logs `params.q`.
+async fn search(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    let q = params.q.as_deref().unwrap_or("");
+    let result = search_messages(
+        &pool,
+        &caller,
+        &SearchQuery {
+            q,
+            conversation_id: params.conversation_id.as_deref(),
+            author_id: params.author_id.as_deref(),
+            before: params.before.as_deref(),
+            limit: params.limit,
+        },
+    )
+    .await
+    .map_err(|error| {
+        let error = lift(error);
+        let reason = message_reason(&error);
+        tracing::warn!(user_id = %caller.user_id, reason, "search failed");
+        error
+    })?;
+    Ok(signed(result))
 }
 
 /// One-way: a plaintext conversation becomes end-to-end encrypted. What was already stored stays

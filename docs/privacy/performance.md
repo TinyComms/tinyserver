@@ -120,7 +120,7 @@ Everything in the "Result" column is **TODO, not measured**. Each row needs: the
 
 | Feature | Plaintext community | Encrypted conversation |
 |---|---|---|
-| Server-side search | Not implemented anyway | Cannot exist |
+| Server-side search | `GET /v1/search` over plaintext bodies (`to_tsvector('simple', body)` partial GIN index on `NOT e2ee`, `0051`) | Cannot exist; `skipped_encrypted: true` tells the client |
 | Link previews and thumbnails made by the server | None implemented | Cannot exist |
 | Virus and type scanning of uploads | clamd and YARA, before the message can reference the file | None for sealed files; the client protects itself |
 | Moderator removal of a message | `manage_channels` deletes the channel; no per-message moderator delete exists today either | None in v1 |

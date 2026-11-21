@@ -146,6 +146,21 @@ pub struct NewMessage<'a> {
 /// Maximum number of mention entries accepted on one message.
 pub const MENTIONS_MAX: usize = 50;
 
+/// Parameters for `GET /v1/search`.
+pub struct SearchQuery<'a> {
+    pub q: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub author_id: Option<&'a str>,
+    pub before: Option<&'a str>,
+    pub limit: Option<i32>,
+}
+
+/// Default and maximum page size for message search.
+pub const SEARCH_DEFAULT_LIMIT: i32 = 25;
+pub const SEARCH_MAX_LIMIT: i32 = 50;
+pub const SEARCH_QUERY_MIN: usize = 2;
+pub const SEARCH_QUERY_MAX: usize = 200;
+
 /// One file a member is uploading. Bytes are written next to the row, under the upload directory.
 pub struct NewAttachment {
     pub name: String,
@@ -327,6 +342,76 @@ pub async fn list_messages(
     )
     .await?;
     commit(tx, value).await
+}
+
+/// Searches plaintext messages the caller may read, newest first.
+/// Bots are refused (`Forbidden`). Rate-limited to 30 searches/min (`SlowDown`).
+pub async fn search_messages(
+    pool: &PgPool,
+    caller: &Caller,
+    params: &SearchQuery<'_>,
+) -> Result<Value, MessageError> {
+    let valid = validate_search(params)?;
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(
+        &mut tx,
+        "SELECT app_search_messages($1, $2::uuid, $3::uuid, $4::uuid, $5)",
+        |query| {
+            query
+                .bind(valid.q)
+                .bind(valid.conversation_id)
+                .bind(valid.author_id)
+                .bind(valid.before)
+                .bind(valid.limit)
+        },
+    )
+    .await?;
+    commit(tx, value).await
+}
+
+struct ValidatedSearch<'a> {
+    q: &'a str,
+    conversation_id: Option<&'a str>,
+    author_id: Option<&'a str>,
+    before: Option<&'a str>,
+    limit: i32,
+}
+
+fn validate_search<'a>(params: &SearchQuery<'a>) -> Result<ValidatedSearch<'a>, MessageError> {
+    let q = params.q.trim();
+    let len = q.chars().count();
+    if !(SEARCH_QUERY_MIN..=SEARCH_QUERY_MAX).contains(&len) || q.chars().any(char::is_control) {
+        return Err(MessageError::Invalid);
+    }
+    let conversation_id = blank_to_none(params.conversation_id);
+    if let Some(id) = conversation_id {
+        if !is_uuid(id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let author_id = blank_to_none(params.author_id);
+    if let Some(id) = author_id {
+        if !is_uuid(id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let before = blank_to_none(params.before);
+    if let Some(id) = before {
+        if !is_uuid(id) {
+            return Err(MessageError::Invalid);
+        }
+    }
+    let limit = params.limit.unwrap_or(SEARCH_DEFAULT_LIMIT);
+    if !(1..=SEARCH_MAX_LIMIT).contains(&limit) {
+        return Err(MessageError::Invalid);
+    }
+    Ok(ValidatedSearch {
+        q,
+        conversation_id,
+        author_id,
+        before,
+        limit,
+    })
 }
 
 pub async fn post_message(
@@ -1381,5 +1466,62 @@ mod tests {
             super::prepare_mentions(body, &too_many),
             Err(MessageError::Invalid)
         ));
+    }
+
+    #[test]
+    fn search_query_validates_length_controls_uuids_and_limit() {
+        let ok = super::validate_search(&super::SearchQuery {
+            q: "  lantern  ",
+            conversation_id: None,
+            author_id: None,
+            before: None,
+            limit: None,
+        })
+        .expect("ok");
+        assert_eq!(ok.q, "lantern");
+        assert_eq!(ok.limit, super::SEARCH_DEFAULT_LIMIT);
+
+        for bad in [
+            super::SearchQuery {
+                q: "a",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: None,
+            },
+            super::SearchQuery {
+                q: "hi\nthere",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: None,
+            },
+            super::SearchQuery {
+                q: "lantern",
+                conversation_id: Some("not-a-uuid"),
+                author_id: None,
+                before: None,
+                limit: None,
+            },
+            super::SearchQuery {
+                q: "lantern",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: Some(51),
+            },
+            super::SearchQuery {
+                q: "lantern",
+                conversation_id: None,
+                author_id: None,
+                before: None,
+                limit: Some(0),
+            },
+        ] {
+            assert!(matches!(
+                super::validate_search(&bad),
+                Err(MessageError::Invalid)
+            ));
+        }
     }
 }

@@ -36,6 +36,7 @@ pub const FEATURES: &[&str] = &[
     "presence_status",
     "pins",
     "mentions",
+    "message_search",
 ];
 
 pub fn routes() -> Router<PgPool> {
