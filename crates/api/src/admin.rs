@@ -44,6 +44,7 @@ pub const FEATURES: &[&str] = &[
     "stickers",
     "threads",
     "groups",
+    "group_calls",
 ];
 
 pub fn routes() -> Router<PgPool> {

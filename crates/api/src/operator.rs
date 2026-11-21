@@ -216,6 +216,10 @@ mod tests {
         assert!(!read_only_frame_allowed("call.accept"));
         assert!(!read_only_frame_allowed("call.decline"));
         assert!(!read_only_frame_allowed("call.cancel"));
+        assert!(!read_only_frame_allowed("call.group.start"));
+        assert!(!read_only_frame_allowed("call.group.ring"));
+        assert!(!read_only_frame_allowed("call.group.unring"));
+        assert!(!read_only_frame_allowed("call.group.decline"));
         assert!(!read_only_frame_allowed("presence.set"));
     }
 }

@@ -279,6 +279,11 @@ impl Rings {
         Some(ring.parties())
     }
 
+    /// Whether `user_id` currently participates in any direct ring or direct call.
+    pub fn has_user(&self, user_id: &str) -> bool {
+        self.by_user.contains_key(user_id)
+    }
+
     pub fn direct_of_room(&self, room_id: &str) -> Option<&str> {
         Some(&self.by_id.get(ring_of_room(room_id)?)?.direct_id)
     }

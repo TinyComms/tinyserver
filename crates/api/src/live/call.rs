@@ -39,6 +39,8 @@ pub(crate) enum Reason {
     Moved,
     /// The other person of a direct call left, so this call ends too.
     PeerLeft,
+    /// Left alone in a group call with no ring pending past the alone timeout.
+    Alone,
 }
 
 impl Reason {
@@ -57,6 +59,7 @@ impl Reason {
             Self::TimedOut => "timed_out",
             Self::Moved => "moved",
             Self::PeerLeft => "peer_left",
+            Self::Alone => "alone",
         }
     }
 
@@ -703,7 +706,7 @@ impl Calls {
     pub fn snapshot(&self) -> Vec<Occupancy> {
         self.rooms
             .iter()
-            .filter(|(room_id, _)| !is_direct_room(room_id))
+            .filter(|(room_id, _)| !is_private_room(room_id))
             .map(|(room_id, people)| Occupancy {
                 room_id: room_id.clone(),
                 participants: people
@@ -740,8 +743,36 @@ impl Calls {
     }
 }
 
+/// What kind of media room a `room_id` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoomKind {
+    Room,
+    Direct,
+    Group,
+}
+
+pub(crate) fn room_kind(room_id: &str) -> RoomKind {
+    if room_id.starts_with("d:") {
+        RoomKind::Direct
+    } else if room_id.starts_with("g:") {
+        RoomKind::Group
+    } else {
+        RoomKind::Room
+    }
+}
+
 pub(crate) fn is_direct_room(room_id: &str) -> bool {
-    room_id.starts_with("d:")
+    room_kind(room_id) == RoomKind::Direct
+}
+
+pub(crate) fn is_group_room(room_id: &str) -> bool {
+    room_kind(room_id) == RoomKind::Group
+}
+
+/// Private calls (direct or group): omitted from `ready.calls`, never broadcast to the whole
+/// server, skipped by room permission refreshes, and refused by voice-room moderation.
+pub(crate) fn is_private_room(room_id: &str) -> bool {
+    room_kind(room_id) != RoomKind::Room
 }
 
 /// Joins and leaves one socket may make: a burst, then one more every `every`.
@@ -1300,6 +1331,30 @@ mod tests {
         assert_eq!(changes.len(), 2);
         assert!(calls.room_of("a").is_none());
         assert!(calls.room_of("b").is_none());
+    }
+
+    #[test]
+    fn a_group_call_is_private_and_leaving_never_cascades_peer_left() {
+        let mut calls = Calls::default();
+        let key = "g:33333333-3333-4333-8333-333333333333";
+        for (i, u) in ["a", "b", "c"].into_iter().enumerate() {
+            calls
+                .join(u, key, i as u64 + 1, None, None, None, FREE, true)
+                .expect(u);
+        }
+        assert!(
+            calls.snapshot().is_empty(),
+            "a group call is not in ready.calls"
+        );
+        let changes = calls.leave("a", Reason::Left);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            &changes[0],
+            Change::Left { user_id, reason: Reason::Left, .. } if user_id == "a"
+        ));
+        assert_eq!(calls.people(key), &["b".to_string(), "c".to_string()]);
+        assert_eq!(calls.room_of("b"), Some(key));
+        assert_eq!(calls.room_of("c"), Some(key));
     }
 
     #[test]

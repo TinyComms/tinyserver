@@ -12,6 +12,7 @@ mod direct_call;
 mod e2ee;
 mod emoji;
 mod error;
+mod group_call;
 mod groups;
 mod link;
 mod media;
@@ -67,6 +68,7 @@ pub use emoji::{
     STICKER_MAX_BYTES, STICKER_MAX_COUNT, STICKER_MAX_PX,
 };
 pub use error::DbError;
+pub use group_call::{group_call_access, record_group_call, GroupCallMembers, GroupCallRecord};
 pub use groups::{
     add_group_member, get_group, leave_group, list_groups, open_group, rename_group,
     validate_group_create_users, validate_group_name, GROUP_CREATE_USERS_MAX,

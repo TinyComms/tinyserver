@@ -6,6 +6,7 @@
 mod call;
 mod e2ee;
 pub(crate) mod frame;
+mod group_call;
 mod hub;
 mod presence;
 mod ring;

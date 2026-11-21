@@ -117,7 +117,7 @@ async fn group_find_or_create_concurrent_rename_isolation_and_capabilities() {
         assert_eq!(g1["unread"], 0);
         assert!(g1.get("peer").is_none());
         assert!(g1.get("peer_read").is_none());
-        assert!(g1.get("last_call").is_none());
+        assert!(g1["last_call"].is_null());
 
         // A creates {A,B,C} again: 200, same id, name unchanged.
         let (st, g2) = Call::new(Method::POST, "/v1/groups")

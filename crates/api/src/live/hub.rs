@@ -50,6 +50,7 @@ struct People {
     next_conn: u64,
     calls: Calls,
     rings: super::ring::Rings,
+    group_calls: super::group_call::GroupCalls,
     /// The latest `call.slots` frame for each SFU participant, seated or not yet.
     slots: HashMap<String, Arc<str>>,
     /// End-to-end encryption: the MLS delivery service for each room's call.
@@ -155,6 +156,7 @@ pub(crate) struct Joined {
     pub calls: Vec<Occupancy>,
     pub ring: Option<super::ring::ReadyRing>,
     pub direct_call: Option<super::ring::ReadyDirect>,
+    pub group_calls: Vec<super::group_call::ReadyGroupCall>,
 }
 
 /// One reserved socket. Dropping it frees the place.
@@ -219,6 +221,7 @@ impl Hub {
         let mut people = lock(&self.people);
         people.calls.clear();
         people.rings = super::ring::Rings::default();
+        people.group_calls.clear();
         people.slots.clear();
         people.e2ee.clear();
         if let Some(media) = &self.media {
@@ -326,6 +329,13 @@ impl Hub {
             calls: people.calls.snapshot(),
             ring: people.rings.ready(user_id),
             direct_call: direct_ready(&people, user_id),
+            group_calls: if bot {
+                Vec::new()
+            } else {
+                people
+                    .group_calls
+                    .ready(user_id, |room_id| people.calls.participants_of(room_id))
+            },
         }
     }
 
@@ -550,11 +560,32 @@ impl Hub {
                 return Err(Refused::NotFound);
             }
         }
+        if super::call::is_group_room(room_id) && !people.group_calls.can_seat(room_id, user_id) {
+            drop(people);
+            if let Some(call_id) = call_id {
+                self.forget(call_id);
+            }
+            return Err(Refused::NotFound);
+        }
         let limit = self.room_limit(&people.calls, user_id, room_id, user_limit);
-        self.capacity_check(&people, user_id, room_id)?;
+        if let Err(refused) = self.capacity_check(&people, user_id, room_id) {
+            if super::call::is_group_room(room_id) {
+                let seated = people.calls.people(room_id).len();
+                if let Some(event) = people.group_calls.cancel_ring_for_room(
+                    room_id,
+                    user_id,
+                    user_id,
+                    seated,
+                    std::time::Instant::now(),
+                ) {
+                    send_group_ring(&people, &event);
+                }
+            }
+            return Err(refused);
+        }
         let previous = people.calls.room_of(user_id).map(str::to_string);
         let again = previous.as_deref() == Some(room_id);
-        let changes = people.calls.join(
+        let changes = match people.calls.join(
             user_id,
             room_id,
             conn,
@@ -563,7 +594,24 @@ impl Hub {
             self.limits.call_server_max,
             access,
             e2ee,
-        )?;
+        ) {
+            Ok(changes) => changes,
+            Err(refused) => {
+                if super::call::is_group_room(room_id) {
+                    let seated = people.calls.people(room_id).len();
+                    if let Some(event) = people.group_calls.cancel_ring_for_room(
+                        room_id,
+                        user_id,
+                        user_id,
+                        seated,
+                        std::time::Instant::now(),
+                    ) {
+                        send_group_ring(&people, &event);
+                    }
+                }
+                return Err(refused);
+            }
+        };
         people.calls.set_session(user_id, session);
         self.tell(&mut people, changes);
         // A seat with media is in the room's group, or is why the room has none. Taking the
@@ -585,17 +633,28 @@ impl Hub {
                     .set_media(user_id, &answer.call_id, answer.camera, answer.share);
             self.tell(&mut people, change);
         }
+        let now = std::time::Instant::now();
+        if super::call::is_group_room(room_id) {
+            let seated = people.calls.people(room_id).len();
+            people.group_calls.on_seated(room_id, user_id, seated, now);
+        }
         if people.calls.note_direct_pair(room_id) {
             people.rings.mark_live(room_id);
         }
         let mut notices = Vec::new();
+        let mut group_ended = Vec::new();
         if let Some(previous) = previous.as_deref() {
-            if previous != room_id
-                && super::call::is_direct_room(previous)
-                && people.calls.people(previous).is_empty()
-            {
-                if let Some(notice) = people.rings.on_room_empty(previous) {
-                    notices.push(notice);
+            if previous != room_id {
+                if super::call::is_direct_room(previous) && people.calls.people(previous).is_empty()
+                {
+                    if let Some(notice) = people.rings.on_room_empty(previous) {
+                        notices.push(notice);
+                    }
+                } else if super::call::is_group_room(previous) {
+                    let remaining = people.calls.people(previous).len();
+                    if let Some(ended) = people.group_calls.on_left(previous, remaining, now) {
+                        group_ended.push(ended);
+                    }
                 }
             }
         }
@@ -609,7 +668,7 @@ impl Hub {
         if let Some(frame) = call_id.and_then(|call_id| people.slots.get(call_id)) {
             people.direct(user_id, conn, frame.clone());
         }
-        self.announce_rings(people, notices);
+        self.announce_settled(people, notices, group_ended);
         Ok(())
     }
 
@@ -701,7 +760,7 @@ impl Hub {
         tokio::spawn(async move {
             let rooms = lock(&hub.people).calls.occupied();
             for (room_id, people) in rooms {
-                if super::call::is_direct_room(&room_id) {
+                if super::call::is_private_room(&room_id) {
                     continue;
                 }
                 let permissions = match db::room_permissions(&hub.pool, &room_id, &people).await {
@@ -780,8 +839,8 @@ impl Hub {
             }
         }
         self.tell(&mut people, changes);
-        let notices = settle_direct(&mut people, room.as_deref(), user_id, end_rings);
-        self.announce_rings(people, notices);
+        let (notices, group_ended) = settle_calls(&mut people, room.as_deref(), user_id, end_rings);
+        self.announce_settled(people, notices, group_ended);
     }
 
     /// Ends `user_id`'s call if it is in `room_id`. False if they were not there.
@@ -792,8 +851,8 @@ impl Hub {
         }
         let change = people.calls.leave(user_id, Reason::Kicked);
         self.tell(&mut people, change);
-        let notices = settle_direct(&mut people, Some(room_id), user_id, false);
-        self.announce_rings(people, notices);
+        let (notices, group_ended) = settle_calls(&mut people, Some(room_id), user_id, false);
+        self.announce_settled(people, notices, group_ended);
         true
     }
 
@@ -805,12 +864,24 @@ impl Hub {
         let mut people = lock(&self.people);
         let changes = people.calls.end_room(room_id, reason);
         self.tell(&mut people, changes);
-        let notices = if super::call::is_direct_room(room_id) {
-            people.rings.on_room_empty(room_id).into_iter().collect()
-        } else {
-            Vec::new()
-        };
-        self.announce_rings(people, notices);
+        let mut notices = Vec::new();
+        let mut group_ended = Vec::new();
+        if super::call::is_direct_room(room_id) {
+            if let Some(notice) = people.rings.on_room_empty(room_id) {
+                notices.push(notice);
+            }
+        } else if super::call::is_group_room(room_id) {
+            if let Some(group_id) = people
+                .group_calls
+                .meta_of_room(room_id)
+                .map(|(gid, _, _)| gid.to_string())
+            {
+                if let Some((_, ended)) = people.group_calls.end_group(&group_id) {
+                    group_ended.push(ended);
+                }
+            }
+        }
+        self.announce_settled(people, notices, group_ended);
     }
 
     /// Socket `conn` closed with `reason`. If it held its person's seat, they leave now, or
@@ -825,8 +896,9 @@ impl Hub {
                 let room = people.calls.room_of(user_id).map(str::to_string);
                 let changes = people.calls.leave(user_id, reason);
                 self.tell(&mut people, changes);
-                let notices = settle_direct(&mut people, room.as_deref(), user_id, false);
-                self.announce_rings(people, notices);
+                let (notices, group_ended) =
+                    settle_calls(&mut people, room.as_deref(), user_id, false);
+                self.announce_settled(people, notices, group_ended);
                 return;
             }
             epoch
@@ -840,12 +912,12 @@ impl Hub {
             let changes = people.calls.expire(&user_id, epoch);
             let left = !changes.is_empty();
             hub.tell(&mut people, changes);
-            let notices = if left {
-                settle_direct(&mut people, room.as_deref(), &user_id, false)
+            let (notices, group_ended) = if left {
+                settle_calls(&mut people, room.as_deref(), &user_id, false)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
-            hub.announce_rings(people, notices);
+            hub.announce_settled(people, notices, group_ended);
         });
     }
 
@@ -872,6 +944,21 @@ impl Hub {
                     self.call_leave(user_id, Reason::TimedOut, true);
                 }
             }
+            "group.member_left" => {
+                if let (Some(group_id), Some(user_id)) = (&event.group, &event.subject) {
+                    self.on_group_member_left(group_id, user_id);
+                }
+            }
+            "group.deleted" => {
+                if let Some(group_id) = &event.group {
+                    self.on_group_deleted(group_id);
+                }
+            }
+            "group.member_added" => {
+                if let (Some(group_id), Some(user_id)) = (&event.group, &event.subject) {
+                    self.on_group_member_added(group_id, user_id);
+                }
+            }
             "role.updated" | "role.deleted" | "member.roles" | "member.role" | "room.updated" => {
                 self.refresh();
             }
@@ -883,50 +970,24 @@ impl Hub {
     /// locked, so frames go out in registry order.
     fn tell(&self, people: &mut People, changes: impl IntoIterator<Item = Change>) {
         for change in changes {
-            let frame = match &change {
-                Change::Joined {
-                    room_id,
-                    participant,
-                } => Out::CallJoined {
-                    room_id,
-                    direct_id: people.rings.direct_of_room(room_id),
-                    participant,
-                }
-                .text(),
-                Change::Left {
-                    room_id,
-                    user_id,
-                    reason,
-                    call_id,
-                } => {
-                    if let Some(call_id) = call_id {
-                        people.slots.remove(call_id);
-                        if let Some(media) = &self.media {
-                            media.leave(call_id);
-                        }
+            if let Change::Left {
+                room_id,
+                user_id,
+                call_id,
+                ..
+            } = &change
+            {
+                if let Some(call_id) = call_id {
+                    people.slots.remove(call_id);
+                    if let Some(media) = &self.media {
+                        media.leave(call_id);
                     }
-                    let frames = people
-                        .e2ee
-                        .leave(room_id, user_id, std::time::Instant::now());
-                    people.e2ee(frames);
-                    Out::CallLeft {
-                        room_id,
-                        direct_id: people.rings.direct_of_room(room_id),
-                        user_id,
-                        reason: reason.as_str(),
-                    }
-                    .text()
                 }
-                Change::State {
-                    room_id,
-                    participant,
-                } => Out::CallState {
-                    room_id,
-                    direct_id: people.rings.direct_of_room(room_id),
-                    participant,
-                }
-                .text(),
-            };
+                let frames = people
+                    .e2ee
+                    .leave(room_id, user_id, std::time::Instant::now());
+                people.e2ee(frames);
+            }
             let (room_id, extra) = match &change {
                 Change::Joined { room_id, .. } | Change::State { room_id, .. } => {
                     (room_id.clone(), None)
@@ -935,22 +996,132 @@ impl Hub {
                     room_id, user_id, ..
                 } => (room_id.clone(), Some(user_id.clone())),
             };
-            let frame: Arc<str> = Arc::from(frame);
-            if super::call::is_direct_room(&room_id) {
-                let mut users = people
-                    .rings
-                    .parties(&room_id)
-                    .unwrap_or_else(|| people.calls.people(&room_id).to_vec());
-                if let Some(extra) = extra {
-                    if !users.iter().any(|user| user == &extra) {
-                        users.push(extra);
+            match super::call::room_kind(&room_id) {
+                super::call::RoomKind::Group => {
+                    let Some((group_id, call_id, mut users)) = people
+                        .group_calls
+                        .meta_of_room(&room_id)
+                        .map(|(gid, cid, members)| {
+                            (gid.to_string(), cid.to_string(), members.to_vec())
+                        })
+                    else {
+                        continue;
+                    };
+                    let frame = match &change {
+                        Change::Joined { participant, .. } => Out::CallGroupJoined {
+                            group_id: &group_id,
+                            call_id: &call_id,
+                            participant,
+                        }
+                        .text(),
+                        Change::Left {
+                            user_id, reason, ..
+                        } => Out::CallGroupLeft {
+                            group_id: &group_id,
+                            call_id: &call_id,
+                            user_id,
+                            reason: reason.as_str(),
+                        }
+                        .text(),
+                        Change::State { participant, .. } => Out::CallGroupState {
+                            group_id: &group_id,
+                            call_id: &call_id,
+                            participant,
+                        }
+                        .text(),
+                    };
+                    if let Some(extra) = extra {
+                        if !users.iter().any(|user| user == &extra) {
+                            users.push(extra);
+                        }
+                    }
+                    let frame: Arc<str> = Arc::from(frame);
+                    for user in users {
+                        people.fanout(&user, Arc::clone(&frame));
                     }
                 }
-                for user in users {
-                    people.fanout(&user, Arc::clone(&frame));
+                super::call::RoomKind::Direct => {
+                    let frame = match &change {
+                        Change::Joined {
+                            room_id,
+                            participant,
+                        } => Out::CallJoined {
+                            room_id,
+                            direct_id: people.rings.direct_of_room(room_id),
+                            participant,
+                        }
+                        .text(),
+                        Change::Left {
+                            room_id,
+                            user_id,
+                            reason,
+                            ..
+                        } => Out::CallLeft {
+                            room_id,
+                            direct_id: people.rings.direct_of_room(room_id),
+                            user_id,
+                            reason: reason.as_str(),
+                        }
+                        .text(),
+                        Change::State {
+                            room_id,
+                            participant,
+                        } => Out::CallState {
+                            room_id,
+                            direct_id: people.rings.direct_of_room(room_id),
+                            participant,
+                        }
+                        .text(),
+                    };
+                    let mut users = people
+                        .rings
+                        .parties(&room_id)
+                        .unwrap_or_else(|| people.calls.people(&room_id).to_vec());
+                    if let Some(extra) = extra {
+                        if !users.iter().any(|user| user == &extra) {
+                            users.push(extra);
+                        }
+                    }
+                    let frame: Arc<str> = Arc::from(frame);
+                    for user in users {
+                        people.fanout(&user, Arc::clone(&frame));
+                    }
                 }
-            } else {
-                let _ = self.ephemeral.send(frame);
+                super::call::RoomKind::Room => {
+                    let frame = match &change {
+                        Change::Joined {
+                            room_id,
+                            participant,
+                        } => Out::CallJoined {
+                            room_id,
+                            direct_id: None,
+                            participant,
+                        }
+                        .text(),
+                        Change::Left {
+                            room_id,
+                            user_id,
+                            reason,
+                            ..
+                        } => Out::CallLeft {
+                            room_id,
+                            direct_id: None,
+                            user_id,
+                            reason: reason.as_str(),
+                        }
+                        .text(),
+                        Change::State {
+                            room_id,
+                            participant,
+                        } => Out::CallState {
+                            room_id,
+                            direct_id: None,
+                            participant,
+                        }
+                        .text(),
+                    };
+                    let _ = self.ephemeral.send(Arc::from(frame));
+                }
             }
         }
     }
@@ -1070,6 +1241,338 @@ impl Hub {
         Ok(())
     }
 
+    /// Starts a group call if none is running (checking capacity for the starter first), or
+    /// resends `call.group.started` to the asker alone if one is already live.
+    pub fn start_group_call(
+        &self,
+        group_id: &str,
+        started_by: &str,
+        members: Vec<String>,
+    ) -> Result<(), Refused> {
+        let mut people = lock(&self.people);
+        if self.closing() {
+            return Err(Refused::Closing);
+        }
+        if people.group_calls.active_room(group_id).is_none() {
+            // Check capacity for the starter before starting or ringing anyone.
+            const PENDING_ROOM: &str = "g:pending";
+            people.calls.check(
+                started_by,
+                PENDING_ROOM,
+                self.limits.call_room_max,
+                self.limits.call_server_max,
+            )?;
+            self.capacity_check(&people, started_by, PENDING_ROOM)?;
+        }
+        let now = std::time::Instant::now();
+        let People {
+            users,
+            calls,
+            rings,
+            group_calls,
+            ..
+        } = &mut *people;
+        let outcome = group_calls.start(
+            group_id,
+            started_by,
+            members,
+            |uid| rings.has_user(uid) || calls.room_of(uid).is_some_and(super::call::is_group_room),
+            |uid| {
+                users
+                    .get(uid)
+                    .is_some_and(|p| !p.bot && !p.conns.is_empty())
+            },
+            |room_id| calls.participants_of(room_id),
+            now,
+        );
+        match outcome {
+            super::group_call::StartOutcome::Created { card, recipients } => {
+                send_group_started(&people, &card, &recipients);
+            }
+            super::group_call::StartOutcome::Existing { card } => {
+                send_group_started(&people, &card, &[started_by.to_string()]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rings `user_ids` in a live group call. The sender must be seated in `g:{call_id}`.
+    pub fn ring_group_call(
+        &self,
+        group_id: &str,
+        call_id: &str,
+        by: &str,
+        user_ids: &[String],
+        members: Vec<String>,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let room_id = people
+            .group_calls
+            .room_for(group_id, call_id)
+            .ok_or("not_found")?;
+        if people.calls.room_of(by) != Some(room_id.as_str()) {
+            return Err("not_found");
+        }
+        let _ = people.group_calls.join_key(group_id, Some(members));
+        let seated = people.calls.people(&room_id).to_vec();
+        let now = std::time::Instant::now();
+        let People {
+            users,
+            calls,
+            rings,
+            group_calls,
+            ..
+        } = &mut *people;
+        let events = group_calls.ring(
+            group_id,
+            call_id,
+            by,
+            user_ids,
+            &seated,
+            |uid| rings.has_user(uid) || calls.room_of(uid).is_some_and(super::call::is_group_room),
+            |uid| {
+                users
+                    .get(uid)
+                    .is_some_and(|p| !p.bot && !p.conns.is_empty())
+            },
+            now,
+        )?;
+        for event in &events {
+            send_group_ring(&people, event);
+        }
+        Ok(())
+    }
+
+    /// Stops ringing `user_ids` in a live group call. The sender must be seated in `g:{call_id}`.
+    pub fn unring_group_call(
+        &self,
+        group_id: &str,
+        call_id: &str,
+        by: &str,
+        user_ids: &[String],
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let room_id = people
+            .group_calls
+            .room_for(group_id, call_id)
+            .ok_or("not_found")?;
+        if people.calls.room_of(by) != Some(room_id.as_str()) {
+            return Err("not_found");
+        }
+        let seated_count = people.calls.people(&room_id).len();
+        let events = people.group_calls.unring(
+            group_id,
+            call_id,
+            by,
+            user_ids,
+            seated_count,
+            std::time::Instant::now(),
+        )?;
+        for event in &events {
+            send_group_ring(&people, event);
+        }
+        Ok(())
+    }
+
+    /// Stops `user_id`'s own ring in `(group_id, call_id)` on all their devices.
+    pub fn decline_group_call(
+        &self,
+        group_id: &str,
+        call_id: &str,
+        user_id: &str,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let room_id = people
+            .group_calls
+            .room_for(group_id, call_id)
+            .ok_or("not_found")?;
+        let seated_count = people.calls.people(&room_id).len();
+        let event = people.group_calls.decline(
+            group_id,
+            call_id,
+            user_id,
+            seated_count,
+            std::time::Instant::now(),
+        )?;
+        send_group_ring(&people, &event);
+        Ok(())
+    }
+
+    /// The media room `g:{call_id}` for `group_id`'s live call, or `not_found`.
+    pub fn group_join_key(
+        &self,
+        group_id: &str,
+        members: Vec<String>,
+    ) -> Result<String, &'static str> {
+        lock(&self.people)
+            .group_calls
+            .join_key(group_id, Some(members))
+            .ok_or("not_found")
+    }
+
+    /// Marks `user_id`'s ring on `group_id` as `answered` before SFU media setup begins.
+    pub fn mark_group_answered(&self, group_id: &str, user_id: &str) {
+        let mut people = lock(&self.people);
+        let seated = people
+            .group_calls
+            .active_room(group_id)
+            .map_or(0, |room_id| people.calls.people(&room_id).len());
+        if let Some(event) =
+            people
+                .group_calls
+                .mark_answered(group_id, user_id, seated, std::time::Instant::now())
+        {
+            send_group_ring(&people, &event);
+        }
+    }
+
+    /// Cancels `user_id`'s pending ring on `room_id` (used when capacity refuses their join).
+    pub fn cancel_group_ring(&self, room_id: &str, user_id: &str) {
+        let mut people = lock(&self.people);
+        let seated = people.calls.people(room_id).len();
+        if let Some(event) = people.group_calls.cancel_ring_for_room(
+            room_id,
+            user_id,
+            user_id,
+            seated,
+            std::time::Instant::now(),
+        ) {
+            send_group_ring(&people, &event);
+        }
+    }
+
+    /// Leaves only `(group_id, call_id)`, leaving any unrelated seat untouched.
+    pub fn leave_group(
+        &self,
+        group_id: &str,
+        call_id: &str,
+        user_id: &str,
+    ) -> Result<(), &'static str> {
+        let mut people = lock(&self.people);
+        let room_id = people
+            .group_calls
+            .room_for(group_id, call_id)
+            .ok_or("not_found")?;
+        let now = std::time::Instant::now();
+        let mut group_ended = Vec::new();
+        if people.calls.room_of(user_id) == Some(room_id.as_str()) {
+            let changes = people.calls.leave(user_id, Reason::Left);
+            self.tell(&mut people, changes);
+            let remaining = people.calls.people(&room_id).len();
+            if let Some(ended) = people.group_calls.on_left(&room_id, remaining, now) {
+                group_ended.push(ended);
+            }
+        } else {
+            let seated = people.calls.people(&room_id).len();
+            if let Some(event) = people
+                .group_calls
+                .cancel_ring_for_room(&room_id, user_id, user_id, seated, now)
+            {
+                send_group_ring(&people, &event);
+            }
+        }
+        self.announce_settled(people, Vec::new(), group_ended);
+        Ok(())
+    }
+
+    fn on_group_member_left(&self, group_id: &str, user_id: &str) {
+        let mut people = lock(&self.people);
+        let Some(room_id) = people.group_calls.active_room(group_id) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if people.calls.room_of(user_id) == Some(room_id.as_str()) {
+            let changes = people.calls.leave(user_id, Reason::Removed);
+            self.tell(&mut people, changes);
+        }
+        let remaining = people.calls.people(&room_id).len();
+        let (_, cancelled) = people
+            .group_calls
+            .on_member_removed(group_id, user_id, remaining, now);
+        if let Some(event) = cancelled {
+            send_group_ring(&people, &event);
+        }
+        let ended = people.group_calls.on_left(&room_id, remaining, now);
+        self.announce_settled(people, Vec::new(), ended);
+    }
+
+    fn on_group_deleted(&self, group_id: &str) {
+        let mut people = lock(&self.people);
+        let Some(room_id) = people.group_calls.active_room(group_id) else {
+            return;
+        };
+        let changes = people.calls.end_room(&room_id, Reason::RoomDeleted);
+        self.tell(&mut people, changes);
+        let ended = people
+            .group_calls
+            .end_group(group_id)
+            .map(|(_, ended)| ended);
+        self.announce_settled(people, Vec::new(), ended);
+    }
+
+    fn on_group_member_added(&self, group_id: &str, user_id: &str) {
+        let mut people = lock(&self.people);
+        let People {
+            calls, group_calls, ..
+        } = &mut *people;
+        let card = group_calls
+            .on_member_added(group_id, user_id, |room_id| calls.participants_of(room_id));
+        if let Some(card) = card {
+            send_group_started(&people, &card, &[user_id.to_string()]);
+        }
+    }
+
+    fn announce_settled(
+        &self,
+        people: MutexGuard<'_, People>,
+        notices: impl IntoIterator<Item = super::ring::Notice>,
+        group_ended: impl IntoIterator<Item = super::group_call::EndedEvent>,
+    ) {
+        let notices: Vec<_> = notices.into_iter().collect();
+        let group_ended: Vec<_> = group_ended.into_iter().collect();
+        for ended in &group_ended {
+            for ring in &ended.cancelled_rings {
+                send_group_ring(&people, ring);
+            }
+            send_group_ended(&people, ended);
+        }
+        self.announce_rings(people, notices);
+        for ended in group_ended {
+            self.record_group_call(ended);
+        }
+    }
+
+    fn record_group_call(&self, ended: super::group_call::EndedEvent) {
+        let record = ended.record;
+        tracing::info!(
+            group_id = %record.group_id,
+            call_id = %record.call_id,
+            user_id = %record.started_by,
+            outcome = record.outcome,
+            "group call ended"
+        );
+        let call = db::GroupCallRecord {
+            call_id: record.call_id,
+            group_id: record.group_id,
+            started_by: record.started_by,
+            outcome: record.outcome,
+            started_at: record.started_at,
+            people: record.people,
+        };
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            if let Err(error) = db::record_group_call(&pool, &call).await {
+                tracing::warn!(
+                    %error,
+                    group_id = %call.group_id,
+                    call_id = %call.call_id,
+                    outcome = call.outcome,
+                    "group call not recorded"
+                );
+            }
+        });
+    }
+
     fn finish_ring(
         &self,
         action: impl FnOnce(&mut super::ring::Rings) -> Result<super::ring::Notice, &'static str>,
@@ -1180,6 +1683,29 @@ impl Hub {
             let notice = people.rings.take_due(&item.id, now);
             self.announce_rings(people, notice);
         }
+
+        let mut people = lock(&self.people);
+        let swept = {
+            let People {
+                calls, group_calls, ..
+            } = &mut *people;
+            group_calls.sweep(now, |room_id| calls.people(room_id).to_vec())
+        };
+        for event in &swept.ring_events {
+            send_group_ring(&people, event);
+        }
+        let mut group_ended = swept.ended;
+        for (room_id, lone_user) in swept.alone_leaves {
+            if people.calls.room_of(&lone_user) == Some(room_id.as_str()) {
+                let changes = people.calls.leave(&lone_user, Reason::Alone);
+                self.tell(&mut people, changes);
+                let remaining = people.calls.people(&room_id).len();
+                if let Some(ended) = people.group_calls.on_left(&room_id, remaining, now) {
+                    group_ended.push(ended);
+                }
+            }
+        }
+        self.announce_settled(people, Vec::new(), group_ended);
     }
 
     /// Acts on what the SFU reports.
@@ -1220,15 +1746,36 @@ impl Hub {
                 people.slots.insert(call_id, frame);
             }
             sfu::Event::Speaking { room_id, user_ids } => {
-                let direct_id = people.rings.direct_of_room(&room_id).map(str::to_string);
-                let frame: Arc<str> = Arc::from(
-                    Out::CallSpeaking {
-                        room_id: &room_id,
-                        direct_id: direct_id.as_deref(),
-                        user_ids: &user_ids,
+                let frame: Arc<str> = match super::call::room_kind(&room_id) {
+                    super::call::RoomKind::Group => {
+                        let Some((group_id, call_id)) = people
+                            .group_calls
+                            .meta_of_room(&room_id)
+                            .map(|(gid, cid, _)| (gid.to_string(), cid.to_string()))
+                        else {
+                            return;
+                        };
+                        Arc::from(
+                            Out::CallGroupSpeaking {
+                                group_id: &group_id,
+                                call_id: &call_id,
+                                user_ids: &user_ids,
+                            }
+                            .text(),
+                        )
                     }
-                    .text(),
-                );
+                    super::call::RoomKind::Direct | super::call::RoomKind::Room => {
+                        let direct_id = people.rings.direct_of_room(&room_id).map(str::to_string);
+                        Arc::from(
+                            Out::CallSpeaking {
+                                room_id: &room_id,
+                                direct_id: direct_id.as_deref(),
+                                user_ids: &user_ids,
+                            }
+                            .text(),
+                        )
+                    }
+                };
                 for user_id in people.calls.people(&room_id) {
                     people.to_seat(user_id, frame.clone());
                 }
@@ -1245,8 +1792,9 @@ impl Hub {
                 };
                 let changes = people.calls.leave(&user_id, reason);
                 self.tell(&mut people, changes);
-                let notices = settle_direct(&mut people, room.as_deref(), &user_id, false);
-                self.announce_rings(people, notices);
+                let (notices, group_ended) =
+                    settle_calls(&mut people, room.as_deref(), &user_id, false);
+                self.announce_settled(people, notices, group_ended);
             }
             sfu::Event::Load {
                 egress_kbps,
@@ -1457,6 +2005,91 @@ fn direct_ready(people: &People, user_id: &str) -> Option<super::ring::ReadyDire
         ring_id,
         participants: people.calls.participants_of(room),
     })
+}
+
+fn send_group_started(
+    people: &People,
+    card: &super::group_call::StartedCard,
+    recipients: &[String],
+) {
+    let frame: Arc<str> = Arc::from(
+        Out::CallGroupStarted {
+            group_id: &card.group_id,
+            call_id: &card.call_id,
+            started_by: &card.started_by,
+            started_at: &card.started_at,
+            rings: &card.rings,
+            participants: &card.participants,
+        }
+        .text(),
+    );
+    for user in recipients {
+        people.fanout(user, Arc::clone(&frame));
+    }
+}
+
+fn send_group_ring(people: &People, event: &super::group_call::RingEvent) {
+    let frame: Arc<str> = Arc::from(
+        Out::CallGroupRing {
+            group_id: &event.group_id,
+            call_id: &event.call_id,
+            user_id: &event.user_id,
+            state: event.state,
+            by: &event.by,
+        }
+        .text(),
+    );
+    for user in &event.recipients {
+        people.fanout(user, Arc::clone(&frame));
+    }
+}
+
+fn send_group_ended(people: &People, ended: &super::group_call::EndedEvent) {
+    let frame: Arc<str> = Arc::from(
+        Out::CallGroupEnded {
+            group_id: &ended.group_id,
+            call_id: &ended.call_id,
+            outcome: ended.outcome,
+        }
+        .text(),
+    );
+    for user in &ended.recipients {
+        people.fanout(user, Arc::clone(&frame));
+    }
+}
+
+/// A direct or group room that just emptied writes its outcome. `end_rings` also drops rings
+/// when a ban, removal, or timeout ends membership. `call.leave` with no seat only cancels a
+/// direct ring this person placed. Leaving a community room does not.
+fn settle_calls(
+    people: &mut People,
+    room: Option<&str>,
+    user_id: &str,
+    end_rings: bool,
+) -> (Vec<super::ring::Notice>, Vec<super::group_call::EndedEvent>) {
+    let notices = settle_direct(people, room, user_id, end_rings);
+    let now = std::time::Instant::now();
+    let mut group_ended = Vec::new();
+    if let Some(room) = room {
+        if super::call::is_group_room(room) {
+            let remaining = people.calls.people(room).len();
+            if let Some(ended) = people.group_calls.on_left(room, remaining, now) {
+                group_ended.push(ended);
+            }
+        }
+    }
+    if end_rings {
+        let cancelled = {
+            let People {
+                calls, group_calls, ..
+            } = people;
+            group_calls.drop_user_rings(user_id, |r| calls.people(r).len(), now)
+        };
+        for event in &cancelled {
+            send_group_ring(people, event);
+        }
+    }
+    (notices, group_ended)
 }
 
 /// A direct room that just emptied writes its outcome. `end_rings` also drops a ring when a
@@ -1787,6 +2420,154 @@ mod tests {
             assert!(!people.has_feature("alice", "group_calls"));
             assert!(!people.seat_has_feature("alice", "group_calls"));
         }
+        hub.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_call_busy_voice_unring_capacity_and_privacy_isolation() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/group_call_unit")
+            .expect("lazy pool");
+        let limits = Limits {
+            call_room_max: Some(2),
+            ..Limits::default()
+        };
+        let hub = Hub::start(pool, limits, None);
+        let mut a = hub.join("a", false, HashSet::new());
+        let mut b = hub.join("b", false, HashSet::new());
+        let mut c = hub.join("c", false, HashSet::new());
+        let mut d = hub.join("d", false, HashSet::new());
+        let outsider = hub.join("outsider", false, HashSet::new());
+        let mut watcher = hub.ephemeral.subscribe();
+
+        // B is in a 1:1 direct call (with X), C is in a voice room.
+        hub.start_ring("d-bx", "b", "x").expect("direct ring");
+        let _ = b.direct.try_recv(); // call.ringing
+        hub.call_join(
+            "c",
+            "voice-1",
+            c.conn,
+            None,
+            0,
+            Access::default(),
+            false,
+            [3; 32],
+        )
+        .expect("c in voice room");
+        let _ = watcher.try_recv(); // voice room call.joined
+
+        let members = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        hub.start_group_call("g1", "a", members.clone())
+            .expect("start group call");
+
+        // All four members get call.group.started; B is busy, C (in voice room) and D are rung.
+        let started_a: Value =
+            serde_json::from_str(&a.direct.try_recv().expect("started a")).expect("json");
+        assert_eq!(started_a["type"], "call.group.started");
+        let call_id = started_a["call_id"].as_str().expect("call_id").to_string();
+        let state_of = |uid: &str| {
+            started_a["rings"]
+                .as_array()
+                .expect("rings")
+                .iter()
+                .find(|r| r["user_id"] == uid)
+                .and_then(|r| r["state"].as_str())
+        };
+        assert_eq!(state_of("b"), Some("busy"));
+        assert_eq!(state_of("c"), Some("ringing"));
+        assert_eq!(state_of("d"), Some("ringing"));
+        // B still got call.group.started despite being busy.
+        let started_b: Value =
+            serde_json::from_str(&b.direct.try_recv().expect("started b")).expect("json");
+        assert_eq!(started_b["type"], "call.group.started");
+        let _ = c.direct.try_recv().expect("started c");
+        let _ = d.direct.try_recv().expect("started d");
+
+        // Unring from A before A is seated is refused.
+        assert_eq!(
+            hub.unring_group_call("g1", &call_id, "a", &["d".to_string()]),
+            Err("not_found")
+        );
+
+        // A and C join the group call (g:{call_id}).
+        let room_id = super::super::group_call::room_key(&call_id);
+        hub.call_join(
+            "a",
+            &room_id,
+            a.conn,
+            None,
+            0,
+            Access::default(),
+            false,
+            [1; 32],
+        )
+        .expect("a join");
+        hub.mark_group_answered("g1", "c");
+        hub.call_join(
+            "c",
+            &room_id,
+            c.conn,
+            None,
+            0,
+            Access::default(),
+            false,
+            [3; 32],
+        )
+        .expect("c join");
+
+        // Now room_max (2) is full: D trying to join gets Refused::Full and D's ring is cancelled!
+        assert_eq!(
+            hub.call_join(
+                "d",
+                &room_id,
+                d.conn,
+                None,
+                0,
+                Access::default(),
+                false,
+                [4; 32]
+            ),
+            Err(Refused::Full)
+        );
+        // Drain D's frames and verify D received call.group.ring cancelled.
+        let mut saw_cancelled = false;
+        while let Ok(raw) = d.direct.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("json");
+            if v["type"] == "call.group.ring" && v["user_id"] == "d" && v["state"] == "cancelled" {
+                saw_cancelled = true;
+            }
+        }
+        assert!(saw_cancelled, "refused join must end the person's ring");
+
+        // ready.calls and server-wide ephemeral broadcast NEVER contain a g: room!
+        let snapshot = lock(&hub.people).calls.snapshot();
+        assert!(
+            snapshot.iter().all(|o| !o.room_id.starts_with("g:")),
+            "ready.calls leaked g: room: {snapshot:?}"
+        );
+        while let Ok(raw) = watcher.try_recv() {
+            assert!(
+                !raw.contains(&room_id) && !raw.contains("call.group."),
+                "ephemeral broadcast leaked group call frame: {raw}"
+            );
+        }
+        // Outsider has no group_calls in ready.
+        let outsider_ready = hub.join("outsider2", false, HashSet::new());
+        assert!(outsider_ready.group_calls.is_empty());
+        assert!(outsider_ready
+            .calls
+            .iter()
+            .all(|o| !o.room_id.starts_with("g:")));
+
+        // Seated A can unring a ringing member (re-add E? check unring ok on non-ringing D).
+        hub.unring_group_call("g1", &call_id, "a", &["d".to_string()])
+            .expect("unring on non-ringing is ok");
+        drop(outsider);
         hub.close();
     }
 }
