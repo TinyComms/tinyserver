@@ -3,9 +3,8 @@
 //!
 //! Every `Rtc` is driven the way str0m requires: one input, then `poll_output` until it
 //! returns a timeout. Audio frames are copied from each publisher to everyone else in the
-//! room, on the receive slot that listener keeps for them. Video goes to each listener's one
-//! video slot: the room's share while there is one, else one layer of one publisher's camera,
-//! switched on a keyframe.
+//! room, on the receive slot that listener keeps for them. Video goes to each listener's
+//! receive video slots (slot 0 main plus tile slots via `call.watch`), switched on a keyframe.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -1191,6 +1190,10 @@ impl Engine {
             })
             .unwrap_or_default();
 
+        if subs.len() > peer.screens.len() {
+            let _ = reply.send(Err(Refused::BadFrame));
+            return;
+        }
         let mut seen_slots = Vec::with_capacity(subs.len());
         let mut seen_sources: Vec<(&str, VideoKind)> = Vec::with_capacity(subs.len());
         let mut main_entry: Option<WatchEntry> = None;
@@ -1257,7 +1260,6 @@ impl Engine {
             peer.watch = Some(ordered);
         }
         self.replan = true;
-        self.plan(now);
         let _ = reply.send(Ok(()));
     }
 
@@ -1510,7 +1512,13 @@ impl Engine {
                         }
                     }
                     (_, Some((_, Layer::High | Layer::Low))) => {
-                        if explicit && idx > 0 {
+                        let pinned = peer.watch.as_ref().is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry.slot == idx
+                                    && matches!(entry.target, WatchTarget::Source { .. })
+                            })
+                        });
+                        if pinned {
                             SlotWhy::Watch
                         } else {
                             SlotWhy::Floor
@@ -2154,11 +2162,15 @@ impl Engine {
                     continue;
                 }
                 let mid = peer.screens[idx].mid;
-                let out = peer.screens[idx].rebase.map(source, time, now);
-                let Some(writer) = peer.rtc.writer(mid) else {
+                let Some(pt) = peer
+                    .rtc
+                    .writer(mid)
+                    .and_then(|writer| writer.match_params(data.params))
+                else {
                     continue;
                 };
-                let Some(pt) = writer.match_params(data.params) else {
+                let out = peer.screens[idx].rebase.map(source, time, now);
+                let Some(writer) = peer.rtc.writer(mid) else {
                     continue;
                 };
                 // Only a frame that went out moves the slot: a failed writer must not turn the
@@ -2173,6 +2185,8 @@ impl Engine {
                 if let Err(error) = writer.write(pt, data.network_time, at, data.data.clone()) {
                     tracing::warn!(call_id = %peer.call_id, direction = "video", reason = crate::rtc_reason(&error), "media failed");
                     peer.rtc.disconnect();
+                    wrote_any = true;
+                    break;
                 }
                 wrote_any = true;
                 switched_any |= switched;
@@ -2237,8 +2251,13 @@ impl Engine {
     fn plan(&mut self, now: Instant) {
         self.replan = false;
         self.planned_at = now;
-        let (mut audio_streams, mut share_streams, mut high_streams, mut low_streams) =
-            (0u64, 0u64, 0u64, 0u64);
+        let (
+            mut audio_streams,
+            mut share_streams,
+            mut high_streams,
+            mut main_low_streams,
+            mut tile_streams,
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64);
         for room in self.rooms.values() {
             let sharer = room
                 .sharer
@@ -2268,7 +2287,7 @@ impl Engine {
                             if peer.quality == Quality::High {
                                 high_streams += 1;
                             } else {
-                                low_streams += 1;
+                                main_low_streams += 1;
                             }
                         }
                     }
@@ -2282,7 +2301,7 @@ impl Engine {
                                         if entry.max.min(peer.quality) == Quality::High {
                                             high_streams += 1;
                                         } else {
-                                            low_streams += 1;
+                                            main_low_streams += 1;
                                         }
                                     }
                                 }
@@ -2303,15 +2322,15 @@ impl Engine {
                                     match kind {
                                         VideoKind::Share => share_streams += 1,
                                         VideoKind::Camera => {
-                                            let max = if entry.slot == 0 {
-                                                entry.max.min(peer.quality)
-                                            } else {
-                                                Quality::Low.min(peer.quality)
-                                            };
-                                            if max == Quality::High {
-                                                high_streams += 1;
-                                            } else if max == Quality::Low {
-                                                low_streams += 1;
+                                            if entry.slot == 0 {
+                                                let max = entry.max.min(peer.quality);
+                                                if max == Quality::High {
+                                                    high_streams += 1;
+                                                } else if max == Quality::Low {
+                                                    main_low_streams += 1;
+                                                }
+                                            } else if peer.quality != Quality::Off {
+                                                tile_streams += 1;
                                             }
                                         }
                                     }
@@ -2327,7 +2346,8 @@ impl Engine {
             audio_streams,
             share_streams,
             high_streams,
-            low_streams,
+            main_low_streams,
+            tile_streams,
         );
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
         for id in ids {
@@ -2387,6 +2407,7 @@ impl Engine {
             held: Option<Layer>,
         }
         let mut candidates: Vec<Candidate> = Vec::with_capacity(entries.len());
+        let mut seen_resolved: Vec<(PeerId, VideoKind)> = Vec::with_capacity(entries.len());
 
         let room = self.rooms.get(&peer.room_id).filter(|_| watching);
         for entry in &entries {
@@ -2428,6 +2449,7 @@ impl Engine {
                             continue;
                         }
                         if share_fits {
+                            seen_resolved.push((sharer, VideoKind::Share));
                             candidates.push(Candidate {
                                 slot: entry.slot,
                                 publisher: sharer,
@@ -2456,6 +2478,7 @@ impl Engine {
                             if max == Quality::Off {
                                 slot_empty_why[entry.slot] = EmptyWhy::Budget;
                             } else {
+                                seen_resolved.push((publisher, VideoKind::Camera));
                                 candidates.push(Candidate {
                                     slot: entry.slot,
                                     publisher,
@@ -2491,11 +2514,16 @@ impl Engine {
                         slot_empty_why[entry.slot] = EmptyWhy::NoSource;
                         continue;
                     };
+                    if seen_resolved.contains(&(publisher, *kind)) {
+                        slot_empty_why[entry.slot] = EmptyWhy::NoSource;
+                        continue;
+                    }
                     match kind {
                         VideoKind::Share => {
                             if !ceiling.share {
                                 slot_empty_why[entry.slot] = EmptyWhy::Budget;
                             } else {
+                                seen_resolved.push((publisher, VideoKind::Share));
                                 candidates.push(Candidate {
                                     slot: entry.slot,
                                     publisher,
@@ -2518,6 +2546,7 @@ impl Engine {
                             if max == Quality::Off {
                                 slot_empty_why[entry.slot] = EmptyWhy::Budget;
                             } else {
+                                seen_resolved.push((publisher, VideoKind::Camera));
                                 candidates.push(Candidate {
                                     slot: entry.slot,
                                     publisher,
@@ -2598,6 +2627,10 @@ impl Engine {
                     slot_empty_why[candidate.slot] = EmptyWhy::Link;
                 }
             }
+        }
+        if !single_candidate && probe > 0 {
+            let quantized_audio = peer.audio_kbps.div_ceil(50).saturating_mul(50);
+            probe = probe.saturating_add(quantized_audio);
         }
         probe = probe.min(video::MAX_PROBE_KBPS);
 

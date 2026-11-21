@@ -61,6 +61,7 @@ async fn direct_calls_fixture_for_client() {
             .unwrap_or_else(|_| format!("http://{addr}"));
         let app = api::app(db.runtime.clone(), live.clone(), None);
         let serving = tokio::spawn(async move { axum::serve(listener, app).await });
+        let tmp_output = format!("{output}.tmp");
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -68,7 +69,7 @@ async fn direct_calls_fixture_for_client() {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&output).expect("private fixture output");
+        let mut file = options.open(&tmp_output).expect("private fixture output");
         let fixture = json!({
             "base_url": base_url,
             "room_id": room.id,
@@ -79,10 +80,26 @@ async fn direct_calls_fixture_for_client() {
         });
         file.write_all(fixture.to_string().as_bytes()).expect("write fixture");
         file.sync_all().expect("flush fixture");
+        drop(file);
+        std::fs::rename(&tmp_output, &output).expect("publish fixture atomically");
         println!("Disposable two-member fixture ready; session values are only in the private output file.");
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
-            _ = tokio::signal::ctrl_c() => {}
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
         }
         live.close();
         serving.abort();

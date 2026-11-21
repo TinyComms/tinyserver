@@ -14,7 +14,7 @@ check_server_log() {
     fi
     awk '
         function has_kv(line, key, val) {
-            return (line ~ (key "=" val "([[:space:]]|$)")) || (line ~ (key "=\"" val "\"([[:space:]]|$)"))
+            return (line ~ ("(^|[ \t])" key "=" val "([ \t\r]|$)")) || (line ~ ("(^|[ \t])" key "=\"" val "\"([ \t\r]|$)"))
         }
         /video publish/ {
             if (has_kv($0, "source", "share") && has_kv($0, "on", "true")) {
@@ -86,24 +86,24 @@ fixture_pid=""
 
 cleanup() {
     if [ -n "$fixture_pid" ] && kill -0 "$fixture_pid" 2>/dev/null; then
-        kill -INT "$fixture_pid" 2>/dev/null || true
+        kill -TERM "$fixture_pid" 2>/dev/null || true
         i=0
-        while [ "$i" -lt 20 ] && kill -0 "$fixture_pid" 2>/dev/null; do
-            sleep 0.25
+        while [ "$i" -lt 5 ] && kill -0 "$fixture_pid" 2>/dev/null; do
+            sleep 1
             i=$((i + 1))
         done
-        if kill -0 "$fixture_pid" 2>/dev/null; then
-            kill -TERM "$fixture_pid" 2>/dev/null || true
-            sleep 0.5
-        fi
         if kill -0 "$fixture_pid" 2>/dev/null; then
             kill -KILL "$fixture_pid" 2>/dev/null || true
         fi
         wait "$fixture_pid" 2>/dev/null || true
     fi
+    fixture_pid=""
     rm -rf "$work"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Resolve the released tinyclient checkout (or an explicit branch/checkout while the probe is
 # pending release, as allowed by docs/quality-gate.md).
@@ -116,9 +116,20 @@ else
     client_ref="${TINYCLIENT_REF:-}"
     if [ -z "$client_ref" ]; then
         client_ref=$(git ls-remote --tags --refs "$client_repo" 'refs/tags/v*' \
-            | awk '{ sub("refs/tags/", "", $2); print $2 }' \
-            | sort -V \
-            | tail -n 1)
+            | "$python_bin" -c 'import re, sys
+tags = []
+for line in sys.stdin:
+    parts = line.strip().split()
+    if len(parts) < 2:
+        continue
+    tag = parts[1].replace("refs/tags/", "", 1)
+    m = re.match(r"^v(\d+)\.(\d+)\.(\d+)$", tag)
+    if m:
+        tags.append(((int(m.group(1)), int(m.group(2)), int(m.group(3))), tag))
+if tags:
+    tags.sort()
+    print(tags[-1][1])
+')
         if [ -z "$client_ref" ]; then
             echo "FAIL: could not determine latest released tinyclient tag from $client_repo" >&2
             exit 1
@@ -127,6 +138,7 @@ else
     client_dir="$work/tinyclient"
     printf '%s\n' "video-received: checking out tinyclient $client_ref from $client_repo"
     git clone --depth 1 --branch "$client_ref" "$client_repo" "$client_dir" >/dev/null 2>&1 || {
+        rm -rf "$client_dir"
         git init -q "$client_dir"
         git -C "$client_dir" fetch --depth 1 "$client_repo" "$client_ref"
         git -C "$client_dir" checkout -q FETCH_HEAD
@@ -142,10 +154,26 @@ if [ ! -f "$driver" ]; then
     exit 1
 fi
 
-printf '%s\n' "video-received: starting disposable server fixture from $repo_root"
+printf '%s\n' "video-received: building disposable server fixture from $repo_root"
+fixture_bin=$(cargo test -p api --test direct_fixture --no-run --message-format=json \
+    | "$python_bin" -c 'import json, sys
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if msg.get("reason") == "compiler-artifact" and msg.get("target", {}).get("name") == "direct_fixture" and msg.get("executable"):
+        print(msg["executable"])
+' | tail -n 1)
+if [ -z "$fixture_bin" ] || [ ! -x "$fixture_bin" ]; then
+    echo "FAIL: could not locate built direct_fixture test binary" >&2
+    exit 1
+fi
+
+printf '%s\n' "video-received: starting disposable server fixture ($fixture_bin)"
 DIRECT_CALL_FIXTURE_FILE="$fixture" \
 DIRECT_CALL_FIXTURE_SECONDS="${DIRECT_CALL_FIXTURE_SECONDS:-600}" \
-cargo test -p api --test direct_fixture direct_calls_fixture_for_client -- --ignored --exact --nocapture \
+"$fixture_bin" direct_calls_fixture_for_client --ignored --exact --nocapture \
     >"$server_log" 2>&1 &
 fixture_pid=$!
 

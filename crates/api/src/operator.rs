@@ -208,6 +208,7 @@ mod tests {
     fn read_only_live_frames() {
         assert!(read_only_frame_allowed("ping"));
         assert!(read_only_frame_allowed("call.leave"));
+        assert!(read_only_frame_allowed("call.watch"));
         assert!(!read_only_frame_allowed("call.join"));
         assert!(!read_only_frame_allowed("call.offer"));
         assert!(!read_only_frame_allowed("typing"));

@@ -371,15 +371,17 @@ pub(crate) struct Ceiling {
 
 /// The plan under the server's upload budget, counted over streams rather than listeners.
 /// Shares come first, because text on a screen matters more than a face: they fit after audio, or
-/// nobody gets one. Then cameras, with what is left: main (`high_streams`) and tiles
-/// (`low_streams`) at full rate if they fit, else all cameras on `l` if that fits, else main only
-/// on `h` or `l`, else audio only.
+/// nobody gets one. Then cameras, with what is left: main cameras (`high_streams` on `h`,
+/// `main_low_streams` already capped to `l`) and tiles (`tile_streams`, `l`-only) at full rate if
+/// they fit, else all cameras on `l` if that fits, else main only on `h`/`l` without tiles, else
+/// main only on `l` without tiles, else audio only.
 pub(crate) fn ceiling(
     budget_kbps: Option<u32>,
     audio_streams: u64,
     share_streams: u64,
     high_streams: u64,
-    low_streams: u64,
+    main_low_streams: u64,
+    tile_streams: u64,
 ) -> Ceiling {
     let Some(budget) = budget_kbps else {
         return Ceiling {
@@ -393,19 +395,20 @@ pub(crate) fn ceiling(
     let shares = audio.saturating_add(share_streams.saturating_mul(SHARE_KBPS));
     let share = shares <= budget;
     let planned = if share { shares } else { audio };
-    let fits = |high_kbps: u64, low_kbps: u64| {
+    let fits = |high_kbps: u64, main_low_kbps: u64, tile_kbps: u64| {
         planned
             .saturating_add(high_streams.saturating_mul(high_kbps))
-            .saturating_add(low_streams.saturating_mul(low_kbps))
+            .saturating_add(main_low_streams.saturating_mul(main_low_kbps))
+            .saturating_add(tile_streams.saturating_mul(tile_kbps))
             <= budget
     };
-    let (camera, tiles) = if fits(HIGH_KBPS, LOW_KBPS) {
+    let (camera, tiles) = if fits(HIGH_KBPS, LOW_KBPS, LOW_KBPS) {
         (Quality::High, true)
-    } else if low_streams > 0 && fits(LOW_KBPS, LOW_KBPS) {
+    } else if tile_streams > 0 && fits(LOW_KBPS, LOW_KBPS, LOW_KBPS) {
         (Quality::Low, true)
-    } else if fits(HIGH_KBPS, 0) {
+    } else if fits(HIGH_KBPS, LOW_KBPS, 0) {
         (Quality::High, false)
-    } else if fits(LOW_KBPS, 0) {
+    } else if fits(LOW_KBPS, LOW_KBPS, 0) {
         (Quality::Low, false)
     } else {
         (Quality::Off, false)
@@ -861,7 +864,7 @@ mod tests {
     }
 
     fn camera(budget: Option<u32>, audio: u64, viewers: u64) -> Quality {
-        ceiling(budget, audio, 0, viewers, 0).camera
+        ceiling(budget, audio, 0, viewers, 0, 0).camera
     }
 
     #[test]
@@ -876,30 +879,30 @@ mod tests {
 
     #[test]
     fn shares_are_planned_before_cameras() {
-        let all = ceiling(None, 100, 100, 100, 100);
+        let all = ceiling(None, 100, 100, 100, 0, 100);
         assert!(all.share);
         assert_eq!(all.camera, Quality::High);
         assert!(all.tiles);
         // Two share streams (8,000 each) and one camera stream, with three audio
         // streams (150): the camera fits above 16,150.
-        let roomy = ceiling(Some(17_400), 3, 2, 1, 0);
+        let roomy = ceiling(Some(17_400), 3, 2, 1, 0, 0);
         assert_eq!((roomy.share, roomy.camera), (true, Quality::High));
-        let tight = ceiling(Some(16_600), 3, 2, 1, 0);
+        let tight = ceiling(Some(16_600), 3, 2, 1, 0, 0);
         assert_eq!((tight.share, tight.camera), (true, Quality::Low));
-        let shares_only = ceiling(Some(16_200), 3, 2, 1, 0);
+        let shares_only = ceiling(Some(16_200), 3, 2, 1, 0, 0);
         assert_eq!(
             (shares_only.share, shares_only.camera),
             (true, Quality::Off)
         );
         // No room for the shares: cameras get the budget instead.
-        let cameras = ceiling(Some(2000), 3, 2, 1, 0);
+        let cameras = ceiling(Some(2000), 3, 2, 1, 0, 0);
         assert_eq!((cameras.share, cameras.camera), (false, Quality::High));
     }
 
     #[test]
     fn ceiling_counts_tile_streams_separately_from_main_and_shares() {
         // 2 audio (100) + 1 share (8,000) + 4 low tiles (1,400) = 9,500.
-        let fits_all = ceiling(Some(9_500), 2, 1, 0, 4);
+        let fits_all = ceiling(Some(9_500), 2, 1, 0, 0, 4);
         assert_eq!(
             fits_all,
             Ceiling {
@@ -909,7 +912,7 @@ mod tests {
             }
         );
         // Below 9,500: share still fits, tiles drop.
-        let share_no_tiles = ceiling(Some(8_500), 2, 1, 0, 4);
+        let share_no_tiles = ceiling(Some(8_500), 2, 1, 0, 0, 4);
         assert_eq!(
             share_no_tiles,
             Ceiling {
@@ -920,7 +923,7 @@ mod tests {
         );
         // 2 audio (100) + 1 main (1,200) + 4 tiles (1,400) = 2,700.
         assert_eq!(
-            ceiling(Some(2_700), 2, 0, 1, 4),
+            ceiling(Some(2_700), 2, 0, 1, 0, 4),
             Ceiling {
                 share: true,
                 camera: Quality::High,
@@ -929,7 +932,7 @@ mod tests {
         );
         // 1,900 fits main on Low (350) + 4 tiles (1,400) + audio (100) = 1,850.
         assert_eq!(
-            ceiling(Some(1_900), 2, 0, 1, 4),
+            ceiling(Some(1_900), 2, 0, 1, 0, 4),
             Ceiling {
                 share: true,
                 camera: Quality::Low,
@@ -938,7 +941,7 @@ mod tests {
         );
         // 1,400 fits main on High (1,200) + audio (100) = 1,300 without tiles.
         assert_eq!(
-            ceiling(Some(1_400), 2, 0, 1, 4),
+            ceiling(Some(1_400), 2, 0, 1, 0, 4),
             Ceiling {
                 share: true,
                 camera: Quality::High,
@@ -947,7 +950,7 @@ mod tests {
         );
         // 500 fits main on Low (350) + audio (100) = 450 without tiles.
         assert_eq!(
-            ceiling(Some(500), 2, 0, 1, 4),
+            ceiling(Some(500), 2, 0, 1, 0, 4),
             Ceiling {
                 share: true,
                 camera: Quality::Low,
@@ -956,11 +959,28 @@ mod tests {
         );
         // 300 fits audio only.
         assert_eq!(
-            ceiling(Some(300), 2, 0, 1, 4),
+            ceiling(Some(300), 2, 0, 1, 0, 4),
             Ceiling {
                 share: true,
                 camera: Quality::Off,
                 tiles: false,
+            }
+        );
+        // Slot-0 cameras capped at Low (e.g. `call.quality("low")`) still respect egress_kbps.
+        assert_eq!(
+            ceiling(Some(300), 2, 0, 0, 1, 0),
+            Ceiling {
+                share: true,
+                camera: Quality::Off,
+                tiles: false,
+            }
+        );
+        assert_eq!(
+            ceiling(Some(450), 2, 0, 0, 1, 0),
+            Ceiling {
+                share: true,
+                camera: Quality::High,
+                tiles: true,
             }
         );
     }

@@ -1055,10 +1055,16 @@ fn call_quality(hub: &Hub, me: &Me, video: Option<&str>) -> Answer {
 }
 
 /// Parses a `call.watch` `video` array into SFU subscriptions.
-fn parse_watch(video: Option<&serde_json::Value>) -> Result<Vec<sfu::Subscription>, &'static str> {
+fn parse_watch(
+    video: Option<&serde_json::Value>,
+    max_slots: usize,
+) -> Result<Vec<sfu::Subscription>, &'static str> {
     let Some(items) = video.and_then(serde_json::Value::as_array) else {
         return Err("bad_frame");
     };
+    if items.len() > max_slots {
+        return Err("bad_frame");
+    }
     let mut subs = Vec::with_capacity(items.len());
     for item in items {
         let Some(obj) = item.as_object() else {
@@ -1121,7 +1127,11 @@ async fn call_watch(
     asking: &mut Asking<'_>,
     video: Option<&serde_json::Value>,
 ) -> Answer {
-    let subs = parse_watch(video)?;
+    let max_slots = hub
+        .media
+        .as_ref()
+        .map_or(sfu::DEFAULT_VIDEO_SLOTS, sfu::Media::video_slots);
+    let subs = parse_watch(video, max_slots)?;
     if !asking.watches.take() {
         return Err("slow_down");
     }
@@ -1479,7 +1489,7 @@ mod tests {
             {"mid": "vR2", "user_id": "u2", "kind": "camera", "max": "low"},
             {"mid": "vR0", "user_id": "auto"}
         ]);
-        let parsed = super::parse_watch(Some(&valid)).expect("valid watch list");
+        let parsed = super::parse_watch(Some(&valid), 5).expect("valid watch list");
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].mid, "vR1");
         assert_eq!(
@@ -1494,29 +1504,33 @@ mod tests {
         assert_eq!(parsed[2].target, sfu::WatchTarget::Auto);
         assert_eq!(parsed[2].max, sfu::Quality::High);
 
-        assert_eq!(super::parse_watch(Some(&json!([]))), Ok(vec![]));
-        assert_eq!(super::parse_watch(None), Err("bad_frame"));
-        assert_eq!(super::parse_watch(Some(&json!("high"))), Err("bad_frame"));
+        assert_eq!(super::parse_watch(Some(&valid), 2), Err("bad_frame"));
+        assert_eq!(super::parse_watch(Some(&json!([])), 5), Ok(vec![]));
+        assert_eq!(super::parse_watch(None, 5), Err("bad_frame"));
+        assert_eq!(super::parse_watch(Some(&json!("high")), 5), Err("bad_frame"));
         assert_eq!(
-            super::parse_watch(Some(
-                &json!([{"mid": "", "user_id": "u1", "kind": "camera"}])
-            )),
+            super::parse_watch(
+                Some(&json!([{"mid": "", "user_id": "u1", "kind": "camera"}])),
+                5
+            ),
             Err("bad_frame")
         );
         assert_eq!(
-            super::parse_watch(Some(&json!([{"mid": "v1", "user_id": "u1"}]))),
+            super::parse_watch(Some(&json!([{"mid": "v1", "user_id": "u1"}])), 5),
             Err("bad_frame")
         );
         assert_eq!(
-            super::parse_watch(Some(
-                &json!([{"mid": "v1", "user_id": "u1", "kind": "screen"}])
-            )),
+            super::parse_watch(
+                Some(&json!([{"mid": "v1", "user_id": "u1", "kind": "screen"}])),
+                5
+            ),
             Err("bad_frame")
         );
         assert_eq!(
-            super::parse_watch(Some(
-                &json!([{"mid": "v1", "user_id": "u1", "kind": "camera", "max": "off"}])
-            )),
+            super::parse_watch(
+                Some(&json!([{"mid": "v1", "user_id": "u1", "kind": "camera", "max": "off"}])),
+                5
+            ),
             Err("bad_frame")
         );
     }
