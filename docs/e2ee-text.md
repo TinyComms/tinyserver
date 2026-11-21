@@ -50,6 +50,8 @@ Honest limit: if no member device can commit, the membership change and new send
 
 **History is not re-encrypted** when a member is removed; they keep whatever they already had.
 
+**Blocking.** Blocking another person (`PUT /v1/blocks/{user_id}`) does not remove the blocked person's devices from an encrypted direct's MLS group. The server simply stops accepting new posts, encrypted reactions, and typing from either side in that direct; existing history stays readable for both.
+
 ## 5. Wire protocol
 
 All routes need a person's bearer session. Bots are refused. Binary values are standard base64. Every request that changes state is rate limited per user.

@@ -119,6 +119,9 @@ pub enum MessageError {
     /// The conversation already holds the most pins it may (50).
     #[error("pin limit")]
     PinLimit,
+    /// The caller already holds the most blocks they may (1000).
+    #[error("block limit")]
+    BlockLimit,
     #[error("could not store the upload: {0}")]
     Store(std::io::Error),
     #[error(transparent)]
@@ -448,6 +451,48 @@ pub async fn list_pins(
     commit(tx, value).await
 }
 
+/// The caller's own block list: `[{user_id, display_name, created_at}]`.
+pub async fn list_blocks(pool: &PgPool, caller: &Caller) -> Result<Value, MessageError> {
+    let mut tx = scoped(pool, caller).await?;
+    let value = json_in(&mut tx, "SELECT app_list_blocks()", |query| query).await?;
+    commit(tx, value).await
+}
+
+/// Blocks `user_id`. Idempotent. Refuses self-block (`Invalid`), missing user (`NotFound`),
+/// and past the per-person cap (`BlockLimit`).
+pub async fn block_user(pool: &PgPool, caller: &Caller, user_id: &str) -> Result<(), MessageError> {
+    if !is_uuid(user_id) {
+        return Err(MessageError::NotFound);
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_block_user($1::uuid)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
+/// Unblocks `user_id`. Idempotent.
+pub async fn unblock_user(
+    pool: &PgPool,
+    caller: &Caller,
+    user_id: &str,
+) -> Result<(), MessageError> {
+    if !is_uuid(user_id) {
+        return Ok(());
+    }
+    let mut tx = scoped(pool, caller).await?;
+    sqlx::query("SELECT app_unblock_user($1::uuid)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(message_sql)?;
+    tx.commit().await.map_err(message_sql)?;
+    Ok(())
+}
+
 pub async fn mark_read(
     pool: &PgPool,
     caller: &Caller,
@@ -747,6 +792,7 @@ pub(crate) fn message_sql(error: sqlx::Error) -> MessageError {
         "P0E21" => MessageError::GenerationChanged,
         "P0E22" => MessageError::RepairUnavailable,
         "P0E23" => MessageError::PinLimit,
+        "P0E24" => MessageError::BlockLimit,
         "P0002" | "22P02" => MessageError::NotFound,
         "22023" | "23514" | "23503" => MessageError::Invalid,
         _ => MessageError::Database(DbError::from(error)),

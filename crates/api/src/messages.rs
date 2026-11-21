@@ -11,11 +11,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use db::{
-    clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
-    list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
-    post_message, save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction,
-    unpin_message, update_channel, upgrade_conversation, Caller, MessageError, NewAttachment,
-    PgPool, ScanEngine,
+    block_user, clear_reaction, create_channel, delete_channel, delete_message, edit_message,
+    list_blocks, list_channels, list_directs, list_messages, list_pins, mark_read, open_attachment,
+    open_direct, pin_message, post_message, save_attachment, save_sealed_attachment,
+    set_channel_override, toggle_reaction, unblock_user, unpin_message, update_channel,
+    upgrade_conversation, Caller, MessageError, NewAttachment, PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -47,6 +47,11 @@ pub fn routes() -> Router<PgPool> {
             axum::routing::put(put_override).delete(remove_override),
         )
         .route("/v1/directs", get(directs).post(add_direct))
+        .route("/v1/blocks", get(blocks))
+        .route(
+            "/v1/blocks/{user_id}",
+            axum::routing::put(put_block).delete(delete_block),
+        )
         .route(
             "/v1/conversations/{id}/messages",
             // A ciphertext post is up to 20 KiB, 27 KiB as base64.
@@ -184,6 +189,7 @@ pub(crate) enum Error {
     GenerationChanged,
     RepairUnavailable,
     PinLimit,
+    BlockLimit,
 }
 
 impl IntoResponse for Error {
@@ -224,6 +230,7 @@ impl IntoResponse for Error {
             Self::GenerationChanged => (StatusCode::CONFLICT, "generation_changed"),
             Self::RepairUnavailable => (StatusCode::CONFLICT, "repair_unavailable"),
             Self::PinLimit => (StatusCode::CONFLICT, "pin_limit"),
+            Self::BlockLimit => (StatusCode::CONFLICT, "block_limit"),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
@@ -265,6 +272,7 @@ pub(crate) fn message_reason(error: &Error) -> &'static str {
         Error::GenerationChanged => "generation_changed",
         Error::RepairUnavailable => "repair_unavailable",
         Error::PinLimit => "pin_limit",
+        Error::BlockLimit => "block_limit",
     }
 }
 
@@ -313,6 +321,7 @@ pub(crate) fn lift(error: MessageError) -> Error {
         MessageError::GenerationChanged => Error::GenerationChanged,
         MessageError::RepairUnavailable => Error::RepairUnavailable,
         MessageError::PinLimit => Error::PinLimit,
+        MessageError::BlockLimit => Error::BlockLimit,
         MessageError::Store(error) => {
             tracing::warn!(%error, "attachment store failed");
             Error::Unavailable
@@ -429,6 +438,31 @@ async fn remove_override(
 async fn directs(State(pool): State<PgPool>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
     list_directs(&pool, &caller).await.map(signed).map_err(lift)
+}
+
+async fn blocks(State(pool): State<PgPool>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    let caller = member(&pool, &headers).await?;
+    list_blocks(&pool, &caller).await.map(Json).map_err(lift)
+}
+
+async fn put_block(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    block_user(&pool, &caller, &user_id).await.map_err(lift)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_block(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<StatusCode, Error> {
+    let caller = member(&pool, &headers).await?;
+    unblock_user(&pool, &caller, &user_id).await.map_err(lift)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn add_direct(

@@ -4923,6 +4923,7 @@ dependencies = [
  "str0m",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
