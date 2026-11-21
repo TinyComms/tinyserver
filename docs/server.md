@@ -188,7 +188,7 @@ The server keeps `TINYSERVER_DB_POOL` Postgres connections (default 16, at least
 | `POST /v1/categories` | manage_channels | `{name}` → 201, placed last |
 | `PATCH /v1/categories/{id}` | manage_channels | `{name}` |
 | `DELETE /v1/categories/{id}` | manage_channels | 204. Its rooms become uncategorized. |
-| `PUT /v1/layout` | manage_channels | `{categories: [{id, room_ids}]}`: the categories in order, `id: null` for the uncategorized rooms, which always come first, and each bucket's rooms in order. Rooms and categories left out keep their place. → `{categories, rooms}` |
+| `PUT /v1/layout` | manage_channels (and manage_channels in every room and channel moved) | `{categories: [{id, items: [{kind: "channel" \| "room", id}]}]}` or legacy `{categories: [{id, room_ids}]}` (both in one bucket is `400 invalid`): the categories in order, `id: null` for uncategorized items, and each bucket's text channels and voice rooms in one shared position order. Items and categories left out keep their place. Legacy `room_ids` leaves text channels untouched; on equal position, a client draws text before voice. Capability: `channel_layout`. → `{categories, rooms, channels: [{id, category_id, position}]}` (for channels the caller can view). |
 
 ### Rooms
 
@@ -255,8 +255,8 @@ Live frames for these objects are in [`calls.md`](calls.md#messages): `channel.c
 
 | Route | Who | |
 | --- | --- | --- |
-| `GET /v1/channels` | view_channel on each | Channels the caller can view, ordered by `position`, `name`, `id`. Each row adds `my_permissions`: the caller's bits in that channel, the same number every channel permission check uses; an owner has every bit. `PUT /v1/layout` does not move these. |
-| `POST /v1/channels` | manage_channels | `{name, category_id?, topic?, position?}` → `201` channel. Name 1 to 80 characters. Topic up to 1024, empty when left out. Position defaults to 0. Audited `channel.create`. |
+| `GET /v1/channels` | view_channel on each | Channels the caller can view, ordered by `position`, `name`, `id`. Each row adds `my_permissions`: the caller's bits in that channel, the same number every channel permission check uses; an owner has every bit. `PUT /v1/layout` orders and files these alongside voice rooms. |
+| `POST /v1/channels` | manage_channels | `{name, category_id?, topic?, position?}` → `201` channel. Name 1 to 80 characters. Topic up to 1024, empty when left out. When `position` is omitted, placed after the last text channel or voice room in its category. Audited `channel.create`. |
 | `PATCH /v1/channels/{id}` | manage_channels in that channel | Any of `name`, `topic` (`null` clears to empty), `position`, `category_id` (`null` uncategorized). Audited `channel.update`. |
 | `DELETE /v1/channels/{id}` | manage_channels in that channel | `204`. Messages go with the channel. Attachment files are deleted. Audited `channel.delete`. |
 | `PUT /v1/channels/{id}/overrides/{role_id}` | manage_roles, and manage_channels in the channel, role below the caller | `{allow, deny}`. Bits outside `2343551` are dropped. A bit in both is allowed. Returns the channel. Audited `channel.override`. |

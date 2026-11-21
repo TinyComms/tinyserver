@@ -7,7 +7,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, put};
 use axum::{Json, Router};
-use db::{LayoutBucket, NewRole, PgPool, RolePatch, ServerPatch};
+use db::{LayoutBucket, LayoutItem, LayoutKind, NewRole, PgPool, RolePatch, ServerPatch};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -35,6 +35,7 @@ pub const FEATURES: &[&str] = &[
     "e2ee_group_generations",
     "presence_status",
     "pins",
+    "channel_layout",
 ];
 
 pub fn routes() -> Router<PgPool> {
@@ -440,11 +441,53 @@ struct LayoutBody {
 }
 
 #[derive(Deserialize)]
+struct LayoutItemBody {
+    kind: String,
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct BucketBody {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
-    room_ids: Vec<String>,
+    room_ids: Option<Vec<String>>,
+    #[serde(default)]
+    items: Option<Vec<LayoutItemBody>>,
+}
+
+fn parse_buckets(body: LayoutBody) -> Result<Vec<LayoutBucket>, ApiError> {
+    body.categories
+        .into_iter()
+        .map(|bucket| {
+            let items = match (bucket.room_ids, bucket.items) {
+                (Some(_), Some(_)) => return Err(ApiError::Invalid),
+                (Some(room_ids), None) => room_ids
+                    .into_iter()
+                    .map(|id| LayoutItem {
+                        kind: LayoutKind::Room,
+                        id,
+                    })
+                    .collect(),
+                (None, Some(items)) => items
+                    .into_iter()
+                    .map(|item| {
+                        let kind = match item.kind.as_str() {
+                            "channel" => LayoutKind::Channel,
+                            "room" => LayoutKind::Room,
+                            _ => return Err(ApiError::Invalid),
+                        };
+                        Ok(LayoutItem { kind, id: item.id })
+                    })
+                    .collect::<Result<Vec<_>, ApiError>>()?,
+                (None, None) => Vec::new(),
+            };
+            Ok(LayoutBucket {
+                category_id: bucket.id,
+                items,
+            })
+        })
+        .collect()
 }
 
 async fn layout(
@@ -453,14 +496,7 @@ async fn layout(
     Json(body): Json<LayoutBody>,
 ) -> Result<Json<Value>, ApiError> {
     let caller = caller(&pool, &headers).await?;
-    let buckets: Vec<LayoutBucket> = body
-        .categories
-        .into_iter()
-        .map(|bucket| LayoutBucket {
-            category_id: bucket.id,
-            room_ids: bucket.room_ids,
-        })
-        .collect();
+    let buckets = parse_buckets(body)?;
     let layout = db::set_layout(&pool, &caller, &buckets)
         .await
         .map_err(lift)?;
@@ -468,4 +504,64 @@ async fn layout(
     serde_json::to_value(layout)
         .map(Json)
         .map_err(|_| ApiError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_buckets, LayoutBody};
+    use db::{LayoutItem, LayoutKind};
+
+    #[test]
+    fn layout_body_accepts_room_ids_or_mixed_items_and_rejects_both() {
+        let legacy: LayoutBody = serde_json::from_str(
+            r#"{"categories":[{"id":null,"room_ids":["r1","r2"]}]}"#,
+        )
+        .expect("legacy");
+        let buckets = parse_buckets(legacy).ok().expect("parse legacy");
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(
+            buckets[0].items,
+            vec![
+                LayoutItem {
+                    kind: LayoutKind::Room,
+                    id: "r1".into()
+                },
+                LayoutItem {
+                    kind: LayoutKind::Room,
+                    id: "r2".into()
+                },
+            ]
+        );
+
+        let mixed: LayoutBody = serde_json::from_str(
+            r#"{"categories":[{"id":"c1","items":[{"kind":"channel","id":"ch1"},{"kind":"room","id":"r1"}]}]}"#,
+        )
+        .expect("mixed");
+        let buckets = parse_buckets(mixed).ok().expect("parse mixed");
+        assert_eq!(
+            buckets[0].items,
+            vec![
+                LayoutItem {
+                    kind: LayoutKind::Channel,
+                    id: "ch1".into()
+                },
+                LayoutItem {
+                    kind: LayoutKind::Room,
+                    id: "r1".into()
+                },
+            ]
+        );
+
+        let both: LayoutBody = serde_json::from_str(
+            r#"{"categories":[{"id":null,"room_ids":["r1"],"items":[{"kind":"room","id":"r1"}]}]}"#,
+        )
+        .expect("both");
+        assert!(parse_buckets(both).is_err());
+
+        let bad_kind: LayoutBody = serde_json::from_str(
+            r#"{"categories":[{"id":null,"items":[{"kind":"voice","id":"r1"}]}]}"#,
+        )
+        .expect("bad kind");
+        assert!(parse_buckets(bad_kind).is_err());
+    }
 }

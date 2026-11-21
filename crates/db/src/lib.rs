@@ -107,8 +107,8 @@ pub use scan::{FakeEngine, ScanEngine, ScanVerdict};
 pub use server::{
     create_category, delete_category, delete_icon, ensure_manage_server, get_icon, get_server,
     list_categories, rename_category, set_icon, set_layout, sniff_image, update_server, Category,
-    Icon, Layout, LayoutBucket, ServerPatch, ServerSettings, FILE_MAX_DEFAULT, ICON_MAX,
-    IMAGE_MAX_DEFAULT, UPLOAD_MAX,
+    Icon, Layout, LayoutBucket, LayoutChannel, LayoutItem, LayoutKind, ServerPatch, ServerSettings,
+    FILE_MAX_DEFAULT, ICON_MAX, IMAGE_MAX_DEFAULT, UPLOAD_MAX,
 };
 pub use session::{
     close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,

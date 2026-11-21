@@ -128,7 +128,7 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `roles.reordered` | `seq`, `role_ids` | Durable. Most senior first. |
 | `category.created`, `category.updated` | `seq`, `category {id, name, position}` | Durable |
 | `category.deleted` | `seq`, `category_id` | Durable. Its rooms are uncategorized now. |
-| `layout.updated` | `seq`, `categories`, `rooms` | Durable. The order after `PUT /v1/layout`. |
+| `layout.updated` | `seq`, `categories`, `rooms` | Durable. The order after `PUT /v1/layout`. Carries categories and rooms only (never text channels, so private channels are not leaked); each moved text channel emits `channel.updated`, narrowed to its viewers. |
 | `room.created`, `room.updated`, `room.renamed` | `seq`, `room {id, name, created_by, created_at, category_id, position, topic, user_limit, bitrate_kbps, ptt_only, video_enabled, overrides}` | Durable. `GET /v1/rooms` without `my_permissions`, which differs per person: refetch. Any change sends `room.updated`; a name change also sends `room.renamed` first, for clients from before `room.updated`. An override change sends `room.updated`. |
 | `room.deleted` | `seq`, `room_id` | Durable. Ends that room's call: everyone in it gets `call.left {reason: "room_deleted"}`. |
 | `member.joined`, `member.role`, `member.roles`, `member.renamed` | `seq`, `member {user_id, display_name, role, owner, roles}` | Durable. No email; `GET /v1/members` has it. `role` is the legacy string or the owner flag. Setting the owner flag emits `member.role` and does not emit `member.roles`. Replacing role ids emits `member.roles`, and emits `member.role` as well only when the legacy string changed. Setting the legacy role emits both. `member.renamed` is a display name change. |

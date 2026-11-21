@@ -327,8 +327,7 @@ pub async fn create_room(
         "INSERT INTO rooms (name, created_by, category_id, position, topic, user_limit,
                             bitrate_kbps, ptt_only, video_enabled, e2ee_required)
          VALUES ($1, $2::uuid, $3::uuid,
-                 (SELECT coalesce(max(position) + 1, 0) FROM rooms
-                  WHERE category_id IS NOT DISTINCT FROM $3::uuid),
+                 app_category_next_position($3::uuid),
                  coalesce($4, ''), coalesce($5, 0), coalesce($6, 64), coalesce($7, false),
                  coalesce($8, true), coalesce($9, false))
          RETURNING id::text",
