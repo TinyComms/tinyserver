@@ -22,7 +22,10 @@ async fn blocking_stops_directs_rings_and_unread_and_stays_private() {
         let app = api::router(db.runtime.clone(), None);
 
         // Capability is advertised.
-        let (status, caps) = Call::new(Method::GET, "/v1/capabilities").send(&app).await;
+        let (status, caps) = Call::new(Method::GET, "/v1/capabilities")
+            .token(&owner_token)
+            .send(&app)
+            .await;
         assert_eq!(status, StatusCode::OK);
         assert!(caps["features"]
             .as_array()

@@ -173,11 +173,14 @@ async fn previews_validate_store_bind_images_and_clear_on_edit_and_delete() {
         assert_eq!(previews[0]["image_attachment_id"], alice_img_id);
 
         // Bob can download the preview image via /v1/media/{id} because he can view the channel.
-        let (status, _) = Call::new(Method::GET, &format!("/v1/media/{alice_img_id}"))
-            .token(&bob_token)
-            .send(&app)
-            .await;
-        assert_eq!(status, StatusCode::OK);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v1/media/{alice_img_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {bob_token}"))
+            .body(Body::empty())
+            .expect("request");
+        let res = app.clone().oneshot(req).await.expect("response");
+        assert_eq!(res.status(), StatusCode::OK);
 
         // Editing the message to remove the URL clears the preview automatically.
         let (status, edited) = Call::new(Method::PATCH, &format!("/v1/messages/{msg_id}"))

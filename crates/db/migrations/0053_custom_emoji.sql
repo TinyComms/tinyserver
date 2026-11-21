@@ -360,6 +360,7 @@ DECLARE
     v_channel uuid;
     v_direct uuid;
     v_deleted timestamptz;
+    v_e2ee boolean;
     v_kind text;
     v_low uuid;
     v_high uuid;
@@ -369,10 +370,14 @@ DECLARE
 BEGIN
     PERFORM app_emoji_ok(p_emoji);
     PERFORM app_msg_voice();
-    SELECT channel_id, direct_id, deleted_at INTO v_channel, v_direct, v_deleted
+    SELECT channel_id, direct_id, deleted_at, e2ee
+    INTO v_channel, v_direct, v_deleted, v_e2ee
     FROM messages WHERE id = p_message;
     IF NOT FOUND OR v_deleted IS NOT NULL THEN
         RAISE EXCEPTION 'not found' USING ERRCODE = 'P0002';
+    END IF;
+    IF v_e2ee THEN
+        RAISE EXCEPTION 'e2ee required' USING ERRCODE = 'P0E01';
     END IF;
     v_conv := coalesce(v_channel, v_direct);
     SELECT kind, low_user_id, high_user_id INTO v_kind, v_low, v_high

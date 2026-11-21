@@ -97,7 +97,7 @@ async fn a_room_the_owner_makes_reaches_a_member() {
                 "created_by": owner.user_id,
                 "created_at": made.created_at,
                 "category_id": null,
-                "position": 0,
+                "position": 1,
                 "topic": "",
                 "user_limit": 0,
                 "bitrate_kbps": 64,

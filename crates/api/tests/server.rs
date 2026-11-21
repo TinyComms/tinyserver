@@ -1696,7 +1696,7 @@ async fn layout_orders_text_channels_and_rooms_together_and_respects_permissions
             .as_array()
             .expect("roles")
             .iter()
-            .find(|r| r["is_default"] == true)
+            .find(|r| r["default"] == true)
             .and_then(|r| r["id"].as_str())
             .expect("everyone role")
             .to_string();

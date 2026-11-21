@@ -235,7 +235,7 @@ async fn channel_threads_filtering_summary_read_cursor_follows_and_permissions()
             .as_array()
             .expect("roles")
             .iter()
-            .find(|r| r["is_default"] == true)
+            .find(|r| r["default"] == true)
             .expect("everyone")["id"]
             .as_str()
             .expect("id")
