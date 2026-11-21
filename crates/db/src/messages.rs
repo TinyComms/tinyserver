@@ -125,6 +125,27 @@ pub enum MessageError {
     Database(#[from] DbError),
 }
 
+/// One mention span in a plaintext message. Offsets are UTF-8 byte offsets into the trimmed body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionInput {
+    pub kind: String,
+    pub id: Option<String>,
+    pub start: i32,
+    pub end: i32,
+}
+
+/// A plaintext message post.
+pub struct NewMessage<'a> {
+    pub body: &'a str,
+    pub reply_to: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+    pub attachments: &'a [String],
+    pub mentions: Option<&'a [MentionInput]>,
+}
+
+/// Maximum number of mention entries accepted on one message.
+pub const MENTIONS_MAX: usize = 50;
+
 /// One file a member is uploading. Bytes are written next to the row, under the upload directory.
 pub struct NewAttachment {
     pub name: String,
@@ -312,32 +333,35 @@ pub async fn post_message(
     pool: &PgPool,
     caller: &Caller,
     conversation: &str,
-    body: &str,
-    reply_to: Option<&str>,
-    client_id: Option<&str>,
-    attachments: &[String],
+    input: &NewMessage<'_>,
 ) -> Result<Value, MessageError> {
-    let reply_to = blank_to_none(reply_to);
+    let reply_to = blank_to_none(input.reply_to);
     if let Some(reply_to) = reply_to {
         if !is_uuid(reply_to) {
             return Err(MessageError::Invalid);
         }
     }
-    let client_id = blank_to_none(client_id);
-    let attachments = uuid_list(attachments)?;
+    let client_id = blank_to_none(input.client_id);
+    let attachments = uuid_list(input.attachments)?;
+    let mentions_json = match input.mentions {
+        Some(list) => Some(prepare_mentions(input.body.trim(), list)?),
+        None => None,
+    };
     let mut tx = scoped(pool, caller).await?;
     let value = json_in(
         &mut tx,
         "SELECT app_post_message($1::uuid, $2, $3::uuid, $4,
             CASE WHEN $5::text[] IS NULL THEN NULL
-            ELSE (SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($5::text[]) AS item) END)",
+            ELSE (SELECT coalesce(array_agg(item::uuid), '{}') FROM unnest($5::text[]) AS item) END,
+            $6)",
         |query| {
             query
                 .bind(conversation)
-                .bind(body)
+                .bind(input.body)
                 .bind(reply_to)
                 .bind(client_id)
                 .bind(attachments)
+                .bind(mentions_json)
         },
     )
     .await?;
@@ -349,13 +373,59 @@ pub async fn edit_message(
     caller: &Caller,
     id: &str,
     body: &str,
+    mentions: Option<&[MentionInput]>,
 ) -> Result<Value, MessageError> {
+    let mentions_json = match mentions {
+        Some(list) => Some(prepare_mentions(body.trim(), list)?),
+        None => None,
+    };
     let mut tx = scoped(pool, caller).await?;
-    let value = json_in(&mut tx, "SELECT app_edit_message($1::uuid, $2)", |query| {
-        query.bind(id).bind(body)
-    })
+    let value = json_in(
+        &mut tx,
+        "SELECT app_edit_message($1::uuid, $2, $3)",
+        |query| query.bind(id).bind(body).bind(mentions_json),
+    )
     .await?;
     commit(tx, value).await
+}
+
+/// Validates mention entries and drops spans that fall outside `body` or split a UTF-8 code point.
+/// More than [`MENTIONS_MAX`] entries or an unknown `kind` is [`MessageError::Invalid`].
+fn prepare_mentions(body: &str, mentions: &[MentionInput]) -> Result<Value, MessageError> {
+    if mentions.len() > MENTIONS_MAX {
+        return Err(MessageError::Invalid);
+    }
+    let mut out = Vec::with_capacity(mentions.len());
+    for entry in mentions {
+        if !matches!(entry.kind.as_str(), "user" | "role" | "everyone") {
+            return Err(MessageError::Invalid);
+        }
+        let Ok(start) = usize::try_from(entry.start) else {
+            continue;
+        };
+        let Ok(end) = usize::try_from(entry.end) else {
+            continue;
+        };
+        if start >= end
+            || end > body.len()
+            || !body.is_char_boundary(start)
+            || !body.is_char_boundary(end)
+        {
+            continue;
+        }
+        let mut obj = Map::new();
+        obj.insert("kind".to_string(), Value::String(entry.kind.clone()));
+        if entry.kind != "everyone" {
+            let Some(id) = entry.id.as_deref().map(str::trim).filter(|s| is_uuid(s)) else {
+                continue;
+            };
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+        obj.insert("start".to_string(), Value::from(entry.start));
+        obj.insert("end".to_string(), Value::from(entry.end));
+        out.push(Value::Object(obj));
+    }
+    Ok(Value::Array(out))
 }
 
 pub async fn delete_message(
@@ -1241,4 +1311,75 @@ mod tests {
     }
 
     const FILE_MAX_PLUS: usize = super::FILE_MAX_DEFAULT as usize + 1;
+
+    #[test]
+    fn mentions_drop_bad_spans_and_reject_over_limit_or_unknown_kind() {
+        let uid = "11111111-1111-4111-8111-111111111111".to_string();
+        let body = "hi @Mara 🎉";
+        let prepared = super::prepare_mentions(
+            body,
+            &[
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some(uid.clone()),
+                    start: 3,
+                    end: 8,
+                },
+                // Out of bounds: dropped.
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some(uid.clone()),
+                    start: 0,
+                    end: 99,
+                },
+                // Splits the 4-byte emoji: dropped.
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some(uid.clone()),
+                    start: 9,
+                    end: 10,
+                },
+                // Bad uuid: dropped.
+                super::MentionInput {
+                    kind: "user".into(),
+                    id: Some("not-a-uuid".into()),
+                    start: 0,
+                    end: 2,
+                },
+                // Valid everyone.
+                super::MentionInput {
+                    kind: "everyone".into(),
+                    id: None,
+                    start: 0,
+                    end: 2,
+                },
+            ],
+        )
+        .expect("ok");
+        assert_eq!(prepared.as_array().map(Vec::len), Some(2));
+
+        let unknown = super::prepare_mentions(
+            body,
+            &[super::MentionInput {
+                kind: "channel".into(),
+                id: None,
+                start: 0,
+                end: 2,
+            }],
+        );
+        assert!(matches!(unknown, Err(MessageError::Invalid)));
+
+        let too_many: Vec<_> = (0..=super::MENTIONS_MAX)
+            .map(|_| super::MentionInput {
+                kind: "everyone".into(),
+                id: None,
+                start: 0,
+                end: 2,
+            })
+            .collect();
+        assert!(matches!(
+            super::prepare_mentions(body, &too_many),
+            Err(MessageError::Invalid)
+        ));
+    }
 }

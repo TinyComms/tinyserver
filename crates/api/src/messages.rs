@@ -14,8 +14,8 @@ use db::{
     clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
     list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
     post_message, save_attachment, save_sealed_attachment, set_channel_override, toggle_reaction,
-    unpin_message, update_channel, upgrade_conversation, Caller, MessageError, NewAttachment,
-    PgPool, ScanEngine,
+    unpin_message, update_channel, upgrade_conversation, Caller, MentionInput, MessageError,
+    NewAttachment, NewMessage, PgPool, ScanEngine,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -100,12 +100,32 @@ struct PageQuery {
 }
 
 #[derive(Deserialize)]
+struct MentionBody {
+    kind: String,
+    id: Option<String>,
+    start: i32,
+    end: i32,
+}
+
+impl From<MentionBody> for MentionInput {
+    fn from(m: MentionBody) -> Self {
+        Self {
+            kind: m.kind,
+            id: m.id,
+            start: m.start,
+            end: m.end,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct PostBody {
     generation: Option<u64>,
     body: Option<String>,
     reply_to: Option<String>,
     client_id: Option<String>,
     attachment_ids: Option<Vec<String>>,
+    mentions: Option<Vec<MentionBody>>,
     // An encrypted conversation takes these and no body. See docs/e2ee-text.md.
     ciphertext: Option<String>,
     epoch: Option<u64>,
@@ -117,6 +137,7 @@ struct PostBody {
 #[derive(Deserialize)]
 struct EditBody {
     body: String,
+    mentions: Option<Vec<MentionBody>>,
 }
 
 #[derive(Deserialize)]
@@ -500,7 +521,7 @@ async fn add_message(
                 client_id: body.client_id.as_deref(),
                 reply_to: body.reply_to.as_deref(),
                 attachments: &attachments,
-                has_body: body.body.is_some(),
+                has_body: body.body.is_some() || body.mentions.is_some(),
             },
         )
         .await
@@ -508,14 +529,20 @@ async fn add_message(
             message_failed(&caller.user_id, &id, error);
         });
     }
+    let mentions: Option<Vec<MentionInput>> = body
+        .mentions
+        .map(|list| list.into_iter().map(MentionInput::from).collect());
     let message = post_message(
         &pool,
         &caller,
         &id,
-        body.body.as_deref().unwrap_or(""),
-        body.reply_to.as_deref(),
-        body.client_id.as_deref(),
-        &attachments,
+        &NewMessage {
+            body: body.body.as_deref().unwrap_or(""),
+            reply_to: body.reply_to.as_deref(),
+            client_id: body.client_id.as_deref(),
+            attachments: &attachments,
+            mentions: mentions.as_deref(),
+        },
     )
     .await
     .map_err(|error| {
@@ -533,7 +560,10 @@ async fn edit(
     Json(body): Json<EditBody>,
 ) -> Result<Json<Value>, Error> {
     let caller = member(&pool, &headers).await?;
-    edit_message(&pool, &caller, &id, &body.body)
+    let mentions: Option<Vec<MentionInput>> = body
+        .mentions
+        .map(|list| list.into_iter().map(MentionInput::from).collect());
+    edit_message(&pool, &caller, &id, &body.body, mentions.as_deref())
         .await
         .map(signed)
         .map_err(|error| {

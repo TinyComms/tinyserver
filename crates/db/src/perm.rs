@@ -27,9 +27,12 @@ pub const MANAGE_REPORTS: i64 = 1 << 20;
 /// Deletes another member's message in a channel the holder can view. A direct stays author-only.
 /// In the room override mask, not in @everyone.
 pub const MANAGE_MESSAGES: i64 = 1 << 21;
+/// Allows mentioning `@everyone` and non-mentionable roles in a channel. In the room override
+/// mask, not in @everyone.
+pub const MENTION_EVERYONE: i64 = 1 << 22;
 
 /// Every bit this server knows. Unknown bits in a request are dropped.
-pub const ALL: i64 = (1 << 22) - 1;
+pub const ALL: i64 = (1 << 23) - 1;
 const _: () = assert!(ALL < 1 << 53, "permissions must fit in a JSON number");
 
 /// The bits a room override may allow or deny.
@@ -45,7 +48,8 @@ pub const CHANNEL: i64 = VIEW_CHANNEL
     | DEAFEN_MEMBERS
     | MOVE_MEMBERS
     | DISCONNECT_MEMBERS
-    | MANAGE_MESSAGES;
+    | MANAGE_MESSAGES
+    | MENTION_EVERYONE;
 
 /// What @everyone has on a new server.
 pub const EVERYONE: i64 = VIEW_CHANNEL | CONNECT | SPEAK | VIDEO | SHARE_SCREEN | VOICE_ACTIVITY;
@@ -78,13 +82,16 @@ mod tests {
 
     #[test]
     fn the_masks_match_the_sql() {
-        assert_eq!(ALL, 4_194_303);
+        assert_eq!(ALL, 8_388_607);
         assert_eq!(MANAGE_REPORTS, 1_048_576);
         assert_eq!(MANAGE_MESSAGES, 2_097_152);
+        assert_eq!(MENTION_EVERYONE, 4_194_304);
         // Not something a member has by default, but something a room can override.
         assert_eq!(EVERYONE & MANAGE_MESSAGES, 0);
         assert_eq!(CHANNEL & MANAGE_MESSAGES, MANAGE_MESSAGES);
-        assert_eq!(CHANNEL, 2_343_551);
+        assert_eq!(EVERYONE & MENTION_EVERYONE, 0);
+        assert_eq!(CHANNEL & MENTION_EVERYONE, MENTION_EVERYONE);
+        assert_eq!(CHANNEL, 6_537_855);
         assert_eq!(EVERYONE, 63);
     }
 

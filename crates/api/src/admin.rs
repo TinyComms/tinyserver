@@ -35,6 +35,7 @@ pub const FEATURES: &[&str] = &[
     "e2ee_group_generations",
     "presence_status",
     "pins",
+    "mentions",
 ];
 
 pub fn routes() -> Router<PgPool> {
@@ -244,6 +245,8 @@ struct RoleBody {
     permissions: Option<u64>,
     #[serde(default)]
     hoist: Option<bool>,
+    #[serde(default)]
+    mentionable: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +259,8 @@ struct RolePatchBody {
     permissions: Option<u64>,
     #[serde(default)]
     hoist: Option<bool>,
+    #[serde(default)]
+    mentionable: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -282,6 +287,7 @@ async fn add_role(
         color: body.color,
         permissions: body.permissions.map(bits),
         hoist: body.hoist,
+        mentionable: body.mentionable,
     };
     let role = db::create_role(&pool, &caller, &input)
         .await
@@ -302,6 +308,7 @@ async fn edit_role(
         color: body.color,
         permissions: body.permissions.map(bits),
         hoist: body.hoist,
+        mentionable: body.mentionable,
     };
     let role = db::update_role(&pool, &caller, &id, &patch)
         .await
