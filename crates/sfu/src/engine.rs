@@ -77,10 +77,72 @@ const LOSS_SPAN: Duration = Duration::from_secs(1);
 /// Who is speaking and which TCP streams expired are looked at this often. They scan every
 /// room and stream, and the loop turns thousands of times a second under load.
 const SCAN_EVERY: Duration = Duration::from_millis(50);
+/// How long a listener's video slot must stay empty or unsatisfied before logging `video slot empty`.
+const EMPTY_LOG_AFTER: Duration = Duration::from_secs(3);
+/// At most one `keyframe asks` info line per publisher layer every 5 s while non-zero.
+const KEYFRAME_ASKS_EVERY: Duration = Duration::from_secs(5);
 
 type PeerId = u64;
 /// One layer of one publisher's camera, or their share.
 type Source = (PeerId, Layer);
+
+/// Why a listener's video slot changed what it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotWhy {
+    ShareStarted,
+    ShareStopped,
+    Floor,
+    LayerUp,
+    LayerDown,
+    PublisherLeft,
+    Deafened,
+    QualityOff,
+    Link,
+    Budget,
+    NoSource,
+}
+
+impl SlotWhy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ShareStarted => "share_started",
+            Self::ShareStopped => "share_stopped",
+            Self::Floor => "floor",
+            Self::LayerUp => "layer_up",
+            Self::LayerDown => "layer_down",
+            Self::PublisherLeft => "publisher_left",
+            Self::Deafened => "deafened",
+            Self::QualityOff => "quality_off",
+            Self::Link => "link",
+            Self::Budget => "budget",
+            Self::NoSource => "no_source",
+        }
+    }
+}
+
+/// Why a listener's video slot is empty or still waiting for its wanted source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyWhy {
+    Deafened,
+    QualityOff,
+    Link,
+    Budget,
+    NoSource,
+    WaitingKeyframe,
+}
+
+impl EmptyWhy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Deafened => "deafened",
+            Self::QualityOff => "quality_off",
+            Self::Link => "link",
+            Self::Budget => "budget",
+            Self::NoSource => "no_source",
+            Self::WaitingKeyframe => "waiting_keyframe",
+        }
+    }
+}
 
 /// One simulcast layer of a publisher's camera, or their share, as it arrives.
 struct Inbound {
@@ -93,6 +155,10 @@ struct Inbound {
     /// A frame was dropped over budget. Nothing more is forwarded until a keyframe fits.
     broken: bool,
     asked: Option<Instant>,
+    /// Keyframe requests sent on this layer since the last `keyframe asks` log.
+    asks: u64,
+    /// When `keyframe asks` was last logged for this layer.
+    asks_logged_at: Option<Instant>,
     /// The last keyframe that arrived, forwarded or not.
     keyframe: Option<Instant>,
 }
@@ -107,6 +173,8 @@ impl Inbound {
             seen: None,
             broken: false,
             asked: None,
+            asks: 0,
+            asks_logged_at: None,
             keyframe: None,
         }
     }
@@ -170,8 +238,16 @@ struct Screen {
     mid: Mid,
     /// What it carries now.
     showing: Option<Source>,
+    /// What it last logged as `video slot`.
+    logged_showing: Option<Source>,
     /// What it should carry. It switches on that source's next keyframe.
     wanted: Option<Source>,
+    /// Why the slot is empty or unsatisfied.
+    empty_why: EmptyWhy,
+    /// When `wanted` became `None` or differed from `showing`.
+    empty_since: Option<Instant>,
+    /// Whether `video slot empty` has already been logged for the current empty spell.
+    empty_logged: bool,
     rebase: Rebase<Source>,
     /// The bitrate the estimator was last told to probe for, in kb/s. 0 while there is no video
     /// to show and none held back: no probes, and `drain` sends no padding.
@@ -886,6 +962,12 @@ impl Engine {
         };
         let sharer = self.sharer(&room_id);
         if starts_share && sharer.is_some_and(|sharer| sharer.user_id != user_id) {
+            tracing::info!(
+                call_id = "none",
+                room_id = %room_id,
+                reason = "share_taken",
+                "share refused"
+            );
             let _ = reply.send(Err(Refused::ShareTaken));
             return;
         }
@@ -1011,6 +1093,12 @@ impl Engine {
             .and_then(|room| room.sharer)
             .is_some_and(|sharer| sharer != id);
         if starts_share && !peer.share_on && taken {
+            tracing::info!(
+                call_id,
+                room_id = %peer.room_id,
+                reason = "share_taken",
+                "share refused"
+            );
             let _ = reply.send(Err(Refused::ShareTaken));
             return;
         }
@@ -1055,6 +1143,13 @@ impl Engine {
             .is_some_and(|media| media.direction().is_receiving());
         if on != peer.camera_on {
             peer.camera_on = on;
+            tracing::info!(
+                call_id = %peer.call_id,
+                room_id = %peer.room_id,
+                source = "camera",
+                on,
+                "video publish"
+            );
             for layer in &mut peer.layers[..2] {
                 layer.restart();
             }
@@ -1087,6 +1182,13 @@ impl Engine {
                 .is_some_and(|room| room.sharer.is_none_or(|sharer| sharer == id));
             if free {
                 peer.sharing = true;
+                tracing::info!(
+                    call_id = %peer.call_id,
+                    room_id = %peer.room_id,
+                    source = "share",
+                    on = true,
+                    "video publish"
+                );
                 peer.layers[Layer::Share.index()].restart();
                 let room_id = peer.room_id.clone();
                 if let Some(room) = self.rooms.get_mut(&room_id) {
@@ -1107,6 +1209,13 @@ impl Engine {
             return;
         }
         peer.sharing = false;
+        tracing::info!(
+            call_id = %peer.call_id,
+            room_id = %peer.room_id,
+            source = "share",
+            on = false,
+            "video publish"
+        );
         if let Some(room) = self.rooms.get_mut(&peer.room_id) {
             if room.sharer == Some(id) {
                 room.sharer = None;
@@ -1219,6 +1328,82 @@ impl Engine {
 
     /// Sends `id`'s slot map if it changed.
     fn tell_slots(&mut self, id: PeerId) {
+        let Some(peer) = self.peers.get(&id) else {
+            return;
+        };
+        let slot_log = peer.screen.as_ref().and_then(|screen| {
+            if screen.showing == screen.logged_showing {
+                return None;
+            }
+            let old = screen.logged_showing;
+            let new = screen.showing;
+            let why = match (old, new) {
+                (_, Some((_, Layer::Share))) => SlotWhy::ShareStarted,
+                (Some((old_p, Layer::Low)), Some((new_p, Layer::High))) if old_p == new_p => {
+                    SlotWhy::LayerUp
+                }
+                (Some((old_p, Layer::High)), Some((new_p, Layer::Low))) if old_p == new_p => {
+                    SlotWhy::LayerDown
+                }
+                (Some((old_p, Layer::Share)), _) => {
+                    if !self.peers.contains_key(&old_p) {
+                        SlotWhy::PublisherLeft
+                    } else if self.peers.get(&old_p).is_some_and(|p| !p.share_live()) {
+                        SlotWhy::ShareStopped
+                    } else {
+                        match screen.empty_why {
+                            EmptyWhy::Deafened => SlotWhy::Deafened,
+                            EmptyWhy::QualityOff => SlotWhy::QualityOff,
+                            EmptyWhy::Link => SlotWhy::Link,
+                            EmptyWhy::Budget => SlotWhy::Budget,
+                            _ => SlotWhy::Floor,
+                        }
+                    }
+                }
+                (_, Some((_, Layer::High | Layer::Low))) => SlotWhy::Floor,
+                (Some((old_p, _)), None) => {
+                    if !self.peers.contains_key(&old_p) {
+                        SlotWhy::PublisherLeft
+                    } else {
+                        match screen.empty_why {
+                            EmptyWhy::Deafened => SlotWhy::Deafened,
+                            EmptyWhy::QualityOff => SlotWhy::QualityOff,
+                            EmptyWhy::Link => SlotWhy::Link,
+                            EmptyWhy::Budget => SlotWhy::Budget,
+                            _ => SlotWhy::NoSource,
+                        }
+                    }
+                }
+                (None, None) => SlotWhy::NoSource,
+            };
+            let (from, layer) = match new {
+                Some((publisher, layer)) => (
+                    self.peers
+                        .get(&publisher)
+                        .map_or("none", |p| p.call_id.as_str())
+                        .to_string(),
+                    layer.as_str(),
+                ),
+                None => ("none".to_string(), "none"),
+            };
+            Some((peer.call_id.clone(), from, layer, why, new))
+        });
+        if let Some((call_id, from, layer, why, new_showing)) = slot_log {
+            tracing::info!(
+                %call_id,
+                %from,
+                layer,
+                why = why.as_str(),
+                "video slot"
+            );
+            if let Some(screen) = self
+                .peers
+                .get_mut(&id)
+                .and_then(|peer| peer.screen.as_mut())
+            {
+                screen.logged_showing = new_showing;
+            }
+        }
         let Some(peer) = self.peers.get(&id) else {
             return;
         };
@@ -1432,6 +1617,41 @@ impl Engine {
         }
         if self.replan || now.saturating_duration_since(self.planned_at) >= PLAN_EVERY {
             self.plan(now);
+        }
+        for peer in self.peers.values_mut() {
+            if peer.connected {
+                if let Some(screen) = &mut peer.screen {
+                    if !screen.empty_logged
+                        && screen
+                            .empty_since
+                            .is_some_and(|since| now.saturating_duration_since(since) >= EMPTY_LOG_AFTER)
+                    {
+                        screen.empty_logged = true;
+                        tracing::info!(
+                            call_id = %peer.call_id,
+                            why = screen.empty_why.as_str(),
+                            "video slot empty"
+                        );
+                    }
+                }
+            }
+            for layer in [Layer::High, Layer::Low, Layer::Share] {
+                let inbound = &mut peer.layers[layer.index()];
+                if inbound.asks > 0
+                    && inbound.asks_logged_at.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= KEYFRAME_ASKS_EVERY
+                    })
+                {
+                    let count = std::mem::take(&mut inbound.asks);
+                    inbound.asks_logged_at = Some(now);
+                    tracing::info!(
+                        call_id = %peer.call_id,
+                        layer = layer.as_str(),
+                        count,
+                        "keyframe asks"
+                    );
+                }
+            }
         }
         if sweep {
             self.expire_streams(now);
@@ -1681,6 +1901,21 @@ impl Engine {
         inbound.rid = data.rid;
         let was_broken = inbound.broken;
         let pass = inbound.admit(keyframe, size, now);
+        if inbound.broken != was_broken {
+            if inbound.broken {
+                tracing::info!(
+                    call_id = %publisher.call_id,
+                    layer = layer.as_str(),
+                    "video layer broken"
+                );
+            } else {
+                tracing::info!(
+                    call_id = %publisher.call_id,
+                    layer = layer.as_str(),
+                    "video layer back"
+                );
+            }
+        }
         if !pass {
             self.counts.video_dropped += 1;
             if !was_broken {
@@ -1731,6 +1966,10 @@ impl Engine {
             // Only a frame that went out moves the slot: a failed writer must not turn the
             // slot to a source no `call.slots` names.
             screen.showing = Some(source);
+            if screen.showing == screen.wanted {
+                screen.empty_since = None;
+                screen.empty_logged = false;
+            }
             let at = MediaTime::new(out, Frequency::NINETY_KHZ);
             peer.video_sent += u64::from(size) + AUDIO_HEADERS;
             if let Err(error) = writer.write(pt, data.network_time, at, data.data.clone()) {
@@ -1775,6 +2014,7 @@ impl Engine {
             return;
         }
         inbound.asked = Some(now);
+        inbound.asks += 1;
         self.counts.keyframe_asks += 1;
         let rid = inbound.rid;
         if let Some(mut writer) = peer.rtc.writer(mid) {
@@ -1913,6 +2153,30 @@ impl Engine {
             // Nobody to show, or video is off: a voice call does not pay for an estimate.
             None => 0,
         };
+        let empty_why = if wanted.is_some() {
+            EmptyWhy::WaitingKeyframe
+        } else if peer.deafened {
+            EmptyWhy::Deafened
+        } else if peer.quality == Quality::Off {
+            EmptyWhy::QualityOff
+        } else if share.is_some() {
+            if !share_fits {
+                EmptyWhy::Link
+            } else if !ceiling.share {
+                EmptyWhy::Budget
+            } else {
+                EmptyWhy::NoSource
+            }
+        } else if publisher.is_some() {
+            if ceiling.camera == Quality::Off {
+                EmptyWhy::Budget
+            } else {
+                EmptyWhy::Link
+            }
+        } else {
+            EmptyWhy::NoSource
+        };
+        let connected = peer.connected;
         let Some(peer) = self.peers.get_mut(&id) else {
             return;
         };
@@ -1922,6 +2186,15 @@ impl Engine {
         let changed = screen.showing != showing;
         screen.wanted = wanted;
         screen.showing = showing;
+        screen.empty_why = empty_why;
+        if connected {
+            if wanted.is_some() && showing == wanted {
+                screen.empty_since = None;
+                screen.empty_logged = false;
+            } else {
+                screen.empty_since.get_or_insert(now);
+            }
+        }
         if screen.probing != Some(probe) {
             let idle = screen.probing == Some(0);
             screen.probing = Some(probe);
@@ -2033,7 +2306,11 @@ fn drain(id: PeerId, peer: &mut Peer, sink: &mut Sink<'_>) {
                             peer.screen = Some(Screen {
                                 mid: added.mid,
                                 showing: None,
+                                logged_showing: None,
                                 wanted: None,
+                                empty_why: EmptyWhy::NoSource,
+                                empty_since: None,
+                                empty_logged: false,
                                 rebase: Rebase::default(),
                                 probing: None,
                                 link: Link::default(),

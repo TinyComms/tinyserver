@@ -188,7 +188,7 @@ The server keeps `TINYSERVER_DB_POOL` Postgres connections (default 16, at least
 | `POST /v1/categories` | manage_channels | `{name}` → 201, placed last |
 | `PATCH /v1/categories/{id}` | manage_channels | `{name}` |
 | `DELETE /v1/categories/{id}` | manage_channels | 204. Its rooms become uncategorized. |
-| `PUT /v1/layout` | manage_channels | `{categories: [{id, room_ids}]}`: the categories in order, `id: null` for the uncategorized rooms, which always come first, and each bucket's rooms in order. Rooms and categories left out keep their place. → `{categories, rooms}` |
+| `PUT /v1/layout` | manage_channels (and manage_channels in every room and channel moved) | `{categories: [{id, items: [{kind: "channel" \| "room", id}]}]}` or legacy `{categories: [{id, room_ids}]}` (both in one bucket is `400 invalid`): the categories in order, `id: null` for uncategorized items, and each bucket's text channels and voice rooms in one shared position order. Items and categories left out keep their place. Legacy `room_ids` leaves text channels untouched; on equal position, a client draws text before voice. Capability: `channel_layout`. → `{categories, rooms, channels: [{id, category_id, position}]}` (for channels the caller can view). |
 
 ### Rooms
 
@@ -255,14 +255,17 @@ Live frames for these objects are in [`calls.md`](calls.md#messages): `channel.c
 
 | Route | Who | |
 | --- | --- | --- |
-| `GET /v1/channels` | view_channel on each | Channels the caller can view, ordered by `position`, `name`, `id`. Each row adds `my_permissions`: the caller's bits in that channel, the same number every channel permission check uses; an owner has every bit. `PUT /v1/layout` does not move these. |
-| `POST /v1/channels` | manage_channels | `{name, category_id?, topic?, position?}` → `201` channel. Name 1 to 80 characters. Topic up to 1024, empty when left out. Position defaults to 0. Audited `channel.create`. |
+| `GET /v1/channels` | view_channel on each | Channels the caller can view, ordered by `position`, `name`, `id`. Each row adds `my_permissions`: the caller's bits in that channel, the same number every channel permission check uses; an owner has every bit. `PUT /v1/layout` orders and files these alongside voice rooms. |
+| `POST /v1/channels` | manage_channels | `{name, category_id?, topic?, position?}` → `201` channel. Name 1 to 80 characters. Topic up to 1024, empty when left out. When `position` is omitted, placed after the last text channel or voice room in its category. Audited `channel.create`. |
 | `PATCH /v1/channels/{id}` | manage_channels in that channel | Any of `name`, `topic` (`null` clears to empty), `position`, `category_id` (`null` uncategorized). Audited `channel.update`. |
 | `DELETE /v1/channels/{id}` | manage_channels in that channel | `204`. Messages go with the channel. Attachment files are deleted. Audited `channel.delete`. |
 | `PUT /v1/channels/{id}/overrides/{role_id}` | manage_roles, and manage_channels in the channel, role below the caller | `{allow, deny}`. Bits outside `2343551` are dropped. A bit in both is allowed. Returns the channel. Audited `channel.override`. |
 | `DELETE /v1/channels/{id}/overrides/{role_id}` | same | Clears that role's override and returns the channel. |
 | `GET /v1/directs` | the two members | The caller's conversations. |
-| `POST /v1/directs` | a member | `{user_id}` → `201` when created, `200` when that pair already has one. |
+| `POST /v1/directs` | a member | `{user_id}` → `201` when created, `200` when that pair already has one. Refused with `403 forbidden` to create a new direct when either person has blocked the other. |
+| `GET /v1/blocks` | a member (not a bot) | `[{user_id, display_name, created_at}]`, the caller's own block list only. Moderators and owners cannot read another member's blocks. Capability: `blocks`. |
+| `PUT /v1/blocks/{user_id}` | a member (not a bot) | `204`, idempotent. Cannot block yourself (`400 invalid`). Target must exist (`404 not_found`), member or not, so someone who left can still be blocked. Capped at 1000 rows per blocker (`409 block_limit`). Stops direct messages, reactions, typing, new directs, and direct call rings in both directions; reading existing history stays allowed. Messages from a blocked user in channels keep arriving for the app to hide and do not count in `unread`. Emits `block.updated {user_id, blocked: true}` to the blocker's own sockets only. Not audited. Account deletion removes rows by cascade; bans and kicks leave rows in place. |
+| `DELETE /v1/blocks/{user_id}` | a member (not a bot) | `204`, idempotent. Emits `block.updated {user_id, blocked: false}` to the blocker's own sockets only when a row was removed. Not audited. |
 | `GET /v1/conversations/{id}/messages?before=&limit=` | view_channel, or either person in the direct | `limit` defaults to 50 and must be 1 to 100. `before` is exclusive. The page is oldest-first inside that window. Deleted messages stay, with an empty body and no attachments or reactions. |
 | `POST /v1/conversations/{id}/messages` | speak in the channel, or either member of the direct, and not timed out | `{body?, reply_to?, client_id?, attachment_ids?}`. Body is trimmed, at most 4000 characters. Empty body needs at least one attachment. `reply_to` must be a message in that conversation. `client_id` is 1 to 64 characters with no ASCII controls; a retry returns the same message and the status is still `201`. → `201` message. |
 | `PATCH /v1/messages/{id}` | the author, with speak, not timed out | `{body}`. A deleted message is `400 invalid`. Empty body is allowed when attachments remain. |

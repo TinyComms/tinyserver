@@ -92,6 +92,7 @@ No log line carries a note, evidence or a moderator's note. Filing a report logs
 - A community's operator can read the database of that community, so they can read every report, note and, for a conversation that is not end-to-end encrypted, every message. "Moderators see reports and the operator sees nothing" is not true and is not claimed. [`tenancy.md`](tenancy.md) says who operates what.
 - It is not a legal-process system. It has no export for requests and no mechanism for responding to them; a held report is kept, nothing more.
 - Everything above covers one community server. Whether TinyCloud, as the host, takes a report about a community, suspends it, or answers a request is policy, written and decided outside this repository.
+- Member blocking (`PUT /v1/blocks/{user_id}`) is private self-help: it stops direct messages, reactions, typing, new directs, and direct call rings between the two people, and is never audited or visible to moderators. Blocking does not replace filing a report when moderator action is needed.
 
 ## Where it is tested
 

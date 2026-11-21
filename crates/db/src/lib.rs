@@ -68,11 +68,11 @@ pub use link::{
 };
 pub use media::prepare_icon;
 pub use messages::{
-    clear_reaction, create_channel, delete_channel, delete_message, edit_message, list_channels,
-    list_directs, list_messages, list_pins, mark_read, open_attachment, open_direct, pin_message,
-    post_message, save_attachment, save_sealed_attachment, scan_timeout, set_channel_override,
-    toggle_reaction, typing_recipients, unpin_message, update_channel, upgrade_conversation,
-    AttachmentFile, MessageError, NewAttachment,
+    block_user, clear_reaction, create_channel, delete_channel, delete_message, edit_message,
+    list_blocks, list_channels, list_directs, list_messages, list_pins, mark_read, open_attachment,
+    open_direct, pin_message, post_message, save_attachment, save_sealed_attachment, scan_timeout,
+    set_channel_override, toggle_reaction, typing_recipients, unblock_user, unpin_message,
+    update_channel, upgrade_conversation, AttachmentFile, MessageError, NewAttachment,
 };
 pub use migrate::migrate;
 pub use moderation::{
@@ -107,8 +107,8 @@ pub use scan::{FakeEngine, ScanEngine, ScanVerdict};
 pub use server::{
     create_category, delete_category, delete_icon, ensure_manage_server, get_icon, get_server,
     list_categories, rename_category, set_icon, set_layout, sniff_image, update_server, Category,
-    Icon, Layout, LayoutBucket, ServerPatch, ServerSettings, FILE_MAX_DEFAULT, ICON_MAX,
-    IMAGE_MAX_DEFAULT, UPLOAD_MAX,
+    Icon, Layout, LayoutBucket, LayoutChannel, LayoutItem, LayoutKind, ServerPatch, ServerSettings,
+    FILE_MAX_DEFAULT, ICON_MAX, IMAGE_MAX_DEFAULT, UPLOAD_MAX,
 };
 pub use session::{
     close_session, current_session, identity, open_session, Identity, OpenedSession, SessionError,

@@ -86,6 +86,14 @@ impl Layer {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "h",
+            Self::Low => "l",
+            Self::Share => "share",
+        }
+    }
+
     /// The camera's other layer. A share has only one.
     pub fn other(self) -> Self {
         match self {

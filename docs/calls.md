@@ -41,7 +41,7 @@ Signaling needs both directions on one ordered stream. SSE would need a second H
 ### Connect
 
 ```
-GET /v1/live?since=<seq>
+GET /v1/live?since=<seq>&features=<name,...>
 Authorization: Bearer <session token>
 Authorization: Bot <bot token>
 Upgrade: websocket
@@ -52,7 +52,7 @@ Upgrade: websocket
 | Auth | `Authorization: Bearer <session token>` or `Authorization: Bot <bot token>`. No query-string token. Checked before the upgrade. No token, a bad token, or an unknown scheme is `401 {"error":"unauthorized"}`. A database error on that check is `500 {"error":"unavailable"}`. The socket re-reads the session every 60 s (a bot token is re-read with `authenticate_bot`). It also re-reads at once on `session.ended`, on `member.role` or `member.roles` for itself, and on any `role.updated` or `role.deleted`. `call.join`, `call.kick`, `call.moderate`, `call.move`, and `call.share_end` re-read before they act. An ended session closes with `4001 session_ended`. A database error on a later re-read keeps the socket; the next re-read tries again. A database error on one of those five call requests returns `error` `unavailable` and does not close the socket. |
 | Membership | A kick emits `member.removed` to every member socket. That person's sockets close with `4003 removed`, and their call ends at once with `call.left` `removed`. Their sessions are deleted, and `session.ended` is not emitted. A ban emits `member.banned` (ban_members only) and then `member.removed` if they were a member. The banned person's sockets close on `member.banned` with `4003` even when they do not receive that frame. The call ends as `banned`. |
 | Session end | Sign-out of one session, sign-out everywhere, and a provider back-channel logout emit `session.ended` with `user_id`. The frame is not sent to clients. Every socket of that user re-checks its own token. A socket whose token is gone closes with `4001`. A socket whose token is still valid stays. Sign-out everywhere deletes every session, so every socket of that user closes. |
-| Query | `since=<seq>`, a non-negative integer. Anything else is `400 {"error":"invalid"}`. Other parameters are ignored. |
+| Query | `since=<seq>`, a non-negative integer; anything else is `400 {"error":"invalid"}`. Optional `features=<name,...>`, a comma-separated list of lower-case live feature names the app understands (such as `group_calls`; at most 16 names of at most 32 bytes; unknown or malformed values are ignored, never a refusal). The declared set stays server-side on that socket and is never included on participant frames. Other parameters are ignored. |
 | Frame size | 64 KiB, for one frame and one message. SDP with simulcast fits. Bigger closes the socket with `1009 too_big`. Binary frames close it with `1003 text_only`. |
 | Client message rate | 20 a second, burst 40. A message over that is dropped, and the first one dropped gets `error {code: "slow_down"}`. 40 dropped in a row closes with `4029 slow_down`. |
 | Sockets per user | 3. A fourth closes the oldest with `4008 replaced`. |
@@ -128,7 +128,8 @@ Audit rows stay out of the live channel. `GET /v1/audit` is unchanged.
 | `roles.reordered` | `seq`, `role_ids` | Durable. Most senior first. |
 | `category.created`, `category.updated` | `seq`, `category {id, name, position}` | Durable |
 | `category.deleted` | `seq`, `category_id` | Durable. Its rooms are uncategorized now. |
-| `layout.updated` | `seq`, `categories`, `rooms` | Durable. The order after `PUT /v1/layout`. |
+| `layout.updated` | `seq`, `categories`, `rooms` | Durable. The order after `PUT /v1/layout`. Carries categories and rooms only (never text channels, so private channels are not leaked); each moved text channel emits `channel.updated`, narrowed to its viewers. |
+| `block.updated` | `seq`, `user_id`, `blocked` | Durable. Sent only to the blocker's own sockets so their other devices follow. Never sent to the blocked person. |
 | `room.created`, `room.updated`, `room.renamed` | `seq`, `room {id, name, created_by, created_at, category_id, position, topic, user_limit, bitrate_kbps, ptt_only, video_enabled, overrides}` | Durable. `GET /v1/rooms` without `my_permissions`, which differs per person: refetch. Any change sends `room.updated`; a name change also sends `room.renamed` first, for clients from before `room.updated`. An override change sends `room.updated`. |
 | `room.deleted` | `seq`, `room_id` | Durable. Ends that room's call: everyone in it gets `call.left {reason: "room_deleted"}`. |
 | `member.joined`, `member.role`, `member.roles`, `member.renamed` | `seq`, `member {user_id, display_name, role, owner, roles}` | Durable. No email; `GET /v1/members` has it. `role` is the legacy string or the owner flag. Setting the owner flag emits `member.role` and does not emit `member.roles`. Replacing role ids emits `member.roles`, and emits `member.role` as well only when the legacy string changed. Setting the legacy role emits both. `member.renamed` is a display name change. |
@@ -683,7 +684,7 @@ Cost, budgeted as if every byte both ways is billed: a 6-person camera call is a
 
 A direct call is not a room and not a message. The ring lives in memory. A restart drops it and writes no row. When it ends, `direct_call_log` stores `missed`, `declined`, `cancelled`, or `ended`, and `direct.call` goes to the two people. `GET /v1/directs` includes `last_call` from that row. There is no duration, SDP, token, key, or message body on it.
 
-`call.ring` `{direct_id}` from one party. Both must still be members, neither banned, neither timed out. Not a bot. The other person already in a direct ring or accepted direct call, or the caller already in one, is `busy`. The first of two people ringing each other wins. A ring lasts 30 s. Both sockets get `call.ringing` `{direct_id, ring_id, caller_id, callee_id}`. No seat yet, and no SFU join. Someone who connects before it ends sees `ring` on `ready`.
+`call.ring` `{direct_id}` from one party. Both must still be members, neither banned, neither timed out, and neither has blocked the other (otherwise `not_found`, and no ring reaches the other party). Not a bot. The other person already in a direct ring or accepted direct call, or the caller already in one, is `busy`. The first of two people ringing each other wins. A ring lasts 30 s. Both sockets get `call.ringing` `{direct_id, ring_id, caller_id, callee_id}`. No seat yet, and no SFU join. Someone who connects before it ends sees `ring` on `ready`.
 
 The callee sends `call.accept`, `call.decline`, or the caller sends `call.cancel`. After accept, each side sends `call.join` with `direct_id` (not `room_id`), plus `sdp` and `e2ee` as for a room. The media room is `d:` plus the ring id, so the next call on the same direct is a new MLS group. That key is not a client field except as `room_id` on `call.joined`, `call.left`, `call.state`, and `call.speaking`, which also carry `direct_id`. Those frames go to the two people, not to every member and not to a `rooms.read` bot. `ready.calls` omits them.
 
