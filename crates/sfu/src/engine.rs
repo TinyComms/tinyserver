@@ -216,7 +216,11 @@ impl Inbound {
         }
         if keyframe && self.budget.overdraw(size, now) {
             self.seen = Some(now);
-            self.broken = true;
+            // The keyframe itself was forwarded. Leave `broken` false so deltas that arrive
+            // once the overdraft has refilled (with no dropped delta in between) can continue;
+            // any delta arriving while the balance is still negative will fail `take` and
+            // mark the layer broken.
+            self.broken = false;
             return true;
         }
         self.broken = true;
@@ -3085,6 +3089,21 @@ mod tests {
         assert!(layer.fresh(later));
         // And the deltas stay held past the second keyframe too.
         assert!(!layer.admit(false, 100, later + AT_30_FPS));
+    }
+
+    #[test]
+    fn an_oversized_keyframe_followed_by_a_refilled_delta_stays_unbroken() {
+        let start = Instant::now();
+        let mut layer = Inbound::new(24, start);
+        layer.arrived = true;
+        // Keyframe slightly over the 3,000-byte burst passes via overdraw (balance = -300).
+        assert!(layer.admit(true, 3300, start));
+        assert!(!layer.broken);
+        // On a low-motion share (e.g. 200 ms until the next delta), the bucket refills
+        // (+600 -> +300) before any delta is dropped, so the delta must pass cleanly.
+        let next = start + Duration::from_millis(200);
+        assert!(layer.admit(false, 200, next));
+        assert!(!layer.broken);
     }
 
     #[test]
