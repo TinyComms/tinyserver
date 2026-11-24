@@ -1,0 +1,10 @@
+{
+  "id": "screenshare-video-overdraft",
+  "title": "Inbound video stays unbroken after keyframe overdraft refills and share caps hold",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "server integration, not released-client or native GUI certification",
+  "native_client_proof": "verified with tinyclient fix/screenshare-video-and-profile"
+}
