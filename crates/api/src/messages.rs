@@ -1337,7 +1337,30 @@ fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_upload, Parsed};
+    use super::{parse_upload, split_parts, Parsed};
+
+    /// `--abc`, then `more` boundary lines that each end an empty part, then the closing one: so
+    /// `more` + 1 parts, from five bytes of body each.
+    fn boundaries(more: usize) -> Vec<u8> {
+        let mut body = b"--abc\r\n".to_vec();
+        for _ in 0..more {
+            body.extend_from_slice(b"\r\n--abc\r\n");
+        }
+        body.extend_from_slice(b"\r\n--abc--\r\n");
+        body
+    }
+
+    /// A form here has at most eight parts. One with a ninth is not split at all: a body made of
+    /// nothing but boundaries must not become millions of slices before it is refused.
+    #[test]
+    fn a_ninth_part_ends_the_splitting() {
+        assert!(split_parts(&boundaries(8), "abc").is_none());
+    }
+
+    #[test]
+    fn eight_parts_are_still_split() {
+        assert_eq!(split_parts(&boundaries(7), "abc").map(Vec::len), Some(8));
+    }
 
     #[test]
     fn a_multipart_body_keeps_the_file_and_its_size() {
