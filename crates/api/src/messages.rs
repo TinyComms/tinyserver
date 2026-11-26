@@ -1106,10 +1106,13 @@ enum Parsed {
     Sealed { bytes: Vec<u8>, id: Option<String> },
 }
 
+/// The most parts a multipart form of this server has.
+const MAX_PARTS: usize = 8;
+
 fn parse_upload(content_type: &str, body: &[u8]) -> Result<Parsed, MessageError> {
     let boundary = boundary(content_type).ok_or(MessageError::Invalid)?;
     let parts = split_parts(body, &boundary).ok_or(MessageError::Invalid)?;
-    if parts.is_empty() || parts.len() > 8 {
+    if parts.is_empty() || parts.len() > MAX_PARTS {
         return Err(MessageError::Invalid);
     }
     let mut file: Option<NewAttachment> = None;
@@ -1199,7 +1202,7 @@ pub(crate) fn parse_multipart_parts(
 ) -> Result<Vec<Part>, MessageError> {
     let boundary = boundary(content_type).ok_or(MessageError::Invalid)?;
     let parts = split_parts(body, &boundary).ok_or(MessageError::Invalid)?;
-    if parts.is_empty() || parts.len() > 8 {
+    if parts.is_empty() || parts.len() > MAX_PARTS {
         return Err(MessageError::Invalid);
     }
     parts
@@ -1220,6 +1223,10 @@ fn boundary(content_type: &str) -> Option<String> {
     Some(raw)
 }
 
+/// The parts between the boundary lines, each with its own headers. `None` when the body is not
+/// such a form, or has more than `MAX_PARTS`: the splitting stops at the ninth part, so that a
+/// body made of nothing but boundaries is not turned into millions of slices first. Both callers
+/// refuse that many anyway.
 fn split_parts<'a>(body: &'a [u8], boundary: &str) -> Option<Vec<&'a [u8]>> {
     let open = format!("--{boundary}");
     let next = format!("\r\n--{boundary}");
@@ -1237,6 +1244,9 @@ fn split_parts<'a>(body: &'a [u8], boundary: &str) -> Option<Vec<&'a [u8]>> {
     let mut parts = Vec::new();
     loop {
         let relative = find_slice(&body[cursor..], next)?;
+        if parts.len() == MAX_PARTS {
+            return None;
+        }
         parts.push(&body[cursor..cursor + relative]);
         cursor += relative + next.len();
         if body.get(cursor..cursor + 2) == Some(b"--") {
