@@ -1359,7 +1359,10 @@ mod tests {
 
     #[test]
     fn eight_parts_are_still_split() {
-        assert_eq!(split_parts(&boundaries(7), "abc").map(Vec::len), Some(8));
+        assert_eq!(
+            split_parts(&boundaries(7), "abc").map(|parts| parts.len()),
+            Some(8)
+        );
     }
 
     #[test]
