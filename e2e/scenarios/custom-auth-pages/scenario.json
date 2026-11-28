@@ -1,0 +1,10 @@
+{
+  "id": "custom-auth-pages",
+  "title": "TinyServer serves its own ts favicon, light/dark custom auth styling, and recovery code Copy/Download controls under strict CSP",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "isolated-postgres"],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "API integration against a real Postgres, checking the served auth HTML, favicon, and CSP",
+  "native_client_proof": "browser-served HTML pages rendered by tinyserver; existing clients open /v1/auth/passkey unchanged"
+}
