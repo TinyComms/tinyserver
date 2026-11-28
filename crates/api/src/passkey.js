@@ -21,7 +21,8 @@
   function buttons(disabled) {
     var all = root.querySelectorAll('button');
     for (var i = 0; i < all.length; i++) {
-      if (all[i].id === 'go') {
+      var id = all[i].id;
+      if (id === 'go' || id === 'copy-codes' || id === 'download-codes') {
         continue;
       }
       all[i].disabled = disabled;
@@ -169,9 +170,55 @@
     $('codes-intro').textContent = intro;
     var hasCodes = codes && codes.length > 0;
     $('codelist').hidden = !hasCodes;
+    var actions = $('codes-actions');
+    if (actions) {
+      actions.hidden = !hasCodes;
+    }
     $('codes-ack').hidden = !hasCodes;
+    var text = hasCodes ? codes.join('\n') : '';
     if (hasCodes) {
-      $('codelist').textContent = codes.join('\n');
+      $('codelist').textContent = text;
+    }
+    var copy = $('copy-codes');
+    if (copy) {
+      copy.textContent = 'Copy codes';
+      copy.disabled = !hasCodes;
+      copy.onclick = function () {
+        if (!hasCodes || !navigator.clipboard || !navigator.clipboard.writeText) {
+          say('Select the codes above and copy them.', false);
+          return;
+        }
+        navigator.clipboard.writeText(text + '\n').then(function () {
+          copy.textContent = 'Copied';
+          setTimeout(function () {
+            copy.textContent = 'Copy codes';
+          }, 2000);
+        }).catch(function () {
+          say('Select the codes above and copy them.', false);
+        });
+      };
+    }
+    var download = $('download-codes');
+    if (download) {
+      download.disabled = !hasCodes;
+      download.onclick = function () {
+        if (!hasCodes) {
+          return;
+        }
+        var server = ($('server-name') && $('server-name').textContent || 'tinyserver').trim();
+        var body = server + ' recovery codes\nEach code works once.\n\n' + text + '\n';
+        var blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
+        var url = URL.createObjectURL(blob);
+        var link = document.createElement('a');
+        link.href = url;
+        link.download = 'tinyserver-recovery-codes.txt';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(function () {
+          URL.revokeObjectURL(url);
+        }, 1000);
+      };
     }
     var go = $('go');
     go.disabled = hasCodes;
@@ -299,6 +346,18 @@
     }
   }
 
+  function bindEnter(id, handler) {
+    var element = $(id);
+    if (element) {
+      element.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          handler();
+        }
+      });
+    }
+  }
+
   if (!window.PublicKeyCredential || !navigator.credentials) {
     say('This browser cannot use passkeys. Try another browser or device.', true);
     buttons(true);
@@ -309,6 +368,8 @@
     bind('login', signIn);
     bind('signup', signUp);
     bind('recover', recover);
+    bindEnter('name', signUp);
+    bindEnter('code', recover);
   } else if (mode === 'claim') {
     // The token is in the address after the #, which the browser never sends anywhere. Read it
     // and take it out of the address bar and history.

@@ -37,6 +37,7 @@ pub fn routes(sign_in: SignIn) -> Router<PgPool> {
         .route("/v1/auth/config", get(config))
         .route("/v1/auth/start", post(start))
         .route("/v1/auth/join", get(join).post(join_new))
+        .route("/favicon.svg", get(favicon))
         .route("/v1/auth/callback", get(callback))
         .route("/v1/auth/token", post(token))
         .route("/v1/auth/backchannel-logout", post(backchannel_logout))
@@ -679,28 +680,99 @@ pub(crate) fn server_trouble() -> Response {
     )
 }
 
+/// The TinyServer `ts` mark, served as `/favicon.svg` and shown in the footer of every auth page.
+pub(crate) const TINY_MARK_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1024 1024\" aria-hidden=\"true\">\
+<defs><linearGradient id=\"ts-plate\" x1=\"0\" y1=\"100\" x2=\"0\" y2=\"924\" gradientUnits=\"userSpaceOnUse\">\
+<stop offset=\"0\" stop-color=\"#4f8cff\"/><stop offset=\"1\" stop-color=\"#1f56d6\"/></linearGradient></defs>\
+<rect x=\"100\" y=\"100\" width=\"824\" height=\"824\" rx=\"186\" fill=\"url(#ts-plate)\"/>\
+<g transform=\"translate(512 512) scale(1.24) translate(-512 -512)\">\
+<path fill=\"#fff\" d=\"M422 282 H602 A160 160 0 0 1 762 442 V562 A160 160 0 0 1 602 722 H280 A18 18 0 0 1 262 704 V442 A160 160 0 0 1 422 282 Z\"/>\
+<path transform=\"translate(-22 -2)\" fill=\"none\" stroke=\"#2f6feb\" stroke-width=\"64\" stroke-linecap=\"round\" stroke-linejoin=\"round\" \
+d=\"M430 384 V578 Q430 624 476 624 H470 M386 488 H476 M670 482 C656 461 636 452 612 452 C579 452 558 470 558 496 C558 525 584 533 613 538 C643 543 670 553 670 584 C670 610 648 624 614 624 C587 624 565 614 552 595\"/>\
+</g></svg>";
+
+async fn favicon() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static("default-src 'none'; sandbox"),
+            ),
+        ],
+        TINY_MARK_SVG,
+    )
+        .into_response()
+}
+
 /// The one stylesheet every page here carries, inline. The policy allows exactly it.
 pub(crate) const STYLE: &str =
-    "body{margin:0;font:16px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;\
-color:#edeef0;background:#18191c;color-scheme:dark;display:flex;justify-content:center}\
-main{max-width:28rem;margin:4rem 1.25rem;padding:2rem;background:#1f2023;border-radius:12px;\
-border:1px solid rgba(255,255,255,.12)}\
-h1{font-size:1.4rem;margin:0 0 .75rem}p{margin:.5rem 0 1rem}\
-.choice{display:flex;flex-direction:column;gap:.75rem;margin-top:1.5rem}\
+    ":root{color-scheme:dark light;--bg:#121315;--canvas:#18191c;--card:#1b1d21;\
+--surface:#14161a;--line:rgba(255,255,255,.08);--border:rgba(255,255,255,.12);\
+--border-strong:rgba(255,255,255,.22);--text:#edeef0;--soft:#a8abb3;--faint:#858993;\
+--accent:#2f6feb;--accent-hi:#4f8cff;--accent-lo:#1f56d6;--link:#8ab4ff;\
+--danger:#f0655d;--danger-soft:rgba(240,101,93,.14);--glow:rgba(47,111,235,.22);\
+--glow-sub:rgba(79,140,255,.09);--dot:rgba(255,255,255,.04);\
+--shadow:0 0 0 1px rgba(255,255,255,.08),0 14px 36px rgba(0,0,0,.45),0 36px 80px rgba(0,0,0,.55)}\
+@media (prefers-color-scheme:light){:root{--bg:#f4f6fa;--canvas:#eef1f7;--card:#ffffff;\
+--surface:#f7f8fa;--line:rgba(15,20,30,.08);--border:rgba(15,20,30,.12);\
+--border-strong:rgba(15,20,30,.22);--text:#16181c;--soft:#4b515c;--faint:#656c78;\
+--link:#1f56d6;--danger:#c2342c;--danger-soft:rgba(208,63,63,.1);\
+--glow:rgba(47,111,235,.14);--glow-sub:rgba(79,140,255,.08);--dot:rgba(15,20,30,.04);\
+--shadow:0 0 0 1px rgba(15,20,30,.09),0 10px 28px rgba(15,20,30,.08),0 28px 64px rgba(15,20,30,.1)}}\
+*,*::before,*::after{box-sizing:border-box}\
+html{min-height:100%}\
+body{margin:0;min-height:100svh;padding:1.5rem 1.25rem;font:15px/1.55 system-ui,-apple-system,\
+BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans',sans-serif;color:var(--text);\
+background-color:var(--bg);\
+background-image:radial-gradient(ellipse 80% 55% at 50% -10%,var(--glow),transparent 70%),\
+radial-gradient(circle at 85% 92%,var(--glow-sub),transparent 45%),\
+radial-gradient(var(--dot) 1px,transparent 1px);\
+background-size:100% 100%,100% 100%,24px 24px;\
+display:flex;flex-direction:column;align-items:center;justify-content:center;\
+-webkit-font-smoothing:antialiased}\
+main{width:100%;max-width:26rem;margin:auto;padding:2rem 2rem 1.4rem;background:var(--card);\
+border-radius:16px;box-shadow:var(--shadow)}\
+h1{font-size:1.35rem;line-height:1.25;letter-spacing:-.015em;margin:0 0 .75rem}\
+p{margin:.5rem 0 1rem;color:var(--soft)}\
+.choice{display:flex;flex-direction:column;gap:.65rem;margin-top:1.5rem}\
 form{margin:0}\
-.button{display:block;box-sizing:border-box;width:100%;padding:.75rem 1rem;border-radius:8px;\
-border:1px solid #2f6feb;background:#2f6feb;color:#fff;font:inherit;font-weight:600;\
-text-align:center;text-decoration:none;cursor:pointer}\
-.button:hover{background:#3a77ee}\
-.button.quiet{background:transparent;color:#8ab4ff;border-color:rgba(255,255,255,.18)}\
-.step{font-weight:600;margin-top:1.5rem}.note{color:#a8abb3;font-size:.875rem}\
-.alert{color:#f0655d}";
+.button{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;\
+width:100%;padding:.72rem 1rem;border-radius:10px;border:1px solid rgba(255,255,255,.12);\
+background:linear-gradient(180deg,#3b7bff 0%,#2563eb 100%);color:#fff;font:inherit;\
+font-weight:600;text-align:center;text-decoration:none;cursor:pointer;\
+box-shadow:0 1px 2px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.18);\
+transition:filter .12s ease,background .12s ease,border-color .12s ease,transform .06s ease}\
+.button:hover{filter:brightness(1.06)}\
+.button:active{transform:translateY(1px)}\
+.button:focus-visible{outline:2px solid var(--link);outline-offset:2px}\
+.button.quiet{background:var(--surface);color:var(--text);border-color:var(--border);\
+box-shadow:none}\
+.button.quiet:hover{filter:none;border-color:var(--border-strong)}\
+.step{font-weight:600;color:var(--text);margin-top:1.5rem}\
+.note{color:var(--faint);font-size:.86rem;line-height:1.5}\
+.alert{color:var(--danger);background:var(--danger-soft);border:1px solid rgba(240,101,93,.28);\
+border-radius:10px;padding:.65rem .85rem;font-size:.9rem}\
+.alert:empty,.note:empty{display:none}\
+.by{display:flex;align-items:center;justify-content:center;gap:.45rem;margin-top:1.5rem;\
+padding-top:1rem;border-top:1px solid var(--line);color:var(--faint);font-size:.8rem;\
+letter-spacing:.01em}\
+.by svg{width:1.15rem;height:1.15rem;flex:none}";
 
-/// No script, nothing loaded, only the stylesheet above, forms only to here, no framing.
+/// No script, nothing loaded except this server's own favicon, only the stylesheet above, forms
+/// only to here, no framing.
 static POLICY: LazyLock<HeaderValue> = LazyLock::new(|| {
     let hash = STANDARD.encode(Sha256::digest(STYLE.as_bytes()));
     HeaderValue::from_str(&format!(
-        "default-src 'none'; style-src 'sha256-{hash}'; form-action 'self'; \
+        "default-src 'none'; style-src 'sha256-{hash}'; img-src 'self'; form-action 'self'; \
          base-uri 'none'; frame-ancestors 'none'"
     ))
     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"))
@@ -718,8 +790,13 @@ fn html(status: StatusCode, title: &str, body: &str) -> Response {
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"referrer\" content=\"no-referrer\">\n\
+         <meta name=\"color-scheme\" content=\"dark light\">\n\
+         <meta name=\"theme-color\" content=\"#121315\" media=\"(prefers-color-scheme: dark)\">\n\
+         <meta name=\"theme-color\" content=\"#f4f6fa\" media=\"(prefers-color-scheme: light)\">\n\
+         <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n\
          <title>{title}</title>\n<style>{STYLE}</style>\n</head>\n<body>\n<main>\n\
-         <h1>{title}</h1>\n{body}\n</main>\n</body>\n</html>\n"
+         <h1>{title}</h1>\n{body}\n<footer class=\"by\">{TINY_MARK_SVG}<span>TinyServer</span></footer>\n\
+         </main>\n</body>\n</html>\n"
     );
     (
         status,

@@ -2359,3 +2359,56 @@ async fn the_pages_name_the_server_only_to_someone_holding_a_live_sign_in_or_cla
     })
     .await;
 }
+
+#[tokio::test]
+async fn custom_auth_pages_serve_tinyserver_branding_and_recovery_actions() {
+    run(|db| async move {
+        let app = passkey_app(&db);
+
+        // The real TinyServer `ts` favicon is served with strict headers and SVG content type.
+        let (status, headers, svg) = page(&app, "/favicon.svg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            "image/svg+xml; charset=utf-8"
+        );
+        assert!(
+            svg.contains("ts-plate") && svg.contains("M670 482"),
+            "{svg}"
+        );
+
+        // The sign-in page links the favicon, uses the `ts` mark, supports light/dark themes,
+        // and includes recovery code Copy and Download controls while keeping strict CSP.
+        let (state, _) = start(&app, None).await;
+        let (status, headers, html) = page(&app, &format!("/v1/auth/passkey?state={state}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let policy = headers[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .expect("csp");
+        assert!(policy.contains("default-src 'none'"), "{policy}");
+        assert!(policy.contains("img-src data: 'self'"), "{policy}");
+        assert!(
+            html.contains("<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("ts-plate") && html.contains("M670 482"),
+            "{html}"
+        );
+        assert!(html.contains("id=\"copy-codes\""), "{html}");
+        assert!(html.contains("id=\"download-codes\""), "{html}");
+        assert!(html.contains("prefers-color-scheme:light"), "{html}");
+
+        // The claim page shares the branding and never embeds server data URIs before peek.
+        let (status, _, claim_html) = page(&app, "/v1/auth/passkey/claim").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            claim_html.contains("<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">")
+                && claim_html.contains("id=\"copy-codes\"")
+                && claim_html.contains("id=\"download-codes\"")
+                && !claim_html.contains("data:image"),
+            "{claim_html}"
+        );
+    })
+    .await;
+}

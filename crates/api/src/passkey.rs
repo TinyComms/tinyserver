@@ -40,7 +40,9 @@ use webauthn_rs::prelude::{
     RegisterPublicKeyCredential, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
 };
 
-use crate::auth::{client_url, effective, escape, expired, server_trouble, Outcome, STYLE};
+use crate::auth::{
+    client_url, effective, escape, expired, server_trouble, Outcome, STYLE, TINY_MARK_SVG,
+};
 use crate::community::{caller, lift, ApiError};
 use crate::oidc::{ConfigError, SignIn};
 use crate::session::bearer;
@@ -1136,29 +1138,51 @@ static SCRIPT: LazyLock<String> =
 static PAGE_STYLE: LazyLock<String> = LazyLock::new(|| {
     format!(
         "{STYLE}\
-         main{{max-width:25rem;padding:2rem 2rem 1.25rem}}\
-         .brand{{display:flex;align-items:center;gap:.9rem;margin:0 0 1.5rem}}\
-         .mark{{flex:none;width:3.25rem;height:3.25rem;border-radius:14px;overflow:hidden;\
-         display:flex;align-items:center;justify-content:center;background:#2f6feb;color:#fff;\
-         font-size:1.5rem;font-weight:700;object-fit:cover}}\
-         .brand h1{{font-size:1.35rem;line-height:1.2;margin:0;overflow-wrap:anywhere}}\
-         .kind{{margin:.15rem 0 0;color:#a8abb3;font-size:.9rem}}\
-         label{{display:block;font-weight:600;margin:0 0 .35rem}}\
-         input[type=text]{{box-sizing:border-box;width:100%;padding:.7rem .8rem;border-radius:8px;\
-         border:1px solid rgba(255,255,255,.18);font:inherit;background:#18191c;color:inherit}}\
-         input[type=text]:focus{{outline:2px solid #2f6feb;outline-offset:1px}}\
-         .button[disabled]{{opacity:.5;cursor:default}}\
+         main{{max-width:26rem;padding:2rem 2rem 1.4rem}}\
+         .brand{{display:flex;align-items:center;gap:.95rem;margin:0 0 1.6rem;\
+         padding-bottom:1.25rem;border-bottom:1px solid var(--line)}}\
+         .mark{{flex:none;width:3.35rem;height:3.35rem;border-radius:14px;overflow:hidden;\
+         display:flex;align-items:center;justify-content:center;\
+         background:linear-gradient(180deg,var(--accent-hi) 0%,var(--accent-lo) 100%);color:#fff;\
+         font-size:1.45rem;font-weight:700;object-fit:cover;\
+         box-shadow:0 4px 14px rgba(31,86,214,.32),inset 0 1px 0 rgba(255,255,255,.2)}}\
+         .brand h1{{font-size:1.3rem;line-height:1.2;margin:0;overflow-wrap:anywhere}}\
+         .kind{{display:inline-block;margin:.3rem 0 0;padding:.12rem .55rem;border-radius:999px;\
+         background:rgba(47,111,235,.15);color:var(--link);font-size:.78rem;font-weight:600;\
+         letter-spacing:.01em}}\
+         label{{display:block;font-weight:600;font-size:.9rem;color:var(--text);margin:0 0 .4rem}}\
+         input[type=text]{{width:100%;padding:.72rem .85rem;border-radius:10px;\
+         border:1px solid var(--border);font:inherit;background:var(--surface);color:var(--text);\
+         transition:border-color .12s ease,box-shadow .12s ease}}\
+         input[type=text]::placeholder{{color:var(--faint)}}\
+         input[type=text]:focus{{outline:none;border-color:var(--accent-hi);\
+         box-shadow:0 0 0 3px rgba(47,111,235,.22)}}\
+         .button[disabled]{{opacity:.48;cursor:not-allowed;filter:none;transform:none}}\
+         .btn-icon{{width:1.05rem;height:1.05rem;flex:none}}\
          .stack{{display:flex;flex-direction:column;gap:.75rem}}\
          .stack p{{margin:0}}\
-         .more{{margin-top:1.25rem;font-size:.9rem;color:#a8abb3}}\
-         .more summary{{cursor:pointer;width:max-content}}\
+         .divider{{display:flex;align-items:center;gap:.75rem;margin:.35rem 0;color:var(--faint);\
+         font-size:.8rem}}\
+         .divider::before,.divider::after{{content:'';flex:1;height:1px;background:var(--line)}}\
+         .more{{margin-top:1.25rem;padding-top:1rem;border-top:1px solid var(--line);\
+         font-size:.9rem;color:var(--soft)}}\
+         .more summary{{cursor:pointer;width:max-content;color:var(--faint);font-weight:500;\
+         user-select:none}}\
+         .more summary:hover{{color:var(--text)}}\
          .more .stack{{margin-top:.9rem}}\
-         pre{{font:15px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\
-         background:#18191c;padding:.75rem 1rem;border-radius:8px;overflow-x:auto;\
-         border:1px solid rgba(255,255,255,.12);user-select:all}}\
-         .by{{display:flex;align-items:center;justify-content:center;gap:.4rem;margin-top:1.5rem;\
-         padding-top:1rem;border-top:1px solid rgba(255,255,255,.08);color:#858993;font-size:.8rem}}\
-         .by svg{{width:1.1rem;height:1.1rem}}\
+         pre{{margin:0;font:14px/1.85 ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;\
+         background:var(--surface);color:var(--text);padding:.9rem 1rem;border-radius:10px;\
+         overflow-x:auto;border:1px solid var(--border);user-select:all;column-count:2;\
+         column-gap:1.25rem}}\
+         @media (max-width:420px){{pre{{column-count:1}}}}\
+         .code-actions{{display:grid;grid-template-columns:1fr 1fr;gap:.55rem}}\
+         .ack{{display:flex;align-items:flex-start;gap:.6rem;padding:.75rem .85rem;\
+         border-radius:10px;background:var(--surface);border:1px solid var(--border);\
+         cursor:pointer;font-weight:500;margin:0}}\
+         .ack input{{margin:.2rem 0 0;accent-color:var(--accent);width:1rem;height:1rem;flex:none}}\
+         .done-card{{padding:1rem;border-radius:12px;background:rgba(63,191,122,.12);\
+         border:1px solid rgba(63,191,122,.28);color:var(--text);font-weight:500}}\
+         #status{{margin-top:1rem;min-height:0}}\
          [hidden]{{display:none !important}}"
     )
 });
@@ -1172,7 +1196,7 @@ fn digest(text: &str) -> String {
 static POLICY: LazyLock<HeaderValue> = LazyLock::new(|| {
     HeaderValue::from_str(&format!(
         "default-src 'none'; style-src 'sha256-{style}'; script-src 'sha256-{script}'; \
-         img-src data:; connect-src 'self'; form-action 'none'; base-uri 'none'; \
+         img-src data: 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; \
          frame-ancestors 'none'",
         style = digest(&PAGE_STYLE),
         script = digest(&SCRIPT),
@@ -1180,14 +1204,12 @@ static POLICY: LazyLock<HeaderValue> = LazyLock::new(|| {
     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"))
 });
 
-/// The Tiny mark, small, under every page.
-const LOGO: &str = "<svg viewBox=\"0 0 1024 1024\" aria-hidden=\"true\"><rect x=\"100\" y=\"100\" \
-    width=\"824\" height=\"824\" rx=\"186\" fill=\"#2f6feb\"/><g transform=\"translate(512 512) \
-    scale(1.24) translate(-512 -512)\"><path fill=\"#fff\" d=\"M422 282 H602 A160 160 0 0 1 762 \
-    442 V562 A160 160 0 0 1 602 722 H280 A18 18 0 0 1 262 704 V442 A160 160 0 0 1 422 282 \
-    Z\"/><path transform=\"translate(-22 -2)\" fill=\"none\" stroke=\"#2f6feb\" \
-    stroke-width=\"74\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M430 384 V578 \
-    Q430 624 476 624 H470 M386 488 H476 M661.5 505.5 A68 68 0 1 0 661.5 606.5\"/></g></svg>";
+/// Key icon for primary passkey buttons, inline so no asset is fetched.
+const KEY_ICON: &str = "<svg class=\"btn-icon\" viewBox=\"0 0 24 24\" fill=\"none\" \
+    stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" \
+    aria-hidden=\"true\"><path d=\"M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 \
+    1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 \
+    6.5 0 1 0-4-4z\"/><circle cx=\"16.5\" cy=\"7.5\" r=\".5\" fill=\"currentColor\"/></svg>";
 
 /// The name and mark at the top of a page: the server's own icon, or its first letter.
 fn brand(face: Option<&db::Face>, kind: &str) -> String {
@@ -1241,12 +1263,14 @@ fn render(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"referrer\" content=\"no-referrer\">\n<meta name=\"color-scheme\" \
-         content=\"dark\">\n<meta name=\"theme-color\" content=\"#18191c\">\n\
-         <title>{title}</title>\n<style>{style}</style>\n</head>\n<body>\n\
+         content=\"dark light\">\n<meta name=\"theme-color\" content=\"#121315\" \
+         media=\"(prefers-color-scheme: dark)\">\n<meta name=\"theme-color\" content=\"#f4f6fa\" \
+         media=\"(prefers-color-scheme: light)\">\n<link rel=\"icon\" href=\"/favicon.svg\" \
+         type=\"image/svg+xml\">\n<title>{title}</title>\n<style>{style}</style>\n</head>\n<body>\n\
          <main data-mode=\"{mode}\" data-state=\"{state}\">\n{brand}\n{body}\n\
          <p id=\"status\" class=\"note\" role=\"status\" aria-live=\"polite\"></p>\n\
          <noscript><p class=\"alert\">Passkeys need JavaScript. Turn it on for this page.</p>\
-         </noscript>\n<footer class=\"by\">{LOGO}<span>TinyServer</span></footer>\n\
+         </noscript>\n<footer class=\"by\">{TINY_MARK_SVG}<span>TinyServer</span></footer>\n\
          </main>\n<script>{script}</script>\n</body>\n</html>\n",
         style = *PAGE_STYLE,
         mode = escape(mode),
@@ -1271,12 +1295,17 @@ fn render(
 const CODES: &str = "<section id=\"codes\" class=\"stack\" hidden>\n\
     <p id=\"codes-intro\"></p>\n\
     <pre id=\"codelist\"></pre>\n\
+    <div id=\"codes-actions\" class=\"code-actions\">\n\
+    <button class=\"button quiet\" id=\"copy-codes\" type=\"button\">Copy codes</button>\n\
+    <button class=\"button quiet\" id=\"download-codes\" type=\"button\">Download .txt</button>\n\
+    </div>\n\
     <div id=\"codes-ack\" class=\"stack\">\n\
-    <label><input type=\"checkbox\" id=\"saved\"> I saved these codes</label>\n\
+    <label class=\"ack\"><input type=\"checkbox\" id=\"saved\"><span>I saved these recovery codes \
+    somewhere safe</span></label>\n\
     <p class=\"note\">Each code works once, and it is the only way back in if you lose your \
     passkeys. Nobody can reset your account for you.</p>\n\
     </div>\n\
-    <button class=\"button\" id=\"go\" type=\"button\" disabled>Continue</button>\n\
+    <button class=\"button\" id=\"go\" type=\"button\" disabled>Continue to Tiny</button>\n\
     </section>";
 
 async fn signin_page(
@@ -1310,7 +1339,8 @@ async fn signin_page(
         .map(|(name, provider)| {
             let url = provider.authorize_url(&state, &leg.nonce, &leg.verifier);
             format!(
-                "<a class=\"button quiet\" href=\"{url}\">Sign in with {name} instead</a>\n",
+                "<div class=\"divider\">or</div>\n\
+                 <a class=\"button quiet\" href=\"{url}\">Sign in with {name} instead</a>\n",
                 url = escape(&url),
                 name = escape(&name),
             )
@@ -1319,21 +1349,27 @@ async fn signin_page(
     // An invited person is here to make an account, so that comes first. Anyone else is here to
     // sign in.
     let lead = if invited {
-        "<div class=\"stack\" id=\"new\">\n\
-         <div><label for=\"name\">Your name</label>\n\
-         <input type=\"text\" id=\"name\" maxlength=\"80\" autocomplete=\"nickname\" \
-         placeholder=\"What people will call you\"></div>\n\
-         <button class=\"button\" id=\"signup\" type=\"button\">Create my account</button>\n\
-         <p class=\"note\">Your passkey stays on your device. This server keeps only its public \
-         half: no email, no phone number.</p>\n\
-         <button class=\"button quiet\" id=\"login\" type=\"button\">I already have a passkey\
-         </button>\n\
-         </div>"
+        format!(
+            "<div class=\"stack\" id=\"new\">\n\
+             <div><label for=\"name\">Your name</label>\n\
+             <input type=\"text\" id=\"name\" maxlength=\"80\" autocomplete=\"nickname\" \
+             placeholder=\"What people will call you\"></div>\n\
+             <button class=\"button\" id=\"signup\" type=\"button\">{KEY_ICON}Create my account\
+             </button>\n\
+             <p class=\"note\">Your passkey stays on your device. This server keeps only its \
+             public half: no email, no phone number.</p>\n\
+             <button class=\"button quiet\" id=\"login\" type=\"button\">I already have a passkey\
+             </button>\n\
+             </div>"
+        )
     } else {
-        "<div class=\"stack\">\n\
-         <button class=\"button\" id=\"login\" type=\"button\">Sign in with a passkey</button>\n\
-         <p class=\"note\">Use the passkey on this device, or a security key.</p>\n\
-         </div>"
+        format!(
+            "<div class=\"stack\">\n\
+             <button class=\"button\" id=\"login\" type=\"button\">{KEY_ICON}Sign in with a \
+             passkey</button>\n\
+             <p class=\"note\">Use the passkey on this device, or a security key.</p>\n\
+             </div>"
+        )
     };
     let body = format!(
         "<div id=\"form\">\n{lead}\n{other}\
@@ -1341,7 +1377,7 @@ async fn signin_page(
          <div class=\"stack\">\n\
          <div><label for=\"code\">A recovery code</label>\n\
          <input type=\"text\" id=\"code\" autocomplete=\"off\" autocapitalize=\"characters\" \
-         spellcheck=\"false\"></div>\n\
+         spellcheck=\"false\" placeholder=\"XXXXX-XXXXX-XXXXX-XXXXX-XXXXX\"></div>\n\
          <button class=\"button quiet\" id=\"recover\" type=\"button\">Use a recovery code\
          </button>\n\
          </div>\n</details>\n</div>\n{CODES}"
@@ -1361,12 +1397,13 @@ async fn claim_page() -> Response {
     let body = format!(
         "<div id=\"form\" class=\"stack\">\n\
          <p id=\"who\">Checking your link…</p>\n\
-         <button class=\"button\" id=\"claim\" type=\"button\" hidden>Make my passkey</button>\n\
+         <button class=\"button\" id=\"claim\" type=\"button\" hidden>{KEY_ICON}Make my passkey\
+         </button>\n\
          <p class=\"note\">Your passkey stays on your device. This server keeps only its public \
          half. Your account, roles and messages stay as they are.</p>\n\
          </div>\n{CODES}\n\
          <section id=\"done\" class=\"stack\" hidden>\n\
-         <p>All set. Open Tiny and sign in with your passkey.</p>\n\
+         <p class=\"done-card\">All set. Open Tiny and sign in with your passkey.</p>\n\
          </section>"
     );
     // The server's name is filled in by the script once the link is checked: until then this
@@ -1520,5 +1557,15 @@ mod tests {
         assert!(Passkeys::new("http://localhost:8080", "T", None).is_ok());
         assert!(Passkeys::new("http://127.0.0.1:8080", "T", None).is_err());
         assert!(Passkeys::new("http://[::1]:8080", "T", None).is_err());
+    }
+
+    #[test]
+    fn auth_pages_use_tinyserver_ts_mark_and_recovery_actions() {
+        use super::{CODES, PAGE_STYLE, TINY_MARK_SVG};
+        assert!(TINY_MARK_SVG.contains("ts-plate"));
+        assert!(TINY_MARK_SVG.contains("M670 482"));
+        assert!(CODES.contains("id=\"copy-codes\""));
+        assert!(CODES.contains("id=\"download-codes\""));
+        assert!(PAGE_STYLE.contains("prefers-color-scheme:light"));
     }
 }
