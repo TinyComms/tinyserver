@@ -9,7 +9,8 @@
 #
 #   deploy/release-cut.sh                  dry run
 #   deploy/release-cut.sh --deployed SHA   dry run against a SHA read from the host instead
-#   deploy/release-cut.sh --apply          back up, swap the tree, build and start
+#   deploy/release-cut.sh --apply          pull GHCR image (fallback: build on build host), back up, swap, start
+#   deploy/release-cut.sh --apply --build  skip GHCR pull and build on the build host
 #
 # --through-freeze only when Justin said "ship through the freeze".
 #
@@ -26,13 +27,14 @@ repo=TinyComms/tinyserver
 
 die() { echo "release-cut: $*" >&2; exit 2; }
 
-apply= through= deployed=
+apply= through= deployed= force_build=
 while [ $# -gt 0 ]; do
     case "$1" in
         --apply) apply=1 ;;
+        --build) force_build=1 ;;
         --through-freeze) through=1 ;;
         --deployed) [ $# -ge 2 ] || die "--deployed needs a SHA"; deployed=$2; shift ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
     shift
@@ -188,26 +190,26 @@ if [ -z "$apply" ]; then
     exit 0
 fi
 
-# Apply: the deploy in use since 2026-11-02. The community host cannot build, so the build host
-# builds the image from an LF archive of origin/main (CRLF breaks entrypoint.sh) and streams it
-# into docker load on the community host. Then the same archive goes to the community host as the
-# new tree, with the host's own compose.vps.yml copied in, pg_dump into backups, the live tree
-# swapped for the new one, and up from the deploy directory with the image already loaded.
-echo "verdict: READY. Deploying $(git rev-parse --short "$head") to $host (built on $build)."
+# Apply: prefer pulling the CI-published GHCR image directly on the community host (one SSH call,
+# ~20s total). If --build is set or GHCR pull fails (e.g., private package with no token on host),
+# fall back to building with BuildKit on the build host and streaming into docker load.
+echo "verdict: READY. Deploying $(git rev-parse --short "$head") to $host."
 short=$(git rev-parse --short=7 "$head")
 ts=$(date +%Y%m%d-%H%M%S)
+ghcr_image="ghcr.io/tinycomms/tinyserver:$head"
 # The community host is behind the 1Password agent, which only Windows' own ssh can reach.
 cssh=${SSH:-ssh}
 [ -n "${SSH:-}" ] || [ ! -x /c/Windows/System32/OpenSSH/ssh.exe ] || cssh=/c/Windows/System32/OpenSSH/ssh.exe
 archive() { command git -C "$root" -c core.autocrlf=false archive --format=tar "$head"; }
-echo "building tinyserver:$short on $build and loading it on $host"
-archive | ssh "$build" "set -eu
-rm -rf /tmp/tinyserver-$short && mkdir -p /tmp/tinyserver-$short && tar -xf - -C /tmp/tinyserver-$short
-cd /tmp/tinyserver-$short && docker build -q -t tinyserver:$short -f Dockerfile . >&2
-docker save tinyserver:$short | gzip -1" | $cssh "$host" "gunzip | docker load" ||
-    die "building or loading tinyserver:$short failed; nothing on $host was changed"
 compose="docker compose -p tinyserver --env-file ../../.env -f compose.yml -f compose.vps.yml"
-remote="set -eu
+deploy_remote() {
+    pull_first=$1
+    cat <<EOF
+set -eu
+if [ "$pull_first" = 1 ]; then
+    docker pull -q "$ghcr_image" || exit 42
+    docker tag "$ghcr_image" "tinyserver:$short"
+fi
 cd '$dir'
 rm -rf src-new
 mkdir src-new
@@ -222,9 +224,32 @@ docker tag tinyserver:$short tinyserver:local
 cd src/deploy
 $compose up -d --no-build --remove-orphans
 $compose ps
-$compose logs --tail 60 tinyserver"
-archive | $cssh "$host" "$remote" ||
-    die "the deploy failed on $host; nothing was recorded. The old tree, if swapped, is $dir/src-pre-$short-$ts"
+$compose logs --tail 60 tinyserver
+EOF
+}
+deployed_fast=0
+if [ -z "$force_build" ]; then
+    echo "trying fast GHCR pull ($ghcr_image) on $host..."
+    rc=0
+    archive | $cssh "$host" "$(deploy_remote 1)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        deployed_fast=1
+    elif [ "$rc" -eq 42 ]; then
+        echo "GHCR pull unavailable on $host; falling back to BuildKit build on $build"
+    else
+        die "the deploy failed on $host (exit $rc); nothing was recorded. The old tree, if swapped, is $dir/src-pre-$short-$ts"
+    fi
+fi
+if [ "$deployed_fast" -eq 0 ]; then
+    echo "building tinyserver:$short on $build (BuildKit) and loading it on $host"
+    archive | ssh "$build" "set -eu
+rm -rf /tmp/tinyserver-$short && mkdir -p /tmp/tinyserver-$short && tar -xf - -C /tmp/tinyserver-$short
+cd /tmp/tinyserver-$short && DOCKER_BUILDKIT=1 docker build -q -t tinyserver:$short -f Dockerfile . >&2
+docker save tinyserver:$short | gzip -1" | $cssh "$host" "gunzip | docker load" ||
+        die "building or loading tinyserver:$short failed; nothing on $host was changed"
+    archive | $cssh "$host" "$(deploy_remote 0)" ||
+        die "the deploy failed on $host; nothing was recorded. The old tree, if swapped, is $dir/src-pre-$short-$ts"
+fi
 echo "$head $today $host" > "$record"
 echo
 echo "Deployed $short to $host and recorded it in $record."

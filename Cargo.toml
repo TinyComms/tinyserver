@@ -47,7 +47,7 @@ webauthn-rs = { version = "=0.6.2", default-features = false, features = ["dange
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
