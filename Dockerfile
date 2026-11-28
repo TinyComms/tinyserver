@@ -1,6 +1,8 @@
+# syntax=docker/dockerfile:1
 # The dependencies build in a layer of their own, from a cargo-chef recipe that lists only what
 # Cargo.toml and Cargo.lock name. A change to the server's own code then rebuilds the workspace
-# crates and not the three hundred crates under them. CI keeps those layers in a registry cache.
+# crates and not the three hundred crates under them. CI keeps those layers in a registry cache,
+# and BuildKit cache mounts keep Cargo's registry/git downloads warm on local/atomicstudio builds.
 FROM rust:1-bookworm AS chef
 RUN cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /src
@@ -13,10 +15,14 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS build
 COPY rust-toolchain.toml ./
 COPY --from=planner /src/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --bin tinyserver
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo chef cook --release --recipe-path recipe.json --bin tinyserver
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
-RUN cargo build --release --bin tinyserver
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release --bin tinyserver
 
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin tinyserver

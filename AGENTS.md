@@ -49,16 +49,14 @@ Build host: `atomicstudio`
 
 ### The deploy
 
-Only when Justin explicitly says to deploy the server, and only after the dry run above is clean. `deploy/release-cut.sh --apply` runs the method in use since 2026-11-02, in one `ssh` to the build host and two to the community host:
+Only when Justin explicitly says to deploy the server, and only after the dry run above is clean. `deploy/release-cut.sh --apply` deploys in ~20 seconds in a single `ssh` visit when `ghcr.io/tinycomms/tinyserver:<sha>` is pullable on the community host (make the GHCR package public or run `docker login ghcr.io` once on `tiny-server`). If GHCR pull is unavailable or `--build` is passed, it falls back to building with BuildKit on `atomicstudio` and streaming into `docker load`:
 
-1. `git -c core.autocrlf=false archive` of `origin/main` (CRLF breaks `entrypoint.sh`) goes to the build host, which builds `tinyserver:<sha>` and streams `docker save` of it into `docker load` on the community host.
-2. The same archive goes to the community host as `<dir>/src-<sha>`, with `deploy/compose.vps.yml` (the host's own overrides, not in this repository) copied in from the live tree.
+1. Try `docker pull ghcr.io/tinycomms/tinyserver:<sha>` directly on the community host (fast path, 1 SSH visit). Fallback: `git -c core.autocrlf=false archive` of `origin/main` (CRLF breaks `entrypoint.sh`) goes to `atomicstudio`, which builds `tinyserver:<sha>` with BuildKit cache mounts and streams `docker save` into `docker load` on the community host.
+2. The LF archive goes to the community host as `<dir>/src-new`, with `deploy/compose.vps.yml` (the host's own overrides, not in this repository) copied in from the live tree.
 3. `pg_dump -U postgres tinyserver` into `<dir>/backups/before-<sha>-<time>.sql`.
 4. The live tree `<dir>/src` moves to `<dir>/src-pre-<sha>-<time>`, the new tree takes its place, `tinyserver:<sha>` is tagged `tinyserver:local`, and from `<dir>/src/deploy`: `docker compose -p tinyserver --env-file ../../.env -f compose.yml -f compose.vps.yml up -d --no-build`.
 
 Then check the logs it prints, `GET /health` on the chat hostname, and that the migrations it named ran. To roll back, move `src-pre-<sha>-<time>` back to `src`, tag the previous image `tinyserver:local` (`docker images tinyserver` lists them by sha), `up -d --no-build` again, and restore the dump only if a migration has to be undone.
-
-CI publishes `ghcr.io/tinycomms/tinyserver:<sha>` too, but the package is private and the host has no token for it, so the image is built and loaded as above.
 
 ### Done
 
